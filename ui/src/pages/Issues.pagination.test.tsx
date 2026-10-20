@@ -72,6 +72,9 @@ describe("Tasks status pagination", () => {
       await settle();
       expect(container.textContent).toContain("Older backlog one");
       expect(container.textContent).toContain("Older backlog two");
+      expect(container.textContent).toContain("Review task");
+      expect(container.textContent).not.toContain("Done 0");
+      expect(mocks.listCompact).toHaveBeenCalledTimes(1);
       expect(mocks.listCompact).toHaveBeenLastCalledWith("company-1", expect.objectContaining({
         status: "backlog,in_review", offset: 0,
       }), expect.anything());
