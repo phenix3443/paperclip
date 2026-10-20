@@ -9,16 +9,17 @@ import { prepareBundledPackage } from "./prepare-bundled-package.mjs";
 test("a clean Git server package includes built UI and release runtime skills", () => {
   const root = mkdtempSync(join(tmpdir(), "paperclip-server-assets-"));
   try {
-    for (const dir of ["server/dist", "scripts", "skills/paperclip", "dependency"]) {
+    for (const dir of ["server/dist", "scripts", "skills/paperclip", "dependency", "server/node_modules/@paperclipai/plugin-sdk"]) {
       mkdirSync(join(root, dir), { recursive: true });
     }
     writeFileSync(join(root, "package.json"), JSON.stringify({ pnpm: {} }));
+    writeFileSync(join(root, "server/node_modules/@paperclipai/plugin-sdk/package.json"), JSON.stringify({ name: "@paperclipai/plugin-sdk", version: "1.0.0" }));
     writeFileSync(join(root, "dependency/package.json"), JSON.stringify({ name: "asset-fixture", version: "1.0.0" }));
     writeFileSync(join(root, "server/package.json"), JSON.stringify({
       name: "@paperclipai/server", version: "0.3.1",
       files: ["dist", "ui-dist", "skills"],
       scripts: { prepack: "node -e 'process.exit(42)'", postpack: "node -e 'process.exit(43)'" },
-      dependencies: { "asset-fixture": `file:${join(root, "dependency")}` },
+      dependencies: { "asset-fixture": `file:${join(root, "dependency")}`, "@paperclipai/plugin-sdk": "workspace:*" },
       bundleDependencies: ["asset-fixture"],
     }));
     writeFileSync(join(root, "server/dist/index.js"), "export {};\n");
@@ -27,6 +28,8 @@ test("a clean Git server package includes built UI and release runtime skills", 
       'set -eu\nmkdir -p server/ui-dist\nprintf "Built UI" > server/ui-dist/index.html\n');
     const destination = join(root, "staged");
     prepareBundledPackage(join(root, "server"), destination, { sourceRoot: root });
+    const stagedManifest = JSON.parse(readFileSync(join(destination, "package.json"), "utf8"));
+    assert.equal(stagedManifest.dependencies["@paperclipai/plugin-sdk"], "1.0.0");
     const [packed] = JSON.parse(execFileSync("npm", ["pack", "--json", "--pack-destination", root], {
       cwd: destination, encoding: "utf8",
     }));
