@@ -65,7 +65,8 @@ jobs:
             exit 0
           fi
 
-          BRANCH="chore/refresh-lockfile-${BASE_BRANCH//\//-}"
+          BASE_HASH="$(printf '%s' "$BASE_BRANCH" | sha256sum | cut -d ' ' -f 1)"
+          BRANCH="chore/refresh-lockfile-$BASE_HASH"
           git config user.name "lockfile-bot"
           git config user.email "lockfile-bot@users.noreply.github.com"
 
@@ -76,7 +77,7 @@ jobs:
 
           # Only reuse an open PR from this repository owner, not a fork with the same branch name.
           pr_url="$(
-            gh pr list --state open --head "$BRANCH" --json url,headRepositoryOwner \
+            gh pr list --state open --base "$BASE_BRANCH" --head "$BRANCH" --json url,headRepositoryOwner \
               --jq ".[] | select(.headRepositoryOwner.login == \"$REPO_OWNER\") | .url" |
             head -n 1
           )"
