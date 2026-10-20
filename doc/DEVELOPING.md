@@ -1847,3 +1847,11 @@ Chromium. The test starts its own loopback Vite server and mocks API responses;
 it needs no running Paperclip instance or provider credentials. The same spec lives
 in the default `test:e2e` discovery tree, so the existing Chrome CI shards run it
 on pull requests.
+
+### Managed Git package assets
+
+The managed Git installer builds the server dependency closure, then stages bundled
+packages with `scripts/prepare-bundled-package.mjs`. For the checkout server, that
+helper runs `prepare-server-ui-dist.sh` and copies the root runtime `skills/` into
+the package, matching release staging. This makes a clean Git archive self-contained
+without relying on an earlier npm release build.

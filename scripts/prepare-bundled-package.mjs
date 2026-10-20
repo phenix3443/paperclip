@@ -145,10 +145,23 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
     throw new Error(`${sourcePackage.name} does not declare bundled dependencies`);
   }
 
+  const checkoutServer = sourcePackage.name === "@paperclipai/server"
+    && resolve(sourceDir) === resolve(sourceRoot, "server");
+  if (checkoutServer) {
+    execFileSync("bash", [resolve(sourceRoot, "scripts/prepare-server-ui-dist.sh")], {
+      cwd: sourceRoot,
+      env: { ...process.env, PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" },
+      stdio: "inherit",
+    });
+  }
+
   rmSync(destinationDir, { recursive: true, force: true });
   mkdirSync(destinationDir, { recursive: true });
   for (const entry of sourcePackage.files ?? []) {
-    cpSync(resolve(sourceDir, entry), resolve(destinationDir, entry), { recursive: true });
+    const entrySource = checkoutServer && entry === "skills"
+      ? resolve(sourceRoot, "skills")
+      : resolve(sourceDir, entry);
+    cpSync(entrySource, resolve(destinationDir, entry), { recursive: true });
   }
   for (const entry of ["README.md", "LICENSE", "LICENSE.md"]) {
     const sourcePath = resolve(sourceDir, entry);
