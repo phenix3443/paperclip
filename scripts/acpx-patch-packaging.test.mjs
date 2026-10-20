@@ -299,6 +299,16 @@ test("server package staging applies every bundled runtime patch and preserves t
     join(sourceDir, "package.json"),
     JSON.stringify({ ...serverPackage, files: ["dist"] }),
   );
+  for (const [name, specifier] of Object.entries({
+    ...serverPackage.dependencies,
+    ...serverPackage.optionalDependencies,
+    ...serverPackage.peerDependencies,
+  })) {
+    if (!specifier.startsWith("workspace:")) continue;
+    const dependencyDir = join(sourceDir, "node_modules", name);
+    mkdirSync(dependencyDir, { recursive: true });
+    writeFileSync(join(dependencyDir, "package.json"), JSON.stringify({ name, version: serverPackage.version }));
+  }
   writeFileSync(callLog, "");
   t.after(() => rmSync(fixtureDir, { recursive: true, force: true }));
 

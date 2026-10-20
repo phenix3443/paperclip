@@ -1855,3 +1855,7 @@ packages with `scripts/prepare-bundled-package.mjs`. For the checkout server, th
 helper runs `prepare-server-ui-dist.sh` and copies the root runtime `skills/` into
 the package, matching release staging. This makes a clean Git archive self-contained
 without relying on an earlier npm release build.
+Staged bundled packages omit source `prepack` and `postpack` hooks because their
+artifacts are already prepared and the temporary package has no source workspace.
+Workspace dependency ranges in these artifacts use the installed dependency
+manifest version. This preserves independently versioned packages such as the plugin SDK.
