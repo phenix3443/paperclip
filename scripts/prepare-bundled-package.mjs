@@ -170,6 +170,11 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
 
   const deployedPackagePath = resolve(destinationDir, "package.json");
   const publishManifest = materializePublishManifest(sourcePackage);
+  // Staged artifacts are already built; source pack hooks refer to absent checkout paths.
+  if (publishManifest.scripts) {
+    delete publishManifest.scripts.prepack;
+    delete publishManifest.scripts.postpack;
+  }
   const installManifest = createBundledInstallManifest(publishManifest, bundledDependencies);
   writeFileSync(deployedPackagePath, `${JSON.stringify(installManifest, null, 2)}\n`);
 

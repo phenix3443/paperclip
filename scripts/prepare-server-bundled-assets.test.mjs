@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,6 +17,7 @@ test("a clean Git server package includes built UI and release runtime skills", 
     writeFileSync(join(root, "server/package.json"), JSON.stringify({
       name: "@paperclipai/server", version: "0.3.1",
       files: ["dist", "ui-dist", "skills"],
+      scripts: { prepack: "node -e 'process.exit(42)'", postpack: "node -e 'process.exit(43)'" },
       dependencies: { "asset-fixture": `file:${join(root, "dependency")}` },
       bundleDependencies: ["asset-fixture"],
     }));
@@ -25,6 +27,12 @@ test("a clean Git server package includes built UI and release runtime skills", 
       'set -eu\nmkdir -p server/ui-dist\nprintf "Built UI" > server/ui-dist/index.html\n');
     const destination = join(root, "staged");
     prepareBundledPackage(join(root, "server"), destination, { sourceRoot: root });
+    const [packed] = JSON.parse(execFileSync("npm", ["pack", "--json", "--pack-destination", root], {
+      cwd: destination, encoding: "utf8",
+    }));
+    const packedFiles = packed.files.map((file) => file.path);
+    assert.ok(packedFiles.includes("ui-dist/index.html"));
+    assert.ok(packedFiles.includes("skills/paperclip/SKILL.md"));
     assert.equal(readFileSync(join(destination, "ui-dist/index.html"), "utf8"), "Built UI");
     assert.equal(readFileSync(join(destination, "skills/paperclip/SKILL.md"), "utf8"), "Runtime skill\n");
   } finally {
