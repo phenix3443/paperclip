@@ -89,7 +89,7 @@ jobs:
               --base "$BASE_BRANCH" \
               --head "$BRANCH" \
               --title "chore(lockfile): refresh pnpm-lock.yaml" \
-              --body "Refresh dependency resolution for $BASE_BRANCH. This PR only updates pnpm-lock.yaml.")"
+              --body-file .github/LOCKFILE_PR_TEMPLATE.md)"
             echo "Created new PR: $pr_url"
           else
             echo "PR already exists: $pr_url"
