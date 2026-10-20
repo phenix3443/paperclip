@@ -20,7 +20,6 @@ vi.mock("@/lib/router", () => ({
 }));
 vi.mock("../hooks/useStreamlinedUiEnabled", () => ({ useStreamlinedUiEnabled: () => ({ enabled: false }) }));
 vi.mock("../hooks/useCombinedInboxTasksEnabled", () => ({ useCombinedInboxTasksEnabled: () => ({ enabled: false }) }));
-vi.mock("../hooks/useShowAgentCreatedTasks", () => ({ useShowAgentCreatedTasks: () => false }));
 vi.mock("@/hooks/useSharedPolling", () => ({
   useSharedPollingQuery: () => ({ enabled: false }),
   usePublishSharedQueryData: () => {},
