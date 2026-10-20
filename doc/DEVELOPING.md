@@ -27,6 +27,11 @@ GitHub Actions owns `pnpm-lock.yaml`.
 - For a maintenance branch, dispatch `refresh-lockfile.yml` on that branch; it opens a lockfile-only PR against that same branch using a branch-specific head. This keeps release fixes out of unrelated branches.
 - Pushes to `master` regenerate `pnpm-lock.yaml` with `pnpm install --lockfile-only --no-frozen-lockfile`, commit it back if needed, and then run verification with `--frozen-lockfile`.
 
+On a workstation with a globally installed `paperclipai`, workspace provisioning tests
+can discover that executable and reject their minimal fixture configuration. Run
+those tests with a PATH that includes Node, pnpm and Git but excludes the global
+CLI location. Keep the live managed installation unchanged.
+
 ## Trusted PR Workflow
 
 The PR caller uses `paperclipai/paperclip/.github/workflows/pr-trusted.yml@master`.
