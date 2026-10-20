@@ -270,6 +270,7 @@ retain their titles and default to no generation request.
 - `billing_code` text null
 - `assignee_adapter_overrides` jsonb null
 - `execution_policy` jsonb null
+  - `maxReviewRounds: 0` opts out of count-based review escalation; omitted/null retains the default cap. Independent review and decision history remain enforced.
 - `execution_state` jsonb null
 - execution workspace fields: `execution_workspace_id`, `execution_workspace_preference`, `execution_workspace_settings`
 - `started_at` timestamptz null

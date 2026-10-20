@@ -442,7 +442,7 @@ export const issueExecutionPolicySchema = z.object({
   maxReviewRounds: z
     .number()
     .int()
-    .positive()
+    .nonnegative()
     .max(50)
     .optional()
     .nullable()

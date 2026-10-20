@@ -679,8 +679,8 @@ export interface IssueExecutionPolicy {
   authorizationPolicy?: TrustAuthorizationPolicy;
   /**
    * Maximum consecutive agent-initiated changes-requested rounds before the
-   * pending stage escalates to the responsible human. Null uses the server
-   * default. Human decisions reset the round counter.
+   * pending stage escalates to the responsible human. Zero disables count-based
+   * escalation. Null uses the server default. Human decisions reset the counter.
    */
   maxReviewRounds?: number | null;
 }

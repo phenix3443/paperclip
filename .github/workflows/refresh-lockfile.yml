@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: refresh-lockfile-master
+  group: refresh-lockfile-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -57,6 +57,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO_OWNER: ${{ github.repository_owner }}
+          BASE_BRANCH: ${{ github.ref_name }}
         run: |
           if git diff --quiet -- pnpm-lock.yaml; then
             echo "Lockfile unchanged, nothing to do."
@@ -64,7 +65,7 @@ jobs:
             exit 0
           fi
 
-          BRANCH="chore/refresh-lockfile"
+          BRANCH="chore/refresh-lockfile-${BASE_BRANCH//\//-}"
           git config user.name "lockfile-bot"
           git config user.email "lockfile-bot@users.noreply.github.com"
 
@@ -81,9 +82,10 @@ jobs:
           )"
           if [ -z "$pr_url" ]; then
             pr_url="$(gh pr create \
+              --base "$BASE_BRANCH" \
               --head "$BRANCH" \
               --title "chore(lockfile): refresh pnpm-lock.yaml" \
-              --body "Auto-generated lockfile refresh after dependencies changed on master. This PR only updates pnpm-lock.yaml.")"
+              --body "Auto-generated lockfile refresh for the selected base branch. This PR only updates pnpm-lock.yaml.")"
             echo "Created new PR: $pr_url"
           else
             echo "PR already exists: $pr_url"

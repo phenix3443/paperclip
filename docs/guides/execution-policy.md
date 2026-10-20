@@ -23,6 +23,7 @@ interface IssueExecutionPolicy {
   mode: "normal" | "auto";
   commentRequired: boolean;       // always true, enforced by runtime
   stages: IssueExecutionStage[];  // ordered list of review/approval stages
+  maxReviewRounds?: number | null; // 0: unlimited; 1–50: cap; null/omitted: default 3
 }
 
 interface IssueExecutionStage {
@@ -123,6 +124,14 @@ interface IssueExecutionDecision {
 3. **Executor makes changes** and transitions to `done` again.
 4. Runtime routes back to the **same review stage** (not the beginning), with the same reviewer.
 5. This loop continues until the reviewer approves.
+
+### Review round limits
+
+By default, the third consecutive agent request for changes transfers the pending stage to the responsible human. Set `executionPolicy.maxReviewRounds` to `0` to keep returning changes to the executor without a round cap. Values from `1` to `50` set a finite cap; omitted or null values retain the default of `3`.
+
+Changing an already escalated policy to unlimited returns the outstanding changes to the original executor without a new decision or a counter reset. Explicit human review participants remain in place.
+
+An unlimited policy preserves independent review, decision history and the diagnostic `changesRequestedCount`. The reviewer still has to approve the stage. Budget limits, explicit human participants, operator stops and other execution controls still apply. Human decisions and stage approval retain their normal counter-reset behavior.
 
 ### Policy Variants
 

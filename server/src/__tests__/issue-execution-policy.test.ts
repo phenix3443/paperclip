@@ -2044,6 +2044,82 @@ describe("review round circuit breaker", () => {
     });
   });
 
+  it("keeps an explicitly unlimited review loop with its reviewer until approval", () => {
+    const unlimitedPolicy = { ...policy, maxReviewRounds: 0 };
+    expect(normalizeIssueExecutionPolicy(unlimitedPolicy)?.maxReviewRounds).toBe(0);
+    let issue = reviewPendingIssue({ executionPolicy: unlimitedPolicy });
+
+    for (let round = 1; round <= 51; round += 1) {
+      const feedback = applyIssueExecutionPolicyTransition({
+        issue,
+        policy: unlimitedPolicy,
+        requestedStatus: "in_progress",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: `Revision ${round} needs changes`,
+      });
+      expect(feedback.patch.status).toBe("in_progress");
+      expect(feedback.patch.assigneeAgentId).toBe(coderAgentId);
+      expect(feedback.patch.assigneeUserId).toBeNull();
+      expect(feedback.decision?.outcome).toBe("changes_requested");
+      expect(feedback.patch.executionState).toMatchObject({ changesRequestedCount: round });
+      issue = { ...issue, ...feedback.patch } as typeof issue;
+
+      const resubmission = applyIssueExecutionPolicyTransition({
+        issue,
+        policy: unlimitedPolicy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        commentBody: `Revision ${round} submitted`,
+      });
+      expect(resubmission.patch.status).toBe("in_review");
+      expect(resubmission.patch.assigneeAgentId).toBe(qaAgentId);
+      expect(resubmission.patch.executionState).toMatchObject({
+        currentParticipant: { type: "agent", agentId: qaAgentId },
+        changesRequestedCount: round,
+      });
+      issue = { ...issue, ...resubmission.patch } as typeof issue;
+    }
+
+    const approved = applyIssueExecutionPolicyTransition({
+      issue,
+      policy: unlimitedPolicy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "Final revision approved",
+    });
+    expect(approved.decision?.outcome).toBe("approved");
+    expect(approved.patch.executionState).toMatchObject({ status: "completed", changesRequestedCount: 0 });
+  });
+
+  it("returns an existing count-based escalation to its executor when made unlimited", () => {
+    const unlimitedPolicy = { ...policy, maxReviewRounds: 0 };
+    const result = applyIssueExecutionPolicyTransition({
+      issue: reviewPendingIssue(
+        { assigneeAgentId: null, assigneeUserId: boardUserId },
+        { currentParticipant: { type: "user", userId: boardUserId }, changesRequestedCount: 3, lastDecisionOutcome: "changes_requested" },
+      ),
+      previousPolicy: policy,
+      policy: unlimitedPolicy,
+      requestedAssigneePatch: {},
+      actor: { userId: boardUserId },
+    });
+    expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+    expect(result.patch.assigneeUserId).toBeNull();
+    expect(result.patch.executionState).toMatchObject({
+      status: "changes_requested",
+      currentParticipant: { type: "agent", agentId: qaAgentId },
+      changesRequestedCount: 3,
+    });
+    expect(result.decision).toBeUndefined();
+  });
+
+  it.each([-1, 51, 1.5])("rejects an invalid review cap %s", (maxReviewRounds) => {
+    expect(() => normalizeIssueExecutionPolicy({ ...policy, maxReviewRounds })).toThrow("Invalid execution policy");
+  });
+
   it("honors a policy maxReviewRounds override", () => {
     const strictPolicy = normalizeIssueExecutionPolicy({
       stages: [{ type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],

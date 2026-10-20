@@ -64,7 +64,7 @@ type TransitionResult = {
 /**
  * Consecutive agent-initiated changes-requested rounds tolerated on one stage
  * before the pending review escalates to the responsible human. Policies can
- * override via `maxReviewRounds`; human decisions always reset the counter.
+ * override via `maxReviewRounds` (0 disables escalation); human decisions reset the counter.
  */
 export const DEFAULT_MAX_REVIEW_ROUNDS = 3;
 
@@ -445,6 +445,7 @@ function principalsEqual(a: IssueExecutionStagePrincipal | null, b: IssueExecuti
 
 function resolveMaxReviewRounds(policy: IssueExecutionPolicy | null): number {
   const configured = policy?.maxReviewRounds;
+  if (configured === 0) return Number.POSITIVE_INFINITY;
   return typeof configured === "number" && configured > 0 ? configured : DEFAULT_MAX_REVIEW_ROUNDS;
 }
 
@@ -752,6 +753,31 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         });
       }
       return { patch };
+    }
+    if (
+      existingState &&
+      input.policy.maxReviewRounds === 0 &&
+      input.previousPolicy && input.previousPolicy.maxReviewRounds !== 0 &&
+      currentParticipant.type === "user" && !stageHasParticipant(activeStage, currentParticipant) &&
+      existingState.lastDecisionOutcome === "changes_requested" && existingState.returnAssignee &&
+      (existingState.changesRequestedCount ?? 0) >= resolveMaxReviewRounds(input.previousPolicy)
+    ) {
+      // Disabling the cap resumes the outstanding rework, not another decision
+      // on the same revision. Keep the existing decision and diagnostic count.
+      const participant = selectStageParticipant(activeStage, {
+        exclude: existingState.returnAssignee,
+      });
+      if (!participant) {
+        throw unprocessable("Execution stage has no eligible reviewer");
+      }
+      patch.status = "in_progress";
+      Object.assign(patch, patchForPrincipal(existingState.returnAssignee));
+      patch.executionState = buildChangesRequestedState(
+        { ...existingState, currentParticipant: participant },
+        activeStage,
+        existingState.changesRequestedCount ?? 0,
+      );
+      return { patch, workflowControlledAssignment: true };
     }
     if (!escalatedHold && !stageHasParticipant(activeStage, currentParticipant)) {
       const participant = selectStageParticipant(activeStage, {
