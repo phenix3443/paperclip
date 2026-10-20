@@ -499,6 +499,7 @@ interface IssuesListProps {
   issueBadgeById?: Map<string, string>;
   onLoadMoreIssues?: () => void;
   onSearchChange?: (search: string) => void;
+  onStatusFilterChange?: (status: string) => void;
   /** Opt in per surface while the canonical task row rolls out across collections. */
   rowPresentation?: IssueRowPresentation;
   /** Opt in per surface while the shared collection toolbar rolls out. */
@@ -739,6 +740,7 @@ function StreamlinedIssuesList({
   issueBadgeById,
   onLoadMoreIssues,
   onSearchChange,
+  onStatusFilterChange,
   rowPresentation = "legacy",
   toolbarContext,
   toolbarPresentation = "legacy",
@@ -819,6 +821,10 @@ function StreamlinedIssuesList({
       initialStatuses,
     ),
   );
+  const statusFilter = [...viewState.statuses].sort().join(",");
+  useEffect(() => {
+    onStatusFilterChange?.(statusFilter);
+  }, [onStatusFilterChange, statusFilter]);
   const [assigneePickerIssueId, setAssigneePickerIssueId] = useState<string | null>(null);
   const [assigneeSearch, setAssigneeSearch] = useState("");
   const [issueSearch, setIssueSearch] = useState(initialSearch ?? "");
