@@ -30,7 +30,10 @@ GitHub Actions owns `pnpm-lock.yaml`.
 On a workstation with a globally installed `paperclipai`, workspace provisioning tests
 can discover that executable and reject their minimal fixture configuration. Run
 those tests with a PATH that includes Node, pnpm and Git but excludes the global
-CLI location. Keep the live managed installation unchanged.
+CLI location. AI-connection tests also inspect parent directories for project
+authentication settings. Use a clean checkout outside a configured user home
+when those fixtures inherit host authentication overrides. Keep the live
+managed installation unchanged.
 
 ## Trusted PR Workflow
 
