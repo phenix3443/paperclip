@@ -13,6 +13,7 @@ import {
   validateExecutionReconciliation,
   markExecutionReconciliation,
   isVerifiedPreStartCancelledReviewerRun,
+  blocksSafeHandBackForPendingStage,
 } from "../services/execution-recovery-resolution.js";
 import {
   storedSteeringAcknowledgement,
@@ -6780,10 +6781,11 @@ export function issueRoutes(
         },
       );
     }
-    const executionState = parseIssueExecutionState(input.issue.executionState);
     if (
-      executionState?.status === "pending" &&
-      !(input.allowPendingReviewStage && executionState.currentStageType === "review")
+      blocksSafeHandBackForPendingStage({
+        executionState: input.issue.executionState,
+        allowPendingReviewStage: input.allowPendingReviewStage === true,
+      })
     ) {
       throw conflict(
         "Safe recovery hand-back cannot bypass a pending execution review or approval stage",

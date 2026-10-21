@@ -52,6 +52,18 @@ export function isVerifiedPreStartCancelledReviewerRun(input: {
   );
 }
 
+/** Safe hand-back may resume, never bypass, a pending review stage; approval stages stay gated. */
+export function blocksSafeHandBackForPendingStage(input: {
+  executionState: unknown;
+  allowPendingReviewStage: boolean;
+}): boolean {
+  const state = parseIssueExecutionState(input.executionState);
+  return (
+    state?.status === "pending" &&
+    !(input.allowPendingReviewStage && state.currentStageType === "review")
+  );
+}
+
 /** An operator records observed outcomes; this is not permission to blindly retry. */
 export async function validateExecutionReconciliation(input: {
   db: Db;

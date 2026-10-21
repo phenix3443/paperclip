@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { isVerifiedPreStartCancelledReviewerRun } from "./execution-recovery-resolution.js";
+import {
+  blocksSafeHandBackForPendingStage,
+  isVerifiedPreStartCancelledReviewerRun,
+} from "./execution-recovery-resolution.js";
 
 type Input = Parameters<typeof isVerifiedPreStartCancelledReviewerRun>[0];
 
@@ -67,5 +70,28 @@ describe("isVerifiedPreStartCancelledReviewerRun", () => {
     ["the action outcome is completed", { ...base, decision: { ...base.decision, actionOutcome: "completed" } }],
   ])("rejects when %s", (_name, input) => {
     expect(isVerifiedPreStartCancelledReviewerRun(input)).toBe(false);
+  });
+});
+
+describe("blocksSafeHandBackForPendingStage", () => {
+  const stateOf = (input: Input) => input.task.executionState;
+
+  it("keeps a pending approval stage gated even when review resume is allowed", () => {
+    const executionState = stateOf(withState({ currentStageType: "approval" }));
+    expect(blocksSafeHandBackForPendingStage({ executionState, allowPendingReviewStage: true })).toBe(true);
+    expect(blocksSafeHandBackForPendingStage({ executionState, allowPendingReviewStage: false })).toBe(true);
+  });
+
+  it("lets only an explicit review resume pass a pending review stage", () => {
+    const executionState = stateOf(verified());
+    expect(blocksSafeHandBackForPendingStage({ executionState, allowPendingReviewStage: true })).toBe(false);
+    expect(blocksSafeHandBackForPendingStage({ executionState, allowPendingReviewStage: false })).toBe(true);
+  });
+
+  it("does not gate hand-back when no stage is pending", () => {
+    for (const executionState of [null, stateOf(withState({ status: "changes_requested" }))]) {
+      expect(blocksSafeHandBackForPendingStage({ executionState, allowPendingReviewStage: false })).toBe(false);
+      expect(blocksSafeHandBackForPendingStage({ executionState, allowPendingReviewStage: true })).toBe(false);
+    }
   });
 });
