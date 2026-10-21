@@ -23,6 +23,35 @@ import {
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
 
+/** A reviewer run that provably never started may resume the same pending review stage. */
+export function isVerifiedPreStartCancelledReviewerRun(input: {
+  task: { status: string; assigneeAgentId: string | null; executionState: unknown };
+  run: Pick<
+    typeof heartbeatRuns.$inferSelect,
+    "status" | "agentId" | "startedAt" | "processPid" | "processGroupId"
+  >;
+  returnOwnerAgentId: string | null;
+  decision: ExecutionReconciliation;
+}): boolean {
+  const state = parseIssueExecutionState(input.task.executionState);
+  const participant = state?.currentParticipant;
+  return (
+    input.task.status === "in_review" &&
+    state?.status === "pending" &&
+    // Never an approval stage.
+    state.currentStageType === "review" &&
+    participant?.type === "agent" &&
+    participant.agentId === input.run.agentId &&
+    input.task.assigneeAgentId === input.run.agentId &&
+    input.returnOwnerAgentId === input.run.agentId &&
+    input.run.status === "cancelled" &&
+    input.run.startedAt == null &&
+    input.run.processPid == null &&
+    input.run.processGroupId == null &&
+    input.decision.actionOutcome === "not_performed"
+  );
+}
+
 /** An operator records observed outcomes; this is not permission to blindly retry. */
 export async function validateExecutionReconciliation(input: {
   db: Db;

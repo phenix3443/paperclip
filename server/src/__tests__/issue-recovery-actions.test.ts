@@ -30,6 +30,8 @@ import {
   issueTreeHolds,
   nativeRunFinalizations,
   projects,
+  toolApplications,
+  toolConnections,
   workspaceOperations,
   issues,
 } from "@paperclipai/db";
@@ -2911,6 +2913,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       for (const spy of killSpies.splice(0)) spy.mockRestore();
       await db.delete(chatConversations);
       await db.delete(chatEndpoints);
+      await db.delete(toolConnections);
+      await db.delete(toolApplications);
       await db.delete(issueApprovals);
       await db.delete(approvals);
       await db.delete(issueTreeHolds);
@@ -2926,6 +2930,16 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     async function seedPreStartCancelledReview() {
       const fixture = await seedCompany();
       const { companyId, coderId, sourceIssueId: issueA } = fixture;
+      const responsibleUserId = randomUUID();
+      await db.insert(authUsers).values({
+        id: responsibleUserId,
+        name: "Recovery operator",
+        email: `${responsibleUserId}@example.test`,
+        emailVerified: true,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+      await db.update(companies).set({ defaultResponsibleUserId: responsibleUserId }).where(eq(companies.id, companyId));
       const reviewerId = randomUUID();
       await db.insert(agents).values({
         id: reviewerId,
@@ -3088,12 +3102,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       return response;
     }
 
-    it("reproduces the contradiction: todo hits the pending stage gate and in_review is otherwise unreachable", async () => {
+    it("keeps refusing a todo hand-back that would bypass the pending review stage", async () => {
       const fixture = await seedPreStartCancelledReview();
+      // Handing back to todo would bypass the pending review, so that gate correctly refuses it.
       await expectRejected(fixture, 409, "recovery_governed_stage_pending", resolveBody(fixture, { sourceIssueStatus: "todo" }));
-      // Without a verified pre-start reviewer run the in_review request stays rejected.
-      await db.update(heartbeatRuns).set({ startedAt: new Date() }).where(eq(heartbeatRuns.id, fixture.run1));
-      await expectRejected(fixture, 409);
     });
 
     it("clears the hold and wakes the current reviewer without touching the review stage", async () => {
@@ -3134,6 +3146,227 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(wakes).toHaveLength(1);
       expect(wakes[0]!.agentId).toBe(fixture.reviewerId);
       expect((await snapshot(fixture)).issue.executionState).toEqual(fixture.executionState);
+    });
+
+    function stubProcessKill(code: string) {
+      const spy = vi.spyOn(process, "kill").mockImplementation((() => {
+        throw Object.assign(new Error(code), { code });
+      }) as never);
+      killSpies.push(spy);
+    }
+
+    async function patchExecutionState(fixture: ReviewFixture, patch: Record<string, unknown> | null) {
+      await db.update(issues).set({ executionState: patch && { ...fixture.executionState, ...patch } })
+        .where(eq(issues.id, fixture.issueA));
+    }
+
+    async function seedOtherRun(fixture: ReviewFixture) {
+      const runId = randomUUID();
+      await seedHeartbeatRun({ companyId: fixture.companyId, agentId: fixture.coderId, runId, issueId: fixture.issueA, status: "queued" });
+      return runId;
+    }
+
+    type Counterexample = {
+      setup: (fixture: ReviewFixture) => Promise<{ body?: Record<string, unknown>; app?: ReturnType<typeof createApp> } | void>;
+      status: number;
+      code?: string;
+      message?: RegExp;
+    };
+
+    const unverified = { status: 409, code: "recovery_review_resume_unverified" };
+    const counterexamples: Record<string, Counterexample> = {
+      "N1 the run started": {
+        setup: async (f) => { await db.update(heartbeatRuns).set({ startedAt: new Date() }).where(eq(heartbeatRuns.id, f.run1)); },
+        ...unverified,
+      },
+      "N2 the run recorded a process": {
+        setup: async (f) => {
+          stubProcessKill("ESRCH");
+          await db.update(heartbeatRuns).set({ processPid: 424242 }).where(eq(heartbeatRuns.id, f.run1));
+        },
+        ...unverified,
+      },
+      "N3 the run recorded a process group": {
+        setup: async (f) => {
+          stubProcessKill("ESRCH");
+          await db.update(heartbeatRuns).set({ processGroupId: 424242 }).where(eq(heartbeatRuns.id, f.run1));
+        },
+        ...unverified,
+      },
+      "N4 process ownership cannot be verified": {
+        setup: async (f) => {
+          stubProcessKill("EPERM");
+          await db.update(heartbeatRuns).set({ processPid: 424242 }).where(eq(heartbeatRuns.id, f.run1));
+        },
+        status: 409,
+        message: /process ownership cannot be verified/,
+      },
+      "N5 the current stage is an approval stage": {
+        setup: (f) => patchExecutionState(f, { currentStageType: "approval" }),
+        ...unverified,
+      },
+      "N6a there is no execution state": {
+        setup: (f) => patchExecutionState(f, null),
+        ...unverified,
+      },
+      "N6b the stage is not pending": {
+        setup: (f) => patchExecutionState(f, { status: "changes_requested" }),
+        ...unverified,
+      },
+      "N7 the action outcome is mixed": {
+        setup: async (f) => ({
+          body: resolveBody(f, { executionReconciliation: { ...resolveBody(f).executionReconciliation, actionOutcome: "mixed" } }),
+        }),
+        ...unverified,
+      },
+      "N8 the action outcome is completed": {
+        setup: async (f) => ({
+          body: resolveBody(f, { executionReconciliation: { ...resolveBody(f).executionReconciliation, actionOutcome: "completed" } }),
+        }),
+        ...unverified,
+      },
+      "N9a the return owner is not the assignee": {
+        setup: async (f) => {
+          await db.update(issueRecoveryActions).set({ returnOwnerAgentId: f.coderId }).where(eq(issueRecoveryActions.id, f.action1.id));
+        },
+        ...unverified,
+      },
+      "N9b the participant is not the run agent": {
+        setup: (f) => patchExecutionState(f, { currentParticipant: { type: "agent", agentId: f.coderId } }),
+        ...unverified,
+      },
+      "N10 the task is bound to a restricted chat conversation": {
+        setup: async (f) => {
+          const endpointId = randomUUID();
+          const [application] = await db.insert(toolApplications).values({
+            companyId: f.companyId, applicationKey: `chat:telegram:${endpointId}`, name: "Telegram", type: "chat", status: "active",
+          }).returning();
+          const [connection] = await db.insert(toolConnections).values({
+            companyId: f.companyId, applicationId: application!.id, name: "Telegram", uid: `chat-telegram-${endpointId}`,
+            connectionPurpose: "channel", transport: "chat_sdk", status: "active", enabled: true,
+          }).returning();
+          const [endpoint] = await db.insert(chatEndpoints).values({
+            id: endpointId,
+            companyId: f.companyId,
+            connectionId: connection!.id,
+            provider: "telegram",
+            publicId: `endpoint-${randomUUID()}`,
+            externalExecutionPolicy: "restricted",
+            assignedAgentId: f.reviewerId,
+          }).returning();
+          await db.insert(chatConversations).values({
+            companyId: f.companyId,
+            endpointId: endpoint!.id,
+            issueId: f.issueA,
+            externalConversationId: "conversation-1",
+            externalLabel: "Conversation 1",
+          });
+        },
+        status: 409,
+        code: "chat_recovery_review_resume_unsupported",
+      },
+      "N11 another run holds the execution lock": {
+        setup: async (f) => {
+          await db.update(issues).set({ executionRunId: await seedOtherRun(f) }).where(eq(issues.id, f.issueA));
+        },
+        status: 409,
+        code: "recovery_source_run_lock",
+      },
+      "N12 another run holds the checkout lock": {
+        setup: async (f) => {
+          await db.update(issues).set({ checkoutRunId: await seedOtherRun(f) }).where(eq(issues.id, f.issueA));
+        },
+        status: 409,
+        code: "recovery_source_run_lock",
+      },
+      "N13 an ancestor has an active pause hold": {
+        setup: async (f) => {
+          const parentId = randomUUID();
+          await db.insert(issues).values({
+            id: parentId, companyId: f.companyId, title: "Parent", status: "in_progress", priority: "medium",
+            issueNumber: 2, identifier: `${f.prefix}-2`,
+          });
+          await db.update(issues).set({ parentId }).where(eq(issues.id, f.issueA));
+          await db.insert(issueTreeHolds).values({ companyId: f.companyId, rootIssueId: parentId, mode: "pause", status: "active" });
+        },
+        status: 409,
+        message: /subtree pause hold/,
+      },
+      "N14 the project is paused": {
+        setup: async (f) => {
+          const [project] = await db.insert(projects).values({ companyId: f.companyId, name: "Paused project", pausedAt: new Date() }).returning();
+          await db.update(issues).set({ projectId: project!.id }).where(eq(issues.id, f.issueA));
+        },
+        status: 409,
+        message: /^Project is paused$/,
+      },
+      "N15 a governed approval is pending": {
+        setup: async (f) => {
+          const [approval] = await db.insert(approvals).values({ companyId: f.companyId, type: "issue_review", status: "pending", payload: {} }).returning();
+          await db.insert(issueApprovals).values({ companyId: f.companyId, issueId: f.issueA, approvalId: approval!.id });
+        },
+        status: 409,
+        code: "recovery_governed_approval_pending",
+      },
+      "N16 the reviewer reached its budget hard-stop": {
+        setup: async (f) => {
+          await db.update(agents).set({ status: "paused", pauseReason: "budget" }).where(eq(agents.id, f.reviewerId));
+        },
+        status: 409,
+        code: "recovery_safe_hand_back_budget_blocked",
+      },
+      "N17 a coordinator still leases the run": {
+        setup: async (f) => {
+          await db.update(heartbeatRuns).set({ nativeIssueId: f.issueA }).where(eq(heartbeatRuns.id, f.run1));
+          await db.insert(nativeRunFinalizations).values({
+            runId: f.run1, companyId: f.companyId, issueId: f.issueA, phase: "terminal_failure", leaseOwner: "controller-1",
+          });
+        },
+        status: 409,
+        message: /coordinator or a linked continuation/,
+      },
+      "N18 the run has a linked successor": {
+        setup: async (f) => {
+          await db.update(heartbeatRuns).set({ nativeIssueId: f.issueA }).where(eq(heartbeatRuns.id, f.run1));
+          await db.insert(nativeRunFinalizations).values({
+            runId: f.run1, companyId: f.companyId, issueId: f.issueA, phase: "terminal_failure",
+            failureDetail: { successorRunId: randomUUID() },
+          });
+        },
+        status: 409,
+        message: /coordinator or a linked continuation/,
+      },
+      "N19 the run's environment lease is unreleased": {
+        setup: async (f) => {
+          await db.insert(environmentLeases).values({ companyId: f.companyId, issueId: f.issueA, heartbeatRunId: f.run1 });
+        },
+        status: 409,
+        message: /environment has not finished releasing/,
+      },
+      "N20 the actor is not the board": {
+        setup: async (f) => {
+          const runId = randomUUID();
+          await seedHeartbeatRun({ companyId: f.companyId, agentId: f.reviewerId, runId, issueId: f.issueA, status: "running" });
+          return {
+            app: createApp({ type: "agent", agentId: f.reviewerId, companyId: f.companyId, runId, source: "agent_jwt" },
+              { chatRunRetries: f.chatRunRetries } as never),
+          };
+        },
+        status: 403,
+        message: /^Board access required$/,
+      },
+    };
+
+    it.each(Object.entries(counterexamples))("fails closed when %s", async (_name, example) => {
+      const fixture = await seedPreStartCancelledReview();
+      const override = (await example.setup(fixture)) ?? {};
+      const response = await expectRejected(
+        override.app ? { ...fixture, app: override.app } : fixture,
+        example.status,
+        example.code,
+        override.body ?? resolveBody(fixture),
+      );
+      if (example.message) expect(response.body.error).toMatch(example.message);
     });
   });
 });
