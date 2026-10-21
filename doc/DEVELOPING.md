@@ -1859,3 +1859,11 @@ Staged bundled packages omit source `prepack` and `postpack` hooks because their
 artifacts are already prepared and the temporary package has no source workspace.
 Workspace dependency ranges in these artifacts use the installed dependency
 manifest version. This preserves independently versioned packages such as the plugin SDK.
+
+### Child process input errors
+
+The shared `runChildProcess` helper records child stdin stream errors through
+`onLogError`. A child that closes its input must not terminate the control plane.
+The helper still waits for the child and preserves its exit status and output.
+Run `pnpm exec vitest run packages/adapter-utils/src/server-utils.test.ts` to
+verify broken-pipe handling, normal input delivery and process cleanup.

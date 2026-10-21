@@ -4878,6 +4878,11 @@ export async function runChildProcess(
 
         const stdin = child.stdin;
         if (opts.stdin != null && stdin) {
+          // The child can close its input while a write is still pending.
+          // Stream errors belong to this run, not the control-plane process.
+          stdin.on("error", (err: Error) => {
+            onLogError(err, runId, "failed to write child stdin");
+          });
           void spawnPersistPromise.finally(() => {
             if (child.killed || stdin.destroyed) return;
             stdin.write(opts.stdin as string);
