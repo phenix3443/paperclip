@@ -587,6 +587,34 @@ describe("runChildProcess", () => {
     expect(result.stdout).toBe("done");
   });
 
+  it.skipIf(process.platform === "win32")("contains a broken stdin pipe and preserves the child exit result", async () => {
+    const errors: Array<{ error: NodeJS.ErrnoException; message: string }> = [];
+    const runId = randomUUID();
+    const result = await runChildProcess(runId, process.execPath, ["-e",
+      "require('node:fs').closeSync(0);setTimeout(()=>{process.stdout.write('child stopped');process.exitCode=23},100);",
+    ], {
+      cwd: process.cwd(),
+      env: {},
+      stdin: "x".repeat(8 * 1024 * 1024),
+      timeoutSec: 5,
+      graceSec: 1,
+      onLog: async () => {},
+      onLogError: (error, id, message) => {
+        expect(id).toBe(runId);
+        errors.push({ error: error as NodeJS.ErrnoException, message });
+      },
+    });
+
+    expect(result.exitCode).toBe(23);
+    expect(result.stdout).toBe("child stopped");
+    expect(result.timedOut).toBe(false);
+    expect(errors).toContainEqual({
+      error: expect.objectContaining({ code: "EPIPE" }),
+      message: "failed to write child stdin",
+    });
+    expect(runningProcesses.has(runId)).toBe(false);
+  });
+
   it("waits for onSpawn before sending stdin to the child", async () => {
     const spawnDelayMs = 150;
     const startedAt = Date.now();
