@@ -9,19 +9,27 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   agents,
   agentRuntimeState,
+  approvals,
   authUsers,
   agentWakeupRequests,
   activityLog,
+  chatConversations,
+  chatEndpoints,
   companies,
   createDb,
   environmentLeases,
   environments,
   heartbeatRuns,
+  issueApprovals,
   issueComments,
+  issueExecutionDecisions,
   issueInboxArchives,
   issueRecoveryActions,
   issueRelations,
   issueThreadInteractions,
+  issueTreeHolds,
+  nativeRunFinalizations,
+  projects,
   workspaceOperations,
   issues,
 } from "@paperclipai/db";
@@ -33,6 +41,7 @@ import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { buildPaperclipWakePayload, heartbeatService } from "../services/heartbeat.js";
 import { deliverReconciledExecutions } from "../services/execution-recovery-resolution.js";
+import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { workspaceOperationService, isNativeWorkspaceFinalizationOperationActive } from "../services/workspace-operations.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryService } from "../services/recovery/service.js";
@@ -2893,5 +2902,238 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.id, action.id));
     expect(actionRow?.status).toBe("active");
+  });
+
+  describe("pending review resume after a verified pre-start cancelled reviewer run", () => {
+    const killSpies: Array<{ mockRestore(): void }> = [];
+
+    afterEach(async () => {
+      for (const spy of killSpies.splice(0)) spy.mockRestore();
+      await db.delete(chatConversations);
+      await db.delete(chatEndpoints);
+      await db.delete(issueApprovals);
+      await db.delete(approvals);
+      await db.delete(issueTreeHolds);
+      await db.delete(nativeRunFinalizations);
+      await db.delete(issueExecutionDecisions);
+      await db.update(issues).set({ projectId: null, parentId: null });
+      await db.delete(projects);
+    });
+
+    // Synthetic fixture: issue-A is in_review with a pending review stage whose
+    // reviewer run-1 was cancelled before it ever started; action-1 keeps the
+    // automatic no-replay hold.
+    async function seedPreStartCancelledReview() {
+      const fixture = await seedCompany();
+      const { companyId, coderId, sourceIssueId: issueA } = fixture;
+      const reviewerId = randomUUID();
+      await db.insert(agents).values({
+        id: reviewerId,
+        companyId,
+        name: "Reviewer",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } },
+        permissions: {},
+      });
+      const stageId = randomUUID();
+      const [priorDecision] = await db.insert(issueExecutionDecisions).values({
+        companyId,
+        issueId: issueA,
+        stageId,
+        stageType: "review",
+        actorAgentId: reviewerId,
+        outcome: "changes_requested",
+        body: "Earlier review round requested changes.",
+      }).returning();
+      const executionState = {
+        status: "pending",
+        currentStageId: stageId,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewerId },
+        returnAssignee: { type: "agent", agentId: coderId },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: priorDecision!.id,
+        lastDecisionOutcome: "changes_requested",
+        changesRequestedCount: 2,
+      };
+      await db.update(issues).set({
+        status: "in_review",
+        assigneeAgentId: reviewerId,
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [{
+            id: stageId,
+            type: "review",
+            approvalsNeeded: 1,
+            participants: [{ id: randomUUID(), type: "agent", agentId: reviewerId }],
+          }],
+        },
+        executionState,
+      }).where(eq(issues.id, issueA));
+      const run1 = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: run1,
+        companyId,
+        agentId: reviewerId,
+        invocationSource: "automation",
+        status: "cancelled",
+        errorCode: "issue_assignee_changed",
+        startedAt: null,
+        processPid: null,
+        processGroupId: null,
+        finishedAt: new Date(),
+        contextSnapshot: { issueId: issueA },
+      });
+      const [action1] = await db.insert(issueRecoveryActions).values({
+        companyId,
+        sourceIssueId: issueA,
+        kind: "active_run_watchdog",
+        status: "resolved",
+        outcome: "blocked",
+        ownerType: "board",
+        returnOwnerAgentId: reviewerId,
+        cause: "legacy_execution_requires_reconciliation",
+        fingerprint: run1,
+        nextAction: "Preserve recorded work without replay.",
+        evidence: {
+          runId: run1,
+          automaticRecovery: { policy: "preserve_without_replay_v1", runId: run1, replay: "blocked", actionOutcome: "unknown" },
+        },
+        resolvedAt: new Date(),
+      }).returning();
+      expect(await getExecutionBlocker(db, companyId, issueA)).not.toBeNull();
+      const chatRunRetries = {
+        prepareFailedChatRunRetry: vi.fn(async () => ({ actionId: randomUUID(), issueId: issueA })),
+        processFailedChatRunRetry: vi.fn(async () => undefined),
+      };
+      return {
+        ...fixture,
+        issueA,
+        reviewerId,
+        stageId,
+        executionState,
+        run1,
+        action1: action1!,
+        chatRunRetries,
+        app: createApp(undefined, { chatRunRetries } as never),
+      };
+    }
+
+    type ReviewFixture = Awaited<ReturnType<typeof seedPreStartCancelledReview>>;
+
+    function resolveBody(fixture: ReviewFixture, overrides: Record<string, unknown> = {}) {
+      return {
+        actionId: fixture.action1.id,
+        outcome: "restored",
+        sourceIssueStatus: "in_review",
+        executionReconciliation: {
+          runId: fixture.run1,
+          providerStopped: true,
+          actionOutcome: "not_performed",
+          outcomeEvidence: "The run was cancelled before it started; no provider process or side effects exist.",
+        },
+        ...overrides,
+      };
+    }
+
+    async function snapshot(fixture: ReviewFixture) {
+      const [issue] = await db.select().from(issues).where(eq(issues.id, fixture.issueA));
+      return {
+        issue: {
+          status: issue!.status,
+          assigneeAgentId: issue!.assigneeAgentId,
+          executionState: issue!.executionState,
+          executionRunId: issue!.executionRunId,
+          checkoutRunId: issue!.checkoutRunId,
+        },
+        decisions: await db.select().from(issueExecutionDecisions)
+          .where(eq(issueExecutionDecisions.issueId, fixture.issueA)),
+        action: (await db.select().from(issueRecoveryActions)
+          .where(eq(issueRecoveryActions.id, fixture.action1.id)))[0],
+      };
+    }
+
+    async function expectUnchanged(fixture: ReviewFixture, before: Awaited<ReturnType<typeof snapshot>>) {
+      expect(await snapshot(fixture)).toEqual(before);
+      expect(before.action!.status).toBe("resolved");
+      expect(before.action!.evidence).toHaveProperty("automaticRecovery");
+      expect(await getExecutionBlocker(db, fixture.companyId, fixture.issueA)).not.toBeNull();
+      const wake = vi.fn(async () => null);
+      await deliverReconciledExecutions(db, wake as never);
+      expect(wake).not.toHaveBeenCalled();
+      expect(await db.select().from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.companyId, fixture.companyId))).toHaveLength(0);
+      expect(fixture.chatRunRetries.prepareFailedChatRunRetry).not.toHaveBeenCalled();
+    }
+
+    async function expectRejected(
+      fixture: ReviewFixture,
+      status: number,
+      code?: string,
+      body: Record<string, unknown> = resolveBody(fixture),
+    ) {
+      const before = await snapshot(fixture);
+      const response = await request(fixture.app)
+        .post(`/api/issues/${fixture.issueA}/recovery-actions/resolve`)
+        .send(body);
+      expect(response.status).toBe(status);
+      if (code) expect(response.body.details?.code ?? response.body.code).toBe(code);
+      await expectUnchanged(fixture, before);
+      return response;
+    }
+
+    it("reproduces the contradiction: todo hits the pending stage gate and in_review is otherwise unreachable", async () => {
+      const fixture = await seedPreStartCancelledReview();
+      await expectRejected(fixture, 409, "recovery_governed_stage_pending", resolveBody(fixture, { sourceIssueStatus: "todo" }));
+      // Without a verified pre-start reviewer run the in_review request stays rejected.
+      await db.update(heartbeatRuns).set({ startedAt: new Date() }).where(eq(heartbeatRuns.id, fixture.run1));
+      await expectRejected(fixture, 409);
+    });
+
+    it("clears the hold and wakes the current reviewer without touching the review stage", async () => {
+      const fixture = await seedPreStartCancelledReview();
+      const before = await snapshot(fixture);
+      const response = await request(fixture.app)
+        .post(`/api/issues/${fixture.issueA}/recovery-actions/resolve`)
+        .send(resolveBody(fixture))
+        .expect(200);
+      expect(response.body.issue.status).toBe("in_review");
+      const after = await snapshot(fixture);
+      expect(after.issue).toEqual(before.issue);
+      expect(after.issue.executionState).toEqual(fixture.executionState);
+      expect(after.decisions).toEqual(before.decisions);
+      expect(after.action!.evidence).not.toHaveProperty("automaticRecovery");
+      expect(after.action!.evidence).toMatchObject({
+        executionReconciliation: { runId: fixture.run1, actionOutcome: "not_performed" },
+        continuationDelivery: "pending",
+      });
+      expect(await getExecutionBlocker(db, fixture.companyId, fixture.issueA)).toBeNull();
+      expect(fixture.chatRunRetries.prepareFailedChatRunRetry).not.toHaveBeenCalled();
+
+      // A duplicate request neither reopens the action nor re-arms delivery.
+      await request(fixture.app)
+        .post(`/api/issues/${fixture.issueA}/recovery-actions/resolve`)
+        .send(resolveBody(fixture))
+        .expect(200);
+      expect((await snapshot(fixture)).action).toEqual(after.action);
+
+      // Occupy the reviewer's only slot so the wake is admitted without launching a provider.
+      await seedHeartbeatRun({ companyId: fixture.companyId, agentId: fixture.reviewerId, runId: randomUUID(), status: "running" });
+      const heartbeat = heartbeatService(db, { runtimeEnv: {} });
+      await deliverReconciledExecutions(db, heartbeat.wakeup);
+      await deliverReconciledExecutions(db, heartbeat.wakeup);
+      const wakes = await db.select().from(agentWakeupRequests).where(
+        eq(agentWakeupRequests.idempotencyKey, `execution-reconciliation:${fixture.action1.id}`),
+      );
+      expect(wakes).toHaveLength(1);
+      expect(wakes[0]!.agentId).toBe(fixture.reviewerId);
+      expect((await snapshot(fixture)).issue.executionState).toEqual(fixture.executionState);
+    });
   });
 });
