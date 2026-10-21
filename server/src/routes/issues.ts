@@ -12,6 +12,8 @@ import { requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
   markExecutionReconciliation,
+  isVerifiedPreStartCancelledReviewerRun,
+  blocksSafeHandBackForPendingStage,
 } from "../services/execution-recovery-resolution.js";
 import {
   storedSteeringAcknowledgement,
@@ -6741,6 +6743,8 @@ export function issueRoutes(
     recoveryAction: NonNullable<
       Awaited<ReturnType<typeof recoveryActionsSvc.getActiveForIssue>>
     >;
+    /** Resume, never bypass, the same pending review stage. */
+    allowPendingReviewStage?: boolean;
   }) {
     const returnOwnerAgentId = input.recoveryAction.returnOwnerAgentId;
     if (
@@ -6778,7 +6782,10 @@ export function issueRoutes(
       );
     }
     if (
-      parseIssueExecutionState(input.issue.executionState)?.status === "pending"
+      blocksSafeHandBackForPendingStage({
+        executionState: input.issue.executionState,
+        allowPendingReviewStage: input.allowPendingReviewStage === true,
+      })
     ) {
       throw conflict(
         "Safe recovery hand-back cannot bypass a pending execution review or approval stage",
@@ -9162,6 +9169,26 @@ export function issueRoutes(
           .for("update")
           .then((rows) => rows[0] ?? null);
         if (!lockedIssue) throw notFound("Issue not found");
+        // Reconciling a reviewer run keeps the task in review; no status change is requested.
+        const pendingReviewResume =
+          outcome === "restored" &&
+          sourceIssueStatus === "in_review" &&
+          lockedIssue.status === "in_review" &&
+          Boolean(executionReconciliation);
+        const findRestrictedChatBinding = () =>
+          tx
+            .select({ id: chatConversations.id })
+            .from(chatConversations)
+            .innerJoin(chatEndpoints, eq(chatEndpoints.id, chatConversations.endpointId))
+            .where(
+              and(
+                eq(chatEndpoints.externalExecutionPolicy, "restricted"),
+                eq(chatConversations.companyId, lockedIssue.companyId),
+                eq(chatConversations.issueId, lockedIssue.id),
+              ),
+            )
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
 
         let activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(
           lockedIssue.companyId,
@@ -9198,7 +9225,7 @@ export function issueRoutes(
               assertBoard(req);
               if (
                 activeRecoveryAction ||
-                sourceIssueStatus !== "todo" ||
+                (sourceIssueStatus !== "todo" && !pendingReviewResume) ||
                 outcome !== "restored"
               ) {
                 throw conflict(
@@ -9301,11 +9328,11 @@ export function issueRoutes(
         }
 
         if (
-          sourceIssueStatus === "todo" &&
+          (sourceIssueStatus === "todo" || pendingReviewResume) &&
           requiresExecutionReconciliation(activeRecoveryAction.cause)
         ) {
           assertBoard(req);
-          await validateExecutionReconciliation({
+          const reconciledRun = await validateExecutionReconciliation({
             db: tx as unknown as Db,
             companyId: lockedIssue.companyId,
             issueId: lockedIssue.id,
@@ -9315,6 +9342,35 @@ export function issueRoutes(
               activeRecoveryAction.evidence.sourceRunId,
             decision: executionReconciliation,
           });
+          if (pendingReviewResume) {
+            if (
+              !isVerifiedPreStartCancelledReviewerRun({
+                task: lockedIssue,
+                run: reconciledRun,
+                returnOwnerAgentId: activeRecoveryAction.returnOwnerAgentId,
+                decision: executionReconciliation!,
+              })
+            ) {
+              throw conflict(
+                "Only a current reviewer run that was cancelled before it started can resume its pending review stage.",
+                { code: "recovery_review_resume_unverified" },
+              );
+            }
+            await assertSafeRecoveryHandBackGates({
+              req,
+              issue: lockedIssue,
+              recoveryAction: activeRecoveryAction,
+              allowPendingReviewStage: true,
+            });
+            // The chat retry protocol does not own review stages; never fall back
+            // to a generic wake for a restricted conversation.
+            if (await findRestrictedChatBinding()) {
+              throw conflict(
+                "This task is bound to a restricted chat conversation; resume its review from the connected conversation.",
+                { code: "chat_recovery_review_resume_unsupported" },
+              );
+            }
+          }
         } else if (executionReconciliation) {
           throw conflict(
             "An execution reconciliation must target the current execution recovery action and continue the task.",
@@ -9323,18 +9379,7 @@ export function issueRoutes(
 
         let chatRetry: { actionId: string; issueId: string } | null = null;
         if (outcome === "restored" && sourceIssueStatus === "todo") {
-          const [chatBinding] = await tx
-            .select({ id: chatConversations.id })
-            .from(chatConversations)
-            .innerJoin(chatEndpoints, eq(chatEndpoints.id, chatConversations.endpointId))
-            .where(
-              and(
-                eq(chatEndpoints.externalExecutionPolicy, "restricted"),
-                eq(chatConversations.companyId, lockedIssue.companyId),
-                eq(chatConversations.issueId, lockedIssue.id),
-              ),
-            )
-            .limit(1);
+          const chatBinding = await findRestrictedChatBinding();
           if (chatBinding) {
             // Admit the exact server-owned recovery evidence before resolving
             // either record. The durable worker, not a best-effort generic wake,
