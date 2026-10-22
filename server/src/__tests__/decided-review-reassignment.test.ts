@@ -14,6 +14,7 @@ import {
   agentTaskSessions,
   agentWakeupRequests,
   agents,
+  approvals,
   authUsers,
   companies,
   companySkills,
@@ -22,6 +23,7 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
+  issueApprovals,
   issueExecutionDecisions,
   issueRecoveryActions,
   issueRelations,
@@ -37,7 +39,7 @@ import { issueRoutes } from "../routes/issues.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { settleUnrecoverableExecutions } from "../services/execution-recovery-resolution.js";
 import { executionBlockerPredicate, getExecutionBlocker } from "../services/execution-blocker.js";
-import { hasLiveLegacyController } from "../services/legacy-controller-lease.js";
+import { hasLiveLegacyController, legacyControllerBootId } from "../services/legacy-controller-lease.js";
 import { runningProcesses } from "../adapters/index.js";
 import { issueService } from "../services/issues.js";
 import {
@@ -45,6 +47,7 @@ import {
   continueDecidedReviewReassignments,
   currentSubmissionIdentity,
   findConsumption,
+  proveDecidedReviewContinuation,
   selectDecidedReviewSource,
 } from "../services/decided-review-reassignment.js";
 
@@ -109,6 +112,8 @@ describeEmbeddedPostgres("decided review continuation after an expected reviewer
     await db.delete(environmentLeases);
     await db.delete(issueRecoveryActions);
     await db.delete(issueThreadInteractions);
+    await db.delete(issueApprovals);
+    await db.delete(approvals);
     await db.delete(issueRelations);
     await db.delete(issueComments);
     await db.delete(issueExecutionDecisions);
@@ -199,7 +204,7 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     await db.insert(heartbeatRuns).values({
       id: runId, companyId: f.companyId, agentId: f.reviewerId, invocationSource: "assignment", triggerDetail: "system",
       status: "running", wakeupRequestId: wakeId, runtimeMode: "legacy", runtimeModeResolvedAt: startedAt, startedAt,
-      processPid: child.pid!, processGroupId: child.pid!, processStartedAt: startedAt,
+      executionStage: "dispatching", processPid: child.pid!, processGroupId: child.pid!, processStartedAt: startedAt,
       controllerBootId: randomUUID(), controllerLeaseExpiresAt: new Date(Date.now() - 1_000),
       contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "execution_review_requested" },
       responsibleUserId: f.userId,
@@ -489,6 +494,31 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     await expectSingleContinuation(f, { resubmittedAt, history, sourceRunId: r.runId });
   }, 60_000);
 
+  it.each([
+    ["the task was already blocked", async (f: Fixture) => {
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, f.issueId));
+    }],
+    ["the stopped reviewer run is native", async (_f: Fixture, runId: string) => patchRun(runId, () => ({ runtimeMode: "native" }))],
+  ])("records no review projection receipt when %s", async (_label, change) => {
+    const f = await seedReview();
+    const r = await seedDetachedLegacyReviewerRun(f);
+    await reapToDetached(r.runId);
+    await recordDecision(f, r.runId);
+    await stopReviewerChild(f, r.pid, r.processGroupId);
+    await db.insert(environmentLeases).values({ companyId: f.companyId, issueId: f.issueId, heartbeatRunId: r.runId, provider: "local" });
+    await resubmitWithSuppressedReviewRequest(f);
+    await scan();
+    expect(await blockingHolds(f)).toHaveLength(1);
+    const [held] = await blockingHolds(f);
+    expect(held!.evidence.runId).toBe(r.runId);
+    await change(f, r.runId);
+    await sweep();
+    const [hold] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, held!.id));
+    expect((await readTask(f)).status).toBe("blocked");
+    expect(hold!.evidence.automaticRecovery).toMatchObject({ policy: "preserve_without_replay_v1" });
+    expect(hold!.evidence).not.toHaveProperty("reviewHoldBlock");
+  }, 60_000);
+
   it.each(["held by the decided reviewer only", "also held by a pre-fix hold on the parked attempt"])(
     "keeps the decided reviewer as the source when parked attempts exist (%s)",
     async (variant) => {
@@ -704,6 +734,53 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
   }
 
   it.each([
+    ["1: the task is not in review", async (b: HeldBase) => {
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, b.f.issueId));
+    }],
+    ["2: the current stage is not a review", async (b: HeldBase) => patchState(b, { currentStageType: "approval" })],
+    ["2: there is no current stage", async (b: HeldBase) => patchState(b, { currentStageId: null })],
+    ["2: another agent is the current participant", async (b: HeldBase) => patchState(b, {
+      currentParticipant: { type: "agent", agentId: b.f.authorId },
+    })],
+    ["3: no last decision is recorded", async (b: HeldBase) => patchState(b, { lastDecisionId: null })],
+    ["3: the decision was recorded by another agent's run", async (b: HeldBase) => {
+      await db.update(issueExecutionDecisions).set({ createdByRunId: b.authorRunId }).where(eq(issueExecutionDecisions.id, b.decision.id));
+    }],
+    ["4: no resubmission follows the decision", async (b: HeldBase) => {
+      await db.delete(activityLog).where(and(eq(activityLog.entityId, b.f.issueId), eq(activityLog.action, "issue.updated"),
+        eq(activityLog.actorId, b.f.authorId)));
+    }],
+  ])("has no submission identity when only condition %s", async (_label, change) => {
+    const b = await heldBase();
+    expect(await readIdentity(b.f)).toEqual({ decisionId: b.decision.id, resubmissionActivityId: expect.any(String) });
+    await change(b);
+    expect(await readIdentity(b.f)).toBeNull();
+  }, 60_000);
+
+  const failingClause: Record<string, string> = {
+    "the decision was recorded by another run": "selector_decision_run_not_participant",
+    "the decision is not the last decision": "selector_decision_not_changes_requested",
+    "the decision predates the stop": "P3_decision_provenance",
+    "a newer decision exists for the stage": "P3_later_decision",
+    "the author never resubmitted": "P5_no_resubmission",
+    "the resubmission came from the stopped reviewer run": "P5_no_resubmission",
+    "a user cancelled the reviewer": "P1_not_expected_reassignment_stop",
+    "the reviewer ended for another reason": "P1_not_expected_reassignment_stop",
+    "the reassignment stop is not confirmed": "P1_not_expected_reassignment_stop",
+    "the reviewer process is still alive": "P2_process_running",
+    "the reviewer's environment lease is not released": "P2_lease_unreleased",
+    "a pending interaction awaits a person": "P6_decision_pending",
+    "a linked approval awaits a person": "P6_decision_pending",
+    "a blocking dependency is unresolved": "P6_dependency",
+    "another agent is the current participant": "selector_decision_run_not_participant",
+    "the current stage is an approval": "P4_not_pending_review",
+    "the hold is already being reconciled": "P7_already_owned",
+    "the hold records a workspace restore failure": "P7_already_owned",
+    "the task is done": "P4_task_closed",
+    "the task is cancelled": "P4_task_closed",
+  };
+
+  it.each([
     ["the decision was recorded by another run", async (b: HeldBase) => {
       await db.update(issueExecutionDecisions).set({ createdByRunId: b.authorRunId }).where(eq(issueExecutionDecisions.id, b.decision.id));
     }],
@@ -743,6 +820,11 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
       await db.insert(issueThreadInteractions).values({ companyId: b.f.companyId, issueId: b.f.issueId, kind: "request_confirmation",
         status: "pending", payload: { version: 1, prompt: "Proceed?" } as any });
     }],
+    ["a linked approval awaits a person", async (b: HeldBase) => {
+      const [approval] = await db.insert(approvals).values({ companyId: b.f.companyId, type: "hire_agent",
+        payload: {} }).returning();
+      await db.insert(issueApprovals).values({ companyId: b.f.companyId, issueId: b.f.issueId, approvalId: approval!.id });
+    }],
     ["a blocking dependency is unresolved", async (b: HeldBase) => {
       const blockerId = randomUUID();
       await db.insert(issues).values({ id: blockerId, companyId: b.f.companyId, title: "Dependency", status: "todo", priority: "medium",
@@ -763,10 +845,13 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     }],
     ["the task is done", async (b: HeldBase) => { await db.update(issues).set({ status: "done" }).where(eq(issues.id, b.f.issueId)); }],
     ["the task is cancelled", async (b: HeldBase) => { await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, b.f.issueId)); }],
-  ])("does not continue when %s", async (_label, change) => {
+  ])("does not continue when %s", async (label, change) => {
     const b = await heldBase();
     const keep = await change(b);
     if (keep !== "keep_lease") await b.releaseLease();
+    const proof = await proveDecidedReviewContinuation(db, { task: await readTask(b.f) });
+    // Each counter-example fails at its own proof clause or selection rule.
+    expect(proof.kind === "hold" ? proof.reason : proof.kind).toBe(failingClause[label]);
     for (let i = 0; i < 2; i += 1) { await scan(); await pass(); }
     expect(await reviewerTurnsAfter(b.f, b.resubmittedAt)).toEqual([]);
     expect(await db.select().from(issueRecoveryActions).where(and(
@@ -1133,7 +1218,8 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     ownedPids.add(real.processPid!); ownedGroups.add(real.processGroupId!);
     expect(real.controllerLeaseExpiresAt!.getTime()).toBeGreaterThan(Date.now());
 
-    const columns = ["status", "runtimeMode", "runtimeModeResolvedAt", "startedAt", "processPid", "processGroupId",
+    expect(real.controllerBootId).toBe(legacyControllerBootId);
+    const columns = ["status", "runtimeMode", "runtimeModeResolvedAt", "executionStage", "startedAt", "processPid", "processGroupId",
       "processStartedAt", "controllerBootId", "controllerLeaseExpiresAt", "wakeupRequestId", "responsibleUserId"] as const;
     const pattern = (run: typeof heartbeatRuns.$inferSelect, keys: readonly (keyof typeof run)[]) =>
       Object.fromEntries(keys.map(key => [key, run[key] === null ? null : typeof run[key]]));
@@ -1141,6 +1227,7 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     const seededRun = (await heartbeat.getRun(seeded.runId))!;
     expect(pattern(seededRun, columns)).toEqual(pattern(real, columns));
     expect(seededRun.runtimeMode).toBe(real.runtimeMode);
+    expect(seededRun.executionStage).toBe(real.executionStage);
     expect(Object.keys(real.contextSnapshot ?? {})).toEqual(expect.arrayContaining(Object.keys(seededRun.contextSnapshot ?? {})));
     // Declared differences: a foreign controller whose lease already expired.
     expect(seededRun.controllerBootId).not.toBe(real.controllerBootId);
