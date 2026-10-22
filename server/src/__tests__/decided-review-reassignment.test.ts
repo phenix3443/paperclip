@@ -1159,10 +1159,15 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     expect(await findConsumption(db, await readTask(b.f), fresh)).toBeNull();
     await waitFor(async () => (await reviewerTurnsAfter(b.f, second.resubmittedAt)).length > 0, 10_000, "the new review turn");
     await drain(b.f);
-    // Besides the replayed W2's own baseline turn, the resubmission gets one.
-    const turns = (await reviewerTurnsAfter(b.f, second.resubmittedAt))
-      .filter(run => !run.retryOfRunId && run.wakeupRequestId !== replayedW2);
+    // The replayed W2 predates this submission, whose own request supersedes
+    // it: one review turn in total, through the real release promotion.
+    // The fake reviewer leaves no comment, so baseline retries its turn for
+    // the required comment; that retry is the same turn, not a new admission.
+    const turns = (await reviewerTurnsAfter(b.f, second.resubmittedAt)).filter(run => !run.retryOfRunId);
     expect(turns).toHaveLength(1);
+    expect(turns[0]!.wakeupRequestId).not.toBe(replayedW2);
+    const [w2] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, replayedW2));
+    expect(w2).toMatchObject({ status: "cancelled", error: "Superseded by the current submission's review request" });
     expect(turns[0]!.contextSnapshot).not.toHaveProperty("decidedReviewContinuation");
     const settled = await db.select().from(issueRecoveryActions).where(and(
       eq(issueRecoveryActions.sourceIssueId, b.f.issueId), sql`${issueRecoveryActions.evidence} ? 'decidedReviewContinuation'`,
