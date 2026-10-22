@@ -1,4 +1,6 @@
-import type { ExecutionProjection, ExecutionBlocker } from "./execution-projection.js";
+import type { ChatProvider } from "./chat-channels.js";
+import type { TaskWorkspaceIntent, TaskWorkspacePendingSelection } from "./task-workspace.js";
+import type { ExecutionProjection, ExecutionBlocker, TaskInterruptionPresentation } from "./execution-projection.js";
 import type {
   IssueCommentAuthorType,
   IssueCommentMetadataRowType,
@@ -46,6 +48,46 @@ import type {
 
 export type { IssueWorkMode };
 
+export type IssueVisibility = "open" | "private";
+/** Management hints for this task; never includes protected project/parent identity. */
+export interface IssuePrivacyConstraints {
+  publicBlockedBy: "parent" | "project" | null;
+  leavesPersonalProject: boolean;
+}
+export type IssueAccessGrantSubjectType = "user" | "agent";
+export type IssueAccessGrantSource = "explicit" | "assignment" | "project" | "owner";
+export type IssueAccessGrantAgentVisibility = "discoverable" | "private";
+
+export interface IssueAccessGrant {
+  id: string;
+  issueId: string;
+  subjectType: IssueAccessGrantSubjectType;
+  subjectId: string;
+  source: IssueAccessGrantSource;
+  /** Effective access inherited from a parent or private project; not revocable here. */
+  inherited?: boolean;
+  grantedByUserId: string | null;
+  grantedByAgentId: string | null;
+  createdAt: Date;
+  revokedAt: Date | null;
+  subjectDisplayName: string | null;
+  subjectAvatarUrl: string | null;
+  subjectInitials: string | null;
+  agentVisibility: IssueAccessGrantAgentVisibility | null;
+}
+
+/**
+ * Existence-only projection used when a readable issue references an issue the
+ * current principal cannot read. Edge projections may return this exact shape
+ * in place of an IssueRelationIssueSummary; direct reads and list/search rows
+ * never return locked stubs.
+ */
+export interface IssueLockedStub {
+  id: string;
+  identifier: string | null;
+  locked: true;
+}
+
 export interface IssueAncestorProject {
   id: string;
   name: string;
@@ -86,6 +128,22 @@ export interface IssueLabel {
   color: string;
   createdAt: Date;
   updatedAt: Date;
+}
+
+/**
+ * The task a run was executing when it created this issue, from recorded run
+ * provenance. Independent of the structural parent and of blockers. Only
+ * present when the viewer may read the source task and its run.
+ */
+export interface IssueCreationSource {
+  issue: {
+    id: string;
+    identifier: string | null;
+    title: string;
+    status: string;
+  };
+  run: { id: string; agentId: string };
+  agent: { id: string; name: string } | null;
 }
 
 export interface IssueAssigneeAdapterOverrides {
@@ -133,6 +191,8 @@ export interface DocumentRevision {
   changeSummary: string | null;
   createdByAgentId: string | null;
   createdByUserId: string | null;
+  /** Writer provenance; reading a revision does not grant access to the run. */
+  createdByRunId?: string | null;
   createdAt: Date;
 }
 
@@ -605,6 +665,7 @@ export interface IssueScheduledRetry {
 export type IssueRetryNowOutcome =
   | "promoted"
   | "already_promoted"
+  | "waiting"
   | "no_scheduled_retry"
   | "gate_suppressed";
 
@@ -773,7 +834,15 @@ export interface IssueChangeReceiptEntry {
 
 export type IssueChanges = Record<string, IssueChangeReceiptEntry>;
 
+export type IssueSummary = Pick<
+  Issue,
+  "id" | "companyId" | "title" | "identifier" | "status" | "updatedAt"
+> & {
+  externalConversationState: "active" | "waiting" | null;
+};
+
 export interface Issue {
+  statusVersion?: number;
   /** True only while the title is the provisional slice of the initial prompt. */
   titleNeedsGeneration?: boolean;
   conversationAgentId?: string | null;
@@ -792,7 +861,14 @@ export interface Issue {
   projectWorkspaceId: string | null;
   goalId: string | null;
   parentId: string | null;
+  /** Present on current API responses; optional for compatibility with older plugin payloads. */
+  visibility?: IssueVisibility;
+  privacyRootIssueId?: string | null;
+  /** Immediate task from which private access flows downward, including chat handoffs. */
+  privacyParentIssueId?: string | null;
   ancestors?: IssueAncestor[];
+  /** Detail responses only: access-checked creation provenance, or null. */
+  createdFrom?: IssueCreationSource | null;
   title: string;
   description: string | null;
   descriptionTruncated?: boolean;
@@ -827,6 +903,9 @@ export interface Issue {
   monitorAttemptCount?: number;
   monitorNotes?: string | null;
   monitorScheduledBy?: IssueMonitorScheduledBy | null;
+  workspaceBindingRevision?: number;
+  workspaceSelection?: TaskWorkspaceIntent | null;
+  workspacePendingSelection?: TaskWorkspacePendingSelection | null;
   executionWorkspaceId: string | null;
   executionWorkspacePreference: string | null;
   executionWorkspaceSettings: IssueExecutionWorkspaceSettings | null;
@@ -848,6 +927,7 @@ export interface Issue {
   activeRecoveryAction?: IssueRecoveryAction | null;
   successfulRunHandoff?: SuccessfulRunHandoffState | null;
   executionBlocker?: ExecutionBlocker | null;
+  interruption?: TaskInterruptionPresentation | null;
   watchdog?: IssueWatchdogSummary | null;
   scheduledRetry?: IssueScheduledRetry | null;
   liveDescendantCount?: number;
@@ -884,6 +964,8 @@ export type CompactIssue = Pick<
   | "projectWorkspaceId"
   | "goalId"
   | "parentId"
+  | "visibility"
+  | "privacyRootIssueId"
   | "title"
   | "description"
   | "status"
@@ -912,6 +994,7 @@ export type CompactIssue = Pick<
   | "createdAt"
   | "updatedAt"
 > & {
+  interruption?: TaskInterruptionPresentation | null;
   labelIds?: string[];
   labels?: IssueLabel[];
   blockedBy?: IssueRelationIssueSummary[];
@@ -955,6 +1038,9 @@ export interface IssueComment {
   companyId: string;
   issueId: string;
   authorType: IssueCommentAuthorType;
+  /** Server-generated receipt provenance; not writable by comment callers. */
+  origin?: "comment" | "fast_response";
+  fastResponseRequestId?: string | null;
   authorAgentId: string | null;
   authorUserId: string | null;
   /** Responsible user attribution. Legacy and plugin-provided comment values may omit it. */
@@ -1075,8 +1161,10 @@ export interface IssueCommentMetadataSection {
 
 export interface IssueCommentMetadata {
   version: 1;
+  /** Producer-classified diagnostics; task interruption UI owns system repair. */
+  recoveryResponsibility?: "system" | "user";
   /** Inbound channel attribution; never an authorization input. */
-  sourceChannel?: "imessage-photon";
+  sourceChannel?: ChatProvider;
   sourceRunId?: string | null;
   sourceIdentityContextId?: string | null;
   authorizationReason?: string | null;
@@ -1194,6 +1282,8 @@ export interface PaperclipQuestionSetQuestion {
   helpText?: string;
   required: boolean;
   answerMode: "single_select" | "multi_select" | "text";
+  /** Editable starting text, never an implicit or submitted answer. Text mode only. */
+  initialText?: string;
   options?: PaperclipQuestionSetOption[];
   customAnswer?: {
     enabled: true;

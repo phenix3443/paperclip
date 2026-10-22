@@ -9,6 +9,7 @@ const mockAgentService = vi.hoisted(() => ({
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({
+  list: vi.fn(async () => []),
   buildRunOutputSilence: vi.fn(),
   decorateActiveRunStatus: vi.fn(),
   getRunIssueSummary: vi.fn(),
@@ -277,6 +278,17 @@ async function requestApp(
 }
 
 describe("agent live run routes", () => {
+  it.each([
+    ["", 200], ["?limit=10&agentId=agent-1&summary=true", 10],
+    ["?limit=99999", 1000], ["?limit=invalid", 200], ["?limit=-10", 1],
+  ])("bounds company history reads for %s", async (query, limit) => {
+    const app = await createApp({});
+    const response = await requestApp(app, baseUrl => request(baseUrl).get(`/api/companies/company-1/heartbeat-runs${query}`));
+    expect(response.status).toBe(200);
+    expect(mockHeartbeatService.list).toHaveBeenCalledWith("company-1", query.includes("agentId") ? "agent-1" : undefined,
+      limit, { summary: query.includes("summary=true") });
+    expect(mockRunSecretRedactionRegistry.redactForRuns).toHaveBeenCalled();
+  });
   beforeEach(() => {
     vi.resetModules();
     vi.doUnmock("../services/agents.js");
@@ -354,6 +366,8 @@ describe("agent live run routes", () => {
     mockHeartbeatService.getRunLogAccess.mockResolvedValue({
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       companyId: "company-1",
+      scopeKind: "company",
+      issueId: null,
       logStore: "local_file",
       logRef: "logs/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.ndjson",
     });
@@ -598,6 +612,8 @@ describe("agent live run routes", () => {
       {
         id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         companyId: "company-1",
+      scopeKind: "company",
+      issueId: null,
         logStore: "local_file",
         logRef: "logs/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.ndjson",
       },
@@ -687,7 +703,8 @@ describe("agent live run routes", () => {
       lastOutputStream: null,
       lastOutputBytes: 0,
       processStartedAt: null,
-      issueId: "issue-1",
+      scopeKind: "company",
+      issueId: null,
     }));
     const { db, limit } = createLiveRunsDbStub(rows);
 
@@ -731,7 +748,8 @@ describe("agent live run routes", () => {
       lastOutputStream: null,
       lastOutputBytes: 0,
       processStartedAt: null,
-      issueId: "issue-1",
+      scopeKind: "company",
+      issueId: null,
     }));
     const { db, limit } = createLiveRunsDbStub(rows);
 
@@ -774,7 +792,8 @@ describe("agent live run routes", () => {
       lastOutputStream: null,
       lastOutputBytes: 0,
       processStartedAt: null,
-      issueId: "issue-1",
+      scopeKind: "company",
+      issueId: null,
     }));
 
     const selectCalls: Array<ReturnType<typeof vi.fn>> = [];
@@ -834,7 +853,8 @@ describe("agent live run routes", () => {
       lastOutputStream: null,
       lastOutputBytes: 0,
       processStartedAt: null,
-      issueId: "issue-1",
+      scopeKind: "company",
+      issueId: null,
     }));
     const recentRows = Array.from({ length: 4 }, (_, index) => ({
       id: `run-recent-${index}`,
@@ -861,7 +881,8 @@ describe("agent live run routes", () => {
       lastOutputStream: null,
       lastOutputBytes: 0,
       processStartedAt: null,
-      issueId: "issue-1",
+      scopeKind: "company",
+      issueId: null,
     }));
 
     let selectCallCount = 0;
@@ -1930,4 +1951,10 @@ describe("agent live run routes", () => {
     expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();
     expect(mockWorkspaceDiffReprojection.persist).not.toHaveBeenCalled();
   });
+});
+
+vi.mock("../services/agent-lifecycle.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/agent-lifecycle.js")>();
+  return { ...actual, createAgentLifecycle: () => ({
+  }) };
 });

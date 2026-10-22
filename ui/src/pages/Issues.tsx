@@ -1,3 +1,6 @@
+import { useShowAgentCreatedTasks } from "../hooks/useShowAgentCreatedTasks";
+import { useDesignSandbox } from "../context/DesignSandboxContext";
+import { DesignSandboxTasks } from "./DesignSandboxTasks";
 import { useEffect, useMemo, useCallback, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useLocation, useNavigate, useSearchParams } from "@/lib/router";
@@ -90,11 +93,12 @@ export function buildIssuesSearchUrl(currentHref: string, search: string): strin
  * get the same Views control in their toolbar, so the switch reads as one page.
  */
 export function Issues() {
+  const designSandbox = useDesignSandbox();
   const { enabled: streamlinedUiEnabled } = useStreamlinedUiEnabled();
   const { enabled: combinedInboxTasksEnabled } = useCombinedInboxTasksEnabled();
   // The merged surface is Combined Inbox + Task List only. With the flag off, and always in
   // the legacy shell, Tasks is the plain task list and Inbox keeps its pages.
-  return streamlinedUiEnabled && combinedInboxTasksEnabled ? <StreamlinedTasks /> : <OrganizationIssues />;
+  return designSandbox ? <DesignSandboxTasks /> : streamlinedUiEnabled && combinedInboxTasksEnabled ? <StreamlinedTasks /> : <OrganizationIssues />;
 }
 
 function StreamlinedTasks() {
@@ -180,6 +184,7 @@ function OrganizationIssues({
     }
     return urlSearch;
   }, [searchOverride, urlSearch, location.search]);
+  const showAgentCreatedTasks = useShowAgentCreatedTasks(selectedCompanyId, "paperclip:issues-view");
   const participantAgentId = searchParams.get("participantAgentId") ?? undefined;
   const initialWorkspaces = searchParams.getAll("workspace").filter((workspaceId) => workspaceId.length > 0);
   const workspaceIdFilter = initialWorkspaces.length === 1 ? initialWorkspaces[0] : undefined;
@@ -255,6 +260,7 @@ function OrganizationIssues({
       workspaceIdFilter ?? "__all__",
       "compact",
       "with-routine-executions",
+      showAgentCreatedTasks,
       "infinite",
       issuePageSize,
       statusFilter,
@@ -264,6 +270,7 @@ function OrganizationIssues({
       participantAgentId,
       workspaceId: workspaceIdFilter,
       includeRoutineExecutions: true,
+      includeAgentCreatedTasks: showAgentCreatedTasks,
       limit: issuePageSize,
       offset: pageParam,
       sortField: "updated",
@@ -326,7 +333,7 @@ function OrganizationIssues({
       initialSearch={syncedSearch}
       onSearchChange={handleSearchChange}
       onStatusFilterChange={setStatusFilter}
-      enableRoutineVisibilityFilter
+      enableAgentCreatedVisibilityFilter
       hasMoreIssues={hasMoreServerIssues}
       onLoadMoreIssues={loadMoreServerIssues}
       onUpdateIssue={(id, data) => updateIssue.mutate({ id, data })}

@@ -307,6 +307,16 @@ describe("nativeRunEventsToTranscript", () => {
     expect(transcript.filter((entry) => entry.kind === "run_terminal")).toHaveLength(1);
   });
 
+  it("preserves buffered output tails when a native turn ends", () => {
+    const transcript = nativeRunEventsToTranscript([
+      event(1, "item.delta", { itemId: "reasoning-1", kind: "reasoning", text: "Thinking" }),
+      event(2, "turn.completed", { status: "completed", outputTails: [
+        { itemId: "reasoning-1", payload: { kind: "reasoning", text: "-" } },
+      ] }),
+    ]);
+    expect(transcript.filter(entry => entry.kind === "thinking").map(entry => "text" in entry ? entry.text : "").join("")).toBe("Thinking-");
+  });
+
   it("projects provider-neutral messages, tools, usage, and the final reply", () => {
     const transcript = nativeRunEventsToTranscript([
       event(6, "run.result.proposed", runResult("Done safely.")),
@@ -690,18 +700,13 @@ describe("nativeRunEventsToTranscript", () => {
     ]);
   });
 
-  it("uses the structured run summary when no agent message was emitted", () => {
+  it("retains a report without manufacturing a provider final message", () => {
     expect(nativeRunEventsToTranscript([
       event(1, "run.result.proposed", runResult("Recovered final reply.")),
     ])).toEqual([
       expect.objectContaining({
         kind: "run_result",
         summary: "Recovered final reply.",
-      }),
-      expect.objectContaining({
-        kind: "assistant",
-        text: "Recovered final reply.",
-        channel: "final",
       }),
     ]);
   });
@@ -771,11 +776,6 @@ describe("nativeRunEventsToTranscript", () => {
       expect.objectContaining({
         kind: "run_result",
         summary: "The implementation is ready.",
-      }),
-      expect.objectContaining({
-        kind: "assistant",
-        text: "The implementation is ready.",
-        channel: "final",
       }),
     ]);
   });

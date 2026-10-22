@@ -99,6 +99,11 @@ const mockDb = vi.hoisted(() => ({
   execute: vi.fn(),
 }));
 
+vi.mock("../services/task-interruption-presentation.js", () => ({
+  taskInterruptionPresentation: vi.fn(async () => null),
+  taskInterruptionPresentations: vi.fn(async () => new Map()),
+}));
+
 vi.mock("../services/index.js", () => ({
   companyService: () => ({
     getById: vi.fn(async () => ({ id: "company-1" })),
@@ -462,6 +467,9 @@ describe("issue goal context routes", () => {
     );
     expect(mockGoalService.getDefaultCompanyGoal).not.toHaveBeenCalled();
     expect(res.body.attachments).toEqual([]);
+    expect(res.body.taskQuestionContext).toEqual({
+      questions: [], truncated: false, guidance: expect.stringContaining("Historical questions remain answerable"),
+    });
   });
 
   it("preserves direct continuation summary lookup in GET /issues/:id/heartbeat-context", async () => {

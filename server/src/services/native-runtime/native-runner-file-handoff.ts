@@ -245,7 +245,13 @@ async function openedFilePath(fd: number): Promise<string> {
       execFile(
         "/usr/sbin/lsof",
         ["-a", "-p", String(process.pid), "-d", String(fd), "-F0n"],
-        { encoding: "buffer", maxBuffer: 16_384, timeout: 1_000 },
+        {
+          encoding: "buffer",
+          maxBuffer: 16_384,
+          timeout: 1_000,
+          // lsof escapes non-ASCII names under the C locale, breaking descriptor verification.
+          env: { ...process.env, LC_ALL: "en_US.UTF-8" },
+        },
         (error, stdout) => {
           if (error) reject(error);
           else resolve(Buffer.from(stdout));
@@ -883,10 +889,10 @@ export async function stageNativeRunnerWakeAttachments(input: {
   if (workspaceRoot) {
     const processDirectoryName = await currentStagingProcessDirectoryName();
     await withStagingRegistryLock(workspaceRoot, async () => {
-      const stagingDirectory = await ensurePrivateStagingDirectory(
-        workspaceRoot,
-        processDirectoryName,
-      );
+      // Empty wakes still scrub abandoned bytes, but need no new staging paths.
+      const stagingDirectory = selections.length > 0
+        ? await ensurePrivateStagingDirectory(workspaceRoot, processDirectoryName)
+        : null;
       const activePaths =
         activeStagingPathsByWorkspace.get(workspaceRoot) ?? new Set<string>();
       const reusablePaths = await scrubNativeRunnerStagingResidue(
@@ -894,7 +900,7 @@ export async function stageNativeRunnerWakeAttachments(input: {
         activePaths,
         processDirectoryName,
       );
-      if (selections.length > 0) {
+      if (stagingDirectory !== null) {
         stagingDestinations = reusablePaths.slice(0, selections.length);
         while (stagingDestinations.length < selections.length) {
           const candidate = path.join(stagingDirectory, randomUUID());
