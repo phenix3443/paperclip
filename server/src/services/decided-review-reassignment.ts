@@ -15,6 +15,7 @@ import {
 } from "@paperclipai/db";
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { persistActivity } from "./activity-log.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
 import { readChatControlRecoveryStop } from "./chat-control-recovery-stop.js";
 import { getConversationOwnershipBlocker } from "./conversation-continuation.js";
@@ -528,6 +529,12 @@ export async function decidedReviewAdmission(db: Db, input: {
   if (!task) return { kind: "continue" };
   const state = readState(task);
   const participant = state?.currentParticipant?.type === "agent" ? state.currentParticipant.agentId ?? null : null;
+  // Any wake on a held decided review may follow the event that settles its
+  // proof (an answer, an approval, a cleared dependency), so it asks the pass
+  // to reconsider this task.
+  if (participant && await hasDecidedReviewCandidate(db, task)) {
+    await notifyDeliveryWork(db, DELIVERY_QUEUES.executionContinuation, task.id);
+  }
   const wakeClass = classifyDecidedReviewWake(input.wake, participant);
   return decideDecidedReviewAdmission(wakeClass, input.wake, {
     identity: () => currentSubmissionIdentity(db, task, input.wake.agentId),
@@ -630,16 +637,31 @@ function decidedReviewCandidate() {
   );
 }
 
-const SCAN_PAGE = 25;
-export type DecidedReviewScan = { after: { companyId: string; issueId: string } | null };
-const defaultScan: DecidedReviewScan = { after: null };
-
-/** Whether a later pass may still have a hold to prove. */
-export async function decidedReviewContinuationPending(db: Db) {
+async function hasDecidedReviewCandidate(db: Db, task: Pick<Task, "companyId" | "id">) {
   const [row] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).innerJoin(issues, and(
     eq(issues.companyId, issueRecoveryActions.companyId), eq(issues.id, issueRecoveryActions.sourceIssueId),
-  )).where(decidedReviewCandidate()).limit(1);
+  )).where(and(eq(issues.companyId, task.companyId), eq(issues.id, task.id), decidedReviewCandidate())).limit(1);
   return Boolean(row);
+}
+
+const SCAN_PAGE = 25;
+/** Proof failures that settle on their own: a stop still finishing, or a run
+ * still owning the task. Only these keep a retry deadline, and only briefly. */
+const SETTLING = new Set(["P2_process_running", "P2_lease_unreleased", "P6_execution_active"]);
+export const DECIDED_REVIEW_SETTLE_RETRIES = 20;
+export type DecidedReviewScan = {
+  after: { companyId: string; issueId: string } | null;
+  settling: Map<string, number>;
+};
+const defaultScan: DecidedReviewScan = { after: null, settling: new Map() };
+
+/**
+ * Whether the pass owes another run without a new event: the rest of a
+ * rotation that hit a full page, or a settling proof within its retry bound.
+ * Reads no database, so an idle or permanently held system stays quiet.
+ */
+export function decidedReviewRetryPending(scan: DecidedReviewScan = defaultScan) {
+  return scan.after !== null || [...scan.settling.values()].some(attempts => attempts < DECIDED_REVIEW_SETTLE_RETRIES);
 }
 
 export async function continueDecidedReviewReassignments(db: Db, wakeup: Wakeup, scan: DecidedReviewScan = defaultScan) {
@@ -659,13 +681,15 @@ export async function continueDecidedReviewReassignments(db: Db, wakeup: Wakeup,
   scan.after = candidates.length === SCAN_PAGE && last ? { companyId: last.companyId, issueId: last.issueId } : null;
   let woken = 0;
   for (const candidate of candidates) {
+    const key = `${candidate.companyId}:${candidate.issueId}`;
+    let held: string | null = null;
     const proved = await db.transaction(async tx => {
       const [task] = await tx.select().from(issues).where(and(
         eq(issues.companyId, candidate.companyId), eq(issues.id, candidate.issueId),
       )).for("update");
       if (!task) return null;
       let proof = await proveDecidedReviewContinuation(tx as unknown as Db, { task });
-      if (proof.kind !== "proved") return null;
+      if (proof.kind !== "proved") { held = proof.reason; return null; }
       if (proof.shape === "blocked_projection") {
         // Restore only the unchanged projection this incident's sweep made.
         // The issue service still enforces assignee and dependency readiness.
@@ -689,6 +713,8 @@ export async function continueDecidedReviewReassignments(db: Db, wakeup: Wakeup,
       if (error instanceof RestoreNotProved) return null;
       throw error;
     });
+    if (held && SETTLING.has(held)) scan.settling.set(key, (scan.settling.get(key) ?? 0) + 1);
+    else scan.settling.delete(key);
     if (!proved) continue;
     await wakeup(proved.source.agentId, buildDecidedReviewContinuationWakeup({
       issueId: proved.task.id, sourceRunId: proved.source.id,

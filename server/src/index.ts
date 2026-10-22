@@ -42,7 +42,7 @@ import { deliverReconciledExecutions, settleUnrecoverableExecutions } from "./se
 import { reconcileSafeNativeReplacements } from "./services/native-runtime/native-safe-replacement.js";
 import { reconcileAbandonedExecutionControl } from "./services/execution-control-reconciliation.js";
 import { executionControlSchedule, registerExecutionControlWork } from "./services/execution-control-work.js";
-import { continueDecidedReviewReassignments, decidedReviewContinuationPending } from "./services/decided-review-reassignment.js";
+import { continueDecidedReviewReassignments, decidedReviewRetryPending } from "./services/decided-review-reassignment.js";
 import { EXECUTION_RECONCILIATION_INTERVAL_MS } from "./services/execution-control-deadline.js";
 import { connectionIntentDeliveryService } from "./services/connection-intent-delivery.js";
 import { existsSync, readFileSync, rmSync } from "node:fs";
@@ -1334,15 +1334,16 @@ async function startServerWithDatabaseTeardown(
     { queue: DELIVERY_QUEUES.localLoginCleanup, run: () => localAiLoginService(db).reapExpired(), next: executionSchedule.localLogin },
     ...(heartbeat ? [
       { queue: DELIVERY_QUEUES.executionReplacement, run: () => reconcileSafeNativeReplacements(db, new Date(), { verifyStoppedSession: run => verifyStoppedNativeSessionForReplacement(db, run) }), next: executionSchedule.replacement },
-      // Recovery hold writes already signal this queue; a decided review
-      // continuation proves against those same holds, so it shares the duty.
+      // Hold writes, issue status/review-state writes and wakes on a held
+      // decided review signal this queue. Without them, only a bounded settle
+      // retry or the rest of a full rotation keeps a deadline.
       { queue: DELIVERY_QUEUES.executionContinuation, run: async () => {
         const settled = await Promise.allSettled([deliverReconciledExecutions(db, heartbeat.wakeup),
           continueDecidedReviewReassignments(db, heartbeat.wakeup)]);
         for (const result of settled) if (result.status === "rejected") throw result.reason;
       }, next: async () => {
         const deadline = await executionSchedule.continuation();
-        if (!(await decidedReviewContinuationPending(db))) return deadline;
+        if (!decidedReviewRetryPending()) return deadline;
         const retry = Date.now() + EXECUTION_RECONCILIATION_INTERVAL_MS;
         return deadline === null ? retry : Math.min(deadline, retry);
       } },

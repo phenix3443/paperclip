@@ -44,6 +44,7 @@ import { executionBlockerPredicate, getExecutionBlocker } from "../services/exec
 import { hasLiveLegacyController, legacyControllerBootId } from "../services/legacy-controller-lease.js";
 import { runningProcesses } from "../adapters/index.js";
 import { issueService } from "../services/issues.js";
+import { DELIVERY_QUEUES, subscribeDeliveryWork } from "../services/delivery-work-notifications.js";
 import {
   buildDecidedReviewContinuationWakeup,
   continueDecidedReviewReassignments,
@@ -52,6 +53,8 @@ import {
   findConsumption,
   proveDecidedReviewContinuation,
   selectDecidedReviewSource,
+  DECIDED_REVIEW_SETTLE_RETRIES,
+  decidedReviewRetryPending,
 } from "../services/decided-review-reassignment.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -1189,6 +1192,30 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     expect(await reviewerTurnsAfter(b.f, beforeLate)).toEqual([]);
   }, 90_000);
 
+  it("bounds the settle retry of a held decided review, then waits quietly for a real producer", async () => {
+    const b = await heldBase();
+    const scan = { after: null, settling: new Map<string, number>() };
+    await continueDecidedReviewReassignments(db, heartbeat.wakeup, scan);
+    expect(decidedReviewRetryPending(scan)).toBe(true);
+    for (let i = 1; i < DECIDED_REVIEW_SETTLE_RETRIES; i += 1) await continueDecidedReviewReassignments(db, heartbeat.wakeup, scan);
+    expect(decidedReviewRetryPending(scan)).toBe(false);
+    expect(await reviewerTurnsAfter(b.f, b.resubmittedAt)).toEqual([]);
+
+    // The lease settles after the bound: nothing reconsiders the task until an
+    // event on it, here a Board comment whose reviewer wake signals the pass.
+    await b.releaseLease();
+    const signals: string[] = [];
+    const stop = subscribeDeliveryWork(db, DELIVERY_QUEUES.executionContinuation, () => signals.push("continuation"));
+    try {
+      const board = app({ type: "board", userId: b.f.userId, companyIds: [b.f.companyId], source: "local_implicit", isInstanceAdmin: true, runId: null });
+      const comment = await request(board).post(`/api/issues/${b.f.issueId}/comments`).send({ body: "Any update on the review?" });
+      expect(comment.status, JSON.stringify(comment.body)).toBe(201);
+      await waitFor(async () => signals.length > 0, 10_000, "the pass to be signalled");
+    } finally { stop(); }
+    await fs.writeFile(b.f.gate, "open");
+    await drain(b.f);
+  }, 60_000);
+
   it("gives a submission one turn when an older parked review request promotes before its own request arrives", async () => {
     const b = await heldBase();
     await fs.rm(b.f.gate, { force: true });
@@ -1285,7 +1312,7 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
         evidence: { runId: randomUUID(), automaticRecovery: { policy: "preserve_without_replay_v1", replay: "blocked", actionOutcome: "unknown" } } });
     }
     expect(b.f.issueId > "00000000-0000-4000-8000-000000000024").toBe(true);
-    const scan: DecidedReviewScan = { after: null };
+    const scan: DecidedReviewScan = { after: null, settling: new Map() };
     const woken: string[] = [];
     const wakeup = async (agentId: string, options: Parameters<typeof heartbeat.wakeup>[1]) => {
       woken.push(String((options?.payload as Record<string, unknown> | undefined)?.issueId));
