@@ -20,7 +20,6 @@ import { readChatControlRecoveryStop } from "./chat-control-recovery-stop.js";
 import { getConversationOwnershipBlocker } from "./conversation-continuation.js";
 import { executionBlockerPredicate } from "./execution-blocker.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
-import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 import { issueService } from "./issues.js";
 import { isPreDispatchExecutionWaitVerified } from "./pre-dispatch-review-wait.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
@@ -397,7 +396,6 @@ export async function admitDecidedReviewContinuation(
   return {
     record,
     foldedWakeIds: parked.map(wake => wake.id),
-    foldedCommentIds: parked.flatMap(wake => queuedCommentIdsFromWakePayload(wake.payload)),
   };
 }
 
@@ -542,7 +540,10 @@ type Wakeup = (agentId: string, options: ReturnType<typeof buildDecidedReviewCon
  * in the wake gate, which proves everything again under the issue lock.
  */
 export async function continueDecidedReviewReassignments(db: Db, wakeup: Wakeup) {
-  const candidates = await db.selectDistinct({ companyId: issueRecoveryActions.companyId, issueId: issueRecoveryActions.sourceIssueId })
+  // Newest issues first, so holds that never prove cannot starve a fresh one.
+  const candidates = await db.selectDistinct({
+    companyId: issueRecoveryActions.companyId, issueId: issueRecoveryActions.sourceIssueId, updatedAt: issues.updatedAt,
+  })
     .from(issueRecoveryActions).innerJoin(issues, and(
       eq(issues.companyId, issueRecoveryActions.companyId), eq(issues.id, issueRecoveryActions.sourceIssueId),
     )).where(and(
@@ -552,7 +553,7 @@ export async function continueDecidedReviewReassignments(db: Db, wakeup: Wakeup)
           sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`)),
       sql`not (${issueRecoveryActions.evidence} ? 'decidedReviewContinuation')`,
       inArray(issues.status, ["in_review", "blocked"]),
-    )).limit(25);
+    )).orderBy(desc(issues.updatedAt)).limit(25);
   let woken = 0;
   for (const candidate of candidates) {
     const proved = await db.transaction(async tx => {
@@ -566,6 +567,13 @@ export async function continueDecidedReviewReassignments(db: Db, wakeup: Wakeup)
         // Restore only the unchanged projection this incident's sweep made.
         // The issue service still enforces assignee and dependency readiness.
         await issueService(tx as unknown as Db).update(task.id, { status: "in_review" }, tx);
+        await persistActivity(tx as unknown as Db, {
+          companyId: task.companyId, actorType: "system", actorId: "execution-recovery",
+          action: "issue.updated", entityType: "issue", entityId: task.id,
+          agentId: proof.source.agentId, runId: proof.source.id,
+          details: { status: "in_review", _previous: { status: task.status }, source: "decided_review_continuation",
+            decisionId: proof.decisionId, resubmissionActivityId: proof.resubmissionActivityId },
+        });
         const [restored] = await tx.select().from(issues).where(eq(issues.id, task.id));
         proof = await proveDecidedReviewContinuation(tx as unknown as Db, { task: restored! });
         if (proof.kind !== "proved" || proof.shape !== "in_review") return null;

@@ -28870,8 +28870,14 @@ export function heartbeatService(
           // A resumed receipt already passed admission under this issue lock.
           // Consume it with its successor even when chat keeps other messages
           // in separate turns, or finalization will deliver it a second time.
+          // Work parked behind the settled holds belongs to their successor,
+          // also on conversations that keep other messages in separate turns.
+          const adoptableWakeIds = [
+            ...(executionWaitRequestId ? [executionWaitRequestId] : []),
+            ...(decidedReviewAdmitted?.foldedWakeIds ?? []),
+          ];
           const pendingComments =
-            (executionWaitRequestId || canCoalesceComments) &&
+            (adoptableWakeIds.length > 0 || canCoalesceComments) &&
             !(await getExecutionBlocker(tx as unknown as Db, issue.companyId, issue.id))
               ? await tx
                   .select()
@@ -28882,14 +28888,13 @@ export function heartbeatService(
                       inArray(agentWakeupRequests.agentId, handoffSource ? [agentId, handoffSource.agentId] : [agentId]),
                       eq(agentWakeupRequests.status, "deferred_issue_execution"),
                       sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
-                      canCoalesceComments ? undefined : eq(agentWakeupRequests.id, executionWaitRequestId!),
+                      canCoalesceComments ? undefined : inArray(agentWakeupRequests.id, adoptableWakeIds),
                     ),
                   )
                   .orderBy(asc(agentWakeupRequests.requestedAt))
               : [];
           const adoptedComments = pendingComments.filter((wake) => {
             if (wake.id === executionWaitRequestId) return true;
-            // Work parked behind the settled holds belongs to their successor.
             if (decidedReviewAdmitted?.foldedWakeIds.includes(wake.id)) return true;
             if (wake.id === opts.queuedCommentInterruptId || wake.id === opts.queuedCommentRequestId) return true;
             const deferredPayload = parseObject(wake.payload);
