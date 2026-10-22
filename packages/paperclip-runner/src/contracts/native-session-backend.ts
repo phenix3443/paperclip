@@ -1,3 +1,4 @@
+import type { NativeRunRuntimeGrant } from "./runtime-context.js";
 import type {
   NativeRunIdentity,
   NativeSessionCapabilities,
@@ -40,6 +41,7 @@ export interface OpenNativeSessionInput {
 }
 
 export interface NativeSessionRecoveryOptions {
+  normalizeReplayPayload?(payload: PrpEvent["payload"]): PrpEvent["payload"];
   /** Abort provider recovery and release any not-yet-returned provider state. */
   signal: AbortSignal;
 }
@@ -63,6 +65,10 @@ export interface PersistedNativeSession {
   terminal?: PrpTerminalState | null;
   activeTurnId?: string | null;
   terminalTurns?: PersistedHarnessTurnTerminal[];
+  /** Control-plane disposition bound to the exact committed tool event. It is
+   * independent of the interaction's later answer and proves no provider terminal. */
+  governedWait?: { sourceEvent: PrpEvent; result: PrpStructuredRunResult };
+
   /** At-most-once marker for resultless disposition repair or restart continuation. */
   dispositionOnlyRecoveryConsumed?: boolean;
   dispositionOnlyRecoveryTurnId?: string | null;
@@ -180,7 +186,7 @@ export class NativeSessionCleanupQuarantinedError extends Error {
 export interface NativeSession {
   identity(): NativeRunIdentity;
   capabilities(): Promise<NativeSessionCapabilities>;
-  attachRun?(input: { identity: NativeRunIdentity }): Promise<void>;
+  attachRun?(input: { identity: NativeRunIdentity; currentRunGrant?: NativeRunRuntimeGrant }): Promise<void>;
   /** Relinquish controller authority without suspending provider execution. */
   detachControllerForRestart?(): Promise<void>;
   events(input?: { afterCursor?: string | null }): AsyncIterable<PrpEvent>;
@@ -189,6 +195,8 @@ export interface NativeSession {
     /** Set by orchestration only after successful provider-session recovery. */
     continuation?: true;
     requestedCollaborationMode?: "default" | "plan";
+    /** OpenCode/OpenRouter only. Applies to this turn, never subsequent turns. */
+    reasoningMode?: "default" | "disabled";
   }): Promise<{
     turnId: string;
     effectiveCollaborationMode?: "default" | "plan";
@@ -200,12 +208,16 @@ export interface NativeSession {
     correlationId?: string;
   }): Promise<void>;
   interrupt?(input: { turnId?: string; reason?: string }): Promise<void>;
+  /** Revoke publication synchronously while the control plane journals a wait.
+   * Does not interrupt the provider; cancel owns the subsequent passive cleanup. */
+  revokeTurnPublication?(): void;
   /** Commit cancellation synchronously; the returned promise owns cleanup only. */
   cancel?(input: {
     reason: string;
     signal: AbortSignal;
   }): NativeSessionCancellation;
   resolveRuntimeRequest?(input: {
+    commandId?: string;
     requestId: string;
     turnId: string;
     resolution: HarnessRuntimeRequestResolution;

@@ -120,10 +120,36 @@ export const INSTANCE_FEATURE_CATALOG: Record<InstanceFeatureKey, FeatureCatalog
     cloudDefault: false,
     selfHostedDefault: false,
   },
+  enableGitHubReviewBots: {
+    title: "GitHub review bots",
+    description: "Show GitHub review bot setup and management independently of chat connectors. Existing bots keep running when hidden; GitHub tool connections are unaffected.",
+    tier: "managed",
+    cloudDefault: false,
+    selfHostedDefault: false,
+  },
+  enableOpenAiDot: {
+    title: "OpenAI Dot",
+    description: "Add OpenAI Dot as a standalone agent choice with its own experimental opt-in. Requires Assistant connections (MCP) and an authenticated instance with a public HTTPS URL.",
+    tier: "managed",
+    cloudDefault: false,
+    selfHostedDefault: false,
+  },
+  enableGrokBot: {
+    title: "Grok Bot",
+    description: "Connect an existing Grok Bot as an experimental Paperclip agent. Requires Assistant connections (MCP), Paperclip Runner, and an authenticated public HTTPS instance. Provider spending is not reported.",
+    tier: "managed",
+    cloudDefault: false,
+    selfHostedDefault: false,
+  },
+  enableMuse: {
+    title: "Muse — Personal agent",
+    description: "Connect your personal Meta Muse through its managed background receiver and the external Paperclip Runner. Experimental; requires authenticated public HTTPS and Paperclip Runner.",
+    tier: "managed", cloudDefault: false, selfHostedDefault: false,
+  },
   enableChatConnectors: {
     title: "Chat connectors",
     description:
-      "Show experimental chat connector setup and Board surfaces. Existing connections keep running when hidden; AgentMail, GitHub tools, and other tool connectors are unaffected.",
+      "Show experimental chat connector setup and Board surfaces. Existing connections keep running when hidden; AgentMail, GitHub review bots, and tool connectors are unaffected.",
     tier: "managed",
     cloudDefault: false,
     selfHostedDefault: false,
@@ -135,19 +161,19 @@ export const INSTANCE_FEATURE_CATALOG: Record<InstanceFeatureKey, FeatureCatalog
     cloudDefault: false,
     selfHostedDefault: false,
   },
+  enablePaperclipNotebook: {
+    title: "Paperclip Notebook",
+    description: "Allow Paperclip Notebook connections and publishing through an explicitly enabled instance rollout.",
+    tier: "managed",
+    cloudDefault: false,
+    selfHostedDefault: false,
+  },
   enableMcpAggregators: {
     title: "MCP aggregators (compatibility)",
     description: "Deprecated compatibility key. MCP aggregators are always enabled; stored and managed values are ignored.",
     tier: "managed",
     cloudDefault: true,
     selfHostedDefault: true,
-  },
-  enablePipelines: {
-    title: "Pipelines",
-    description: "Enable pipeline definitions and pipeline-driven case production surfaces.",
-    tier: "managed",
-    cloudDefault: false,
-    selfHostedDefault: false,
   },
   enableCases: {
     title: "Cases",
@@ -256,6 +282,14 @@ export const INSTANCE_FEATURE_CATALOG: Record<InstanceFeatureKey, FeatureCatalog
     description:
       "Show the Decisions item in the main sidebar — the attention home that surfaces tasks awaiting input.",
     tier: "preference",
+    cloudDefault: false,
+    selfHostedDefault: false,
+  },
+  enableFastResponses: {
+    title: "Experimental fast responses",
+    description:
+      "Allow short acknowledgements while agents begin work. Configure them in Settings → Connections.",
+    tier: "managed",
     cloudDefault: false,
     selfHostedDefault: false,
   },

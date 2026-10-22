@@ -1,15 +1,30 @@
+import { isOpenRouterUrl, OPENROUTER_ATTRIBUTION_HEADERS } from "../openrouter-attribution.js";
 import { spawn, type ChildProcess } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { resolveCompletionContinuation } from "../completion-continuation.js";
+import { createHash, randomBytes } from "node:crypto";
+import { accessSync, constants, readFileSync, realpathSync, statSync } from "node:fs";
+import { createRequire } from "node:module";
 import {
   chmod,
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
+  realpath,
   rm,
   writeFile,
 } from "node:fs/promises";
 import { createServer } from "node:net";
-import { dirname, join, resolve } from "node:path";
+import { constants as osConstants } from "node:os";
+import { Agent as HttpAgent, createServer as createHttpServer, request as requestHttp, type IncomingMessage } from "node:http";
+import { Agent as HttpsAgent, request as requestHttps } from "node:https";
+import { getCACertificates } from "node:tls";
+import { pipeline } from "node:stream/promises";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+
+import { parseOpenCodeReasoningMode, type OpenCodeReasoningMode } from "./reasoning-mode.js";
+import { annotateOmittedProviderText, parseOpenCodeSseFrames } from "./sse-frames.js";
+import { githubCredentialEnvironment } from "../../github-credential-environment.js";
 
 import {
   CODEX_SKILLLESS_BASE_INSTRUCTIONS,
@@ -77,6 +92,69 @@ export const QUALIFIED_OPENCODE_VERSION = "1.18.34" as const;
 export const QUALIFIED_OPENCODE_MODEL =
   "openrouter/deepseek/deepseek-v4-flash-0731" as const;
 
+/** Resolve a declared, pinned native dependency without PATH or install fallback. */
+export function resolvePinnedOpenCodeCommand(
+  issuer: string | URL = import.meta.url,
+  target: { platform?: string; architecture?: string } = {},
+): string {
+  try {
+    const platform = target.platform ?? process.platform;
+    const architecture = target.architecture ?? process.arch;
+    const packageNames: Record<string, string[]> = {
+      "linux-x64": ["opencode-linux-x64-baseline"],
+      "darwin-arm64": ["opencode-darwin-arm64"],
+      "darwin-x64": ["opencode-darwin-x64-baseline"],
+    };
+    const candidates = packageNames[`${platform}-${architecture}`];
+    if (!candidates) {
+      throw new Error("OpenCode native target is not qualified");
+    }
+    const manifestPath = realpathSync(createRequire(issuer).resolve("opencode-ai/package.json"));
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    if (manifest.name !== "opencode-ai" || manifest.version !== QUALIFIED_OPENCODE_VERSION) {
+      throw new Error(`OpenCode package version mismatch: expected opencode-ai@${QUALIFIED_OPENCODE_VERSION}`);
+    }
+    const dependencyRequire = createRequire(manifestPath);
+    for (const name of candidates) {
+      if (manifest.optionalDependencies?.[name] !== QUALIFIED_OPENCODE_VERSION) {
+        throw new Error("OpenCode platform dependency does not match its qualified version");
+      }
+      let platformManifest: string;
+      try {
+        platformManifest = realpathSync(dependencyRequire.resolve(`${name}/package.json`));
+      } catch (error) {
+        if (["MODULE_NOT_FOUND", "ENOENT"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+          continue;
+        }
+        throw error;
+      }
+      const metadata = JSON.parse(readFileSync(platformManifest, "utf8"));
+      if (metadata.name !== name || metadata.version !== QUALIFIED_OPENCODE_VERSION
+        || !Array.isArray(metadata.os) || !metadata.os.includes(platform)
+        || !Array.isArray(metadata.cpu) || !metadata.cpu.includes(architecture)) {
+        throw new Error("OpenCode installed platform artifact identity mismatch");
+      }
+      const root = dirname(platformManifest);
+      const executable = realpathSync(resolve(root, "bin/opencode"));
+      const inside = relative(root, executable);
+      if (!inside || inside === ".." || inside.startsWith(`..${sep}`) || isAbsolute(inside)) {
+        throw new Error("OpenCode executable escapes its qualified platform package");
+      }
+      if (!statSync(executable).isFile()) {
+        throw new Error("OpenCode executable is not a regular file");
+      }
+      accessSync(executable, constants.X_OK);
+      return executable;
+    }
+    throw new Error("OpenCode qualified platform dependency is missing");
+  } catch (error) {
+    throw new Error(
+      `Pinned OpenCode runtime unavailable: ${(error as Error).message}. Restore Paperclip's runtime dependencies.`,
+      { cause: error },
+    );
+  }
+}
+
 type DynamicToolHandler = (call: {
   tool: string;
   callId: string;
@@ -105,6 +183,7 @@ export interface OpenCodeServerDriverOptions {
   commandLifecycle?: {
     beforeSpawn(): void;
     afterSpawn(): void;
+    afterExit?(): void;
   };
   runtimeDirectory: string;
   systemInstructions?: string;
@@ -262,6 +341,7 @@ export class OpenCodeServerDriver implements HarnessDriver {
         recovered: false,
         reason: redact(String(error), [
           this.#options.environment?.OPENROUTER_API_KEY,
+          this.#options.environment?.PAPERCLIP_AI_PROVIDER_KEY,
         ]),
       };
     }
@@ -407,6 +487,7 @@ class OpenCodeHarnessSession implements HarnessSession {
     Array<Record<string, unknown>>
   >();
   readonly #partText = new Map<string, string>();
+  readonly #streamingParts = new Map<string, Record<string, unknown>>();
   readonly #completedTextPartIds = new Set<string>();
   readonly #completedReasoningPartIds = new Set<string>();
   readonly #completedTextParts: Array<{
@@ -418,6 +499,7 @@ class OpenCodeHarnessSession implements HarnessSession {
   }> = [];
   readonly #messageUsageFingerprints = new Map<string, string>();
   readonly #workspaceChangesByTurn = new Map<string, Record<string, unknown>>();
+  #reportedSseCompaction = false;
   readonly #emittedFileReferences = new Set<string>();
   readonly #pendingRuntimeRequests = new Map<
     string,
@@ -568,12 +650,22 @@ class OpenCodeHarnessSession implements HarnessSession {
       .finally(() => this.#pumpEvents());
   }
 
+  supportsTurnReasoning(): boolean {
+    return this.#model.startsWith("openrouter/");
+  }
+
   async startTurn(input: {
     message: NativeUserMessage;
+    reasoningMode?: OpenCodeReasoningMode;
   }): Promise<{ turnId: string }> {
     if (this.#activeTurnId !== null)
       throw new Error("OpenCode session already has an active turn");
+    const reasoningMode = parseOpenCodeReasoningMode(input.reasoningMode);
+    if (input.reasoningMode !== undefined && !this.#model.startsWith("openrouter/")) {
+      throw new Error("Per-turn OpenCode reasoning is supported only for OpenRouter models");
+    }
     const turnId = `turn-${randomBytes(12).toString("hex")}`;
+    this.#streamingParts.clear();
     this.#activeTurnId = turnId;
     this.#emit("turn.submitted", {
       envelopeSchema: this.#taskEnvelope.schema,
@@ -583,12 +675,9 @@ class OpenCodeHarnessSession implements HarnessSession {
     this.#emit("turn.started", { status: "inProgress" }, { turnId });
     const [providerID, ...modelParts] = this.#model.split("/");
     const modelID = modelParts.join("/");
-    // A resumed OpenCode provider session already retains the original system
-    // instructions and task envelope in its conversation. Repeating both on
-    // every Paperclip continuation can overflow smaller context windows and
-    // OpenCode then completes with `finish: unknown` and zero tokens. The
-    // native model envelope still carries the authoritative wake delta,
-    // interaction responses, completion contract, and current issue context.
+    // Keep the task envelope only on the initial task-mode wake. OpenCode
+    // rebuilds system instructions from the latest user message, so system
+    // instructions must still accompany every prompt (including recovery).
     const prompt = this.#sendFullContext
       ? JSON.stringify({
           task: this.#taskEnvelope,
@@ -610,13 +699,15 @@ class OpenCodeHarnessSession implements HarnessSession {
           // at this HTTP boundary.
           providerID,
           modelID,
-          // This exact OpenCode version passed the native-question conformance
-          // suite. question.asked is adapted into PRP v2 and its reply/reject API
-          // remains private to this driver.
-          tools: { question: true },
-          ...(this.#sendFullContext
-            ? { system: this.#systemInstructions }
+          // Always select the empty default variant on an ordinary turn so a
+          // previous disabled turn cannot change this turn's provider defaults.
+          ...(providerID === "openrouter"
+            ? { variant: reasoningMode === "disabled" ? "paperclip-no-reasoning" : "paperclip-default" }
             : {}),
+          // Keep question enabled in the isolated config. OpenCode 1.18.32
+          // turns a prompt's deprecated `tools` map into replacement session
+          // permissions, so a sparse override here discards the session policy.
+          system: this.#systemInstructions,
           parts: [{ type: "text", text: prompt }],
         }),
       },
@@ -952,7 +1043,15 @@ class OpenCodeHarnessSession implements HarnessSession {
       try {
         if (this.#closed || this.#completionSettlement)
           throw new Error("A completion is already settling or the session is closed");
-        const validation = validatePrpStructuredRunResult(call.arguments);
+        this.#completionSettlement = new Promise<void>(resolve => { settle = resolve; });
+        const completionInput = await resolveCompletionContinuation(call.arguments, this.#runId,
+          this.#dynamicToolHandler ? () => this.#dynamicToolHandler!({
+            tool: "get_task_context", callId: `${call.callId}:continuation`,
+            threadId: this.#providerSessionId, turnId, arguments: {},
+          }) : undefined);
+        if (this.#closed || this.#activeTurnId !== turnId)
+          throw new Error("The turn ended while resolving completion");
+        const validation = validatePrpStructuredRunResult(completionInput);
         if (!validation.ok) throw new Error("Invalid semantic result");
         if (
           (tool === PRP_BLOCK_TOOL_NAME &&
@@ -981,7 +1080,6 @@ class OpenCodeHarnessSession implements HarnessSession {
         const fingerprint = canonicalJson(validation.result);
         if (this.#resultFingerprint && this.#resultFingerprint !== fingerprint)
           throw new Error("A different semantic result was already committed");
-        this.#completionSettlement = new Promise<void>(resolve => { settle = resolve; });
         // Wait for the bound controller before committing or resolving the
         // provider call. A rejection remains repairable in this same turn.
         const feedback = this.#completionFeedback
@@ -1256,8 +1354,9 @@ class OpenCodeHarnessSession implements HarnessSession {
           signal: this.#abort.signal,
         });
         if (!response.ok || !response.body)
-          throw new Error(
-            `OpenCode event stream returned HTTP ${response.status}`,
+          throw Object.assign(
+            new Error(`OpenCode event stream returned HTTP ${response.status}`),
+            { httpStatus: response.status },
           );
         const outboundFrameId = this.#runtime.trace?.frame({
           direction: "client_to_provider",
@@ -1274,8 +1373,31 @@ class OpenCodeHarnessSession implements HarnessSession {
             reason: "Opened the OpenCode server-sent event stream",
           });
         }
-        for await (const frame of parseSseFrames(response.body)) {
+        for await (const frame of parseOpenCodeSseFrames(response.body)) {
           if (this.#closed) return;
+          const compaction = frame.compaction;
+          if (compaction?.omitted) {
+            // Even the compacted structure exceeded its bound. Report the
+            // frame instead of ending the stream or dropping it silently.
+            this.#emit("harness.diagnostic", {
+              code: "opencode_sse_event_omitted",
+              message: `OpenCode sent a ${compaction.frameChars}-character event that could not be retained within the payload bound.`,
+              providerEventType: compaction.eventType,
+              frameChars: compaction.frameChars,
+            });
+            continue;
+          }
+          if (compaction && !this.#reportedSseCompaction) {
+            this.#reportedSseCompaction = true;
+            this.#emit("harness.diagnostic", {
+              code: "opencode_sse_event_compacted",
+              message: `OpenCode sent a ${compaction.frameChars}-character event. Long strings were shortened to keep the event within the payload bound.`,
+              providerEventType: compaction.eventType,
+              frameChars: compaction.frameChars,
+              truncatedStrings: compaction.truncatedStrings,
+              omittedChars: compaction.omittedChars,
+            });
+          }
           const frameId =
             this.#runtime.trace?.frame({
               direction: "provider_to_client",
@@ -1286,22 +1408,26 @@ class OpenCodeHarnessSession implements HarnessSession {
           let event: unknown;
           try {
             event = JSON.parse(frame.data);
+            if (compaction) annotateOmittedProviderText(event, compaction);
             if (frameId) {
               this.#runtime.trace?.interpretation({
                 frameId,
                 stage: "typescript_opencode_sse_parse",
-                ruleId: "opencode.sse.json",
+                ruleId: compaction ? "opencode.sse.compacted_json" : "opencode.sse.json",
                 disposition: "mapped",
                 fieldMappings: [
                   {
                     inputPath: "$raw.data",
                     outputPath: "$providerEvent",
                     action: "normalized",
-                    reason:
-                      "Decoded the exact SSE data payload as an OpenCode event",
+                    reason: compaction
+                      ? "Decoded the compacted SSE data payload as an OpenCode event"
+                      : "Decoded the exact SSE data payload as an OpenCode event",
                   },
                 ],
-                reason: "OpenCode SSE frame parsed as JSON",
+                reason: compaction
+                  ? `OpenCode SSE frame of ${compaction.frameChars} characters parsed as JSON after ${compaction.truncatedStrings} long strings were shortened (${compaction.omittedChars} characters omitted)`
+                  : "OpenCode SSE frame parsed as JSON",
               });
             }
           } catch (error) {
@@ -1328,8 +1454,9 @@ class OpenCodeHarnessSession implements HarnessSession {
           }
           this.#mapProviderEvent(event, frameId);
         }
-        throw new Error(
-          "OpenCode event stream closed before the session became terminal",
+        throw Object.assign(
+          new Error("OpenCode event stream closed before the session became terminal"),
+          { streamClosed: true },
         );
       } catch (error) {
         if (this.#closed || this.#abort.signal.aborted) return;
@@ -1337,16 +1464,48 @@ class OpenCodeHarnessSession implements HarnessSession {
         if (attempts > 3) {
           await this.#completionSettlement;
           if (this.#closed) return;
+          const failure = await openCodeEventStreamFailure(error, this.#runtime.process);
+          if (this.#closed) return;
           this.#emit("harness.diagnostic", {
             code: "opencode_sse_failed",
             message: redact(String(error), this.#runtime.sensitiveValues),
+            failure,
           });
+          this.#failActiveTurnOnStreamLoss(failure);
           this.#events.fail(error);
           return;
         }
         await new Promise((resolve) => setTimeout(resolve, 50 * attempts));
       }
     }
+  }
+
+  /**
+   * The event stream is the only path for this turn's terminal event. Once it
+   * is gone the turn cannot finish, so record why before the stream ends
+   * instead of leaving runnerd to close it later with no cause.
+   */
+  #failActiveTurnOnStreamLoss(failure: OpenCodeEventStreamFailure): void {
+    const turnId = this.#activeTurnId;
+    if (!turnId || this.#terminalTurns.has(turnId)) return;
+    this.#settlePendingRuntimeRequestsForTurn(turnId);
+    this.#emit(
+      "turn.failed",
+      {
+        status: "failed",
+        providerTerminalObserved: false,
+        error: {
+          code: failure.kind === "server_exited" ? "opencode_server_exited" : "opencode_event_stream_lost",
+          message: failure.kind === "server_exited"
+            ? "OpenCode stopped while the turn was running."
+            : "The OpenCode event stream failed while the turn was running.",
+          opencodeFailure: failure,
+        },
+      },
+      { turnId },
+    );
+    this.#terminalTurns.set(turnId, canonicalJson({ status: "failed" }));
+    this.#activeTurnId = null;
   }
 
   #mapProviderEvent(value: unknown, traceFrameId: number | null = null): void {
@@ -1399,9 +1558,15 @@ class OpenCodeHarnessSession implements HarnessSession {
     const event = record(value);
     const properties = record(event.properties);
     const type = text(event.type);
-    const eventId = text(event.id, canonicalJson(value));
-    if (this.#seenProviderEvents.has(eventId)) return;
-    this.#seenProviderEvents.add(eventId);
+    // Id-less deltas are additive: two identical chunks can be legitimate
+    // adjacent tokens. Content deduplication would silently lose the second.
+    // Key id-less events by digest: a retained canonical copy of each recent
+    // event would hold up to 10,000 large tool payloads in memory.
+    const eventId = text(event.id) || (type === "message.part.delta"
+      ? null
+      : `sha256:${createHash("sha256").update(canonicalJson(value)).digest("hex")}`);
+    if (eventId !== null && this.#seenProviderEvents.has(eventId)) return;
+    if (eventId !== null) this.#seenProviderEvents.add(eventId);
     if (this.#seenProviderEvents.size > 10_000)
       this.#seenProviderEvents.delete(
         this.#seenProviderEvents.values().next().value!,
@@ -1494,8 +1659,16 @@ class OpenCodeHarnessSession implements HarnessSession {
       );
       return;
     }
-    if (type === "message.part.updated") {
-      const part = record(properties.part);
+    if (type === "message.part.updated" || type === "message.part.delta") {
+      let part = record(properties.part);
+      if (type === "message.part.delta") {
+        const previous = this.#streamingParts.get(text(properties.partID));
+        // A delta has no role or part type. Only stream text for an observed
+        // part with matching message identity; never infer assistant identity.
+        if (!previous || properties.field !== "text" || typeof properties.delta !== "string"
+          || text(previous.messageID, text(previous.messageId)) !== text(properties.messageID)) return;
+        part = { ...previous, text: text(previous.text) + properties.delta };
+      }
       const messageId = text(part.messageID, text(part.messageId));
       if (!messageId) return;
       // Resolve the turn this message actually belongs to, not whichever
@@ -1503,11 +1676,20 @@ class OpenCodeHarnessSession implements HarnessSession {
       // must stay attributed to the turn that created that message.
       const owningTurnId = this.#messageTurnIds.get(messageId) ?? turnId;
       if (!owningTurnId) return;
+      if (owningTurnId === turnId && text(part.id) && ["text", "reasoning"].includes(text(part.type))) {
+        this.#streamingParts.set(text(part.id), part);
+      }
       const role = this.#messageRoles.get(messageId);
       if (role === "assistant") this.#emitAssistantPart(part, owningTurnId);
       else if (role === undefined) {
         const pending = this.#pendingMessageParts.get(messageId) ?? [];
-        if (pending.length < 100) pending.push(part);
+        // Text deltas are cumulative by this point. Keep the newest snapshot
+        // (including completion metadata), not the first 100 token chunks.
+        const previousIndex = ["text", "reasoning"].includes(text(part.type)) && text(part.id)
+          ? pending.findIndex(candidate => candidate.id === part.id && candidate.type === part.type)
+          : -1;
+        if (previousIndex >= 0) pending[previousIndex] = part;
+        else if (pending.length < 100) pending.push(part);
         this.#pendingMessageParts.set(messageId, pending);
       }
       return;
@@ -1969,6 +2151,110 @@ class OpenCodeHarnessSession implements HarnessSession {
   }
 }
 
+/** Retain the reusable gateway key in the runner; the harness gets a session-scoped capability. */
+async function startOpenCodeProviderProxy(baseUrl: string, key: string, model: string, environment: NodeJS.ProcessEnv) {
+  const upstreamUrl = new URL(`${baseUrl.replace(/\/+$/, "")}/chat/completions`);
+  const token = randomBytes(32).toString("base64url");
+  // Agent-local settings keep one runtime's transport configuration out of other sessions.
+  const proxyEnv = {
+    HTTP_PROXY: environment.http_proxy ?? environment.HTTP_PROXY ?? environment.all_proxy ?? environment.ALL_PROXY,
+    HTTPS_PROXY: environment.https_proxy ?? environment.HTTPS_PROXY ?? environment.http_proxy ?? environment.HTTP_PROXY ?? environment.all_proxy ?? environment.ALL_PROXY,
+    NO_PROXY: environment.no_proxy ?? environment.NO_PROXY,
+  };
+  const ca = [...getCACertificates("default")];
+  if (environment.SSL_CERT_FILE) ca.push(await readFile(environment.SSL_CERT_FILE, "utf8"));
+  if (environment.SSL_CERT_DIR) {
+    for (const entry of await readdir(environment.SSL_CERT_DIR, { withFileTypes: true })) {
+      if (!entry.isDirectory()) {
+        const certificate = await readFile(join(environment.SSL_CERT_DIR, entry.name), "utf8");
+        if (certificate.includes("-----BEGIN CERTIFICATE-----")) ca.push(certificate);
+      }
+    }
+  }
+  const agent = upstreamUrl.protocol === "https:" ? new HttpsAgent({ proxyEnv, ca }) : new HttpAgent({ proxyEnv });
+  const controllers = new Set<AbortController>();
+  const server = createHttpServer((request, response) => {
+    const controller = new AbortController();
+    controllers.add(controller);
+    response.once("close", () => controller.abort());
+    void (async () => {
+      if (request.headers.authorization !== `Bearer ${token}`) {
+        response.writeHead(401).end();
+        return;
+      }
+      if (request.method !== "POST" || request.url !== "/v1/chat/completions") {
+        response.writeHead(404).end();
+        return;
+      }
+      const chunks: Buffer[] = [];
+      let bytes = 0;
+      for await (const chunk of request) {
+        bytes += chunk.length;
+        if (bytes > 16 * 1024 * 1024) {
+          response.writeHead(413).end();
+          return;
+        }
+        chunks.push(Buffer.from(chunk));
+      }
+      const body = Buffer.concat(chunks);
+      let payload: Record<string, unknown>;
+      try { payload = JSON.parse(body.toString("utf8")); }
+      catch { response.writeHead(400).end(); return; }
+      if (!payload || typeof payload !== "object" || payload.model !== model) {
+        response.writeHead(400).end();
+        return;
+      }
+      const upstream = await new Promise<IncomingMessage>((resolve, reject) => {
+        const outgoing = (upstreamUrl.protocol === "https:" ? requestHttps : requestHttp)(upstreamUrl, {
+          method: "POST",
+          agent,
+          headers: { ...(isOpenRouterUrl(baseUrl) ? OPENROUTER_ATTRIBUTION_HEADERS : {}), "Content-Type": "application/json", "Content-Length": body.length, ...(key ? { Authorization: `Bearer ${key}` } : {}) },
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(600_000)]),
+        }, resolve);
+        outgoing.once("error", reject);
+        outgoing.end(body);
+      });
+      // Never forward authentication to a redirect destination.
+      const status = upstream.statusCode ?? 502;
+      if (status >= 300 && status < 400) {
+        upstream.destroy();
+        throw new Error("Provider redirects are not supported");
+      }
+      const headers: Record<string, string> = {};
+      for (const name of ["content-type", "content-encoding", "cache-control", "retry-after"]) {
+        const value = upstream.headers[name];
+        if (typeof value === "string") headers[name] = value;
+      }
+      response.writeHead(status, headers);
+      await pipeline(upstream, response);
+    })().catch(() => {
+      if (!response.headersSent) response.writeHead(502).end("Provider request failed");
+      else response.destroy();
+    }).finally(() => controllers.delete(controller));
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => { server.off("error", reject); resolve(); });
+    });
+  } catch (error) { agent.destroy(); throw error; }
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    server.close();
+    agent.destroy();
+    throw new Error("Could not bind OpenCode provider proxy");
+  }
+  return {
+    baseURL: `http://127.0.0.1:${address.port}/v1`,
+    token,
+    close: async () => {
+      for (const controller of controllers) controller.abort();
+      agent.destroy();
+      await new Promise<void>((resolve) => { server.close(() => resolve()); server.closeAllConnections(); });
+    },
+  };
+}
+
 async function startRuntime(input: {
   options: OpenCodeServerDriverOptions;
   root: string;
@@ -2020,143 +2306,202 @@ async function startRuntime(input: {
   const assignedMcp = nativeMcpLaunchBinding(
     input.options.environment ?? process.env,
   );
-  input.trace?.addSensitiveValues([
+  const identityKey = input.options.environment?.PAPERCLIP_AGENT_PRIVATE_KEY;
+  const identityValues = identityKey ? [identityKey, JSON.stringify(identityKey).slice(1, -1),
+    ...identityKey.split(/\r?\n/).filter(line => line && !line.startsWith("-----"))] : [];
+  const sensitiveValues = [
+    ...identityValues,
     password,
     authHeader,
     bridge.secret,
     assignedMcp?.token,
     input.options.environment?.OPENROUTER_API_KEY,
-  ]);
+    input.options.environment?.PAPERCLIP_AI_PROVIDER_KEY,
+  ].filter((value): value is string => Boolean(value));
+  input.trace?.addSensitiveValues(sensitiveValues);
   const instructionRoot =
     input.options.runtimeContext?.instructions.bundle.rootPath;
+  // OpenCode canonicalizes tool paths (for example /var -> /private/var on
+  // macOS). Permit the assigned workspace under either spelling; operations
+  // within it still obey the selected allow/ask/deny permission mode.
+  const externalDirectories: Record<string, string> = { "*": "deny" };
+  for (const root of new Set([input.cwd, await realpath(input.cwd)])) {
+    externalDirectories[root] = "allow";
+    externalDirectories[`${root}/**`] = "allow";
+  }
+  if (instructionRoot) externalDirectories[`${instructionRoot}/**`] = "allow";
   const [modelProvider, ...modelIdParts] = input.options.model.split("/");
   const providerModelId = modelIdParts.join("/");
-  const config = {
-    $schema: "https://opencode.ai/config.json",
-    model: input.options.model,
-    small_model: input.options.model,
-    share: "disabled",
-    // The configured entry is already composed exactly once into the session
-    // system prompt; siblings remain available through the read-only root.
-    instructions: [],
-    plugin: [],
-    // OpenCode's bundled models.dev snapshot can lag behind OpenRouter's live
-    // catalog. Bind the already-qualified exact model slug into the built-in
-    // provider instead of silently falling back or rejecting a newer model.
-    provider: {
-      [modelProvider!]: {
-        models: {
-          [providerModelId]: { name: providerModelId },
+  const providerProxy = modelProvider === "paperclip" && input.options.environment?.PAPERCLIP_AI_PROVIDER_URL
+    ? await startOpenCodeProviderProxy(input.options.environment.PAPERCLIP_AI_PROVIDER_URL, input.options.environment.PAPERCLIP_AI_PROVIDER_KEY ?? "", providerModelId, input.options.environment).catch(async error => {
+        await bridge.close().catch(() => {});
+        await rm(isolatedHome, { recursive: true, force: true }).catch(() => {});
+        throw error;
+      })
+    : null;
+  if (providerProxy) {
+    sensitiveValues.push(providerProxy.token);
+    input.trace?.addSensitiveValues([providerProxy.token]);
+  }
+  let child: ChildProcess | undefined;
+  let launchPrepared = false;
+  const releaseExecutable = () => {
+    if (!launchPrepared) return;
+    launchPrepared = false;
+    try {
+      input.options.commandLifecycle?.afterExit?.();
+    } catch (error) {
+      input.options.onDiagnostic?.(redact(`OpenCode executable cleanup failed: ${String(error)}`, sensitiveValues));
+    }
+  };
+  try {
+    const config = {
+      $schema: "https://opencode.ai/config.json",
+      model: input.options.model,
+      small_model: input.options.model,
+      share: "disabled",
+      autoupdate: false,
+      // The configured entry is already composed exactly once into the session
+      // system prompt; siblings remain available through the read-only root.
+      instructions: [],
+      plugin: [],
+      // OpenCode's bundled models.dev snapshot can lag behind OpenRouter's live
+      // catalog. Bind the already-qualified exact model slug into the built-in
+      // provider instead of silently falling back or rejecting a newer model.
+      provider: {
+        [modelProvider!]: {
+          ...(modelProvider === "openrouter" ? { options: { headers: OPENROUTER_ATTRIBUTION_HEADERS } } : {}),
+          ...(providerProxy ? {
+            npm: "@ai-sdk/openai-compatible",
+            name: "Paperclip connection",
+            options: {
+              baseURL: providerProxy.baseURL,
+              apiKey: providerProxy.token,
+            },
+          } : {}),
+          models: {
+            [providerModelId]: {
+              name: providerModelId,
+              ...(modelProvider === "openrouter"
+                ? { variants: {
+                    "paperclip-default": {},
+                    "paperclip-no-reasoning": { reasoning: { enabled: false } },
+                  } }
+                : {}),
+            },
+          },
         },
       },
-    },
-    tools: {
-      question: true,
-    },
-    permission: {
-      "*": input.options.permissionMode ?? "allow",
-      question: "allow",
-      "paperclip_*": "allow",
-      "mcp__paperclip__*": "allow",
-      external_directory: instructionRoot
-        ? { "*": "deny", [`${instructionRoot}/**`]: "allow" }
-        : "deny",
-    },
-    mcp: {
-      paperclip: {
-        type: "remote",
-        url: bridge.url,
-        enabled: true,
-        oauth: false,
-        headers: { Authorization: `Bearer ${bridge.secret}` },
-        timeout: 30_000,
+      tools: {
+        question: true,
       },
-      ...(assignedMcp
-        ? {
-            [assignedMcp.name]: {
-              type: "remote",
-              url: assignedMcp.url,
-              enabled: true,
-              oauth: false,
-              headers: { Authorization: `Bearer ${assignedMcp.token}` },
-              timeout: 30_000,
-            },
-          }
-        : {}),
-    },
-  };
-  await writeFile(
-    join(configHome, "opencode", "opencode.json"),
-    `${JSON.stringify(config, null, 2)}\n`,
-    { mode: 0o600 },
-  );
-  const environment = sanitizedEnvironment(
-    input.options.environment ?? process.env,
-    {
-      HOME: isolatedHome,
-      XDG_CONFIG_HOME: configHome,
-      XDG_DATA_HOME: dataHome,
-      XDG_CACHE_HOME: cacheHome,
-      OPENCODE_DISABLE_PROJECT_CONFIG: "true",
-      OPENCODE_SERVER_USERNAME: username,
-      OPENCODE_SERVER_PASSWORD: password,
-    },
-  );
-  const isolateProcessGroup = input.options.isolateProcessGroup ?? true;
-  const stdio: Array<"ignore" | "pipe" | number> = ["ignore", "ignore", "pipe"];
-  if (input.options.commandFd !== undefined) {
-    while (stdio.length <= input.options.commandFd) stdio.push("ignore");
-    stdio[input.options.commandFd] = input.options.commandFd;
-  }
-  input.options.commandLifecycle?.beforeSpawn();
-  const child = spawn(
-    input.options.command ?? "opencode",
-    ["serve", "--hostname", "127.0.0.1", "--port", String(port)],
-    {
-      cwd: input.cwd,
-      env: environment,
-      stdio,
-      detached: globalThis.process.platform !== "win32" && isolateProcessGroup,
-    },
-  );
-  if (child.pid !== undefined) {
-    try {
-      input.options.commandLifecycle?.afterSpawn();
-    } catch (error) {
-      child.kill("SIGKILL");
-      throw error;
+      permission: {
+        "*": input.options.permissionMode ?? "allow",
+        question: "allow",
+        "paperclip_*": "allow",
+        "mcp__paperclip__*": "allow",
+        external_directory: externalDirectories,
+      },
+      mcp: {
+        paperclip: {
+          type: "remote",
+          url: bridge.url,
+          enabled: true,
+          oauth: false,
+          headers: { Authorization: `Bearer ${bridge.secret}` },
+          timeout: 30_000,
+        },
+        ...(assignedMcp
+          ? {
+              [assignedMcp.name]: {
+                type: "remote",
+                url: assignedMcp.url,
+                enabled: true,
+                oauth: false,
+                headers: { Authorization: `Bearer ${assignedMcp.token}` },
+                timeout: 30_000,
+              },
+            }
+          : {}),
+      },
+    };
+    await writeFile(
+      join(configHome, "opencode", "opencode.json"),
+      `${JSON.stringify(config, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+    const environment = sanitizedEnvironment(
+      input.options.environment,
+      {
+        HOME: isolatedHome,
+        XDG_CONFIG_HOME: configHome,
+        XDG_DATA_HOME: dataHome,
+        XDG_CACHE_HOME: cacheHome,
+        OPENCODE_DISABLE_PROJECT_CONFIG: "true",
+        // The runner pins the executable, model and assigned MCP tools. A
+        // fresh isolated cache must not fetch a catalog or install unrelated
+        // default plugins before it can submit the first prompt.
+        OPENCODE_DISABLE_MODELS_FETCH: "true",
+        OPENCODE_DISABLE_DEFAULT_PLUGINS: "true",
+        OPENCODE_SERVER_USERNAME: username,
+        OPENCODE_SERVER_PASSWORD: password,
+        ...(providerProxy ? { NO_PROXY: [input.options.environment?.no_proxy ?? input.options.environment?.NO_PROXY, "127.0.0.1", "localhost"].filter(Boolean).join(",") } : {}),
+      },
+    );
+    const isolateProcessGroup = input.options.isolateProcessGroup ?? true;
+    const stdio: Array<"ignore" | "pipe" | number> = ["ignore", "ignore", "pipe"];
+    if (input.options.commandFd !== undefined) {
+      while (stdio.length <= input.options.commandFd) stdio.push("ignore");
+      stdio[input.options.commandFd] = input.options.commandFd;
     }
-  }
-  let diagnostics = "";
-  child.stderr?.on("data", (chunk) => {
-    const raw = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
-    const redactedDiagnostic = redact(raw.toString("utf8"), [
-      password,
-      input.options.environment?.OPENROUTER_API_KEY,
-    ]);
-    diagnostics = `${diagnostics}${redactedDiagnostic}`.slice(-8_192);
-    const frameId = input.trace?.frame({
-      direction: "provider_stderr",
-      raw,
-      transport: "process_stderr",
-      nativeMethod: "opencode serve stderr",
-    });
-    if (frameId) {
-      input.trace?.interpretation({
-        frameId,
-        stage: "typescript_opencode_process_transport",
-        ruleId: "opencode.stderr",
-        disposition: "operator_only",
-        reason:
-          "OpenCode stderr is retained only in the restricted trace sidecar",
+    input.options.commandLifecycle?.beforeSpawn();
+    launchPrepared = true;
+    child = spawn(
+      input.options.command ?? resolvePinnedOpenCodeCommand(),
+      ["serve", "--hostname", "127.0.0.1", "--port", String(port)],
+      {
+        cwd: input.cwd,
+        env: environment,
+        stdio,
+        detached: globalThis.process.platform !== "win32" && isolateProcessGroup,
+      },
+    );
+    child.once("exit", releaseExecutable);
+    if (child.pid !== undefined) {
+      try {
+        input.options.commandLifecycle?.afterSpawn();
+      } catch (error) {
+        child.kill("SIGKILL");
+        throw error;
+      }
+    }
+    let diagnostics = "";
+    child.stderr?.on("data", (chunk) => {
+      const raw = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+      const redactedDiagnostic = redact(raw.toString("utf8"), sensitiveValues);
+      diagnostics = `${diagnostics}${redactedDiagnostic}`.slice(-8_192);
+      const frameId = input.trace?.frame({
+        direction: "provider_stderr",
+        raw,
+        transport: "process_stderr",
+        nativeMethod: "opencode serve stderr",
       });
-    }
-    input.options.onDiagnostic?.(redactedDiagnostic);
-  });
-  try {
+      if (frameId) {
+        input.trace?.interpretation({
+          frameId,
+          stage: "typescript_opencode_process_transport",
+          ruleId: "opencode.stderr",
+          disposition: "operator_only",
+          reason:
+            "OpenCode stderr is retained only in the restricted trace sidecar",
+        });
+      }
+      input.options.onDiagnostic?.(redactedDiagnostic);
+    });
+    const providerChild = child;
     await new Promise<void>((resolve, reject) => {
-      child.once("spawn", resolve);
-      child.once("error", reject);
+      providerChild.once("spawn", resolve);
+      providerChild.once("error", reject);
     });
     if (child.pid)
       await input.options.onSpawn?.({
@@ -2196,30 +2541,29 @@ async function startRuntime(input: {
       process: child,
       bridge,
       trace: input.trace,
-      sensitiveValues: [
-        password,
-        input.options.environment?.OPENROUTER_API_KEY,
-      ].filter((value): value is string => Boolean(value)),
+      sensitiveValues,
       close: async (closeInput = {}) => {
+        await providerProxy?.close();
         await bridge.close().catch(() => {});
-        if (child.exitCode === null && child.signalCode === null && child.pid) {
+        if (providerChild.exitCode === null && providerChild.signalCode === null && providerChild.pid) {
           try {
             if (globalThis.process.platform === "win32" || !isolateProcessGroup)
-              child.kill("SIGTERM");
-            else globalThis.process.kill(-child.pid, "SIGTERM");
+              providerChild.kill("SIGTERM");
+            else globalThis.process.kill(-providerChild.pid, "SIGTERM");
           } catch {
-            child.kill("SIGTERM");
+            providerChild.kill("SIGTERM");
           }
         }
-        await waitForExit(child, 2_000);
-        if (child.exitCode === null && child.signalCode === null && child.pid) {
+        await waitForExit(providerChild, 2_000);
+        if (providerChild.exitCode === null && providerChild.signalCode === null && providerChild.pid) {
           try {
             if (globalThis.process.platform === "win32" || !isolateProcessGroup)
-              child.kill("SIGKILL");
-            else globalThis.process.kill(-child.pid, "SIGKILL");
+              providerChild.kill("SIGKILL");
+            else globalThis.process.kill(-providerChild.pid, "SIGKILL");
           } catch {
-            child.kill("SIGKILL");
+            providerChild.kill("SIGKILL");
           }
+          await waitForExit(providerChild, 2_000);
         }
         await rm(join(configHome, "opencode", "opencode.json"), {
           force: true,
@@ -2233,8 +2577,11 @@ async function startRuntime(input: {
       },
     };
   } catch (error) {
+    await providerProxy?.close();
     await bridge.close().catch(() => {});
-    child.kill("SIGKILL");
+    child?.kill("SIGKILL");
+    if (child?.pid) await waitForExit(child, 2_000);
+    if (!child?.pid || child.exitCode !== null || child.signalCode !== null) releaseExecutable();
     await rm(join(configHome, "opencode", "opencode.json"), {
       force: true,
     }).catch(() => undefined);
@@ -2561,44 +2908,23 @@ async function reservePort(): Promise<number> {
   return port;
 }
 
-async function* parseSseFrames(
-  stream: ReadableStream<Uint8Array>,
-): AsyncIterable<{ raw: string; data: string }> {
-  const decoder = new TextDecoder();
-  let buffer = "";
-  for await (const chunk of stream as unknown as AsyncIterable<Uint8Array>) {
-    buffer += decoder.decode(chunk, { stream: true });
-    if (buffer.length > 1_048_576)
-      throw new Error("OpenCode SSE event exceeded the retained payload limit");
-    let boundary: RegExpExecArray | null;
-    while ((boundary = /\r?\n\r?\n/.exec(buffer)) !== null) {
-      const rawFrame = buffer.slice(0, boundary.index);
-      const raw = buffer.slice(0, boundary.index + boundary[0].length);
-      const frame = rawFrame.replaceAll("\r", "");
-      buffer = buffer.slice(boundary.index + boundary[0].length);
-      const data = frame
-        .split("\n")
-        .filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).trimStart())
-        .join("\n");
-      if (!data || data === "[DONE]") continue;
-      yield { raw, data };
-    }
-  }
-}
-
 async function* parseSse(
   stream: ReadableStream<Uint8Array>,
 ): AsyncIterable<unknown> {
-  for await (const frame of parseSseFrames(stream))
-    yield JSON.parse(frame.data);
+  for await (const frame of parseOpenCodeSseFrames(stream)) {
+    if (frame.compaction?.omitted) continue;
+    const event = JSON.parse(frame.data) as unknown;
+    if (frame.compaction) annotateOmittedProviderText(event, frame.compaction);
+    yield event;
+  }
 }
 
 function sanitizedEnvironment(
-  source: NodeJS.ProcessEnv,
+  source: NodeJS.ProcessEnv | undefined,
   overrides: Record<string, string>,
 ): NodeJS.ProcessEnv {
   const allowed = [
+    "PAPERCLIP_AGENT_KEY_ID", "PAPERCLIP_AGENT_PUBLIC_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY",
     "PATH",
     "LANG",
     "LC_ALL",
@@ -2613,9 +2939,10 @@ function sanitizedEnvironment(
     "OPENROUTER_API_KEY",
   ];
   const result: NodeJS.ProcessEnv = {};
+  const candidate = source ?? process.env;
   for (const key of allowed)
-    if (source[key] !== undefined) result[key] = source[key];
-  return { ...result, ...overrides };
+    if (candidate[key] !== undefined) result[key] = candidate[key];
+  return { ...result, ...githubCredentialEnvironment(source ?? {}), ...overrides };
 }
 
 function sanitizedEnvironmentKeys(): string[] {
@@ -2739,7 +3066,55 @@ async function waitForExit(
   });
 }
 
-export const openCodeServerDriverInternals = { parseSse };
+/** Closed vocabulary for a lost OpenCode event stream. Never provider text. */
+export interface OpenCodeEventStreamFailure {
+  kind: "server_exited" | "connection_failed" | "http_error" | "stream_closed" | "stream_error";
+  exitCode?: number;
+  signal?: string;
+  connectionError?: string;
+  httpStatus?: number;
+}
+
+const OPENCODE_CONNECTION_ERROR_CODES: ReadonlySet<string> = new Set([
+  "ECONNREFUSED", "ECONNRESET", "EPIPE", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH",
+  "UND_ERR_SOCKET", "UND_ERR_CLOSED", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_BODY_TIMEOUT",
+]);
+
+function connectionErrorCode(error: unknown): string | undefined {
+  // undici reports `TypeError: fetch failed` and keeps the socket error in `cause`.
+  for (let current = error, depth = 0; current && depth < 4; current = record(current).cause, depth += 1) {
+    const code = record(current).code;
+    if (typeof code === "string") return OPENCODE_CONNECTION_ERROR_CODES.has(code) ? code : "unrecognized";
+  }
+  return undefined;
+}
+
+async function openCodeEventStreamFailure(
+  error: unknown,
+  process: ChildProcess,
+): Promise<OpenCodeEventStreamFailure> {
+  const connectionError = connectionErrorCode(error);
+  // A refused or reset connection usually means `opencode serve` has died.
+  // Give its exit a moment to be observed so the cause is the exit itself.
+  if (connectionError) await waitForExit(process, 1_000);
+  if (process.exitCode !== null || process.signalCode !== null) {
+    return {
+      kind: "server_exited",
+      ...(process.exitCode !== null ? { exitCode: process.exitCode } : {}),
+      ...(process.signalCode !== null && process.signalCode in osConstants.signals ? { signal: process.signalCode } : {}),
+      ...(connectionError ? { connectionError } : {}),
+    };
+  }
+  const httpStatus = record(error).httpStatus;
+  if (typeof httpStatus === "number" && Number.isInteger(httpStatus) && httpStatus >= 100 && httpStatus <= 599)
+    return { kind: "http_error", httpStatus };
+  if (connectionError) return { kind: "connection_failed", connectionError };
+  if (record(error).streamClosed === true) return { kind: "stream_closed" };
+  return { kind: "stream_error" };
+}
+
+export const openCodeServerDriverInternals = { parseSse, openCodeEventStreamFailure };
 
 class AsyncQueue<T> implements AsyncIterable<T> {
   #items: T[] = [];

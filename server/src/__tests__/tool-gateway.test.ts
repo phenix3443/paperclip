@@ -7,6 +7,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   activityLog,
   agents,
+  agentWakeupRequests,
   companySecretBindings,
   companySecrets,
   companySecretVersions,
@@ -487,12 +488,14 @@ async function startFakeRemoteMcpServer(handler: (request: FakeMcpRequest) => Pr
   body?: unknown;
   rawBody?: string;
   delayMs?: number;
+  bodyDelayMs?: number;
 }> | {
   status?: number;
   headers?: Record<string, string>;
   body?: unknown;
   rawBody?: string;
   delayMs?: number;
+  bodyDelayMs?: number;
 }) {
   const requests: FakeMcpRequest[] = [];
   const server = createServer(async (req, res) => {
@@ -516,10 +519,15 @@ async function startFakeRemoteMcpServer(handler: (request: FakeMcpRequest) => Pr
       for (const [key, value] of Object.entries(response.headers ?? {})) {
         res.setHeader(key, value);
       }
+      if (response.bodyDelayMs) {
+        res.setHeader("content-type", "application/json");
+        res.flushHeaders();
+        await new Promise((resolve) => setTimeout(resolve, response.bodyDelayMs));
+      }
       if (response.rawBody !== undefined) {
         res.end(response.rawBody);
       } else {
-        res.setHeader("content-type", "application/json");
+        if (!res.headersSent) res.setHeader("content-type", "application/json");
         res.end(JSON.stringify(response.body ?? {
           jsonrpc: "2.0",
           id: body?.id ?? "test",
@@ -573,6 +581,7 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
     await db.delete(companySecrets);
     await db.delete(userSecretDefinitions);
     await db.delete(issueThreadInteractions);
+    await db.delete(agentWakeupRequests);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(projects);
@@ -1376,6 +1385,40 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
       agentId: agent.id,
       runId: run.id,
     });
+  });
+
+  it("fences an uncertain upstream mutation after fresh Retry while allowing independent reads", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { issue, run } = await createIssueAndRun(db, company.id, agent.id);
+    const remote = await createRemoteMcpTool(db, company.id);
+    await allowAllToolsForAgent(db, company.id, agent.id);
+    const gateway = createTestToolGatewayService(db);
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    const tool = (await gateway.listToolsForSession(session.token))
+      .find(item => item.connectionId === remote.connection.id)!;
+    const [source] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id,
+      issueId: issue.id, status: "failed", createdAt: new Date(Date.now() - 60_000) }).returning();
+    const intentId = randomUUID();
+    await db.insert(agentWakeupRequests).values({ id: intentId, companyId: company.id, agentId: agent.id,
+      runId: run.id, source: "on_demand", reason: "task_retry", status: "coalesced",
+      requestedByActorType: "user", requestedByActorId: "board",
+      payload: { issueId: issue.id, taskRetry: { schema: "paperclip.task-retry.v1",
+        generationId: intentId, sourceRunId: source.id, actorId: "board", strategy: "fresh_isolated_workspace" } } });
+    const [uncertain] = await db.insert(toolInvocations).values({ companyId: company.id,
+      issueId: issue.id, runId: source.id, agentId: agent.id, connectionId: remote.connection.id,
+      toolName: tool.name, riskLevel: "write", status: "timed_out", startedAt: new Date() }).returning();
+    const fetcher = vi.spyOn(globalThis, "fetch");
+    try {
+      await expect(gateway.executeTool({ sessionToken: session.token, tool: tool.name,
+        idempotencyKey: randomUUID(), parameters: { key: "new-key", value: "do not repeat" } }))
+        .rejects.toMatchObject({ status: 409, reasonCode: "recovery_effect_outcome_unresolved" });
+      expect(fetcher).not.toHaveBeenCalled();
+      expect(await gateway.executeTool({ sessionToken: session.token, tool: "mcp-remote-fixture:add",
+        parameters: { a: 2, b: 3 } })).toMatchObject({ status: "completed", result: { content: "5" } });
+      const [retained] = await db.select().from(toolInvocations).where(eq(toolInvocations.id, uncertain.id));
+      expect(retained.status).toBe("timed_out");
+    } finally { fetcher.mockRestore(); }
   });
 
   it("filters discovery, executes a remote HTTP fixture, and audits run and issue links", async () => {
@@ -3640,6 +3683,11 @@ rl.on("line", (line) => {
         .from(toolInvocations)
         .where(eq(toolInvocations.id, approvalRequest.invocationId));
       expect(approvalInvocation).toMatchObject({
+        companyId: company.id,
+        actorType: "agent",
+        agentId: agent.id,
+        runId: run.id,
+        issueId: issue.id,
         status: "awaiting_approval",
         policyDecision: "require_approval",
         connectionId: approvalTool.connection.id,
@@ -3647,6 +3695,14 @@ rl.on("line", (line) => {
         applicationKey: "shopify",
         upstreamToolName: "kv_set",
       });
+
+      // Matching persisted company/connection rows must still be hidden from
+      // the Test tab when a real agent run owns the approval.
+      await expect(gateway.getTestCallStatus({
+        companyId: company.id,
+        connectionId: approvalTool.connection.id,
+        actionRequestId: approvalRequest.id,
+      })).rejects.toMatchObject({ status: 404, reasonCode: "action_request_not_found" });
 
       await db
         .update(issueThreadInteractions)
@@ -4412,6 +4468,216 @@ rl.on("line", (line) => {
       }
     });
   }
+
+  function initializeFakeMcpSession(request: FakeMcpRequest, sessionId: string) {
+    return {
+      headers: { "mcp-session-id": sessionId },
+      body: {
+        jsonrpc: "2.0",
+        id: request.body?.id,
+        result: { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "fake", version: "1" } },
+      },
+    };
+  }
+
+  const perCallResponseFailures = [
+    {
+      name: "a tool call timeout",
+      reasonCode: "tool_timeout",
+      status: 504,
+      timeoutMs: 300,
+      response: () => ({ delayMs: 1_000, body: {} }),
+    },
+    {
+      name: "a response body timeout",
+      reasonCode: "tool_timeout",
+      status: 504,
+      timeoutMs: 300,
+      response: () => ({ bodyDelayMs: 1_000, body: {} }),
+    },
+    {
+      name: "an oversized response",
+      reasonCode: "mcp_remote_response_too_large",
+      response: () => ({ headers: { "content-type": "application/json" }, rawBody: "x".repeat(1_200_000) }),
+      check: (error: ToolGatewayHttpError) => {
+        expect(error.message).toContain("smaller page size");
+        expect(error.details).toMatchObject({ maxBytes: 1_000_000 });
+      },
+    },
+    {
+      name: "an invalid JSON response",
+      reasonCode: "mcp_remote_invalid_json",
+      response: () => ({ headers: { "content-type": "application/json" }, rawBody: "not json" }),
+    },
+    {
+      name: "a response without the requested message ID",
+      reasonCode: "remote_mcp_malformed_response",
+      response: () => ({ body: { jsonrpc: "2.0", id: "someone-else", result: { content: [{ type: "text", text: "wrong id" }] } } }),
+    },
+  ];
+
+  for (const scenario of perCallResponseFailures) {
+    it(`keeps a remote MCP connection healthy and starts a fresh MCP session after ${scenario.name}`, async () => {
+      const company = await createCompany(db);
+      const agent = await createAgent(db, company.id);
+      const { run } = await createIssueAndRun(db, company.id, agent.id);
+      let initializeCount = 0;
+      let toolCallCount = 0;
+      const fake = await startFakeRemoteMcpServer((request) => {
+        if (request.body?.method === "initialize") {
+          initializeCount += 1;
+          return initializeFakeMcpSession(request, `session-${initializeCount}`);
+        }
+        if (request.body?.method === "notifications/initialized") return { status: 202, rawBody: "" };
+        toolCallCount += 1;
+        if (toolCallCount === 1) return scenario.response();
+        return { body: { jsonrpc: "2.0", id: request.body?.id, result: { content: [{ type: "text", text: "small page" }] } } };
+      });
+      try {
+        const { connection } = await createRemoteMcpTool(db, company.id, {
+          applicationKey: `per-call-${scenario.reasonCode}`,
+          toolName: "kv_get",
+          url: fake.url,
+          connectionConfig: { mcpSessionRequired: true },
+        });
+        await allowAllToolsForAgent(db, company.id, agent.id);
+        const gateway = createTestToolGatewayService(db);
+        const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+        const connectedTool = (await gateway.listToolsForSession(session.token))
+          .find((tool) => tool.providerType === "mcp_remote_http");
+        expect(connectedTool).toBeTruthy();
+
+        await gateway.executeTool({
+          sessionToken: session.token,
+          tool: connectedTool!.name,
+          parameters: { key: "everything" },
+          timeoutMs: scenario.timeoutMs,
+        }).then(
+          () => {
+            throw new Error("Expected the remote MCP call to fail");
+          },
+          (error) => {
+            expectGatewayError(error, scenario.status ?? 502, scenario.reasonCode);
+            scenario.check?.(error as ToolGatewayHttpError);
+          },
+        );
+
+        await expect(db.select({ healthStatus: toolConnections.healthStatus }).from(toolConnections).where(
+          eq(toolConnections.id, connection.id),
+        )).resolves.toEqual([{ healthStatus: "ok" }]);
+
+        expect(toolCallCount).toBe(1);
+        const [failedInvocation] = await db.select().from(toolInvocations);
+        expect(failedInvocation).toMatchObject({
+          status: scenario.status === 504 ? "timed_out" : "failed",
+          errorCode: scenario.reasonCode,
+        });
+
+        const nextSession = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+        await expect(gateway.listToolsForSession(nextSession.token)).resolves.toEqual(
+          expect.arrayContaining([expect.objectContaining({ name: connectedTool!.name })]),
+        );
+        await expect(gateway.executeTool({
+          sessionToken: nextSession.token,
+          tool: connectedTool!.name,
+          parameters: { key: "page-1" },
+        })).resolves.toMatchObject({ status: "completed" });
+
+        const toolCallSessionIds = fake.requests
+          .filter((request) => request.body?.method === "tools/call")
+          .map((request) => request.headers["mcp-session-id"]);
+        expect(toolCallSessionIds).toEqual(["session-1", "session-2"]);
+      } finally {
+        await fake.close();
+      }
+    });
+  }
+
+  it("resets only the failing agent's MCP session when another agent is initializing on the same connection", async () => {
+    const company = await createCompany(db);
+    const agentA = await createAgent(db, company.id);
+    const agentB = await createAgent(db, company.id);
+    const { run: runA } = await createIssueAndRun(db, company.id, agentA.id);
+    const { run: runB } = await createIssueAndRun(db, company.id, agentB.id);
+    let initializeCount = 0;
+    let markOversizedCallStarted!: () => void;
+    const oversizedCallStarted = new Promise<void>((resolve) => { markOversizedCallStarted = resolve; });
+    let markSecondInitializeStarted!: () => void;
+    const secondInitializeStarted = new Promise<void>((resolve) => { markSecondInitializeStarted = resolve; });
+    let releaseSecondInitialize!: () => void;
+    const secondInitializeReleased = new Promise<void>((resolve) => { releaseSecondInitialize = resolve; });
+    const fake = await startFakeRemoteMcpServer(async (request) => {
+      if (request.body?.method === "initialize") {
+        initializeCount += 1;
+        const sessionId = `session-${initializeCount}`;
+        if (initializeCount === 2) {
+          markSecondInitializeStarted();
+          await secondInitializeReleased;
+        }
+        return initializeFakeMcpSession(request, sessionId);
+      }
+      if (request.body?.method === "notifications/initialized") return { status: 202, rawBody: "" };
+      if (request.headers["mcp-session-id"] === "session-1") {
+        markOversizedCallStarted();
+        // Fail agent A's call only while agent B's initialization is in flight.
+        await secondInitializeStarted;
+        return { headers: { "content-type": "application/json" }, rawBody: "x".repeat(1_200_000) };
+      }
+      return { body: { jsonrpc: "2.0", id: request.body?.id, result: { content: [{ type: "text", text: "ok" }] } } };
+    });
+    let callA: Promise<unknown> | undefined;
+    let callB: Promise<unknown> | undefined;
+    try {
+      const { connection } = await createRemoteMcpTool(db, company.id, {
+        applicationKey: "overlapping-sessions",
+        toolName: "kv_get",
+        url: fake.url,
+        connectionConfig: { mcpSessionRequired: true },
+      });
+      await allowAllToolsForAgent(db, company.id, agentA.id);
+      await allowAllToolsForAgent(db, company.id, agentB.id);
+      const gateway = createTestToolGatewayService(db);
+      const sessionA = await gateway.createSession({ companyId: company.id, agentId: agentA.id, runId: runA.id });
+      const sessionB = await gateway.createSession({ companyId: company.id, agentId: agentB.id, runId: runB.id });
+      const connectedTool = (await gateway.listToolsForSession(sessionA.token))
+        .find((tool) => tool.providerType === "mcp_remote_http");
+      expect(connectedTool).toBeTruthy();
+
+      callA = gateway.executeTool({
+        sessionToken: sessionA.token,
+        tool: connectedTool!.name,
+        parameters: { key: "everything" },
+      }).then(
+        () => {
+          throw new Error("Expected agent A's oversized remote MCP response to fail");
+        },
+        (error) => expectGatewayError(error, 502, "mcp_remote_response_too_large"),
+      );
+      await oversizedCallStarted;
+      callB = gateway.executeTool({
+        sessionToken: sessionB.token,
+        tool: connectedTool!.name,
+        parameters: { key: "page-1" },
+      });
+      await callA;
+      releaseSecondInitialize();
+      await expect(callB).resolves.toMatchObject({ status: "completed" });
+
+      await expect(db.select({ healthStatus: toolConnections.healthStatus }).from(toolConnections).where(
+        eq(toolConnections.id, connection.id),
+      )).resolves.toEqual([{ healthStatus: "ok" }]);
+      const toolCallSessionIds = fake.requests
+        .filter((request) => request.body?.method === "tools/call")
+        .map((request) => request.headers["mcp-session-id"]);
+      expect(toolCallSessionIds).toEqual(["session-1", "session-2"]);
+    } finally {
+      // Open both gates and settle both calls so a failed assertion can't leave a fake-server request hanging.
+      markSecondInitializeStarted();
+      releaseSecondInitialize();
+      await Promise.allSettled([callA, callB]);
+      await fake.close();
+    }
+  });
 
   it("persists hashed sessions and accepts them across gateway service instances", async () => {
     const company = await createCompany(db);
@@ -5655,7 +5921,7 @@ rl.on("line", (line) => {
     });
   });
 
-  it("wraps plugin tool discovery and execution behind the same gateway policy", async () => {
+  it.each([1, 2])("wraps plugin tool discovery and execution behind the same gateway policy (%i copies)", async copies => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
     const { run, project } = await createIssueAndRun(db, company.id, agent.id);
@@ -5663,15 +5929,13 @@ rl.on("line", (line) => {
     const dispatcher: PluginToolDispatcher = {
       initialize: async () => {},
       teardown: () => {},
-      listToolsForAgent: () => [
-        {
+      listToolsForAgent: () => Array.from({ length: copies }, () => ({
           name: "demo-plugin:read_status",
           displayName: "Read status",
           description: "Read status through a plugin tool.",
           parametersSchema: { type: "object" },
           pluginId: "demo-plugin",
-        },
-      ],
+        })),
       getTool: () => null,
       executeTool: async (tool, parameters, runContext) => {
         calls.push({ tool, parameters, runContext });
@@ -5704,6 +5968,10 @@ rl.on("line", (line) => {
     );
 
     await allowToolsForAgent(db, company.id, agent.id, ["demo-plugin:read_status"]);
+
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id, projectId: project.id });
+    expect((await gateway.listToolsForSession(session.token)).filter(tool => tool.pluginId === "demo-plugin"))
+      .toEqual([expect.objectContaining({ name: "demo-plugin:read_status" })]);
 
     await expect(gateway.listPluginToolsForAgent({ companyId: company.id, agentId: agent.id })).resolves.toEqual([
       expect.objectContaining({ name: "demo-plugin:read_status" }),

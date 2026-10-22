@@ -1,5 +1,6 @@
+import { validateAiApiKey } from "../services/ai-api-key-test.js";
+export { validateAiApiKey } from "../services/ai-api-key-test.js";
 import { supportsLocalAiLogin } from "../services/local-ai-login-policy.js";
-import { readVerifiedLocalAiCredential } from "../services/local-ai-credentials.js";
 import { localAiLoginService } from "../services/local-ai-login.js";
 import { z } from "zod";
 import { Router, type Request } from "express";
@@ -17,6 +18,7 @@ import {
   aiConnectionLoginIntentSchema,
   localAiConnectionSchema,
   localAiLoginStartSchema,
+  browserCodeSchema,
   isAiConnectionCompatible,
   type AiConnectionLoginIntent,
   type AiProvider,
@@ -31,6 +33,8 @@ import { logActivity } from "../services/activity-log.js";
 import { aiConnectionRouterService } from "../services/ai-connection-router.js";
 import { aiConnectionService } from "../services/ai-connections.js";
 import { validate } from "../middleware/validate.js";
+import { probeCopilotConnection } from "../services/copilot-connection-probe.js";
+import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 
 /** Agent API calls inherit authenticated run identity, never the agent's own ID. */
 export function responsibleUserForAiRequest(req: Request): string | null {
@@ -39,7 +43,7 @@ export function responsibleUserForAiRequest(req: Request): string | null {
     : getActorInfo(req).actorId;
 }
 
-async function canManageAiConnections(db: Db, req: Request, companyId: string): Promise<boolean> {
+export async function canManageAiConnections(db: Db, req: Request, companyId: string): Promise<boolean> {
   const membership = req.actor.memberships?.find((m) => m.companyId === companyId && m.status === "active");
   if (membership?.membershipRole === "viewer") return false;
   return req.actor.source === "local_implicit" || Boolean(req.actor.isInstanceAdmin)
@@ -133,42 +137,8 @@ export async function canInstallSharedAiConnectionForNewAgent(
     connection.creator === userId || await accessService(db).hasPermission(companyId, "user", userId, "tools:manage_connections");
 }
 
-/** Fixed provider endpoints; credentials are never sent to a caller-supplied URL or through a redirect. */
-export async function validateAiApiKey(
-  provider: AiProvider,
-  key: string,
-  request: typeof fetch = fetch,
-) {
-  const endpoints = {
-    anthropic: "https://api.anthropic.com/v1/models?limit=1",
-    openai: "https://api.openai.com/v1/models",
-    openrouter: "https://openrouter.ai/api/v1/key",
-    xai: "https://api.x.ai/v1/models",
-  };
-  let response: Response;
-  try {
-    response = await request(endpoints[provider], {
-      redirect: "error",
-      signal: AbortSignal.timeout(15000),
-      headers:
-        provider === "anthropic"
-          ? { "x-api-key": key, "anthropic-version": "2023-06-01" }
-          : { Authorization: `Bearer ${key}` },
-    });
-  } catch {
-    throw unprocessable("Could not verify the account. Try again.", { code: "ai_connection_verification_failed" });
-  }
-  await response.body?.cancel();
-  if (!response.ok)
-    throw unprocessable(
-      response.status === 401 || response.status === 403
-        ? "The provider rejected this API key."
-        : "The provider could not verify this account. Try again.",
-      { code: response.status === 401 || response.status === 403 ? "ai_connection_api_key_rejected" : "ai_connection_verification_failed" },
-    );
-}
 
-export function aiConnectionRoutes(db: Db, options: Parameters<typeof supportsLocalAiLogin>[0] = {}) {
+export function aiConnectionRoutes(db: Db, options: Parameters<typeof supportsLocalAiLogin>[0] & { pluginWorkerManager?: PluginWorkerManager } = {}) {
   function assertLocalLoginAvailable() {
     if (!supportsLocalAiLogin(options)) throw unprocessable("Server-host subscription sign-in is unavailable on this hosted instance. Choose a supported sign-in environment or use an API key.");
   }
@@ -223,9 +193,6 @@ export function aiConnectionRoutes(db: Db, options: Parameters<typeof supportsLo
     const companyId = req.params.companyId as string;
     const { localSessionId, ...intent } = localAiConnectionSchema.parse(req.body);
     assertLocalLoginAvailable();
-    // Only implicit local operators may inspect ambient Claude credentials.
-    // Authenticated users sign in to their own company/user-scoped attempt.
-    if (intent.provider === "anthropic" && !localSessionId) assertLocalOperator(req);
     const userId = await assertAiConnectionCreateAccess(db, req, companyId, intent);
     res.setHeader("Cache-Control", "no-store");
     res.json(await localLogin.check(companyId, userId, intent, localSessionId));
@@ -235,6 +202,16 @@ export function aiConnectionRoutes(db: Db, options: Parameters<typeof supportsLo
     assertCompanyAccess(req, req.params.companyId as string);
     const id = z.string().uuid().parse(req.params.sessionId);
     await localLogin.cancel(req.params.companyId as string, getActorInfo(req).actorId, id);
+    res.json({ ok: true });
+  });
+  router.post("/companies/:companyId/ai-connections/local/attempts/:sessionId/code", validate(z.object({ browserCode: browserCodeSchema })), async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertLocalLoginAvailable();
+    assertBoard(req);
+    assertCompanyAccess(req, companyId);
+    const id = z.string().uuid().parse(req.params.sessionId);
+    await localLogin.submitCode(companyId, getActorInfo(req).actorId, id, browserCodeSchema.parse(req.body.browserCode));
+    res.setHeader("Cache-Control", "no-store");
     res.json({ ok: true });
   });
   router.get("/companies/:companyId/ai-connections", async (req, res) => {
@@ -328,12 +305,15 @@ export function aiConnectionRoutes(db: Db, options: Parameters<typeof supportsLo
           "Use the existing provider sign-in flow to connect a subscription",
         );
       const attemptStartedAt = new Date();
-      await validateAiApiKey(input.provider, input.apiKey!);
+      if (input.provider === "github") {
+        if (!input.apiKey?.startsWith("github_pat_")) throw unprocessable("Use a personal fine-grained token with Copilot Requests permission.", { code: "COPILOT_AUTH_REQUIRED" });
+        await probeCopilotConnection(db, companyId, input.apiKey, input.environmentId, undefined, { pluginWorkerManager: options.pluginWorkerManager });
+      } else if (!input.routing || input.routing.kind === "openrouter") await validateAiApiKey(input.provider, input.apiKey!);
       const result = await service.save(
         companyId,
         userId,
         input,
-        input.apiKey!,
+        input.apiKey ?? "",
         undefined,
         attemptStartedAt,
       );
@@ -347,16 +327,11 @@ export function aiConnectionRoutes(db: Db, options: Parameters<typeof supportsLo
       const companyId = req.params.companyId as string;
       const { localSessionId, ...input } = localAiConnectionSchema.parse(req.body);
       assertLocalLoginAvailable();
-      if (input.provider === "anthropic" && !localSessionId) assertLocalOperator(req);
       const userId = await assertAiConnectionCreateAccess(db, req, companyId, input);
-      if (localSessionId || input.provider === "openai" || input.provider === "xai") {
-        if (!localSessionId) throw unprocessable("Start a separate local sign-in for this connection before connecting.");
-        res.status(201).json(await localLogin.complete(companyId, userId, localSessionId, input));
-        return;
-      }
-      const attemptStartedAt = new Date();
-      const credential = await readVerifiedLocalAiCredential(input.provider);
-      res.status(201).json(await service.save(companyId, userId, input, credential, undefined, attemptStartedAt));
+      if (!localSessionId) throw unprocessable(input.provider === "xai"
+        ? "Start local sign-in for this connection before connecting."
+        : "Start browser sign-in for this connection before connecting.");
+      res.status(201).json(await localLogin.complete(companyId, userId, localSessionId, input));
     },
   );
   router.put(

@@ -6,6 +6,7 @@ import { WebSocketServer } from "ws";
 import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
+  costEvents,
   activityLog,
   authUsers,
   agentWakeupRequests,
@@ -103,6 +104,7 @@ async function deleteHeartbeatRunsAndWakeupsAfterActivityLogDrains(db: Db) {
     await db.delete(activityLog);
     try {
       await db.delete(heartbeatRunEvents);
+      await db.delete(costEvents);
       await db.delete(heartbeatRuns);
       await db.delete(agentWakeupRequests);
       return;
@@ -434,6 +436,8 @@ async function seedLowTrustFixture(db: Db) {
       defaultResponsibleUserId: "board-user",
     })
     .returning();
+  await db.insert(authUsers).values({ id: "board-user", name: "Owner", email: "owner@example.test", createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();
+  await db.insert(companyMemberships).values({ companyId: company!.id, principalType: "user", principalId: "board-user", membershipRole: "owner", status: "active" });
   const [allowedProject] = await db
     .insert(projects)
     .values({
@@ -928,8 +932,6 @@ describeEmbeddedPostgres(
 
     it("allows the human-requested run through HTTP while rejecting attribution-only authority", async () => {
       const fixture = await seedLowTrustFixture(db);
-      await db.insert(authUsers).values({ id: "board-user", name: "Owner", email: "owner@example.test", createdAt: new Date(), updatedAt: new Date() });
-      await db.insert(companyMemberships).values({ companyId: fixture.company.id, principalType: "user", principalId: "board-user", membershipRole: "owner", status: "active" });
       // The fixture already occupies the agent's sole execution slot. Let the
       // real board route enqueue work, then bind its queued run for HTTP checks.
       await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } } })
@@ -975,21 +977,24 @@ describeEmbeddedPostgres(
       const handoff = await request(directedAgent).patch(`/api/issues/${created.body.id}`)
         .send({ status: "in_review", assigneeAgentId: null, assigneeUserId: "board-user", comment: "Ready for human review" });
       expect(handoff.status, JSON.stringify(handoff.body)).toBe(200);
-      const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, directRun.id));
-      expect(stopped).toMatchObject({ status: "cancelled", errorCode: "issue_reassigned" });
+      expect(handoff.body).toMatchObject({ status: "in_review", assigneeAgentId: null, assigneeUserId: "board-user" });
+      const [outgoing] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, directRun.id));
+      expect(outgoing).toMatchObject({ status: "running", errorCode: null });
+      const lateEdit = await request(directedAgent).patch(`/api/issues/${created.body.id}`)
+        .send({ description: "Late outgoing edit" });
+      expect([403, 404]).toContain(lateEdit.status);
       const returned = await request(board).patch(`/api/issues/${created.body.id}`)
         .send({ status: "backlog", assigneeAgentId: fixture.agents.lowTrust.id, assigneeUserId: null });
       expect(returned.status, JSON.stringify(returned.body)).toBe(200);
-      // Reassignment back does not revive the cancelled run's human request.
-      const staleRead = await request(directedAgent).get(`/api/issues/${created.body.id}`);
-      expect([403, 404]).toContain(staleRead.status);
+      const [humanRequest] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id));
+      expect(humanRequest.status).toBe("cancelled");
+      const reassignedRead = await request(directedAgent).get(`/api/issues/${created.body.id}`);
+      expect(reassignedRead.status, JSON.stringify(reassignedRead.body)).toBe(200);
 
     });
 
     it("retains a board backlog assignment and rejects plugin-attributed wakes with forged board payloads", async () => {
       const fixture = await seedLowTrustFixture(db);
-      await db.insert(authUsers).values({ id: "board-user", name: "Owner", email: "owner@example.test", createdAt: new Date(), updatedAt: new Date() });
-      await db.insert(companyMemberships).values({ companyId: fixture.company.id, principalType: "user", principalId: "board-user", membershipRole: "owner", status: "active" });
       await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } } })
         .where(eq(agents.id, fixture.agents.lowTrust.id));
       const board = createApp(db, boardActor(fixture));
@@ -1366,10 +1371,8 @@ describeEmbeddedPostgres(
       expect(
         unmentionedComment.status,
         JSON.stringify(unmentionedComment.body),
-      ).toBe(403);
-      expect(unmentionedComment.body.details.code).toBe(
-        "issue_write_actor_class_excluded",
-      );
+      ).toBe(404);
+      expect(unmentionedComment.body).toEqual({ error: "Issue not found" });
     });
 
     it("propagates denied low-trust policy conflicts on control-plane guards", async () => {
@@ -1736,7 +1739,7 @@ describeEmbeddedPostgres(
         const before = await snapshot(db);
         const res = await attempt.req();
         expect(res.status, `${attempt.id}: ${JSON.stringify(res.body)}`).toBe(
-          403,
+          ["LT approvals", "LT-15/16", "LT-19", "LT-26 child", "LT-26 child with unauthorized assignee", "LT-26 company issue", "LT-26 interaction", "LT-06 resume", "LT-06 blocker mutation"].includes(attempt.id) ? 403 : 404,
         );
         expectNoCanary(res.body, ...forbiddenMarkers);
         const after = await snapshot(db);
@@ -1879,7 +1882,7 @@ describeEmbeddedPostgres(
       for (const attempt of attempts) {
         const res = await attempt.req();
         expect(res.status, `${attempt.id}: ${JSON.stringify(res.body)}`).toBe(
-          403,
+          404,
         );
         expectNoCanary(res.body, ...forbiddenMarkers);
       }

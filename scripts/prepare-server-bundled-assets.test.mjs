@@ -27,7 +27,16 @@ test("a clean Git server package includes built UI and release runtime skills", 
     writeFileSync(join(root, "scripts/prepare-server-ui-dist.sh"),
       'set -eu\nmkdir -p server/ui-dist\nprintf "Built UI" > server/ui-dist/index.html\n');
     const destination = join(root, "staged");
-    prepareBundledPackage(join(root, "server"), destination, { sourceRoot: root });
+    // Real bundled dependencies come from the registry and install as directories.
+    // npm links a `file:` fixture by default, and the esbuild graph check refuses links.
+    const previousInstallLinks = process.env.npm_config_install_links;
+    process.env.npm_config_install_links = "true";
+    try {
+      prepareBundledPackage(join(root, "server"), destination, { sourceRoot: root });
+    } finally {
+      if (previousInstallLinks === undefined) delete process.env.npm_config_install_links;
+      else process.env.npm_config_install_links = previousInstallLinks;
+    }
     const stagedManifest = JSON.parse(readFileSync(join(destination, "package.json"), "utf8"));
     assert.equal(stagedManifest.dependencies["@paperclipai/plugin-sdk"], "1.0.0");
     const [packed] = JSON.parse(execFileSync("npm", ["pack", "--json", "--pack-destination", root], {

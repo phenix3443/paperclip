@@ -21,7 +21,7 @@ import { getConversationOwnershipBlocker } from "./conversation-continuation.js"
 import { executionBlockerPredicate } from "./execution-blocker.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { issueService } from "./issues.js";
-import { isPreDispatchExecutionWaitVerified } from "./pre-dispatch-review-wait.js";
+import { isPreDispatchExecutionWaitVerified } from "./pre-dispatch-execution-wait.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 
 /**
@@ -541,21 +541,44 @@ type Wakeup = (agentId: string, options: ReturnType<typeof buildDecidedReviewCon
  * sends one continuation wake per proved submission. Admission itself happens
  * in the wake gate, which proves everything again under the issue lock.
  */
-export async function continueDecidedReviewReassignments(db: Db, wakeup: Wakeup) {
-  // Newest issues first, so holds that never prove cannot starve a fresh one.
+function decidedReviewCandidate() {
+  return and(
+    eq(issueRecoveryActions.cause, LEGACY_RECOVERY_CAUSE),
+    or(inArray(issueRecoveryActions.status, ["active", "escalated"]),
+      and(eq(issueRecoveryActions.status, "resolved"),
+        sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`)),
+    sql`not (${issueRecoveryActions.evidence} ? 'decidedReviewContinuation')`,
+    inArray(issues.status, ["in_review", "blocked"]),
+  );
+}
+
+const SCAN_PAGE = 25;
+export type DecidedReviewScan = { after: { companyId: string; issueId: string } | null };
+const defaultScan: DecidedReviewScan = { after: null };
+
+/** Whether a later pass may still have a hold to prove. */
+export async function decidedReviewContinuationPending(db: Db) {
+  const [row] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).innerJoin(issues, and(
+    eq(issues.companyId, issueRecoveryActions.companyId), eq(issues.id, issueRecoveryActions.sourceIssueId),
+  )).where(decidedReviewCandidate()).limit(1);
+  return Boolean(row);
+}
+
+export async function continueDecidedReviewReassignments(db: Db, wakeup: Wakeup, scan: DecidedReviewScan = defaultScan) {
+  // Pages rotate through every candidate in key order, so holds that never
+  // prove cannot keep any other issue out of the pass.
+  const after = scan.after;
   const candidates = await db.selectDistinct({
-    companyId: issueRecoveryActions.companyId, issueId: issueRecoveryActions.sourceIssueId, updatedAt: issues.updatedAt,
+    companyId: issueRecoveryActions.companyId, issueId: issueRecoveryActions.sourceIssueId,
   })
     .from(issueRecoveryActions).innerJoin(issues, and(
       eq(issues.companyId, issueRecoveryActions.companyId), eq(issues.id, issueRecoveryActions.sourceIssueId),
     )).where(and(
-      eq(issueRecoveryActions.cause, LEGACY_RECOVERY_CAUSE),
-      or(inArray(issueRecoveryActions.status, ["active", "escalated"]),
-        and(eq(issueRecoveryActions.status, "resolved"),
-          sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`)),
-      sql`not (${issueRecoveryActions.evidence} ? 'decidedReviewContinuation')`,
-      inArray(issues.status, ["in_review", "blocked"]),
-    )).orderBy(desc(issues.updatedAt)).limit(25);
+      decidedReviewCandidate(),
+      after ? sql`(${issueRecoveryActions.companyId}, ${issueRecoveryActions.sourceIssueId}) > (${after.companyId}, ${after.issueId})` : undefined,
+    )).orderBy(asc(issueRecoveryActions.companyId), asc(issueRecoveryActions.sourceIssueId)).limit(SCAN_PAGE);
+  const last = candidates[candidates.length - 1];
+  scan.after = candidates.length === SCAN_PAGE && last ? { companyId: last.companyId, issueId: last.issueId } : null;
   let woken = 0;
   for (const candidate of candidates) {
     const proved = await db.transaction(async tx => {
