@@ -14,8 +14,25 @@ type DispatchFields = "startedAt" | "runtimeModeResolvedAt" | "processPid" | "pr
 export function isPreDispatchReviewWait(
   run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, DispatchFields>>,
 ): boolean {
+  return isStaleGateCancellation(run, "issue_continuation_waiting_on_review");
+}
+
+/** A queued attempt the stale gate cancelled because a recovery hold already
+ * blocked the issue. It never claimed execution, so it has no actions of its own. */
+export function isPreDispatchExecutionWait(
+  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, DispatchFields>>,
+): boolean {
+  const wait = run.resultJson?.executionWait as Record<string, unknown> | undefined;
+  return isStaleGateCancellation(run, "execution_reconciliation_required") &&
+    typeof wait?.recoveryActionId === "string";
+}
+
+function isStaleGateCancellation(
+  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, DispatchFields>>,
+  errorCode: string,
+): boolean {
   return run.runtimeMode === "legacy" && run.status === "cancelled" &&
-    run.errorCode === "issue_continuation_waiting_on_review" &&
+    run.errorCode === errorCode &&
     run.resultJson?.stopReason === run.errorCode &&
     run.resultJson?.timeoutSource === "stale_queued_run_gate" &&
     run.resultJson?.workspaceRestoreFailure !== "restore_unsafe_archive" &&
@@ -29,7 +46,15 @@ export function isPreDispatchReviewWait(
  * retained execution or cleanup evidence. Historical false holds must be
  * checked against the same evidence that gates explicit user admission. */
 export async function isPreDispatchReviewWaitVerified(db: Db, run: Run): Promise<boolean> {
-  if (!isPreDispatchReviewWait(run)) return false;
+  return isPreDispatchReviewWait(run) && await hasNoDispatchEvidence(db, run);
+}
+
+/** Same retained-evidence check as the review wait, for a recovery-hold wait. */
+export async function isPreDispatchExecutionWaitVerified(db: Db, run: Run): Promise<boolean> {
+  return isPreDispatchExecutionWait(run) && await hasNoDispatchEvidence(db, run);
+}
+
+async function hasNoDispatchEvidence(db: Db, run: Run): Promise<boolean> {
   const [coordinator] = await db.select({ id: nativeRunFinalizations.runId }).from(nativeRunFinalizations).where(and(
     eq(nativeRunFinalizations.companyId, run.companyId), eq(nativeRunFinalizations.runId, run.id),
   )).limit(1);
