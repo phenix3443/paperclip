@@ -10,6 +10,16 @@ import { canonicalNativeRuntimeContextDigest, parseNativeExecutionInput } from "
 
 export type NativeToolExecutionTargetKind = "local" | "remote";
 
+/** Fence live ACPX owners when shared runtime semantics change, even if the
+ * underlying native executable/profile did not change. Undefined preserves
+ * the existing configuration digest for other provider transports.
+ */
+export function nativeRuntimeContractForProvider(
+  provider: NativeExecutionInput["provider"],
+): string | undefined {
+  return provider.kind === "acpx" ? "paperclip.acpx-runtime-contract.v1" : undefined;
+}
+
 /**
  * Persisted provider threads retain their dynamic-tool declarations. This
  * fingerprint is part of checkpoint compatibility and must change whenever
@@ -23,7 +33,7 @@ export function nativeToolContractFingerprintForTarget(
   return `sha256:${createHash("sha256")
     .update(
       JSON.stringify({
-        schema: "paperclip.native-tool-contract.v14",
+        schema: "paperclip.native-tool-contract.v17",
         executionTargetKind,
         advertisementPolicy: {
           // Direct provider threads retain declarations from thread/start.
@@ -38,6 +48,9 @@ export function nativeToolContractFingerprintForTarget(
             "always_advertised_run_issue_agent_binding_gated_current_task_description.v2",
           semanticCompletion: "finish_accessible_deliverable_evidence.v4",
           connectorTools: "assigned_resources_and_pinned_skill_bundle.v1",
+          chatTaskTools: "durable_task_binding_and_accepted_origin.v1",
+          githubResponses: "bound_working_comment_progress_and_final.v1",
+          githubInstructionSkills: "trusted_configuration_native_selection.v1",
           ...(executionTargetKind === "remote"
             ? { assignedMcpTools: "codex_server_gateway_prp_relay.v1" }
             : {}),
@@ -518,6 +531,7 @@ export function rebindNativeSessionCheckpoint(input: {
       ("executionMode" in current ? current.executionMode : "default") ||
     !sameProvider(previousExecution.provider, current.provider) ||
     previousExecution.schema !== current.schema ||
+    ("homeMode" in previousExecution ? previousExecution.homeMode : "isolated") !== ("homeMode" in current ? current.homeMode : "isolated") ||
     ("runtimeContext" in previousExecution &&
       "runtimeContext" in current &&
       previousExecution.runtimeContext.aggregateDigest !== current.runtimeContext.aggregateDigest &&
@@ -558,6 +572,9 @@ export function rebindNativeSessionCheckpoint(input: {
     activeTurnId: null,
     terminalTurns: [],
     pendingRuntimeRequests: [],
+    // Settlement evidence belongs to the prior heartbeat run, even when the
+    // provider session is reused for the user's response.
+    governedWait: undefined,
     providerRecoveryPolicy,
   };
 }

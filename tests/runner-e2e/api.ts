@@ -9,6 +9,22 @@ async function failureMessage(response: APIResponse, method: string) {
   return `${method} ${response.url()} returned ${response.status()}${text ? `: ${text}` : ""}`;
 }
 
+/** Preserve HTTP status independently of diagnostic response text. */
+export class RunnerApiHttpError extends Error {
+  constructor(readonly status: number, message: string) { super(message); this.name = "RunnerApiHttpError"; }
+}
+
+/** Admission-only diagnostics. Never retain the rejected value or its cause. */
+export class RemoteAdmissionReadError extends Error {
+  constructor(
+    readonly endpoint: "issue" | "run" | "leases",
+    readonly failureClass: "candidate_failure" | "transient_infrastructure" | "permanent_infrastructure",
+  ) {
+    super(`Remote admission ${endpoint} read failed (${failureClass}); diagnostics withheld`);
+    this.name = "RemoteAdmissionReadError";
+  }
+}
+
 export class RunnerApi {
   readonly baseURL: string;
   private browserCookie?: string;
@@ -24,14 +40,14 @@ export class RunnerApi {
     this.baseURL = `http://127.0.0.1:${port}`;
   }
 
-  async get<T>(path: string): Promise<T> {
-    const response = await this.request.get(path, this.sessionOptions());
-    if (!response.ok()) throw new Error(await failureMessage(response, "GET"));
+  async get<T>(path: string, options?: { timeout: number }): Promise<T> {
+    const response = await this.request.get(path, { ...this.sessionOptions(), ...options });
+    if (!response.ok()) throw new RunnerApiHttpError(response.status(), await failureMessage(response, "GET"));
     return response.json() as Promise<T>;
   }
 
-  async post<T>(path: string, data?: unknown): Promise<T> {
-    const response = await this.request.post(path, { data, ...this.sessionOptions() });
+  async post<T>(path: string, data?: unknown, options?: { timeout: number }): Promise<T> {
+    const response = await this.request.post(path, { data, ...this.sessionOptions(), ...options });
     if (!response.ok()) throw new Error(await failureMessage(response, "POST"));
     return response.json() as Promise<T>;
   }
@@ -105,6 +121,7 @@ export async function pollUntil<T>(input: {
   accept: (value: T) => boolean;
   reject?: (value: T) => string | undefined;
   intervalMs?: number;
+  retryOnError?: (error: unknown) => boolean;
   timeoutFailureClass?: "candidate_failure" | "transient_infrastructure";
   timeoutDetail?: (value: T | undefined) => string | undefined;
 }): Promise<T> {
@@ -120,6 +137,7 @@ export async function pollUntil<T>(input: {
       }
       lastError = undefined;
     } catch (error) {
+      if (input.retryOnError && !input.retryOnError(error)) throw error;
       if (
         error instanceof Error &&
         error.message.startsWith(`Stopped waiting for ${input.label}:`)

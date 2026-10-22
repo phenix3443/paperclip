@@ -64,7 +64,7 @@ import { TaskChatComposerTakeoverActionsContext } from "./TaskChatComposerTakeov
 import { TaskChatPausedTakeover, type TaskComposerPause } from "./TaskChatPausedTakeover";
 import { ComposerRunSettingsPicker } from "./ComposerRunSettingsPicker";
 import { TaskChatComposerBar } from "./TaskChatComposerBar";
-import { ComposerAddMenu, ComposerModeChip } from "./ComposerAddMenu";
+import { ComposerAddMenu, ComposerModeChip, ComposerPrivacyChip } from "./ComposerAddMenu";
 import type { ComposerRunSettings } from "./composer-run-settings";
 import type { Agent, IssueAssigneeAdapterOverrides } from "@paperclipai/shared";
 
@@ -110,6 +110,7 @@ interface TaskChatComposerProps {
     details?: ReactNode;
     contextBar?: ReactNode;
     submitDisabled?: boolean;
+    privacy?: { private: boolean; inherited?: string; onChange: (value: boolean) => void };
     onSelectFiles: (files: File[]) => void;
     runSettings: ComposerRunSettings | null;
     onRunSettingsChange: (settings: ComposerRunSettings | null) => void;
@@ -141,6 +142,7 @@ interface TaskChatComposerProps {
     { label: string; image: string | null }
   > | null;
   currentAssigneeValue?: string;
+  suggestedAssigneeValue?: string;
   onPendingAssigneeChange?: (value: string | null) => void;
   issueStatus?: string;
   /** Mobile document-flow host: 16px editor text so iOS doesn't zoom on focus. */
@@ -396,6 +398,7 @@ export function TaskChatComposer({
   assigneeAdapterOverrides,
   userProfileMap,
   currentAssigneeValue = "",
+  suggestedAssigneeValue,
   onPendingAssigneeChange,
   issueStatus,
   mobile = false,
@@ -637,7 +640,7 @@ export function TaskChatComposer({
   const showAssignee = Boolean(
     enableReassign && reassignOptions && reassignOptions.length > 0,
   );
-  const assigneeValue = creation ? currentAssigneeValue : pendingAssignee ?? currentAssigneeValue;
+  const assigneeValue = creation ? currentAssigneeValue : pendingAssignee ?? suggestedAssigneeValue ?? currentAssigneeValue;
   const assigneeLabel =
     reassignOptions?.find((o) => o.id === assigneeValue)?.label ?? "Unassigned";
   const assigneeName =
@@ -1460,6 +1463,7 @@ export function TaskChatComposer({
               <input ref={fileInputRef} type="file" className="hidden" multiple={Boolean(creation)} onChange={handleFileInputChange} />
             ) : null}
             <ComposerAddMenu
+              privacy={creation?.privacy}
               mode={pendingMode}
               onModeChange={!queuedEdit && onWorkModeChange ? changeMode : undefined}
               onAttachFile={canAcceptFiles ? () => fileInputRef.current?.click() : undefined}
@@ -1471,6 +1475,7 @@ export function TaskChatComposer({
               triggerTestId="task-chat-composer-add"
               menuTestId="task-chat-composer-add-menu"
             />
+            {creation?.privacy?.private ? <ComposerPrivacyChip inherited={creation.privacy.inherited} onRemove={() => creation.privacy!.onChange(false)} disabled={disabled} /> : null}
             {queuedEdit ? (
               <span className="px-1 text-xs font-medium text-muted-foreground">
                 {queuedEdit.stale

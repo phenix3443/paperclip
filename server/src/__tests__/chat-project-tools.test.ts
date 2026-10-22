@@ -190,8 +190,9 @@ const support = await getEmbeddedPostgresTestSupport();
         { projectId: f.projectId, assigneeAgentId: null, assigneeUserId: "board-user" },
       ]) {
         const result = await create(path, fields);
-        expect(result.status, JSON.stringify(result.body)).toBe(403);
-        expect(result.body.error).toMatch(/outside.*boundary|cannot assign work to board users|different company/i);
+        const hiddenProject = fields.projectId !== f.projectId && path.startsWith("/api/companies/");
+        expect(result.status, JSON.stringify(result.body)).toBe(hiddenProject ? 404 : 403);
+        expect(result.body.error).toMatch(hiddenProject ? /^Project not found$/ : /outside.*boundary|cannot assign work to board users|different company/i);
       }
     }
     const after = await server.db.select({ id: issues.id }).from(issues).where(eq(issues.companyId, f.companyId));
@@ -232,7 +233,10 @@ const support = await getEmbeddedPostgresTestSupport();
         body: JSON.stringify({ title: "Root cannot escape into another project", parentId: f.issueId,
           projectId: outside.id, assigneeAgentId: f.agentId, status: "backlog" }),
       });
-      expect(response.status, JSON.stringify(await response.json())).toBe(403);
+      const denied = await response.json();
+      const hiddenProject = path.startsWith("/api/companies/");
+      expect(response.status, JSON.stringify(denied)).toBe(hiddenProject ? 404 : 403);
+      expect(denied.error).toMatch(hiddenProject ? /^Project not found$/ : /outside.*boundary/i);
     }
     await expect(call(f, "create_task", { title: "Native root cannot escape", projectId: outside.id,
       idempotencyKey: "root-outside", status: "backlog" })).rejects.toThrow(/outside.*boundary/);
@@ -242,7 +246,7 @@ const support = await getEmbeddedPostgresTestSupport();
     await expect(call(f, "create_task", { title: "Exact scope is not a subtree", idempotencyKey: "exact-child" })).rejects.toThrow(/outside.*boundary/);
   });
 
-  it("authorizes workspace-derived projects before creating children of a projectless root", async () => {
+  it("authorizes workspace sources without assigning projects to children of a projectless root", async () => {
     const f = await server.fixture({ disableWakeOnDemand: true });
     const settings = instanceSettingsService(server.db);
     const previous = await settings.getExperimental();
@@ -250,7 +254,7 @@ const support = await getEmbeddedPostgresTestSupport();
     try {
       await server.db.update(issues).set({ projectId: null, projectWorkspaceId: null }).where(eq(issues.id, f.issueId));
       const [executionWorkspace] = await server.db.insert(executionWorkspaces).values({ companyId: f.companyId,
-        projectId: f.projectId, projectWorkspaceId: f.projectWorkspaceId, mode: "shared", strategyType: "project_primary", name: "Outside root" }).returning();
+        projectId: f.projectId, projectWorkspaceId: f.projectWorkspaceId, mode: "shared_workspace", strategyType: "project_primary", name: "Outside root" }).returning();
       const boundary = { mode: "low_trust_review", companyId: f.companyId, rootIssueId: f.issueId };
       await server.db.update(agents).set({ permissions: { trustPreset: "low_trust_review", authorizationPolicy: { trustBoundary: boundary } } }).where(eq(agents.id, f.agentId));
       const token = createLocalAgentJwt(f.agentId, f.companyId, "paperclip_runner", f.runId, f.responsibleUserId)!;
@@ -275,6 +279,8 @@ const support = await getEmbeddedPostgresTestSupport();
       }
       expect(await server.db.select({ id: issues.id }).from(issues).where(eq(issues.companyId, f.companyId))).toEqual(before);
 
+      await server.db.update(issues).set({ executionWorkspaceId: executionWorkspace.id }).where(eq(issues.id, f.issueId));
+      await expect(call(f, "create_task", { title: "Inherited source cannot escape", idempotencyKey: "inherited-source-denied", status: "backlog" })).rejects.toThrow(/outside.*boundary/i);
       await server.db.update(agents).set({ permissions: { trustPreset: "low_trust_review", authorizationPolicy: {
         trustBoundary: { ...boundary, projectIds: [f.projectId] },
       } } }).where(eq(agents.id, f.agentId));
@@ -283,7 +289,11 @@ const support = await getEmbeddedPostgresTestSupport();
           if (path.endsWith("/children") && selection.inheritExecutionWorkspaceFromIssueId) continue;
           const response = await create(path, selection);
           expect(response.status, JSON.stringify(response.body)).toBe(201);
-          expect(response.body.projectId).toBe(f.projectId);
+          expect(response.body.projectId).toBe(selection.inheritExecutionWorkspaceFromIssueId ? f.projectId : null);
+          if (selection.projectWorkspaceId) {
+            expect(response.body.projectWorkspaceId).toBe(selection.projectWorkspaceId);
+            expect(response.body.executionWorkspaceId).toBeNull();
+          }
           expect(response.body.executionPolicy.authorizationPolicy.trustBoundary.projectIds).toEqual([f.projectId]);
         }
       }
