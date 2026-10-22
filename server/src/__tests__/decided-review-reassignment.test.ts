@@ -24,6 +24,8 @@ import {
   issueComments,
   issueExecutionDecisions,
   issueRecoveryActions,
+  issueRelations,
+  issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
 import {
@@ -37,7 +39,14 @@ import { settleUnrecoverableExecutions } from "../services/execution-recovery-re
 import { executionBlockerPredicate, getExecutionBlocker } from "../services/execution-blocker.js";
 import { hasLiveLegacyController } from "../services/legacy-controller-lease.js";
 import { runningProcesses } from "../adapters/index.js";
-import { continueDecidedReviewReassignments } from "../services/decided-review-reassignment.js";
+import { issueService } from "../services/issues.js";
+import {
+  buildDecidedReviewContinuationWakeup,
+  continueDecidedReviewReassignments,
+  currentSubmissionIdentity,
+  findConsumption,
+  selectDecidedReviewSource,
+} from "../services/decided-review-reassignment.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -99,6 +108,8 @@ describeEmbeddedPostgres("decided review continuation after an expected reviewer
     await heartbeat.drainActiveRunExecutions();
     await db.delete(environmentLeases);
     await db.delete(issueRecoveryActions);
+    await db.delete(issueThreadInteractions);
+    await db.delete(issueRelations);
     await db.delete(issueComments);
     await db.delete(issueExecutionDecisions);
     await db.delete(activityLog);
@@ -197,6 +208,20 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     return { runId, pid: child.pid!, processGroupId: child.pid! };
   }
 
+  /** Declared seeded: an unrelated newer run of the reviewer on the issue
+   * that was dispatched, started and finished. Test 1a checks its shape. */
+  async function seedStartedUnrelatedRun(f: Fixture) {
+    const wakeId = randomUUID();
+    const id = randomUUID();
+    await db.insert(agentWakeupRequests).values({ id: wakeId, companyId: f.companyId, agentId: f.reviewerId, source: "automation",
+      triggerDetail: "system", reason: "issue_commented", payload: { issueId: f.issueId }, status: "completed", runId: id, finishedAt: new Date() });
+    await db.insert(heartbeatRuns).values({ id, companyId: f.companyId, agentId: f.reviewerId, invocationSource: "automation",
+      triggerDetail: "system", status: "succeeded", wakeupRequestId: wakeId, runtimeMode: "legacy", runtimeModeResolvedAt: new Date(),
+      startedAt: new Date(), finishedAt: new Date(), responsibleUserId: f.userId,
+      contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "issue_commented" } });
+    return id;
+  }
+
   /** Production: the reaper finds a live child without an owning controller. */
   async function reapToDetached(runId: string) {
     await heartbeat.reapOrphanedRuns();
@@ -232,6 +257,9 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     const endedByCancel = !isAlive(pid) && !isAlive(-processGroupId);
     await fs.writeFile(f.gate, "open");
     await waitFor(() => !isAlive(pid) && !isAlive(-processGroupId), 5_000, "reviewer child to exit");
+    // Production: the lease sweeps release what the dead controller held.
+    await heartbeat.sweepOrphanedActiveLeases({ backoffMs: 0 });
+    await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
     return { endedByCancel };
   }
@@ -244,13 +272,26 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
    * reviewer run and nothing needs recovery. */
   async function resubmitWithSuppressedReviewRequest(f: Fixture) {
     let authorRunId = "";
+    // When the decision landed while R's detached child still ran, the
+    // author's decision wake was skipped behind it. The production stranded
+    // assignee scan wakes the author once nothing blocks the task.
+    if (!(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.authorId))).length) {
+      await scan();
+      await heartbeat.resumeQueuedRuns();
+    }
     await waitFor(async () => {
       const [run] = await db.select().from(heartbeatRuns).where(and(
         eq(heartbeatRuns.agentId, f.authorId), eq(heartbeatRuns.status, "running"),
       ));
       authorRunId = run?.id ?? "";
       return Boolean(run?.processPid);
-    }, 10_000, "the author's run to start");
+    }, 10_000, "the author's run to start").catch(async error => {
+      const runs = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, error: heartbeatRuns.error })
+        .from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.authorId));
+      const wakes = await db.select({ status: agentWakeupRequests.status, reason: agentWakeupRequests.reason, error: agentWakeupRequests.error })
+        .from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.authorId));
+      throw new Error(`${(error as Error).message}: ${JSON.stringify({ runs, wakes })}`);
+    });
     const resubmittedAt = new Date();
     process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS = "true";
     try {
@@ -514,4 +555,604 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     },
     60_000,
   );
+
+  /** Shared base for the remaining cases: the seeded detached R recorded its
+   * decision and stopped, the author resubmitted, and R's environment lease is
+   * still held, so the post-resubmission scan holds R exactly as today. */
+  async function heldBase() {
+    const f = await seedReview();
+    const r = await seedDetachedLegacyReviewerRun(f);
+    await reapToDetached(r.runId);
+    const decision = await recordDecision(f, r.runId);
+    await stopReviewerChild(f, r.pid, r.processGroupId);
+    const [lease] = await db.insert(environmentLeases).values({ companyId: f.companyId, issueId: f.issueId, heartbeatRunId: r.runId, provider: "local" }).returning();
+    const { resubmittedAt, authorRunId } = await resubmitWithSuppressedReviewRequest(f);
+    const history = await snapshotReviewHistory(f);
+    await scan();
+    const [hold] = await blockingHolds(f);
+    expect(hold!.evidence.runId).toBe(r.runId);
+    const releaseLease = async () => {
+      await db.update(environmentLeases).set({ releasedAt: new Date(), status: "released" }).where(eq(environmentLeases.id, lease!.id));
+    };
+    return { f, r, decision, hold: hold!, resubmittedAt, authorRunId, history, releaseLease };
+  }
+  type HeldBase = Awaited<ReturnType<typeof heldBase>>;
+
+  /** Reviewer runs that executed (or wait to) after the resubmission. Parked
+   * attempts the stale gate cancelled before dispatch are not turns. */
+  async function reviewerTurnsAfter(f: Fixture, after: Date) {
+    return (await reviewerRunsAfter(f, after)).filter(run => run.errorCode !== "execution_reconciliation_required");
+  }
+
+  async function expectHeldWithoutSuccessor(b: HeldBase, seededRunIds: string[] = []) {
+    for (let i = 0; i < 2; i += 1) { await scan(); await pass(); }
+    expect((await blockingHolds(b.f)).length).toBeGreaterThan(0);
+    expect((await reviewerTurnsAfter(b.f, b.resubmittedAt)).filter(run => !seededRunIds.includes(run.id))).toEqual([]);
+    expect(await db.select().from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.sourceIssueId, b.f.issueId), sql`${issueRecoveryActions.evidence} ? 'decidedReviewContinuation'`,
+    ))).toEqual([]);
+  }
+
+  async function readTask(f: Fixture) {
+    return (await db.select().from(issues).where(eq(issues.id, f.issueId)))[0]!;
+  }
+
+  /** The real sweep projects the held review to blocked and records its receipt. */
+  async function sweepToBlocked(b: HeldBase) {
+    await sweep();
+    const blocked = await readTask(b.f);
+    expect(blocked.status).toBe("blocked");
+    const receipt = (await blockingHolds(b.f))[0]!.evidence.reviewHoldBlock as { statusVersion: number };
+    expect(receipt.statusVersion).toBe(blocked.statusVersion);
+    return receipt;
+  }
+
+  it.each([
+    ["a human reasserts blocked", async (b: HeldBase) => {
+      await issueService(db).update(b.f.issueId, { status: "blocked" });
+    }],
+    ["a human unblocks, then blocks again", async (b: HeldBase) => {
+      await issueService(db).update(b.f.issueId, { status: "in_review" });
+      await issueService(db).update(b.f.issueId, { status: "blocked" });
+    }],
+    ["a human sets a blocker", async (b: HeldBase) => {
+      const blockerId = randomUUID();
+      await db.insert(issues).values({ id: blockerId, companyId: b.f.companyId, title: "Blocker", status: "todo", priority: "medium",
+        issueNumber: 2, identifier: `${b.f.issueId.slice(0, 4)}-2` });
+      await issueService(db).update(b.f.issueId, { blockedByIssueIds: [blockerId] });
+    }],
+    ["the task is reassigned away and back", async (b: HeldBase) => {
+      await issueService(db).update(b.f.issueId, { assigneeAgentId: b.f.authorId });
+      await issueService(db).update(b.f.issueId, { assigneeAgentId: b.f.reviewerId });
+    }],
+  ])("keeps a sweep-blocked review held after %s", async (_label, change) => {
+    const b = await heldBase();
+    const receipt = await sweepToBlocked(b);
+    await change(b);
+    await b.releaseLease();
+    await expectHeldWithoutSuccessor(b);
+    const task = await readTask(b.f);
+    expect(task.status).toBe("blocked");
+    expect(task.statusVersion).not.toBe(receipt.statusVersion);
+  }, 60_000);
+
+  it("keeps a pre-fix block without a projection receipt held", async () => {
+    const b = await heldBase();
+    await sweepToBlocked(b);
+    // Declared seeded: the same hold as written by the pre-fix sweep, which had no receipt.
+    for (const hold of await blockingHolds(b.f)) {
+      const { reviewHoldBlock: _receipt, ...evidence } = hold.evidence;
+      await db.update(issueRecoveryActions).set({ evidence }).where(eq(issueRecoveryActions.id, hold.id));
+    }
+    await b.releaseLease();
+    await expectHeldWithoutSuccessor(b);
+    expect((await readTask(b.f)).status).toBe("blocked");
+  }, 60_000);
+
+  /** Declared seeded reviewer run on the issue, newer than R. */
+  async function seedReviewerRun(b: HeldBase, values: Partial<typeof heartbeatRuns.$inferInsert>) {
+    const id = randomUUID();
+    await db.insert(heartbeatRuns).values({ id, companyId: b.f.companyId, agentId: b.f.reviewerId, invocationSource: "assignment",
+      triggerDetail: "system", status: "queued", contextSnapshot: { issueId: b.f.issueId, taskId: b.f.issueId, wakeReason: "execution_review_requested" },
+      responsibleUserId: b.f.userId, ...values });
+    return id;
+  }
+
+  it.each([
+    ["a newer reviewer run that started", async (b: HeldBase) =>
+      seedReviewerRun(b, { status: "succeeded", runtimeMode: "legacy", startedAt: new Date(), finishedAt: new Date() })],
+    ["a newer reviewer run cancelled for another reason", async (b: HeldBase) =>
+      seedReviewerRun(b, { status: "cancelled", runtimeMode: "legacy", errorCode: "cancelled", finishedAt: new Date() })],
+    ["a parked attempt chained to a foreign hold", async (b: HeldBase) => {
+      await seedReviewerRun(b, { status: "cancelled", runtimeMode: "legacy", errorCode: "execution_reconciliation_required", finishedAt: new Date(),
+        resultJson: { stopReason: "execution_reconciliation_required", timeoutSource: "stale_queued_run_gate",
+          executionWait: { issueId: b.f.issueId, recoveryActionId: randomUUID() } } });
+    }],
+    ["a queued run of another agent on the issue", async (b: HeldBase) => {
+      await db.insert(heartbeatRuns).values({ companyId: b.f.companyId, agentId: b.f.authorId, invocationSource: "assignment",
+        triggerDetail: "system", status: "queued", contextSnapshot: { issueId: b.f.issueId }, responsibleUserId: b.f.userId });
+    }],
+    ["another cause's execution hold on the issue", async (b: HeldBase) => {
+      // Only one hold per issue may be active, so the foreign one is resolved but still blocks replay.
+      await db.insert(issueRecoveryActions).values({ companyId: b.f.companyId, sourceIssueId: b.f.issueId, kind: "active_run_watchdog",
+        status: "resolved", outcome: "blocked", resolvedAt: new Date(), ownerType: "board", returnOwnerAgentId: b.f.reviewerId,
+        cause: "uncertain_provider_action", fingerprint: `other:${randomUUID()}`, nextAction: "Reconcile the provider action.",
+        evidence: { runId: randomUUID(), automaticRecovery: { policy: "preserve_without_replay_v1", replay: "blocked", actionOutcome: "unknown" } } });
+    }],
+    ["a parked attempt whose environment lease is not released", async (b: HeldBase) => {
+      const q = await seedReviewerRun(b, {});
+      await heartbeat.resumeQueuedRuns();
+      expect(await heartbeat.getRun(q)).toMatchObject({ status: "cancelled", errorCode: "execution_reconciliation_required" });
+      await db.insert(environmentLeases).values({ companyId: b.f.companyId, issueId: b.f.issueId, heartbeatRunId: q, provider: "local" });
+    }],
+  ])("keeps the review held for %s", async (_label, change) => {
+    const b = await heldBase();
+    const seeded = await change(b);
+    await b.releaseLease();
+    await expectHeldWithoutSuccessor(b, typeof seeded === "string" ? [seeded] : []);
+  }, 60_000);
+
+  async function patchRun(runId: string, change: (run: typeof heartbeatRuns.$inferSelect) => Partial<typeof heartbeatRuns.$inferInsert>) {
+    const run = (await heartbeat.getRun(runId))!;
+    await db.update(heartbeatRuns).set(change(run)).where(eq(heartbeatRuns.id, runId));
+  }
+
+  async function patchState(b: HeldBase, change: Record<string, unknown>) {
+    const task = await readTask(b.f);
+    await db.update(issues).set({ executionState: { ...(task.executionState as Record<string, unknown>), ...change } as any })
+      .where(eq(issues.id, b.f.issueId));
+  }
+
+  it.each([
+    ["the decision was recorded by another run", async (b: HeldBase) => {
+      await db.update(issueExecutionDecisions).set({ createdByRunId: b.authorRunId }).where(eq(issueExecutionDecisions.id, b.decision.id));
+    }],
+    ["the decision is not the last decision", async (b: HeldBase) => patchState(b, { lastDecisionId: null })],
+    ["the decision predates the stop", async (b: HeldBase) => {
+      const run = (await heartbeat.getRun(b.r.runId))!;
+      await db.update(issueExecutionDecisions).set({ createdAt: new Date(run.finishedAt!.getTime() - 1_000) })
+        .where(eq(issueExecutionDecisions.id, b.decision.id));
+    }],
+    ["a newer decision exists for the stage", async (b: HeldBase) => {
+      const { id: _id, ...decision } = b.decision;
+      await db.insert(issueExecutionDecisions).values({ ...decision, createdAt: new Date() });
+    }],
+    ["the author never resubmitted", async (b: HeldBase) => {
+      await db.delete(activityLog).where(and(eq(activityLog.entityId, b.f.issueId), eq(activityLog.action, "issue.updated"),
+        eq(activityLog.actorId, b.f.authorId)));
+    }],
+    ["the resubmission came from the stopped reviewer run", async (b: HeldBase) => {
+      await db.update(activityLog).set({ runId: b.r.runId }).where(and(eq(activityLog.entityId, b.f.issueId),
+        eq(activityLog.action, "issue.updated"), eq(activityLog.actorId, b.f.authorId)));
+    }],
+    ["a user cancelled the reviewer", async (b: HeldBase) => patchRun(b.r.runId, run => ({
+      resultJson: { ...run.resultJson, cancellation: { ...(run.resultJson!.cancellation as object), initiator: { type: "user", id: b.f.userId } } },
+    }))],
+    ["the reviewer ended for another reason", async (b: HeldBase) => patchRun(b.r.runId, () => ({ errorCode: "cancelled" }))],
+    ["the reassignment stop is not confirmed", async (b: HeldBase) => patchRun(b.r.runId, run => {
+      const { reassignmentStopConfirmed: _confirmed, ...resultJson } = run.resultJson!;
+      return { resultJson };
+    })],
+    ["the reviewer process is still alive", async (b: HeldBase) => {
+      const alive = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+      ownedChildren.add(alive); ownedPids.add(alive.pid!); ownedGroups.add(alive.pid!);
+      await patchRun(b.r.runId, () => ({ processPid: alive.pid!, processGroupId: alive.pid! }));
+    }],
+    ["the reviewer's environment lease is not released", async (_b: HeldBase) => "keep_lease" as const],
+    ["a pending interaction awaits a person", async (b: HeldBase) => {
+      await db.insert(issueThreadInteractions).values({ companyId: b.f.companyId, issueId: b.f.issueId, kind: "request_confirmation",
+        status: "pending", payload: { version: 1, prompt: "Proceed?" } as any });
+    }],
+    ["a blocking dependency is unresolved", async (b: HeldBase) => {
+      const blockerId = randomUUID();
+      await db.insert(issues).values({ id: blockerId, companyId: b.f.companyId, title: "Dependency", status: "todo", priority: "medium",
+        issueNumber: 2, identifier: `${b.f.issueId.slice(0, 4)}-2` });
+      await db.insert(issueRelations).values({ companyId: b.f.companyId, issueId: blockerId, relatedIssueId: b.f.issueId, type: "blocks" });
+    }],
+    ["another agent is the current participant", async (b: HeldBase) => patchState(b, {
+      currentParticipant: { type: "agent", agentId: b.f.authorId },
+    })],
+    ["the current stage is an approval", async (b: HeldBase) => patchState(b, { currentStageType: "approval" })],
+    ["the hold is already being reconciled", async (b: HeldBase) => {
+      await db.update(issueRecoveryActions).set({ evidence: { ...b.hold.evidence, executionReconciliation: { recordedAt: new Date().toISOString() } } })
+        .where(eq(issueRecoveryActions.id, b.hold.id));
+    }],
+    ["the hold records a workspace restore failure", async (b: HeldBase) => {
+      await db.update(issueRecoveryActions).set({ evidence: { ...b.hold.evidence, workspaceRestoreFailure: "restore_unsafe_archive" } })
+        .where(eq(issueRecoveryActions.id, b.hold.id));
+    }],
+    ["the task is done", async (b: HeldBase) => { await db.update(issues).set({ status: "done" }).where(eq(issues.id, b.f.issueId)); }],
+    ["the task is cancelled", async (b: HeldBase) => { await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, b.f.issueId)); }],
+  ])("does not continue when %s", async (_label, change) => {
+    const b = await heldBase();
+    const keep = await change(b);
+    if (keep !== "keep_lease") await b.releaseLease();
+    for (let i = 0; i < 2; i += 1) { await scan(); await pass(); }
+    expect(await reviewerTurnsAfter(b.f, b.resubmittedAt)).toEqual([]);
+    expect(await db.select().from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.sourceIssueId, b.f.issueId), sql`${issueRecoveryActions.evidence} ? 'decidedReviewContinuation'`,
+    ))).toEqual([]);
+    const task = await readTask(b.f);
+    if (!["done", "cancelled"].includes(task.status)) expect((await blockingHolds(b.f)).length).toBeGreaterThan(0);
+  }, 60_000);
+
+
+  /** The author's review request exactly as the route's private stage-wake
+   * builder produced it, rebuilt from its durable suppressed receipt. */
+  async function authorReviewRequest(f: Fixture) {
+    const [receipt] = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId, f.reviewerId), eq(agentWakeupRequests.reason, "heartbeat.scheduling_suppressed"),
+    ));
+    const { heartbeatSkip: _skip, ...payload } = receipt!.payload as Record<string, unknown>;
+    expect(payload).toMatchObject({ issueId: f.issueId, mutation: "update" });
+    return {
+      source: receipt!.source as "assignment", triggerDetail: receipt!.triggerDetail as "system",
+      reason: "execution_review_requested", payload,
+      requestedByActorType: receipt!.requestedByActorType as "agent", requestedByActorId: receipt!.requestedByActorId!,
+      contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "execution_review_requested",
+        source: "issue.execution_stage", executionStage: payload.executionStage },
+    };
+  }
+
+  async function readIdentity(f: Fixture) {
+    const task = await readTask(f);
+    return currentSubmissionIdentity(db, task, f.reviewerId);
+  }
+
+  async function wakesWithReason(f: Fixture, reason: string) {
+    return db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId, f.reviewerId), eq(agentWakeupRequests.reason, reason),
+      sql`${agentWakeupRequests.payload}->>'issueId' = ${f.issueId}`,
+    ));
+  }
+
+  it("admits one successor when every entry path races, folding a parked comment into it", async () => {
+    const b = await heldBase();
+    const comment = await request(app({ type: "agent", source: "agent_key", companyId: b.f.companyId, agentId: b.f.authorId, runId: b.authorRunId }))
+      .post(`/api/issues/${b.f.issueId}/comments`).send({ body: "One more note for the reviewer." });
+    expect(comment.status, JSON.stringify(comment.body)).toBe(201);
+    await waitFor(async () => (await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId, b.f.reviewerId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+    ))).length === 1, 5_000, "the parked comment wake");
+    await b.releaseLease();
+    const w2 = await authorReviewRequest(b.f);
+    await Promise.all([heartbeat.wakeup(b.f.reviewerId, w2), scan(), scan(), pass(), pass()]);
+    await drain(b.f);
+    for (let i = 0; i < 2; i += 1) { await scan(); await pass(); await sweep(); }
+    await drain(b.f);
+
+    const successor = await expectSingleContinuation(b.f, { resubmittedAt: b.resubmittedAt, history: b.history, sourceRunId: b.r.runId });
+    expect((await db.select().from(activityLog).where(and(eq(activityLog.entityId, b.f.issueId),
+      eq(activityLog.action, "issue.execution_recovery_settled"),
+      sql`${activityLog.details}->>'continuation' = 'decided_review_reassignment'`)))).toHaveLength(1);
+    const [parked] = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId, b.f.reviewerId), eq(agentWakeupRequests.reason, "issue_commented"),
+    ));
+    expect(parked).toMatchObject({ status: "coalesced", runId: successor.id });
+    expect(successor.contextSnapshot?.wakeCommentIds).toContain(comment.body.id);
+  }, 60_000);
+
+  /** A pass whose wake waits at a barrier after its proof transaction committed. */
+  function gatedPass() {
+    let entered!: () => void;
+    let release!: () => void;
+    const enteredP = new Promise<void>(resolve => { entered = resolve; });
+    const releaseP = new Promise<void>(resolve => { release = resolve; });
+    let carried: Record<string, unknown> | null = null;
+    const done = continueDecidedReviewReassignments(db, async (agentId, options) => {
+      carried = options.payload.decidedReviewContinuation;
+      entered();
+      await releaseP;
+      return heartbeat.wakeup(agentId, options);
+    });
+    return { entered: enteredP, release, done, carried: () => carried };
+  }
+
+  it.each(["a second pass", "the author's own review request"])(
+    "records a late pass as consumed after the successor admitted by %s finished",
+    async (admitter) => {
+      const b = await heldBase();
+      await b.releaseLease();
+      const late = gatedPass();
+      await late.entered;
+      if (admitter === "a second pass") await pass();
+      else await heartbeat.wakeup(b.f.reviewerId, await authorReviewRequest(b.f));
+      await drain(b.f);
+      const successor = await expectOneSuccessor(b.f, b.resubmittedAt);
+      // The selector no longer picks R, but the submission is unchanged.
+      expect(await selectDecidedReviewSource(db, await readTask(b.f))).toMatchObject({ kind: "none" });
+      expect(await readIdentity(b.f)).toMatchObject({ decisionId: b.decision.id });
+      expect(late.carried()).toMatchObject(await readIdentity(b.f) as object);
+      late.release();
+      await late.done;
+
+      expect(await wakesWithReason(b.f, "decided_review_continuation_consumed")).toEqual([
+        expect.objectContaining({ status: "skipped", payload: expect.objectContaining({
+          decidedReviewContinuationOutcome: expect.objectContaining({ successorRunId: successor.id }) }) }),
+      ]);
+      // A delayed copy of the author's request is consumed the same way.
+      await heartbeat.wakeup(b.f.reviewerId, await authorReviewRequest(b.f));
+      expect(await wakesWithReason(b.f, "decided_review_continuation_consumed")).toHaveLength(2);
+      await drain(b.f);
+      expect((await expectOneSuccessor(b.f, b.resubmittedAt)).id).toBe(successor.id);
+    },
+    60_000,
+  );
+
+  it("coalesces a late pass into a successor that is still running", async () => {
+    const b = await heldBase();
+    await fs.rm(b.f.gate, { force: true });
+    await b.releaseLease();
+    const late = gatedPass();
+    await late.entered;
+    await pass();
+    const [successor] = await reviewerTurnsAfter(b.f, b.resubmittedAt);
+    await waitFor(async () => (await heartbeat.getRun(successor!.id))?.status === "running" &&
+      (await readTask(b.f)).executionRunId === successor!.id, 10_000, "the successor to run");
+    expect(await selectDecidedReviewSource(db, await readTask(b.f))).toMatchObject({ kind: "none" });
+    late.release();
+    await late.done;
+    const coalesced = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId, b.f.reviewerId), eq(agentWakeupRequests.status, "coalesced"),
+      sql`${agentWakeupRequests.payload} ? 'decidedReviewContinuation'`,
+    ));
+    expect(coalesced).toEqual([expect.objectContaining({ runId: successor!.id })]);
+    await fs.writeFile(b.f.gate, "open");
+    await drain(b.f);
+    expect((await expectOneSuccessor(b.f, b.resubmittedAt)).id).toBe(successor!.id);
+  }, 60_000);
+
+  it("leaves an unconsumed submission held when a newer started run breaks the source chain", async () => {
+    const b = await heldBase();
+    const u = await seedStartedUnrelatedRun(b.f);
+
+    // Preconditions under the issue lock: held, unconsumed, selector rejects U.
+    const pre = await db.transaction(async tx => {
+      const [task] = await tx.select().from(issues).where(eq(issues.id, b.f.issueId)).for("update");
+      const identity = await currentSubmissionIdentity(tx as any, task!, b.f.reviewerId);
+      return {
+        blocker: await getExecutionBlocker(tx as any, b.f.companyId, b.f.issueId),
+        identity, consumed: identity ? await findConsumption(tx as any, task!, identity) : "no identity",
+        selected: await selectDecidedReviewSource(tx as any, task!, identity),
+        task: task!,
+      };
+    });
+    expect(pre.blocker).toMatchObject({ recoveryActionId: b.hold.id });
+    expect(pre.identity).toEqual({ decisionId: b.decision.id, resubmissionActivityId: expect.any(String) });
+    expect(pre.consumed).toBeNull();
+    expect(pre.selected).toEqual({ kind: "none", rule: "newer_run_not_verified_pre_dispatch_wait", runId: u });
+    const holdsBefore = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, b.f.issueId));
+    const runsBefore = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.agentId, b.f.reviewerId));
+    const wakeIdsBefore = new Set((await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, b.f.reviewerId))).map(row => row.id));
+
+    await heartbeat.wakeup(b.f.reviewerId, buildDecidedReviewContinuationWakeup({ issueId: b.f.issueId, sourceRunId: b.r.runId, ...pre.identity! }));
+    const w2 = await authorReviewRequest(b.f);
+    await heartbeat.wakeup(b.f.reviewerId, w2);
+
+    expect(await wakesWithReason(b.f, "decided_review_continuation_not_eligible")).toEqual([
+      expect.objectContaining({ status: "skipped", payload: expect.objectContaining({
+        decidedReviewContinuationOutcome: expect.objectContaining({ rule: "newer_run_not_verified_pre_dispatch_wait", runId: u }) }) }),
+    ]);
+    const newW2 = (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, b.f.reviewerId)))
+      .filter(row => !wakeIdsBefore.has(row.id) && row.reason !== "decided_review_continuation_not_eligible");
+    expect(newW2).toEqual([expect.objectContaining({
+      status: "skipped", runId: null, finishedAt: expect.any(Date), reason: "execution_reconciliation_required",
+      source: "assignment", triggerDetail: "system", requestedByActorType: "agent", requestedByActorId: b.f.authorId,
+      error: pre.blocker!.nextAction,
+      payload: expect.objectContaining({ issueId: b.f.issueId, executionWait: expect.objectContaining({
+        recoveryActionId: b.hold.id, reason: "execution_recovery" }) }),
+    })]);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, b.f.issueId))).toEqual(holdsBefore);
+    const task = await readTask(b.f);
+    expect({ status: task.status, statusVersion: task.statusVersion, executionState: task.executionState, executionRunId: task.executionRunId })
+      .toEqual({ status: pre.task.status, statusVersion: pre.task.statusVersion, executionState: pre.task.executionState, executionRunId: pre.task.executionRunId });
+    expect(await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.agentId, b.f.reviewerId))).toEqual(runsBefore);
+  }, 60_000);
+
+  it("skips a pass wake as not held once another owner released the holds", async () => {
+    const b = await heldBase();
+    await b.releaseLease();
+    const late = gatedPass();
+    await late.entered;
+    // Another owner (here: operator reconciliation, declared) released the holds before the wake.
+    await db.update(issueRecoveryActions).set({ status: "resolved", resolvedAt: new Date(),
+      evidence: { ...b.hold.evidence, automaticRecovery: { replay: "reconciled" } } }).where(eq(issueRecoveryActions.id, b.hold.id));
+    late.release();
+    await late.done;
+    expect(await wakesWithReason(b.f, "decided_review_continuation_not_held")).toHaveLength(1);
+    expect(await reviewerTurnsAfter(b.f, b.resubmittedAt)).toEqual([]);
+  }, 60_000);
+
+  it("keeps the admission record after the successor ends, and a newer submission gets its own turn", async () => {
+    const b = await heldBase();
+    await b.releaseLease();
+    await pass();
+    await drain(b.f);
+    const successor = await expectOneSuccessor(b.f, b.resubmittedAt);
+    const identity = (await readIdentity(b.f))!;
+    expect(await findConsumption(db, await readTask(b.f), identity)).toMatchObject({ successorRunId: successor.id });
+    expect(await selectDecidedReviewSource(db, await readTask(b.f))).toMatchObject({ kind: "none" });
+    for (const hold of await db.select().from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.sourceIssueId, b.f.issueId), sql`${issueRecoveryActions.evidence} ? 'decidedReviewContinuation'`,
+    ))) expect(hold.evidence.decidedReviewContinuation).toMatchObject({ ...identity, successorRunId: successor.id });
+
+    // A comment from the author is new work: the decided-review gate leaves it
+    // to the ordinary path (here baseline's re-wake throttle answers it).
+    const before = new Date();
+    const comment = await request(app({ type: "agent", source: "agent_key", companyId: b.f.companyId, agentId: b.f.authorId, runId: b.authorRunId }))
+      .post(`/api/issues/${b.f.issueId}/comments`).send({ body: "Also covered the null case." });
+    expect(comment.status, JSON.stringify(comment.body)).toBe(201);
+    await waitFor(async () => (await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId, b.f.reviewerId), gt(agentWakeupRequests.createdAt, before),
+    ))).length > 0, 10_000, "the comment's reviewer wake");
+    await drain(b.f);
+    const later = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId, b.f.reviewerId), gt(agentWakeupRequests.createdAt, before),
+    ));
+    expect(later.length).toBeGreaterThan(0);
+    expect(later.filter(wake => wake.reason?.startsWith("decided_review_continuation"))).toEqual([]);
+  }, 60_000);
+
+  /** Production: the author's running turn resubmits, and the review request
+   * goes through the ordinary path. */
+  async function resubmit(f: Fixture) {
+    let authorRunId = "";
+    await waitFor(async () => {
+      const [run] = await db.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.agentId, f.authorId), eq(heartbeatRuns.status, "running"),
+      ));
+      authorRunId = run?.id ?? "";
+      return Boolean(run?.processPid);
+    }, 10_000, "the author's run to start");
+    const resubmittedAt = new Date();
+    const response = await request(app({ type: "agent", source: "agent_key", companyId: f.companyId, agentId: f.authorId, runId: authorRunId }))
+      .patch(`/api/issues/${f.issueId}`).send({ status: "done", comment: "Handled the null case too." });
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    return { resubmittedAt, authorRunId };
+  }
+
+  it("invalidates the served identity with a newer decision, and a newer submission gets one ordinary turn", async () => {
+    const b = await heldBase();
+    await fs.rm(b.f.gate, { force: true });
+    await b.releaseLease();
+    await pass();
+    const [s] = await reviewerTurnsAfter(b.f, b.resubmittedAt);
+    await waitFor(async () => (await heartbeat.getRun(s!.id))?.status === "running" &&
+      (await readTask(b.f)).executionRunId === s!.id, 10_000, "the successor to run");
+    const served = (await readIdentity(b.f))!;
+    expect(await findConsumption(db, await readTask(b.f), served)).toMatchObject({ successorRunId: s!.id });
+
+    // (b) S records a new changes_requested decision through the real route.
+    const decided = await request(app({ type: "agent", source: "agent_key", companyId: b.f.companyId, agentId: b.f.reviewerId, runId: s!.id }))
+      .patch(`/api/issues/${b.f.issueId}`).send({ status: "in_progress", comment: "The null case still throws." });
+    expect(decided.status, JSON.stringify(decided.body)).toBe(200);
+    await waitFor(async () => ["cancelled", "succeeded"].includes((await heartbeat.getRun(s!.id))?.status ?? ""), 10_000, "S to stop");
+    const decisions = await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, b.f.issueId))
+      .orderBy(asc(issueExecutionDecisions.createdAt));
+    expect(decisions).toHaveLength(2);
+    const d2 = decisions[1]!;
+    expect(d2).toMatchObject({ createdByRunId: s!.id, outcome: "changes_requested" });
+
+    // (e) No resubmission yet: the old identity is stale, a W2 copy follows baseline.
+    expect(await readIdentity(b.f)).toBeNull();
+    const oldW1 = buildDecidedReviewContinuationWakeup({ issueId: b.f.issueId, sourceRunId: b.r.runId, ...served });
+    await heartbeat.wakeup(b.f.reviewerId, oldW1);
+    expect(await wakesWithReason(b.f, "decided_review_continuation_stale")).toEqual([
+      expect.objectContaining({ status: "skipped", payload: expect.objectContaining({
+        decidedReviewContinuationOutcome: { detail: "identity_unavailable" } }) }),
+    ]);
+    const beforeW2 = new Date();
+    await heartbeat.wakeup(b.f.reviewerId, await authorReviewRequest(b.f));
+    const w2Rows = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId, b.f.reviewerId), gt(agentWakeupRequests.createdAt, beforeW2),
+    ));
+    // Baseline parks it behind the issue's execution; the gate does not touch it.
+    expect(w2Rows).toEqual([expect.objectContaining({ status: "deferred_issue_execution", reason: "issue_execution_deferred" })]);
+    const replayedW2 = w2Rows[0]!.id;
+
+    // (f) The author resubmits: the new identity has no record, the old
+    // record stays on R's holds, and exactly one review turn runs.
+    await fs.writeFile(b.f.gate, "open");
+    const second = await resubmit(b.f);
+    const fresh = (await readIdentity(b.f))!;
+    expect(fresh).toEqual({ decisionId: d2.id, resubmissionActivityId: expect.any(String) });
+    expect(fresh.resubmissionActivityId).not.toBe(served.resubmissionActivityId);
+    expect(await findConsumption(db, await readTask(b.f), fresh)).toBeNull();
+    await waitFor(async () => (await reviewerTurnsAfter(b.f, second.resubmittedAt)).length > 0, 10_000, "the new review turn");
+    await drain(b.f);
+    // Besides the replayed W2's own baseline turn, the resubmission gets one.
+    const turns = (await reviewerTurnsAfter(b.f, second.resubmittedAt))
+      .filter(run => !run.retryOfRunId && run.wakeupRequestId !== replayedW2);
+    expect(turns).toHaveLength(1);
+    expect(turns[0]!.contextSnapshot).not.toHaveProperty("decidedReviewContinuation");
+    const settled = await db.select().from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.sourceIssueId, b.f.issueId), sql`${issueRecoveryActions.evidence} ? 'decidedReviewContinuation'`,
+    ));
+    expect(settled.length).toBeGreaterThan(0);
+    for (const hold of settled) expect(hold.evidence.decidedReviewContinuation).toMatchObject({ ...served, successorRunId: s!.id });
+
+    // (d) A pass carrying the old identity afterwards: stale, no run.
+    const beforeLate = new Date();
+    await heartbeat.wakeup(b.f.reviewerId, { ...oldW1, idempotencyKey: `${oldW1.idempotencyKey}:late` });
+    await pass();
+    expect(await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId, b.f.reviewerId), gt(agentWakeupRequests.createdAt, beforeLate),
+    ))).toEqual([expect.objectContaining({ status: "skipped", reason: "decided_review_continuation_stale",
+      payload: expect.objectContaining({ decidedReviewContinuationOutcome: expect.objectContaining({ detail: "identity_changed", ...fresh }) }) })]);
+    expect(await reviewerTurnsAfter(b.f, beforeLate)).toEqual([]);
+  }, 90_000);
+
+  it("leaves a Board --resume on the held review to the explicit continuation path", async () => {
+    const b = await heldBase();
+    const identity = (await readIdentity(b.f))!;
+    expect(identity).toMatchObject({ decisionId: b.decision.id });
+    await sweepToBlocked(b);
+    await b.releaseLease();
+    // (c) / 12(a): as in the incident, the Board comments on the blocked task
+    // with explicit continuation intent through the real route.
+    const board = app({ type: "board", userId: b.f.userId, companyIds: [b.f.companyId], source: "local_implicit", isInstanceAdmin: true, runId: null });
+    const comment = await request(board).post(`/api/issues/${b.f.issueId}/comments`).send({ body: "Please review the resubmission.", resume: true });
+    expect(comment.status, JSON.stringify(comment.body)).toBe(201);
+    await waitFor(async () => (await reviewerTurnsAfter(b.f, b.resubmittedAt)).length > 0, 10_000, "the Board's continuation");
+    const [boardRun] = await reviewerTurnsAfter(b.f, b.resubmittedAt);
+    expect(boardRun!.contextSnapshot).not.toHaveProperty("decidedReviewContinuation");
+    expect(await blockingHolds(b.f)).toEqual([]);
+    await drain(b.f);
+    // The route reopened the blocked task for the Board's turn, so the
+    // submission no longer stands for review. The pass's wake for it,
+    // arriving after the release, is skipped as stale and starts nothing.
+    expect((await readTask(b.f)).status).toBe("todo");
+    expect(await readIdentity(b.f)).toBeNull();
+    const beforeLate = new Date();
+    await heartbeat.wakeup(b.f.reviewerId, buildDecidedReviewContinuationWakeup({ issueId: b.f.issueId, sourceRunId: b.r.runId, ...identity }));
+    await pass();
+    await drain(b.f);
+    expect(await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId, b.f.reviewerId), gt(agentWakeupRequests.createdAt, beforeLate),
+    ))).toEqual([expect.objectContaining({ status: "skipped", reason: "decided_review_continuation_stale", runId: null,
+      payload: expect.objectContaining({ decidedReviewContinuationOutcome: { detail: "identity_unavailable" } }) })]);
+    expect((await reviewerTurnsAfter(b.f, b.resubmittedAt)).filter(run => !run.retryOfRunId).map(run => run.id)).toEqual([boardRun!.id]);
+    expect(await db.select().from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.sourceIssueId, b.f.issueId), sql`${issueRecoveryActions.evidence} ? 'decidedReviewContinuation'`,
+    ))).toEqual([]);
+  }, 60_000);
+
+
+  it("seeds detached reviewers and unrelated runs with the column shape of real runs", async () => {
+    const f = await seedReview();
+    const launched = await heartbeat.wakeup(f.reviewerId, {
+      source: "assignment", triggerDetail: "system", reason: "execution_review_requested", payload: { issueId: f.issueId },
+      contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "execution_review_requested" },
+    });
+    await waitFor(async () => {
+      const run = await heartbeat.getRun(launched!.id);
+      return run?.status === "running" && Boolean(run.processPid && run.processGroupId);
+    }, 15_000, "a real reviewer launch");
+    const real = (await heartbeat.getRun(launched!.id))!;
+    ownedPids.add(real.processPid!); ownedGroups.add(real.processGroupId!);
+    expect(real.controllerLeaseExpiresAt!.getTime()).toBeGreaterThan(Date.now());
+
+    const columns = ["status", "runtimeMode", "runtimeModeResolvedAt", "startedAt", "processPid", "processGroupId",
+      "processStartedAt", "controllerBootId", "controllerLeaseExpiresAt", "wakeupRequestId", "responsibleUserId"] as const;
+    const pattern = (run: typeof heartbeatRuns.$inferSelect, keys: readonly (keyof typeof run)[]) =>
+      Object.fromEntries(keys.map(key => [key, run[key] === null ? null : typeof run[key]]));
+    const seeded = await seedDetachedLegacyReviewerRun(f);
+    const seededRun = (await heartbeat.getRun(seeded.runId))!;
+    expect(pattern(seededRun, columns)).toEqual(pattern(real, columns));
+    expect(seededRun.runtimeMode).toBe(real.runtimeMode);
+    expect(Object.keys(real.contextSnapshot ?? {})).toEqual(expect.arrayContaining(Object.keys(seededRun.contextSnapshot ?? {})));
+    // Declared differences: a foreign controller whose lease already expired.
+    expect(seededRun.controllerBootId).not.toBe(real.controllerBootId);
+    expect(seededRun.controllerLeaseExpiresAt!.getTime()).toBeLessThan(Date.now());
+
+    await heartbeat.cancelRun(real.id);
+    await heartbeat.drainActiveRunExecutions();
+    await waitFor(() => !isAlive(real.processPid!) && !isAlive(-real.processGroupId!), 5_000, "the real launch to stop");
+    const terminal = (await heartbeat.getRun(real.id))!;
+    const unrelated = (await heartbeat.getRun(await seedStartedUnrelatedRun(f)))!;
+    const terminalColumns = ["runtimeMode", "runtimeModeResolvedAt", "startedAt", "finishedAt", "wakeupRequestId", "responsibleUserId"] as const;
+    expect(pattern(unrelated, terminalColumns)).toEqual(pattern(terminal, terminalColumns));
+  }, 60_000);
+
 });
