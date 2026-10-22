@@ -1219,11 +1219,13 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     const b = await heldBase();
     await fs.rm(b.f.gate, { force: true });
     await b.releaseLease();
-    // 25 newer held reviews with no decision, keyed to sort ahead of b.
+    // 25 newer held reviews in the decided shape whose decision never proves
+    // for them, keyed to sort ahead of b.
+    const { executionState } = await readTask(b.f);
     for (let i = 0; i < 25; i += 1) {
       const issueId = `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`;
       await db.insert(issues).values({ id: issueId, companyId: b.f.companyId, title: `Unproved ${i}`, status: "in_review",
-        priority: "medium", assigneeAgentId: b.f.reviewerId, issueNumber: 100 + i, identifier: `UNPROVED-${i}` });
+        priority: "medium", assigneeAgentId: b.f.reviewerId, issueNumber: 100 + i, identifier: `UNPROVED-${i}`, executionState });
       await db.insert(issueRecoveryActions).values({ companyId: b.f.companyId, sourceIssueId: issueId, kind: "active_run_watchdog",
         status: "resolved", outcome: "blocked", ownerType: "board", returnOwnerAgentId: b.f.reviewerId,
         cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${randomUUID()}`,

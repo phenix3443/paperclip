@@ -526,8 +526,12 @@ export async function isSupersededReviewRequest(db: Db, input: { companyId: stri
   // A parked row keeps its original reason in the deferred wake context.
   const deferredContext = evidenceObject(payload?._paperclipWakeContext);
   const reason = typeof deferredContext?.wakeReason === "string" ? deferredContext.wakeReason : wake.reason;
-  const carriesInput = Boolean(payload?.commentId || deferredContext?.commentId ||
-    (Array.isArray(payload?.queuedCommentIds) && payload.queuedCommentIds.length));
+  // Same notion of new input as the admission gate: any of it makes this W3.
+  const carriesInput = wake.idempotencyKey?.startsWith("chat-inbound:") ||
+    ["commentId", "wakeCommentId", "failedRunId", "taskRetryRequestId", "nativeStatusWakeIntentId",
+      "interactionId", "interactionKind", "interactionStatus", "continuationPolicy"]
+      .some(key => Boolean(payload?.[key] || deferredContext?.[key])) ||
+    [payload?.queuedCommentIds, deferredContext?.queuedCommentIds].some(ids => Array.isArray(ids) && ids.length > 0);
   if (classifyDecidedReviewWake({ agentId: wake.agentId, reason, source: wake.source,
     requestedByActorType: wake.requestedByActorType, payload, carriesInput }, participant) !== "W2") return false;
   const [continued] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
@@ -593,6 +597,12 @@ function decidedReviewCandidate() {
         sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`)),
     sql`not (${issueRecoveryActions.evidence} ? 'decidedReviewContinuation')`,
     inArray(issues.status, ["in_review", "blocked"]),
+    // Only a pending review an agent already decided can ever prove, so other
+    // legacy holds never keep the pass scheduled.
+    sql`${issues.executionState}->>'status' = 'pending'`,
+    sql`${issues.executionState}->>'currentStageType' = 'review'`,
+    sql`${issues.executionState}->'currentParticipant'->>'type' = 'agent'`,
+    sql`${issues.executionState}->>'lastDecisionId' is not null`,
   );
 }
 
