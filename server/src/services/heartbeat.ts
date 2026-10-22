@@ -27852,6 +27852,11 @@ export function heartbeatService(
             });
             return { kind: "coalesced" as const, run: successor! };
           }
+          // Kept so a wake that fails the final proof is parked as it arrived.
+          const contextBeforeDecidedReview = {
+            forceFreshSession: enrichedContextSnapshot.forceFreshSession,
+            previousRunId: enrichedContextSnapshot.previousRunId,
+          };
           if (decidedReview.kind === "admit") {
             // A fresh review of the new submission, never a resume of the stopped run.
             enrichedContextSnapshot.forceFreshSession = true;
@@ -28817,6 +28822,11 @@ export function heartbeatService(
                 decisionId: proof.decisionId,
                 resubmissionActivityId: proof.resubmissionActivityId,
               };
+            } else {
+              for (const [key, value] of Object.entries(contextBeforeDecidedReview)) {
+                if (value === undefined) delete enrichedContextSnapshot[key];
+                else enrichedContextSnapshot[key] = value;
+              }
             }
           }
           const explicitContinuation = decidedReviewAdmitted ? null : await admitExplicitNativeContinuation({

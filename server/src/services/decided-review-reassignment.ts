@@ -187,7 +187,7 @@ export async function selectDecidedReviewSource(
   const newer = await db.select().from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, task.companyId), eq(heartbeatRuns.agentId, agentId),
     or(eq(heartbeatRuns.nativeIssueId, task.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${task.id}`),
-    sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (select created_at, id from heartbeat_runs where id = ${source.id})`,
+    sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (select created_at, id from heartbeat_runs where company_id = ${task.companyId} and id = ${source.id})`,
   )).orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id));
   const fingerprints = (ids: string[]) => ids.map(id => `legacy-execution:${id}`);
   const chain: Run[] = [];
@@ -378,7 +378,7 @@ export async function admitDecidedReviewContinuation(
         },
         decidedReviewContinuation: record,
       },
-    }).where(eq(issueRecoveryActions.id, hold.id));
+    }).where(and(eq(issueRecoveryActions.companyId, proof.task.companyId), eq(issueRecoveryActions.id, hold.id)));
   }
   const holdIds = proof.holds.map(hold => hold.id);
   const parked = await db.select().from(agentWakeupRequests).where(and(
@@ -532,6 +532,8 @@ export function buildDecidedReviewContinuationWakeup(input: {
   };
 }
 
+class RestoreNotProved extends Error {}
+
 type Wakeup = (agentId: string, options: ReturnType<typeof buildDecidedReviewContinuationWakeup>) => Promise<unknown>;
 
 /**
@@ -574,11 +576,17 @@ export async function continueDecidedReviewReassignments(db: Db, wakeup: Wakeup)
           details: { status: "in_review", _previous: { status: task.status }, source: "decided_review_continuation",
             decisionId: proof.decisionId, resubmissionActivityId: proof.resubmissionActivityId },
         });
-        const [restored] = await tx.select().from(issues).where(eq(issues.id, task.id));
+        const [restored] = await tx.select().from(issues).where(and(
+          eq(issues.companyId, task.companyId), eq(issues.id, task.id),
+        ));
         proof = await proveDecidedReviewContinuation(tx as unknown as Db, { task: restored! });
-        if (proof.kind !== "proved" || proof.shape !== "in_review") return null;
+        // Never keep a restore the proof no longer justifies.
+        if (proof.kind !== "proved" || proof.shape !== "in_review") throw new RestoreNotProved();
       }
       return proof;
+    }).catch(error => {
+      if (error instanceof RestoreNotProved) return null;
+      throw error;
     });
     if (!proved) continue;
     await wakeup(proved.source.agentId, buildDecidedReviewContinuationWakeup({
