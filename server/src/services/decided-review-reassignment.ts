@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, inArray, isNull, ne, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNull, ne, notInArray, or, sql } from "drizzle-orm";
 import {
   activityLog,
   agentWakeupRequests,
@@ -506,6 +506,50 @@ export async function decidedReviewAdmission(db: Db, input: {
     )).limit(1)).length > 0,
     prove: () => proveDecidedReviewContinuation(db, { task }),
   });
+}
+
+/**
+ * Release-drain guard for a parked review request (W2). On an issue whose
+ * review was continued here, a request made before the current submission
+ * belongs to an earlier one. When the current submission's own request is
+ * already recorded, promoting the older copy would start a second review turn.
+ */
+export async function isSupersededReviewRequest(db: Db, input: { companyId: string; issueId: string; wakeId: string }) {
+  const [wake] = await db.select().from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.id, input.wakeId),
+  )).limit(1);
+  const [task] = await db.select().from(issues).where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)));
+  if (!wake || !task) return false;
+  const payload = evidenceObject(wake.payload);
+  const state = readState(task);
+  const participant = state?.currentParticipant?.type === "agent" ? state.currentParticipant.agentId ?? null : null;
+  // A parked row keeps its original reason in the deferred wake context.
+  const deferredContext = evidenceObject(payload?._paperclipWakeContext);
+  const reason = typeof deferredContext?.wakeReason === "string" ? deferredContext.wakeReason : wake.reason;
+  const carriesInput = Boolean(payload?.commentId || deferredContext?.commentId ||
+    (Array.isArray(payload?.queuedCommentIds) && payload.queuedCommentIds.length));
+  if (classifyDecidedReviewWake({ agentId: wake.agentId, reason, source: wake.source,
+    requestedByActorType: wake.requestedByActorType, payload, carriesInput }, participant) !== "W2") return false;
+  const [continued] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.companyId, task.companyId), eq(issueRecoveryActions.sourceIssueId, task.id),
+    sql`${issueRecoveryActions.evidence} ? 'decidedReviewContinuation'`,
+  )).limit(1);
+  if (!continued) return false;
+  const identity = await currentSubmissionIdentity(db, task, wake.agentId);
+  if (!identity) return false;
+  const [resubmission] = await db.select({ createdAt: activityLog.createdAt }).from(activityLog).where(and(
+    eq(activityLog.companyId, task.companyId), eq(activityLog.id, identity.resubmissionActivityId),
+  )).limit(1);
+  if (!resubmission || wake.requestedAt >= resubmission.createdAt) return false;
+  const [own] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, task.companyId), eq(agentWakeupRequests.agentId, wake.agentId),
+    ne(agentWakeupRequests.id, wake.id),
+    sql`coalesce(${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'wakeReason', ${agentWakeupRequests.reason}) = ${REVIEW_REQUEST_REASON}`,
+    sql`${agentWakeupRequests.payload}->>'issueId' = ${task.id}`,
+    gte(agentWakeupRequests.requestedAt, resubmission.createdAt),
+    notInArray(agentWakeupRequests.status, ["skipped", "cancelled", "failed"]),
+  )).limit(1);
+  return Boolean(own);
 }
 
 /** The pass's wake. Exported so tests can send the exact production shape. */
