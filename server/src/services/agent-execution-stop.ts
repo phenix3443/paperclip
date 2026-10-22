@@ -7,14 +7,25 @@ import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
 import { legacyControllerBootId } from "./legacy-controller-lease.js";
 import { execFile } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { uptime } from "node:os";
 
 /** Host facts used as stop evidence. Each returns null when the platform cannot answer. */
 export type HostProcessProbe = {
+  bootedAt(): Date | null;
   groupMemberPids(processGroupId: number): Promise<number[] | null>;
   processStartedAt(pid: number): Promise<string | null>;
 };
 
 export const hostProcessProbe: HostProcessProbe = {
+  bootedAt() {
+    // Linux uptime excludes suspend, so it would place the boot too late; read btime instead.
+    if (process.platform === "linux") {
+      const btime = /^btime (\d+)$/m.exec(readFileSync("/proc/stat", "utf8"))?.[1];
+      return btime ? new Date(Number(btime) * 1000) : null;
+    }
+    return process.platform === "darwin" ? new Date(Date.now() - uptime() * 1000) : null;
+  },
   groupMemberPids(processGroupId) {
     if (process.platform === "win32") return Promise.resolve(null);
     return new Promise(resolve => execFile("ps", ["-A", "-o", "pid=,pgid="], { encoding: "utf8", timeout: 1_500 },
@@ -58,6 +69,10 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[], hos
       if (run.status === "cancelled" && !runLeases.every(hasRemoteTerminationReceipt)) return false;
       continue;
     }
+    // No local process outlives a host restart, and PIDs recorded before it may belong to anything now.
+    // Superseded by paperclipai/paperclip#17204 once it merges.
+    const bootedAt = run.finishedAt ? host.bootedAt() : null;
+    if (bootedAt && run.finishedAt && bootedAt.getTime() > run.finishedAt.getTime()) continue;
     let processAlive = Boolean(run.processPid && !absent(run.processPid));
     let groupAlive = Boolean(run.processGroupId && !absent(-run.processGroupId));
     if (processAlive && run.processStartedAt) {

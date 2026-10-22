@@ -349,6 +349,17 @@ const support = await getEmbeddedPostgresTestSupport();
     expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, run.id)))[0]).toMatchObject({ leaseOwner: null, leaseExpiresAt: null });
   });
 
+  it("treats a host restart after a run ended as proof that its local process is gone", async () => {
+    const agent = await hire();
+    const finishedAt = new Date(Date.now() - 60_000);
+    await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, status: "succeeded", invocationSource: "on_demand",
+      runtimeMode: "legacy", startedAt: finishedAt, finishedAt, processPid: process.pid, processGroupId: process.pid });
+    const probe = (bootedAt: Date) => ({ bootedAt: () => bootedAt, groupMemberPids: async () => [process.pid],
+      processStartedAt: async () => new Date(0).toISOString() });
+    expect(await agentExecutionsHaveStopped(db, [agent.id], probe(new Date(finishedAt.getTime() - 1_000)))).toBe(false);
+    expect(await agentExecutionsHaveStopped(db, [agent.id], probe(new Date()))).toBe(true);
+  });
+
   it("ignores a reused process group whose members all started after the run ended", async () => {
     const agent = await hire();
     const finishedAt = new Date(Date.now() - 60_000);
@@ -356,7 +367,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const processGroupId = Number(execFileSync("ps", ["-o", "pgid=", "-p", String(process.pid)], { encoding: "utf8" }).trim());
     await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, status: "succeeded", invocationSource: "on_demand",
       runtimeMode: "legacy", startedAt: finishedAt, finishedAt, processPid: 2_000_000_000, processGroupId });
-    const probe = (memberStartedAt: Date) => ({ groupMemberPids: async () => [process.pid],
+    const probe = (memberStartedAt: Date) => ({ bootedAt: () => null, groupMemberPids: async () => [process.pid],
       processStartedAt: async () => memberStartedAt.toISOString() });
     expect(await agentExecutionsHaveStopped(db, [agent.id], probe(new Date(finishedAt.getTime() - 1_000)))).toBe(false);
     expect(await agentExecutionsHaveStopped(db, [agent.id], { ...probe(new Date()), groupMemberPids: async () => null })).toBe(false);
@@ -368,7 +379,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, status: "cancelled", invocationSource: "on_demand",
       runtimeMode: "legacy", executionStage: "dispatching", startedAt: new Date(), finishedAt: new Date(),
       controllerBootId: randomUUID(), controllerLeaseExpiresAt: new Date(Date.now() - 1_000) }).returning();
-    const probe = { groupMemberPids: async () => null, processStartedAt: async () => null };
+    const probe = { bootedAt: () => null, groupMemberPids: async () => null, processStartedAt: async () => null };
     expect(await agentExecutionsHaveStopped(db, [agent.id], probe)).toBe(false);
     await db.update(heartbeatRuns).set({ executionStage: "preparing", controllerBootId: null }).where(eq(heartbeatRuns.id, run.id));
     expect(await agentExecutionsHaveStopped(db, [agent.id], probe)).toBe(false);
