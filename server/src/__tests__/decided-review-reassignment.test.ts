@@ -1189,7 +1189,7 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     expect(await reviewerTurnsAfter(b.f, beforeLate)).toEqual([]);
   }, 90_000);
 
-  it.skip("gives a submission one turn when an older parked review request promotes before its own request arrives", async () => {
+  it("gives a submission one turn when an older parked review request promotes before its own request arrives", async () => {
     const b = await heldBase();
     await fs.rm(b.f.gate, { force: true });
     await b.releaseLease();
@@ -1215,9 +1215,15 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     await fs.writeFile(b.f.gate, "open");
     const second = await resubmitWithSuppressedReviewRequest(b.f);
     const fresh = (await readIdentity(b.f))!;
-    await heartbeat.resumeQueuedRuns();
+    // A Board comment is new work; its turn's release drains the older request.
+    const board = app({ type: "board", userId: b.f.userId, companyIds: [b.f.companyId], source: "local_implicit", isInstanceAdmin: true, runId: null });
+    const comment = await request(board).post(`/api/issues/${b.f.issueId}/comments`).send({ body: "Please look at the edge cases too." });
+    expect(comment.status, JSON.stringify(comment.body)).toBe(201);
+    await waitFor(async () => (await reviewerTurnsAfter(b.f, second.resubmittedAt)).length > 0, 10_000, "the comment's turn");
     await drain(b.f);
-    const promoted = (await reviewerTurnsAfter(b.f, second.resubmittedAt)).filter(run => !run.retryOfRunId);
+    const reviewTurns = async () => (await reviewerTurnsAfter(b.f, second.resubmittedAt))
+      .filter(run => !run.retryOfRunId && run.contextSnapshot?.wakeReason !== "issue_commented");
+    const promoted = await reviewTurns();
     expect(promoted.map(run => ({ wakeupRequestId: run.wakeupRequestId, submission: run.contextSnapshot?.decidedReviewSubmission })))
       .toEqual([{ wakeupRequestId: old!.id, submission: fresh }]);
     expect((await readTask(b.f)).status).toBe("in_review");
@@ -1226,7 +1232,7 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     const beforeLate = new Date();
     await heartbeat.wakeup(b.f.reviewerId, await authorReviewRequest(b.f));
     await drain(b.f);
-    expect((await reviewerTurnsAfter(b.f, second.resubmittedAt)).filter(run => !run.retryOfRunId)).toHaveLength(1);
+    expect(await reviewTurns()).toHaveLength(1);
     expect(await db.select().from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.agentId, b.f.reviewerId), gt(agentWakeupRequests.createdAt, beforeLate),
     ))).toEqual([expect.objectContaining({ status: "skipped", reason: "decided_review_continuation_consumed",
