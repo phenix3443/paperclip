@@ -6,7 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import express from "express";
 import request from "supertest";
-import { and, asc, eq, gt, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -303,6 +303,10 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
         .from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.authorId));
       throw new Error(`${(error as Error).message}: ${JSON.stringify({ runs, wakes })}`);
     });
+    const suppressed = async () => (await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId, f.reviewerId), eq(agentWakeupRequests.reason, "heartbeat.scheduling_suppressed"),
+    ))).length;
+    const suppressedBefore = await suppressed();
     const resubmittedAt = new Date();
     process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS = "true";
     try {
@@ -310,9 +314,7 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
         .patch(`/api/issues/${f.issueId}`).send({ status: "done", comment: "Handled the empty input case." });
       expect(response.status, JSON.stringify(response.body)).toBe(200);
       // The route sends the review request after responding.
-      await waitFor(async () => (await db.select().from(agentWakeupRequests).where(and(
-        eq(agentWakeupRequests.agentId, f.reviewerId), eq(agentWakeupRequests.reason, "heartbeat.scheduling_suppressed"),
-      ))).length === 1, 5_000, "the suppressed review request");
+      await waitFor(async () => await suppressed() === suppressedBefore + 1, 5_000, "the suppressed review request");
     } finally {
       delete process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS;
     }
@@ -878,7 +880,7 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
   async function authorReviewRequest(f: Fixture) {
     const [receipt] = await db.select().from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.agentId, f.reviewerId), eq(agentWakeupRequests.reason, "heartbeat.scheduling_suppressed"),
-    ));
+    )).orderBy(desc(agentWakeupRequests.createdAt)).limit(1);
     const { heartbeatSkip: _skip, ...payload } = receipt!.payload as Record<string, unknown>;
     expect(payload).toMatchObject({ issueId: f.issueId, mutation: "update" });
     return {
@@ -1168,7 +1170,7 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     expect(turns).toHaveLength(1);
     expect(turns[0]!.wakeupRequestId).not.toBe(replayedW2);
     const [w2] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, replayedW2));
-    expect(w2).toMatchObject({ status: "cancelled", error: "Superseded by the current submission's review request" });
+    expect(w2).toMatchObject({ status: "cancelled", error: "Superseded by the current submission's review turn" });
     expect(turns[0]!.contextSnapshot).not.toHaveProperty("decidedReviewContinuation");
     const settled = await db.select().from(issueRecoveryActions).where(and(
       eq(issueRecoveryActions.sourceIssueId, b.f.issueId), sql`${issueRecoveryActions.evidence} ? 'decidedReviewContinuation'`,
@@ -1185,6 +1187,50 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     ))).toEqual([expect.objectContaining({ status: "skipped", reason: "decided_review_continuation_stale",
       payload: expect.objectContaining({ decidedReviewContinuationOutcome: expect.objectContaining({ detail: "identity_changed", ...fresh }) }) })]);
     expect(await reviewerTurnsAfter(b.f, beforeLate)).toEqual([]);
+  }, 90_000);
+
+  it.skip("gives a submission one turn when an older parked review request promotes before its own request arrives", async () => {
+    const b = await heldBase();
+    await fs.rm(b.f.gate, { force: true });
+    await b.releaseLease();
+    await pass();
+    const [s] = await reviewerTurnsAfter(b.f, b.resubmittedAt);
+    await waitFor(async () => (await heartbeat.getRun(s!.id))?.status === "running" &&
+      (await readTask(b.f)).executionRunId === s!.id, 10_000, "the successor to run");
+    const decided = await request(app({ type: "agent", source: "agent_key", companyId: b.f.companyId, agentId: b.f.reviewerId, runId: s!.id }))
+      .patch(`/api/issues/${b.f.issueId}`).send({ status: "in_progress", comment: "The null case still throws." });
+    expect(decided.status, JSON.stringify(decided.body)).toBe(200);
+    await waitFor(async () => ["cancelled", "succeeded"].includes((await heartbeat.getRun(s!.id))?.status ?? ""), 10_000, "S to stop");
+
+    // An older review request parks behind the author's turn.
+    const beforeOld = new Date();
+    await heartbeat.wakeup(b.f.reviewerId, await authorReviewRequest(b.f));
+    const [old] = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId, b.f.reviewerId), gt(agentWakeupRequests.createdAt, beforeOld),
+    ));
+    expect(old).toMatchObject({ status: "deferred_issue_execution" });
+
+    // Barrier: the resubmission commits, and its own request is held back
+    // while the author's release promotes the older request.
+    await fs.writeFile(b.f.gate, "open");
+    const second = await resubmitWithSuppressedReviewRequest(b.f);
+    const fresh = (await readIdentity(b.f))!;
+    await heartbeat.resumeQueuedRuns();
+    await drain(b.f);
+    const promoted = (await reviewerTurnsAfter(b.f, second.resubmittedAt)).filter(run => !run.retryOfRunId);
+    expect(promoted.map(run => ({ wakeupRequestId: run.wakeupRequestId, submission: run.contextSnapshot?.decidedReviewSubmission })))
+      .toEqual([{ wakeupRequestId: old!.id, submission: fresh }]);
+    expect((await readTask(b.f)).status).toBe("in_review");
+
+    // The held request arrives after that turn ended without a decision.
+    const beforeLate = new Date();
+    await heartbeat.wakeup(b.f.reviewerId, await authorReviewRequest(b.f));
+    await drain(b.f);
+    expect((await reviewerTurnsAfter(b.f, second.resubmittedAt)).filter(run => !run.retryOfRunId)).toHaveLength(1);
+    expect(await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId, b.f.reviewerId), gt(agentWakeupRequests.createdAt, beforeLate),
+    ))).toEqual([expect.objectContaining({ status: "skipped", reason: "decided_review_continuation_consumed",
+      payload: expect.objectContaining({ decidedReviewContinuationOutcome: { successorRunId: promoted[0]!.id, ...fresh } }) })]);
   }, 90_000);
 
   it("leaves a parked interaction wake to its own promotion when the successor folds the holds' wakes", async () => {

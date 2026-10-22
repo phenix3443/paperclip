@@ -3209,6 +3209,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             forceFreshSession: enrichedContextSnapshot.forceFreshSession,
             previousRunId: enrichedContextSnapshot.previousRunId,
           };
+          if (decidedReview.kind === "continue" && decidedReview.serves) {
+            enrichedContextSnapshot.decidedReviewSubmission = decidedReview.serves;
+          }
           if (decidedReview.kind === "admit") {
             // A fresh review of the new submission, never a resume of the stopped run.
             enrichedContextSnapshot.forceFreshSession = true;

@@ -307,18 +307,25 @@ async function runReleaseDrain(
       continue;
     }
 
-    // The current submission's own review request supersedes an older parked
-    // copy, so the release does not start a second turn for one submission.
-    if (await ports.transaction.isSupersededReviewRequest({
+    // One turn per submission on a continued review, whichever request
+    // starts it first. A promoted request records the submission it serves.
+    const reviewRequest = await ports.transaction.parkedReviewRequestSubmission({
       companyId: run.companyId, issueId: issue.id, wakeId: workingCandidate.id,
-    })) {
+    });
+    if (reviewRequest?.kind === "superseded") {
       await ports.transaction.cancelDeferredWake({
         companyId: run.companyId,
         wakeId: workingCandidate.id,
-        reason: "Superseded by the current submission's review request",
+        reason: "Superseded by the current submission's review turn",
         now: input.now,
       });
       continue;
+    }
+    if (reviewRequest?.kind === "serves") {
+      workingCandidate = {
+        ...workingCandidate,
+        deferredContextSeed: { ...workingCandidate.deferredContextSeed, decidedReviewSubmission: reviewRequest.submission },
+      };
     }
 
     // Unreachable: decideWakeOutcome only returns "promote" when agentFound and invokable are both true.

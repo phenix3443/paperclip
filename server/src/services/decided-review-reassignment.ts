@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, gte, inArray, isNull, ne, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import {
   activityLog,
   agentWakeupRequests,
@@ -41,6 +41,8 @@ type Decision = typeof issueExecutionDecisions.$inferSelect;
 const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
 export const DECIDED_REVIEW_CONTINUATION_REPLAY = "decided_review_continuation_v1";
 const REVIEW_REQUEST_REASON = "execution_review_requested";
+/** Run context key naming the submission a review request's turn serves. */
+export const SUBMISSION_STAMP = "decidedReviewSubmission";
 
 /** A submission is the recorded decision plus the author's later resubmission. */
 export type SubmissionIdentity = { decisionId: string; resubmissionActivityId: string };
@@ -161,6 +163,34 @@ export async function findConsumption(
   return (evidenceObject(row?.evidence.decidedReviewContinuation) as DecidedReviewConsumption | null) ?? null;
 }
 
+/**
+ * The review turn already started for one submission on a continued review:
+ * the continuation's own successor, or a run stamped with that submission by
+ * the review request that started it. Both entry points read this record.
+ */
+export async function findSubmissionTurn(
+  db: Db, task: Pick<Task, "companyId" | "id">, identity: SubmissionIdentity,
+): Promise<{ successorRunId: string } | null> {
+  const consumed = await findConsumption(db, task, identity);
+  if (consumed) return { successorRunId: consumed.successorRunId };
+  const [run] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, task.companyId),
+    or(eq(heartbeatRuns.nativeIssueId, task.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${task.id}`),
+    sql`${heartbeatRuns.contextSnapshot}->'decidedReviewSubmission'->>'decisionId' = ${identity.decisionId}`,
+    sql`${heartbeatRuns.contextSnapshot}->'decidedReviewSubmission'->>'resubmissionActivityId' = ${identity.resubmissionActivityId}`,
+  )).orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id)).limit(1);
+  return run ? { successorRunId: run.id } : null;
+}
+
+/** Whether a review on this task was ever continued here. Only those dedupe review requests. */
+async function isContinuedReview(db: Db, task: Pick<Task, "companyId" | "id">) {
+  const [continued] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.companyId, task.companyId), eq(issueRecoveryActions.sourceIssueId, task.id),
+    sql`${issueRecoveryActions.evidence} ? 'decidedReviewContinuation'`,
+  )).limit(1);
+  return Boolean(continued);
+}
+
 function isBlockingHold(hold: Hold) {
   return ["active", "escalated"].includes(hold.status) ||
     evidenceObject(hold.evidence.automaticRecovery)?.replay === "blocked";
@@ -183,7 +213,7 @@ export async function selectDecidedReviewSource(
   const source = await readRun(db, task.companyId, decision.createdByRunId);
   if (!source || source.agentId !== agentId || runIssueId(source) !== task.id) return { kind: "none", rule: "decision_run_not_participant" };
   const submission = identity === undefined ? await currentSubmissionIdentity(db, task, agentId) : identity;
-  if (submission && await findConsumption(db, task, submission)) return { kind: "none", rule: "consumed" };
+  if (submission && await findSubmissionTurn(db, task, submission)) return { kind: "none", rule: "consumed" };
   const newer = await db.select().from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, task.companyId), eq(heartbeatRuns.agentId, agentId),
     or(eq(heartbeatRuns.nativeIssueId, task.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${task.id}`),
@@ -411,14 +441,17 @@ export type DecidedReviewWake = {
 };
 
 export type DecidedReviewAdmissionOutcome =
-  | { kind: "continue" }
+  | { kind: "continue"; serves?: SubmissionIdentity }
   | { kind: "skip"; reason: string; detail: Record<string, unknown> }
   | { kind: "coalesce"; runId: string }
   | { kind: "admit"; identity: SubmissionIdentity };
 
 export type DecidedReviewAdmissionReads = {
   identity(): Promise<SubmissionIdentity | null>;
-  consumption(identity: SubmissionIdentity): Promise<DecidedReviewConsumption | null>;
+  /** The turn already started for this submission, by either entry point. */
+  consumption(identity: SubmissionIdentity): Promise<{ successorRunId: string } | null>;
+  /** True when a review on this task was continued here before. */
+  continued(): Promise<boolean>;
   /** True when the recorded successor still owns the issue execution. */
   successorActive(runId: string): Promise<boolean>;
   select(identity: SubmissionIdentity): Promise<{ kind: "selected" } | { kind: "none"; rule: string; runId?: string }>;
@@ -467,18 +500,22 @@ export async function decideDecidedReviewAdmission(
       ? { kind: "coalesce", runId: consumed.successorRunId }
       : { kind: "skip", reason: "decided_review_continuation_consumed", detail: { successorRunId: consumed.successorRunId, ...identity } };
   }
+  // A review request that starts an ordinary turn records the submission it
+  // serves, so a later copy from either entry point finds that turn above.
+  const ordinary = async (): Promise<DecidedReviewAdmissionOutcome> =>
+    await reads.continued() ? { kind: "continue", serves: identity } : { kind: "continue" };
   const selected = await reads.select(identity);
   if (selected.kind === "none") {
     return recovery
       ? { kind: "skip", reason: "decided_review_continuation_not_eligible", detail: { rule: selected.rule, runId: selected.runId ?? null, ...identity } }
-      : { kind: "continue" };
+      : await ordinary();
   }
   if (!(await reads.hasBlocker())) {
-    return recovery ? { kind: "skip", reason: "decided_review_continuation_not_held", detail: { ...identity } } : { kind: "continue" };
+    return recovery ? { kind: "skip", reason: "decided_review_continuation_not_held", detail: { ...identity } } : await ordinary();
   }
   const proof = await reads.prove();
   if (proof.kind === "hold") {
-    return recovery ? { kind: "skip", reason: "decided_review_continuation_unproven", detail: { predicate: proof.reason, ...identity } } : { kind: "continue" };
+    return recovery ? { kind: "skip", reason: "decided_review_continuation_unproven", detail: { predicate: proof.reason, ...identity } } : await ordinary();
   }
   return { kind: "admit", identity };
 }
@@ -494,7 +531,8 @@ export async function decidedReviewAdmission(db: Db, input: {
   const wakeClass = classifyDecidedReviewWake(input.wake, participant);
   return decideDecidedReviewAdmission(wakeClass, input.wake, {
     identity: () => currentSubmissionIdentity(db, task, input.wake.agentId),
-    consumption: identity => findConsumption(db, task, identity),
+    consumption: identity => findSubmissionTurn(db, task, identity),
+    continued: () => isContinuedReview(db, task),
     successorActive: async runId => {
       const run = await readRun(db, task.companyId, runId);
       return Boolean(run && ["queued", "running"].includes(run.status) && task.executionRunId === run.id);
@@ -509,17 +547,19 @@ export async function decidedReviewAdmission(db: Db, input: {
 }
 
 /**
- * Release-drain guard for a parked review request (W2). On an issue whose
- * review was continued here, a request made before the current submission
- * belongs to an earlier one. When the current submission's own request is
- * already recorded, promoting the older copy would start a second review turn.
+ * Release-drain check for a parked review request (W2) on a continued review.
+ * The current submission gets one turn whichever entry point starts it first:
+ * a request whose submission already has a turn is superseded, and any other
+ * is promoted as that submission's turn.
  */
-export async function isSupersededReviewRequest(db: Db, input: { companyId: string; issueId: string; wakeId: string }) {
+export async function parkedReviewRequestSubmission(
+  db: Db, input: { companyId: string; issueId: string; wakeId: string },
+): Promise<{ kind: "superseded" } | { kind: "serves"; submission: SubmissionIdentity } | null> {
   const [wake] = await db.select().from(agentWakeupRequests).where(and(
     eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.id, input.wakeId),
   )).limit(1);
   const [task] = await db.select().from(issues).where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)));
-  if (!wake || !task) return false;
+  if (!wake || !task) return null;
   const payload = evidenceObject(wake.payload);
   const state = readState(task);
   const participant = state?.currentParticipant?.type === "agent" ? state.currentParticipant.agentId ?? null : null;
@@ -533,27 +573,11 @@ export async function isSupersededReviewRequest(db: Db, input: { companyId: stri
       .some(key => Boolean(payload?.[key] || deferredContext?.[key])) ||
     [payload?.queuedCommentIds, deferredContext?.queuedCommentIds].some(ids => Array.isArray(ids) && ids.length > 0);
   if (classifyDecidedReviewWake({ agentId: wake.agentId, reason, source: wake.source,
-    requestedByActorType: wake.requestedByActorType, payload, carriesInput }, participant) !== "W2") return false;
-  const [continued] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
-    eq(issueRecoveryActions.companyId, task.companyId), eq(issueRecoveryActions.sourceIssueId, task.id),
-    sql`${issueRecoveryActions.evidence} ? 'decidedReviewContinuation'`,
-  )).limit(1);
-  if (!continued) return false;
+    requestedByActorType: wake.requestedByActorType, payload, carriesInput }, participant) !== "W2") return null;
+  if (!(await isContinuedReview(db, task))) return null;
   const identity = await currentSubmissionIdentity(db, task, wake.agentId);
-  if (!identity) return false;
-  const [resubmission] = await db.select({ createdAt: activityLog.createdAt }).from(activityLog).where(and(
-    eq(activityLog.companyId, task.companyId), eq(activityLog.id, identity.resubmissionActivityId),
-  )).limit(1);
-  if (!resubmission || wake.requestedAt >= resubmission.createdAt) return false;
-  const [own] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
-    eq(agentWakeupRequests.companyId, task.companyId), eq(agentWakeupRequests.agentId, wake.agentId),
-    ne(agentWakeupRequests.id, wake.id),
-    sql`coalesce(${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'wakeReason', ${agentWakeupRequests.reason}) = ${REVIEW_REQUEST_REASON}`,
-    sql`${agentWakeupRequests.payload}->>'issueId' = ${task.id}`,
-    gte(agentWakeupRequests.requestedAt, resubmission.createdAt),
-    notInArray(agentWakeupRequests.status, ["skipped", "cancelled", "failed"]),
-  )).limit(1);
-  return Boolean(own);
+  if (!identity) return null;
+  return await findSubmissionTurn(db, task, identity) ? { kind: "superseded" } : { kind: "serves", submission: identity };
 }
 
 /** The pass's wake. Exported so tests can send the exact production shape. */

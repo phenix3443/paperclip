@@ -36,6 +36,7 @@ function reads(overrides: Partial<DecidedReviewAdmissionReads>): DecidedReviewAd
   return {
     identity: unexpected("identity"),
     consumption: unexpected("consumption"),
+    continued: unexpected("continued"),
     successorActive: unexpected("successorActive"),
     select: unexpected("select"),
     hasBlocker: unexpected("hasBlocker"),
@@ -110,7 +111,7 @@ describe("decideDecidedReviewAdmission", () => {
   });
 
   describe("step 4: source selection for an unconsumed identity", () => {
-    const unselected = { identity: async () => identity, consumption: async () => null,
+    const unselected = { identity: async () => identity, consumption: async () => null, continued: async () => false,
       select: async () => ({ kind: "none" as const, rule: "newer_run_not_verified_pre_dispatch_wait", runId: "run-u" }) };
 
     it("skips W1 as not eligible, naming the failing rule", async () => {
@@ -123,10 +124,16 @@ describe("decideDecidedReviewAdmission", () => {
     it("lets W2 continue on the baseline path", async () => {
       await expect(decideDecidedReviewAdmission("W2", reviewRequest(), reads(unselected))).resolves.toEqual({ kind: "continue" });
     });
+
+    it("records the submission an ordinary W2 turn serves once a review was continued", async () => {
+      await expect(decideDecidedReviewAdmission("W2", reviewRequest(), reads({ ...unselected, continued: async () => true })))
+        .resolves.toEqual({ kind: "continue", serves: identity });
+    });
   });
 
   describe("step 5: proof and admission", () => {
-    const selected = { identity: async () => identity, consumption: async () => null, select: async () => ({ kind: "selected" as const }) };
+    const selected = { identity: async () => identity, consumption: async () => null, continued: async () => false,
+      select: async () => ({ kind: "selected" as const }) };
 
     it("skips W1 as not held, and lets W2 take the ordinary path, when no blocker exists", async () => {
       const r = reads({ ...selected, hasBlocker: async () => false });
