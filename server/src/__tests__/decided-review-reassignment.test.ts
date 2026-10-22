@@ -47,6 +47,7 @@ import { issueService } from "../services/issues.js";
 import {
   buildDecidedReviewContinuationWakeup,
   continueDecidedReviewReassignments,
+  type DecidedReviewScan,
   currentSubmissionIdentity,
   findConsumption,
   proveDecidedReviewContinuation,
@@ -1185,6 +1186,66 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
       payload: expect.objectContaining({ decidedReviewContinuationOutcome: expect.objectContaining({ detail: "identity_changed", ...fresh }) }) })]);
     expect(await reviewerTurnsAfter(b.f, beforeLate)).toEqual([]);
   }, 90_000);
+
+  it("leaves a parked interaction wake to its own promotion when the successor folds the holds' wakes", async () => {
+    const b = await heldBase();
+    await fs.rm(b.f.gate, { force: true });
+    await b.releaseLease();
+    const holds = await blockingHolds(b.f);
+    expect(holds.length).toBeGreaterThan(0);
+    const interactionId = randomUUID();
+    const context = { issueId: b.f.issueId, taskId: b.f.issueId, wakeReason: "issue_commented", source: "issue.interaction",
+      interactionId, interactionKind: "ask_user_questions", interactionStatus: "answered" };
+    const [parked] = await db.insert(agentWakeupRequests).values({
+      companyId: b.f.companyId, agentId: b.f.reviewerId, source: "automation", triggerDetail: "system",
+      reason: "issue_execution_deferred", status: "deferred_issue_execution", requestedByActorType: "system",
+      payload: { issueId: b.f.issueId, executionWait: { issueId: b.f.issueId, recoveryActionId: holds[0]!.id },
+        _paperclipWakeContext: context },
+    }).returning();
+    await pass();
+    const [s] = await reviewerTurnsAfter(b.f, b.resubmittedAt);
+    expect(s).toBeDefined();
+    expect(s!.contextSnapshot).toHaveProperty("decidedReviewContinuation");
+    expect(s!.contextSnapshot).not.toHaveProperty("interactionId");
+    // Not adopted by ID: the wake keeps its status, receipt and full context.
+    const [after] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, parked!.id));
+    expect(after).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    expect((after!.payload as Record<string, unknown>)._paperclipWakeContext).toEqual(context);
+    await fs.writeFile(b.f.gate, "open");
+    await drain(b.f);
+  }, 60_000);
+
+  it("rotates the pass past more than a page of newer holds that never prove", async () => {
+    const b = await heldBase();
+    await fs.rm(b.f.gate, { force: true });
+    await b.releaseLease();
+    // 25 newer held reviews with no decision, keyed to sort ahead of b.
+    for (let i = 0; i < 25; i += 1) {
+      const issueId = `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`;
+      await db.insert(issues).values({ id: issueId, companyId: b.f.companyId, title: `Unproved ${i}`, status: "in_review",
+        priority: "medium", assigneeAgentId: b.f.reviewerId, issueNumber: 100 + i, identifier: `UNPROVED-${i}` });
+      await db.insert(issueRecoveryActions).values({ companyId: b.f.companyId, sourceIssueId: issueId, kind: "active_run_watchdog",
+        status: "resolved", outcome: "blocked", ownerType: "board", returnOwnerAgentId: b.f.reviewerId,
+        cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${randomUUID()}`,
+        nextAction: "Reconcile.", resolvedAt: new Date(),
+        evidence: { runId: randomUUID(), automaticRecovery: { policy: "preserve_without_replay_v1", replay: "blocked", actionOutcome: "unknown" } } });
+    }
+    expect(b.f.issueId > "00000000-0000-4000-8000-000000000024").toBe(true);
+    const scan: DecidedReviewScan = { after: null };
+    const woken: string[] = [];
+    const wakeup = async (agentId: string, options: Parameters<typeof heartbeat.wakeup>[1]) => {
+      woken.push(String((options?.payload as Record<string, unknown> | undefined)?.issueId));
+      return heartbeat.wakeup(agentId, options);
+    };
+    expect(await continueDecidedReviewReassignments(db, wakeup, scan)).toEqual({ scanned: 25, woken: 0 });
+    expect(scan.after).not.toBeNull();
+    expect(await continueDecidedReviewReassignments(db, wakeup, scan)).toEqual({ scanned: 1, woken: 1 });
+    expect(woken).toEqual([b.f.issueId]);
+    expect(scan.after).toBeNull();
+    expect(await reviewerTurnsAfter(b.f, b.resubmittedAt)).toHaveLength(1);
+    await fs.writeFile(b.f.gate, "open");
+    await drain(b.f);
+  }, 60_000);
 
   it("leaves a Board --resume on the held review to the explicit continuation path", async () => {
     const b = await heldBase();
