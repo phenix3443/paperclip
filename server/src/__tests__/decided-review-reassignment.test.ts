@@ -559,8 +559,12 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
             automaticRecovery: { policy: "preserve_without_replay_v1", runId: q1, replay: "blocked", actionOutcome: "unknown", recordedAt: new Date().toISOString() } },
           resolvedAt: new Date() });
         const q2 = await seedQueued();
+        const gateBlocker = await getExecutionBlocker(db, f.companyId, f.issueId);
         await heartbeat.resumeQueuedRuns();
-        expect(await heartbeat.getRun(q2)).toMatchObject({ status: "cancelled", errorCode: "execution_reconciliation_required" });
+        const cancelledQ2 = (await heartbeat.getRun(q2))!;
+        expect(cancelledQ2).toMatchObject({ status: "cancelled", errorCode: "execution_reconciliation_required" });
+        // Chained to whichever hold the gate returned.
+        expect(cancelledQ2.resultJson).toMatchObject({ executionWait: { issueId: f.issueId, recoveryActionId: gateBlocker!.recoveryActionId } });
       }
       const holdIdsBefore = (await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions)
         .where(eq(issueRecoveryActions.sourceIssueId, f.issueId))).map(row => row.id);
@@ -568,6 +572,7 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
       for (let i = 0; i < 3; i += 1) await scan();
       await sweep();
       await db.update(environmentLeases).set({ releasedAt: new Date(), status: "released" }).where(eq(environmentLeases.id, lease!.id));
+      await heartbeat.resumeQueuedRuns();
       await pass();
       await drain(f);
       for (let i = 0; i < 2; i += 1) { await scan(); await pass(); await sweep(); }
@@ -901,7 +906,8 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     ))).length === 1, 5_000, "the parked comment wake");
     await b.releaseLease();
     const w2 = await authorReviewRequest(b.f);
-    await Promise.all([heartbeat.wakeup(b.f.reviewerId, w2), scan(), scan(), pass(), pass()]);
+    // The author's request, the parked comment's promotion, two scans and two passes.
+    await Promise.all([heartbeat.wakeup(b.f.reviewerId, w2), heartbeat.resumeQueuedRuns(), scan(), scan(), pass(), pass()]);
     await drain(b.f);
     for (let i = 0; i < 2; i += 1) { await scan(); await pass(); await sweep(); }
     await drain(b.f);
@@ -1025,8 +1031,10 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
       status: "skipped", runId: null, finishedAt: expect.any(Date), reason: "execution_reconciliation_required",
       source: "assignment", triggerDetail: "system", requestedByActorType: "agent", requestedByActorId: b.f.authorId,
       error: pre.blocker!.nextAction,
-      payload: expect.objectContaining({ issueId: b.f.issueId, executionWait: expect.objectContaining({
-        recoveryActionId: b.hold.id, reason: "execution_recovery" }) }),
+      payload: expect.objectContaining({ issueId: b.f.issueId, executionWait: {
+        recoveryActionId: b.hold.id, reason: "execution_recovery",
+        message: "Waiting for execution recovery. Your message is saved.",
+        requestedIdempotencyKey: (w2 as { idempotencyKey?: string | null }).idempotencyKey ?? null } }),
     })]);
     expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, b.f.issueId))).toEqual(holdsBefore);
     const task = await readTask(b.f);
