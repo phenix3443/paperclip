@@ -4742,8 +4742,6 @@ export function recoveryService(
         continue;
       }
 
-      // A reviewer stopped after recording its decision stays the recovery
-      // source while its later attempts are only unused, parked admissions.
       const decidedReviewSource =
         issue.status === "in_review" && participantAgentId
           ? await selectDecidedReviewSource(db, issue)

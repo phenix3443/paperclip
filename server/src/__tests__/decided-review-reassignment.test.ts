@@ -88,14 +88,11 @@ describeEmbeddedPostgres("decided review continuation after an expected reviewer
   let scratch: string;
   let heartbeat: ReturnType<typeof heartbeatService>;
   const priorInWorktree = process.env.PAPERCLIP_IN_WORKTREE;
-  // Every process a test starts, killed in afterEach whatever the outcome.
   const ownedPids = new Set<number>();
   const ownedGroups = new Set<number>();
   const ownedChildren = new Set<ChildProcess>();
 
   beforeAll(async () => {
-    // Route handlers build their own heartbeat service from process.env. A
-    // local worktree marker would suppress the scheduling under test.
     delete process.env.PAPERCLIP_IN_WORKTREE;
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-decided-review-");
     db = createDb(tempDb.connectionString);
@@ -155,10 +152,6 @@ describeEmbeddedPostgres("decided review continuation after an expected reviewer
     return testApp;
   }
 
-  // Synthetic fixture: an issue already in review. The reviewer uses a local
-  // sessioned adapter whose CLI is a script the test controls: it waits for a
-  // gate file, then exits 0 without output, so losing its parent cannot break
-  // it with SIGPIPE. Probe invocations (no turn arguments) exit at once.
   async function seedReview() {
     const companyId = randomUUID();
     const userId = randomUUID();
@@ -199,9 +192,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
   }
   type Fixture = Awaited<ReturnType<typeof seedReview>>;
 
-  /** Declared synthetic: a running legacy reviewer whose controller crashed.
-   * The child is real and owns its process group; the controller boot id is
-   * foreign and its lease already expired, as test 1 produces with real time. */
   async function seedDetachedLegacyReviewerRun(f: Fixture) {
     const child = spawn(f.cli, ["--output-format", "stream-json"], { detached: true, stdio: "ignore" });
     ownedChildren.add(child); ownedPids.add(child.pid!); ownedGroups.add(child.pid!);
@@ -222,8 +212,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     return { runId, pid: child.pid!, processGroupId: child.pid! };
   }
 
-  /** Declared seeded: an unrelated newer run of the reviewer on the issue
-   * that was dispatched, started and finished. Test 1a checks its shape. */
   async function seedStartedUnrelatedRun(f: Fixture) {
     const wakeId = randomUUID();
     const id = randomUUID();
@@ -236,7 +224,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     return id;
   }
 
-  /** Production: the reaper finds a live child without an owning controller. */
   async function reapToDetached(runId: string) {
     await heartbeat.reapOrphanedRuns();
     const run = await heartbeat.getRun(runId);
@@ -245,8 +232,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     expect(events.some(event => (event.payload as Record<string, unknown> | null)?.ownedProcessHandle === false)).toBe(true);
   }
 
-  /** Production: the reviewer requests changes as R, which reassigns the task
-   * to the author and stops R through the same mutation. */
   async function recordDecision(f: Fixture, runId: string) {
     const response = await request(app({ type: "agent", source: "agent_key", companyId: f.companyId, agentId: f.reviewerId, runId }))
       .patch(`/api/issues/${f.issueId}`).send({ status: "in_progress", comment: "Please handle the empty input case." });
@@ -257,38 +242,23 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
       cancellation: { source: "control_plane", expected: true } });
     const [decision] = await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, f.issueId));
     expect(decision).toMatchObject({ createdByRunId: runId, outcome: "changes_requested", actorAgentId: f.reviewerId });
-    // The real cancel-time hold exists, and source revalidation retires it when
-    // the task moves to the author.
     const [cancelTimeHold] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.fingerprint, `legacy-execution:${runId}`));
     expect(cancelTimeHold).toMatchObject({ status: "cancelled" });
     return decision!;
   }
 
-  /** The explicit physical stop. Records whether the cancel already ended the
-   * child; otherwise the gate opens and the child exits on its own. Afterwards
-   * nothing blocks the task. */
   async function stopReviewerChild(f: Fixture, pid: number, processGroupId: number) {
     const endedByCancel = !isAlive(pid) && !isAlive(-processGroupId);
     await fs.writeFile(f.gate, "open");
     await waitFor(() => !isAlive(pid) && !isAlive(-processGroupId), 5_000, "reviewer child to exit");
-    // Production: the lease sweeps release what the dead controller held.
     await heartbeat.sweepOrphanedActiveLeases({ backoffMs: 0 });
     await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
     return { endedByCancel };
   }
 
-  /** Production: the decision woke the author, whose real run resubmits.
-   * The reported incident shows no reviewer run between the resubmission and
-   * the Board comment, so its review request was never admitted. Declared
-   * stand-in for that unobserved cause: the scheduling gate suppresses the
-   * request (a skipped receipt, no run). Without it the request starts a
-   * reviewer run and nothing needs recovery. */
   async function resubmitWithSuppressedReviewRequest(f: Fixture) {
     let authorRunId = "";
-    // When the decision landed while R's detached child still ran, the
-    // author's decision wake was skipped behind it. The production stranded
-    // assignee scan wakes the author once nothing blocks the task.
     if (!(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.authorId))).length) {
       await scan();
       await heartbeat.resumeQueuedRuns();
@@ -316,7 +286,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
       const response = await request(app({ type: "agent", source: "agent_key", companyId: f.companyId, agentId: f.authorId, runId: authorRunId }))
         .patch(`/api/issues/${f.issueId}`).send({ status: "done", comment: "Handled the empty input case." });
       expect(response.status, JSON.stringify(response.body)).toBe(200);
-      // The route sends the review request after responding.
       await waitFor(async () => await suppressed() === suppressedBefore + 1, 5_000, "the suppressed review request");
     } finally {
       delete process.env.PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS;
@@ -348,7 +317,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
   async function sweep() { return settleUnrecoverableExecutions(db); }
   async function pass() { return continueDecidedReviewReassignments(db, heartbeat.wakeup); }
 
-  /** Let every admitted run finish, then let release/promotion settle. */
   async function drain(f: Fixture) {
     await waitFor(async () => {
       const live = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
@@ -364,17 +332,12 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     expect(deferred).toEqual([]);
   }
 
-  /** Execution holds that keep reviewer dispatch blocked. */
   async function blockingHolds(f: Fixture) {
     return db.select().from(issueRecoveryActions).where(and(
       eq(issueRecoveryActions.sourceIssueId, f.issueId), executionBlockerPredicate(),
     ));
   }
 
-  /** Exactly one reviewer turn was admitted for the resubmission. A turn
-   * that ends without a decision keeps baseline follow-ups (retries of that
-   * turn); those descend from it and are not further continuations. Parked
-   * attempts the stale gate cancelled before dispatch never ran. */
   async function expectOneSuccessor(f: Fixture, after: Date) {
     const runs = (await reviewerRunsAfter(f, after)).filter(run => run.errorCode !== "execution_reconciliation_required");
     const roots = runs.filter(run => !run.retryOfRunId);
@@ -414,8 +377,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
 
   it("continues the review once after a detached reviewer recorded its decision and was stopped by reassignment", async () => {
     const f = await seedReview();
-    // Real launch in a separate controller process, so its in-memory process
-    // tracking and lease renewal really disappear when that process dies.
     const controller = spawn(process.execPath, ["--import", "tsx", CONTROLLER_HELPER], {
       cwd: SERVER_ROOT,
       stdio: ["ignore", "pipe", "inherit", "ipc"],
@@ -435,7 +396,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     });
     ownedPids.add(ready.pid); ownedGroups.add(ready.processGroupId);
     const runId = ready.runId;
-    // This process never launched R, and the controller still owns it.
     expect(runningProcesses.has(runId)).toBe(false);
     const launched = (await heartbeat.getRun(runId))!;
     expect(await hasLiveLegacyController(db, launched)).toBe(true);
@@ -460,7 +420,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
 
     await scan();
     await pass();
-    // Admitted while still in review: the sweep has nothing left to block.
     expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0]!.status).toBe("in_review");
     await sweep();
     await drain(f);
@@ -476,7 +435,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     await reapToDetached(r.runId);
     await recordDecision(f, r.runId);
     await stopReviewerChild(f, r.pid, r.processGroupId);
-    // The environment has not finished releasing, so the stop is not proved yet.
     const [lease] = await db.insert(environmentLeases).values({ companyId: f.companyId, issueId: f.issueId, heartbeatRunId: r.runId, provider: "local" }).returning();
     const { resubmittedAt } = await resubmitWithSuppressedReviewRequest(f);
     const history = await snapshotReviewHistory(f);
@@ -545,8 +503,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
       const [rHold] = await blockingHolds(f);
       expect(rHold!.evidence.runId).toBe(r.runId);
 
-      // Declared seeded: a reviewer attempt already queued when the hold is
-      // observed. Its cancellation runs through the real dispatch gate.
       const seedQueued = async () => {
         const id = randomUUID();
         await db.insert(heartbeatRuns).values({ id, companyId: f.companyId, agentId: f.reviewerId, invocationSource: "assignment",
@@ -561,7 +517,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
       expect(cancelledQ1.resultJson).toMatchObject({ stopReason: "execution_reconciliation_required", timeoutSource: "stale_queued_run_gate",
         executionWait: { issueId: f.issueId, recoveryActionId: rHold!.id } });
       if (variant !== "held by the decided reviewer only") {
-        // Declared seeded: the hold pre-fix scans put on the parked attempt.
         await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId, kind: "active_run_watchdog",
           status: "resolved", outcome: "blocked", ownerType: "board", returnOwnerAgentId: f.reviewerId,
           cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${q1}`,
@@ -574,7 +529,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
         await heartbeat.resumeQueuedRuns();
         const cancelledQ2 = (await heartbeat.getRun(q2))!;
         expect(cancelledQ2).toMatchObject({ status: "cancelled", errorCode: "execution_reconciliation_required" });
-        // Chained to whichever hold the gate returned.
         expect(cancelledQ2.resultJson).toMatchObject({ executionWait: { issueId: f.issueId, recoveryActionId: gateBlocker!.recoveryActionId } });
       }
       const holdIdsBefore = (await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions)
@@ -602,9 +556,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     60_000,
   );
 
-  /** Shared base for the remaining cases: the seeded detached R recorded its
-   * decision and stopped, the author resubmitted, and R's environment lease is
-   * still held, so the post-resubmission scan holds R exactly as today. */
   async function heldBase() {
     const f = await seedReview();
     const r = await seedDetachedLegacyReviewerRun(f);
@@ -624,8 +575,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
   }
   type HeldBase = Awaited<ReturnType<typeof heldBase>>;
 
-  /** Reviewer runs that executed (or wait to) after the resubmission. Parked
-   * attempts the stale gate cancelled before dispatch are not turns. */
   async function reviewerTurnsAfter(f: Fixture, after: Date) {
     return (await reviewerRunsAfter(f, after)).filter(run => run.errorCode !== "execution_reconciliation_required");
   }
@@ -643,7 +592,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     return (await db.select().from(issues).where(eq(issues.id, f.issueId)))[0]!;
   }
 
-  /** The real sweep projects the held review to blocked and records its receipt. */
   async function sweepToBlocked(b: HeldBase) {
     await sweep();
     const blocked = await readTask(b.f);
@@ -685,7 +633,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
   it("keeps a pre-fix block without a projection receipt held", async () => {
     const b = await heldBase();
     await sweepToBlocked(b);
-    // Declared seeded: the same hold as written by the pre-fix sweep, which had no receipt.
     for (const hold of await blockingHolds(b.f)) {
       const { reviewHoldBlock: _receipt, ...evidence } = hold.evidence;
       await db.update(issueRecoveryActions).set({ evidence }).where(eq(issueRecoveryActions.id, hold.id));
@@ -695,7 +642,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     expect((await readTask(b.f)).status).toBe("blocked");
   }, 60_000);
 
-  /** Declared seeded reviewer run on the issue, newer than R. */
   async function seedReviewerRun(b: HeldBase, values: Partial<typeof heartbeatRuns.$inferInsert>) {
     const id = randomUUID();
     await db.insert(heartbeatRuns).values({ id, companyId: b.f.companyId, agentId: b.f.reviewerId, invocationSource: "assignment",
@@ -719,7 +665,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
         triggerDetail: "system", status: "queued", contextSnapshot: { issueId: b.f.issueId }, responsibleUserId: b.f.userId });
     }],
     ["another cause's execution hold on the issue", async (b: HeldBase) => {
-      // Only one hold per issue may be active, so the foreign one is resolved but still blocks replay.
       await db.insert(issueRecoveryActions).values({ companyId: b.f.companyId, sourceIssueId: b.f.issueId, kind: "active_run_watchdog",
         status: "resolved", outcome: "blocked", resolvedAt: new Date(), ownerType: "board", returnOwnerAgentId: b.f.reviewerId,
         cause: "uncertain_provider_action", fingerprint: `other:${randomUUID()}`, nextAction: "Reconcile the provider action.",
@@ -866,7 +811,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     const keep = await change(b);
     if (keep !== "keep_lease") await b.releaseLease();
     const proof = await proveDecidedReviewContinuation(db, { task: await readTask(b.f) });
-    // Each counter-example fails at its own proof clause or selection rule.
     expect(proof.kind === "hold" ? proof.reason : proof.kind).toBe(failingClause[label]);
     for (let i = 0; i < 2; i += 1) { await scan(); await pass(); }
     expect(await reviewerTurnsAfter(b.f, b.resubmittedAt)).toEqual([]);
@@ -878,8 +822,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
   }, 60_000);
 
 
-  /** The author's review request exactly as the route's private stage-wake
-   * builder produced it, rebuilt from its durable suppressed receipt. */
   async function authorReviewRequest(f: Fixture) {
     const [receipt] = await db.select().from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.agentId, f.reviewerId), eq(agentWakeupRequests.reason, "heartbeat.scheduling_suppressed"),
@@ -917,7 +859,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     ))).length === 1, 5_000, "the parked comment wake");
     await b.releaseLease();
     const w2 = await authorReviewRequest(b.f);
-    // The author's request, the parked comment's promotion, two scans and two passes.
     await Promise.all([heartbeat.wakeup(b.f.reviewerId, w2), heartbeat.resumeQueuedRuns(), scan(), scan(), pass(), pass()]);
     await drain(b.f);
     for (let i = 0; i < 2; i += 1) { await scan(); await pass(); await sweep(); }
@@ -934,7 +875,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     expect(successor.contextSnapshot?.wakeCommentIds).toContain(comment.body.id);
   }, 60_000);
 
-  /** A pass whose wake waits at a barrier after its proof transaction committed. */
   function gatedPass() {
     let entered!: () => void;
     let release!: () => void;
@@ -961,7 +901,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
       else await heartbeat.wakeup(b.f.reviewerId, await authorReviewRequest(b.f));
       await drain(b.f);
       const successor = await expectOneSuccessor(b.f, b.resubmittedAt);
-      // The selector no longer picks R, but the submission is unchanged.
       expect(await selectDecidedReviewSource(db, await readTask(b.f))).toMatchObject({ kind: "none" });
       expect(await readIdentity(b.f)).toMatchObject({ decisionId: b.decision.id });
       expect(late.carried()).toMatchObject(await readIdentity(b.f) as object);
@@ -972,7 +911,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
         expect.objectContaining({ status: "skipped", payload: expect.objectContaining({
           decidedReviewContinuationOutcome: expect.objectContaining({ successorRunId: successor.id }) }) }),
       ]);
-      // A delayed copy of the author's request is consumed the same way.
       await heartbeat.wakeup(b.f.reviewerId, await authorReviewRequest(b.f));
       expect(await wakesWithReason(b.f, "decided_review_continuation_consumed")).toHaveLength(2);
       await drain(b.f);
@@ -1008,7 +946,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     const b = await heldBase();
     const u = await seedStartedUnrelatedRun(b.f);
 
-    // Preconditions under the issue lock: held, unconsumed, selector rejects U.
     const pre = await db.transaction(async tx => {
       const [task] = await tx.select().from(issues).where(eq(issues.id, b.f.issueId)).for("update");
       const identity = await currentSubmissionIdentity(tx as any, task!, b.f.reviewerId);
@@ -1059,7 +996,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     await b.releaseLease();
     const late = gatedPass();
     await late.entered;
-    // Another owner (here: operator reconciliation, declared) released the holds before the wake.
     await db.update(issueRecoveryActions).set({ status: "resolved", resolvedAt: new Date(),
       evidence: { ...b.hold.evidence, automaticRecovery: { replay: "reconciled" } } }).where(eq(issueRecoveryActions.id, b.hold.id));
     late.release();
@@ -1081,8 +1017,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
       eq(issueRecoveryActions.sourceIssueId, b.f.issueId), sql`${issueRecoveryActions.evidence} ? 'decidedReviewContinuation'`,
     ))) expect(hold.evidence.decidedReviewContinuation).toMatchObject({ ...identity, successorRunId: successor.id });
 
-    // A comment from the author is new work: the decided-review gate leaves it
-    // to the ordinary path (here baseline's re-wake throttle answers it).
     const before = new Date();
     const comment = await request(app({ type: "agent", source: "agent_key", companyId: b.f.companyId, agentId: b.f.authorId, runId: b.authorRunId }))
       .post(`/api/issues/${b.f.issueId}/comments`).send({ body: "Also covered the null case." });
@@ -1098,8 +1032,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     expect(later.filter(wake => wake.reason?.startsWith("decided_review_continuation"))).toEqual([]);
   }, 60_000);
 
-  /** Production: the author's running turn resubmits, and the review request
-   * goes through the ordinary path. */
   async function resubmit(f: Fixture) {
     let authorRunId = "";
     await waitFor(async () => {
@@ -1127,7 +1059,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     const served = (await readIdentity(b.f))!;
     expect(await findConsumption(db, await readTask(b.f), served)).toMatchObject({ successorRunId: s!.id });
 
-    // (b) S records a new changes_requested decision through the real route.
     const decided = await request(app({ type: "agent", source: "agent_key", companyId: b.f.companyId, agentId: b.f.reviewerId, runId: s!.id }))
       .patch(`/api/issues/${b.f.issueId}`).send({ status: "in_progress", comment: "The null case still throws." });
     expect(decided.status, JSON.stringify(decided.body)).toBe(200);
@@ -1138,7 +1069,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     const d2 = decisions[1]!;
     expect(d2).toMatchObject({ createdByRunId: s!.id, outcome: "changes_requested" });
 
-    // (e) No resubmission yet: the old identity is stale, a W2 copy follows baseline.
     expect(await readIdentity(b.f)).toBeNull();
     const oldW1 = buildDecidedReviewContinuationWakeup({ issueId: b.f.issueId, sourceRunId: b.r.runId, ...served });
     await heartbeat.wakeup(b.f.reviewerId, oldW1);
@@ -1151,12 +1081,9 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     const w2Rows = await db.select().from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.agentId, b.f.reviewerId), gt(agentWakeupRequests.createdAt, beforeW2),
     ));
-    // Baseline parks it behind the issue's execution; the gate does not touch it.
     expect(w2Rows).toEqual([expect.objectContaining({ status: "deferred_issue_execution", reason: "issue_execution_deferred" })]);
     const replayedW2 = w2Rows[0]!.id;
 
-    // (f) The author resubmits: the new identity has no record, the old
-    // record stays on R's holds, and exactly one review turn runs.
     await fs.writeFile(b.f.gate, "open");
     const second = await resubmit(b.f);
     const fresh = (await readIdentity(b.f))!;
@@ -1165,10 +1092,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     expect(await findConsumption(db, await readTask(b.f), fresh)).toBeNull();
     await waitFor(async () => (await reviewerTurnsAfter(b.f, second.resubmittedAt)).length > 0, 10_000, "the new review turn");
     await drain(b.f);
-    // The replayed W2 predates this submission, whose own request supersedes
-    // it: one review turn in total, through the real release promotion.
-    // The fake reviewer leaves no comment, so baseline retries its turn for
-    // the required comment; that retry is the same turn, not a new admission.
     const turns = (await reviewerTurnsAfter(b.f, second.resubmittedAt)).filter(run => !run.retryOfRunId);
     expect(turns).toHaveLength(1);
     expect(turns[0]!.wakeupRequestId).not.toBe(replayedW2);
@@ -1181,7 +1104,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     expect(settled.length).toBeGreaterThan(0);
     for (const hold of settled) expect(hold.evidence.decidedReviewContinuation).toMatchObject({ ...served, successorRunId: s!.id });
 
-    // (d) A pass carrying the old identity afterwards: stale, no run.
     const beforeLate = new Date();
     await heartbeat.wakeup(b.f.reviewerId, { ...oldW1, idempotencyKey: `${oldW1.idempotencyKey}:late` });
     await pass();
@@ -1201,8 +1123,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     expect(decidedReviewRetryPending(scan)).toBe(false);
     expect(await reviewerTurnsAfter(b.f, b.resubmittedAt)).toEqual([]);
 
-    // The lease settles after the bound: nothing reconsiders the task until an
-    // event on it, here a Board comment whose reviewer wake signals the pass.
     await b.releaseLease();
     const signals: string[] = [];
     const stop = subscribeDeliveryWork(db, DELIVERY_QUEUES.executionContinuation, () => signals.push("continuation"));
@@ -1229,7 +1149,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     expect(decided.status, JSON.stringify(decided.body)).toBe(200);
     await waitFor(async () => ["cancelled", "succeeded"].includes((await heartbeat.getRun(s!.id))?.status ?? ""), 10_000, "S to stop");
 
-    // An older review request parks behind the author's turn.
     const beforeOld = new Date();
     await heartbeat.wakeup(b.f.reviewerId, await authorReviewRequest(b.f));
     const [old] = await db.select().from(agentWakeupRequests).where(and(
@@ -1237,12 +1156,9 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     ));
     expect(old).toMatchObject({ status: "deferred_issue_execution" });
 
-    // Barrier: the resubmission commits, and its own request is held back
-    // while the author's release promotes the older request.
     await fs.writeFile(b.f.gate, "open");
     const second = await resubmitWithSuppressedReviewRequest(b.f);
     const fresh = (await readIdentity(b.f))!;
-    // A Board comment is new work; its turn's release drains the older request.
     const board = app({ type: "board", userId: b.f.userId, companyIds: [b.f.companyId], source: "local_implicit", isInstanceAdmin: true, runId: null });
     const comment = await request(board).post(`/api/issues/${b.f.issueId}/comments`).send({ body: "Please look at the edge cases too." });
     expect(comment.status, JSON.stringify(comment.body)).toBe(201);
@@ -1255,7 +1171,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
       .toEqual([{ wakeupRequestId: old!.id, submission: fresh }]);
     expect((await readTask(b.f)).status).toBe("in_review");
 
-    // The held request arrives after that turn ended without a decision.
     const beforeLate = new Date();
     await heartbeat.wakeup(b.f.reviewerId, await authorReviewRequest(b.f));
     await drain(b.f);
@@ -1286,7 +1201,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     expect(s).toBeDefined();
     expect(s!.contextSnapshot).toHaveProperty("decidedReviewContinuation");
     expect(s!.contextSnapshot).not.toHaveProperty("interactionId");
-    // Not adopted by ID: the wake keeps its status, receipt and full context.
     const [after] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, parked!.id));
     expect(after).toMatchObject({ status: "deferred_issue_execution", runId: null });
     expect((after!.payload as Record<string, unknown>)._paperclipWakeContext).toEqual(context);
@@ -1298,8 +1212,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     const b = await heldBase();
     await fs.rm(b.f.gate, { force: true });
     await b.releaseLease();
-    // 25 newer held reviews in the decided shape whose decision never proves
-    // for them, keyed to sort ahead of b.
     const { executionState } = await readTask(b.f);
     for (let i = 0; i < 25; i += 1) {
       const issueId = `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`;
@@ -1334,8 +1246,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     expect(identity).toMatchObject({ decisionId: b.decision.id });
     await sweepToBlocked(b);
     await b.releaseLease();
-    // (c) / 12(a): as in the incident, the Board comments on the blocked task
-    // with explicit continuation intent through the real route.
     const board = app({ type: "board", userId: b.f.userId, companyIds: [b.f.companyId], source: "local_implicit", isInstanceAdmin: true, runId: null });
     const comment = await request(board).post(`/api/issues/${b.f.issueId}/comments`).send({ body: "Please review the resubmission.", resume: true });
     expect(comment.status, JSON.stringify(comment.body)).toBe(201);
@@ -1344,9 +1254,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     expect(boardRun!.contextSnapshot).not.toHaveProperty("decidedReviewContinuation");
     expect(await blockingHolds(b.f)).toEqual([]);
     await drain(b.f);
-    // The route reopened the blocked task for the Board's turn, so the
-    // submission no longer stands for review. The pass's wake for it,
-    // arriving after the release, is skipped as stale and starts nothing.
     expect((await readTask(b.f)).status).toBe("todo");
     expect(await readIdentity(b.f)).toBeNull();
     const beforeLate = new Date();
@@ -1389,7 +1296,6 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     expect(seededRun.runtimeMode).toBe(real.runtimeMode);
     expect(seededRun.executionStage).toBe(real.executionStage);
     expect(Object.keys(real.contextSnapshot ?? {})).toEqual(expect.arrayContaining(Object.keys(seededRun.contextSnapshot ?? {})));
-    // Declared differences: a foreign controller whose lease already expired.
     expect(seededRun.controllerBootId).not.toBe(real.controllerBootId);
     expect(seededRun.controllerLeaseExpiresAt!.getTime()).toBeLessThan(Date.now());
 

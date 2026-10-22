@@ -603,8 +603,6 @@ export async function settleUnrecoverableExecutions(
               run.errorCode === "server_shutdown_interrupted" && claimedAdapterType(run) === "paperclip_runner") {
             nativeBootstrapFailureBlock = { runId: run.id, statusVersion: projected!.statusVersion, previousStatus: task.status };
           }
-          // Record which pending review this projection blocked. It grants
-          // nothing by itself; a later status or owner change invalidates it.
           const review = parseIssueExecutionState(task.executionState);
           if (task.status === "in_review" && run.runtimeMode === "legacy" && review?.status === "pending" &&
               review.currentStageType === "review" && review.currentParticipant?.type === "agent" &&

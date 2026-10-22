@@ -1334,9 +1334,6 @@ async function startServerWithDatabaseTeardown(
     { queue: DELIVERY_QUEUES.localLoginCleanup, run: () => localAiLoginService(db).reapExpired(), next: executionSchedule.localLogin },
     ...(heartbeat ? [
       { queue: DELIVERY_QUEUES.executionReplacement, run: () => reconcileSafeNativeReplacements(db, new Date(), { verifyStoppedSession: run => verifyStoppedNativeSessionForReplacement(db, run) }), next: executionSchedule.replacement },
-      // Hold writes, issue status/review-state writes and wakes on a held
-      // decided review signal this queue. Without them, only a bounded settle
-      // retry or the rest of a full rotation keeps a deadline.
       { queue: DELIVERY_QUEUES.executionContinuation, run: async () => {
         const settled = await Promise.allSettled([deliverReconciledExecutions(db, heartbeat.wakeup),
           continueDecidedReviewReassignments(db, heartbeat.wakeup)]);

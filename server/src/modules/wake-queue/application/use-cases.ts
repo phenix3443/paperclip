@@ -307,8 +307,6 @@ async function runReleaseDrain(
       continue;
     }
 
-    // One turn per submission on a continued review, whichever request
-    // starts it first. A promoted request records the submission it serves.
     const reviewRequest = await ports.transaction.parkedReviewRequestSubmission({
       companyId: run.companyId, issueId: issue.id, wakeId: workingCandidate.id,
     });

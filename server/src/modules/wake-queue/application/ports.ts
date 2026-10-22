@@ -166,7 +166,6 @@ export interface WakeQueueTransaction {
     wakeAgentId: string;
     commentIds: string[];
   }): Promise<boolean>;
-  /** For a parked review request on a continued review: superseded when its submission already has a turn, else the submission it serves. */
   parkedReviewRequestSubmission(input: { companyId: string; issueId: string; wakeId: string }): Promise<
     { kind: "superseded" } | { kind: "serves"; submission: { decisionId: string; resubmissionActivityId: string } } | null
   >;

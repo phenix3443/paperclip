@@ -25,14 +25,6 @@ import { issueService } from "./issues.js";
 import { isPreDispatchExecutionWaitVerified } from "./pre-dispatch-execution-wait.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 
-/**
- * A reviewer run that recorded a durable decision and was then stopped by the
- * expected reassignment of that same mutation has no unknown review outcome:
- * its outcome is the decision. After the author resubmits, the current review
- * participant needs a fresh turn on the new submission, not a replay of the
- * stopped run. Everything here runs under the issue row lock and proves the
- * exact provenance again; unproven, unknown or foreign cases keep their hold.
- */
 
 type Run = typeof heartbeatRuns.$inferSelect;
 type Task = typeof issues.$inferSelect;
@@ -42,10 +34,8 @@ type Decision = typeof issueExecutionDecisions.$inferSelect;
 const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
 export const DECIDED_REVIEW_CONTINUATION_REPLAY = "decided_review_continuation_v1";
 const REVIEW_REQUEST_REASON = "execution_review_requested";
-/** Run context key naming the submission a review request's turn serves. */
 export const SUBMISSION_STAMP = "decidedReviewSubmission";
 
-/** A submission is the recorded decision plus the author's later resubmission. */
 export type SubmissionIdentity = { decisionId: string; resubmissionActivityId: string };
 
 export type DecidedReviewConsumption = {
@@ -111,7 +101,6 @@ async function readRun(db: Db, companyId: string, runId: string | null | undefin
   return run ?? null;
 }
 
-/** The newest author resubmission into the current review stage after `decision`. */
 async function latestResubmission(db: Db, task: Pick<Task, "companyId" | "id" | "executionState">, decision: Decision) {
   const state = readState(task);
   const author = state?.returnAssignee;
@@ -132,11 +121,6 @@ async function latestResubmission(db: Db, task: Pick<Task, "companyId" | "id" | 
   return activity ?? null;
 }
 
-/**
- * Identify the submission this wake would serve, from durable task history
- * only. It deliberately ignores runs, holds and process state: those decide
- * whether a new continuation may be admitted, not whether one already was.
- */
 export async function currentSubmissionIdentity(
   db: Db, task: Pick<Task, "companyId" | "id" | "status" | "executionState">, agentId: string,
 ): Promise<SubmissionIdentity | null> {
@@ -152,7 +136,6 @@ export async function currentSubmissionIdentity(
   return resubmission ? { decisionId: decision.id, resubmissionActivityId: resubmission.id } : null;
 }
 
-/** The durable admission record for one submission, kept on its settled holds. */
 export async function findConsumption(
   db: Db, task: Pick<Task, "companyId" | "id">, identity: SubmissionIdentity,
 ): Promise<DecidedReviewConsumption | null> {
@@ -164,11 +147,6 @@ export async function findConsumption(
   return (evidenceObject(row?.evidence.decidedReviewContinuation) as DecidedReviewConsumption | null) ?? null;
 }
 
-/**
- * The review turn already started for one submission on a continued review:
- * the continuation's own successor, or a run stamped with that submission by
- * the review request that started it. Both entry points read this record.
- */
 export async function findSubmissionTurn(
   db: Db, task: Pick<Task, "companyId" | "id">, identity: SubmissionIdentity,
 ): Promise<{ successorRunId: string } | null> {
@@ -183,7 +161,6 @@ export async function findSubmissionTurn(
   return run ? { successorRunId: run.id } : null;
 }
 
-/** Whether a review on this task was ever continued here. Only those dedupe review requests. */
 async function isContinuedReview(db: Db, task: Pick<Task, "companyId" | "id">) {
   const [continued] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, task.companyId), eq(issueRecoveryActions.sourceIssueId, task.id),
@@ -197,12 +174,6 @@ function isBlockingHold(hold: Hold) {
     evidenceObject(hold.evidence.automaticRecovery)?.replay === "blocked";
 }
 
-/**
- * Choose the recovery source from decision provenance, never from "latest run".
- * Every newer run of the reviewer must be a verified unused attempt that the
- * stale gate parked behind this incident's own hold; anything else ends the
- * selection and leaves today's handling in force.
- */
 export async function selectDecidedReviewSource(
   db: Db, task: Task, identity?: SubmissionIdentity | null,
 ): Promise<DecidedReviewSelection> {
@@ -257,7 +228,6 @@ async function provesStopSettled(db: Db, run: Run) {
   return null;
 }
 
-/** P1: the run ended by the expected stop of the mutation that reassigned it. */
 async function provesExpectedReassignmentStop(db: Db, run: Run) {
   const result = run.resultJson ?? {};
   const cancellation = evidenceObject(result.cancellation);
@@ -273,7 +243,6 @@ async function provesExpectedReassignmentStop(db: Db, run: Run) {
   return native ? "P1_native_finalization" : null;
 }
 
-/** P3: the run's own decision, recorded by the same mutation that stopped it. */
 async function provesDecisionProvenance(db: Db, task: Task, run: Run, decision: Decision) {
   const state = readState(task);
   if (decision.createdByRunId !== run.id || decision.actorAgentId !== run.agentId ||
@@ -288,17 +257,11 @@ async function provesDecisionProvenance(db: Db, task: Task, run: Run, decision: 
   return later ? "P3_later_decision" : null;
 }
 
-/** P1-P3 for a selected source: the incident's outcome is the recorded decision. */
 export async function provesDecidedReviewProvenance(db: Db, task: Task, selected: DecidedReviewSource) {
   return await provesExpectedReassignmentStop(db, selected.source) ??
     await provesDecisionProvenance(db, task, selected.source, selected.decision);
 }
 
-/**
- * Prove, under the issue lock, that the current review participant may get a
- * fresh turn on the author's resubmission. Returns the failing clause name
- * otherwise and writes nothing.
- */
 export async function proveDecidedReviewContinuation(db: Db, input: { task: Task }): Promise<DecidedReviewProof> {
   const { task } = input;
   const state = readState(task);
@@ -313,7 +276,6 @@ export async function proveDecidedReviewContinuation(db: Db, input: { task: Task
   const stop = await provesStopSettled(db, source);
   if (stop) return { kind: "hold", reason: stop };
 
-  // P4: the review participant is the stopped reviewer, in one of two shapes.
   if (task.assigneeAgentId !== source.agentId || isSupersededConversationRun(task, source)) return { kind: "hold", reason: "P4_assignee" };
   let shape: "in_review" | "blocked_projection";
   if (task.status === "in_review") shape = "in_review";
@@ -329,11 +291,9 @@ export async function proveDecidedReviewContinuation(db: Db, input: { task: Task
     shape = "blocked_projection";
   } else return { kind: "hold", reason: "P4_status" };
 
-  // P5: a separate author resubmission after the decision.
   const resubmission = await latestResubmission(db, task, decision);
   if (!resubmission) return { kind: "hold", reason: "P5_no_resubmission" };
 
-  // P6: no other gate owns this task.
   if (!holds.length) return { kind: "hold", reason: "P6_no_hold" };
   const readiness = (await issueService(db).listDependencyReadiness(task.companyId, [task.id], db)).get(task.id);
   if (readiness && !readiness.isDependencyReady) return { kind: "hold", reason: "P6_dependency" };
@@ -363,7 +323,6 @@ export async function proveDecidedReviewContinuation(db: Db, input: { task: Task
   ));
   if (blockers.some(blocker => !settledIds.has(blocker.id))) return { kind: "hold", reason: "P6_foreign_hold" };
 
-  // P7: this incident has not been admitted or handed to another owner.
   if (holds.some(hold => ["decidedReviewContinuation", "executionReconciliation", "explicitUserContinuation",
     "workspaceRestoreFailure"].some(key => key in hold.evidence))) return { kind: "hold", reason: "P7_already_owned" };
 
@@ -373,11 +332,6 @@ export async function proveDecidedReviewContinuation(db: Db, input: { task: Task
   };
 }
 
-/**
- * Settle the proved holds for one successor, in the transaction that inserts
- * that successor. Returns parked wakes of these holds for the caller to fold
- * into the successor once its run row exists.
- */
 export async function admitDecidedReviewContinuation(
   db: Db, proof: Extract<DecidedReviewProof, { kind: "proved" }>, input: { successorRunId: string; now?: Date },
 ) {
@@ -436,8 +390,6 @@ export type DecidedReviewWake = {
   source: string;
   requestedByActorType: string | null | undefined;
   payload: Record<string, unknown> | null;
-  /** True when the wake carries a comment, saved input, interaction or chat
-   * context, or a failed-run retry. Those are new information, never W2. */
   carriesInput: boolean;
 };
 
@@ -449,11 +401,8 @@ export type DecidedReviewAdmissionOutcome =
 
 export type DecidedReviewAdmissionReads = {
   identity(): Promise<SubmissionIdentity | null>;
-  /** The turn already started for this submission, by either entry point. */
   consumption(identity: SubmissionIdentity): Promise<{ successorRunId: string } | null>;
-  /** True when a review on this task was continued here before. */
   continued(): Promise<boolean>;
-  /** True when the recorded successor still owns the issue execution. */
   successorActive(runId: string): Promise<boolean>;
   select(identity: SubmissionIdentity): Promise<{ kind: "selected" } | { kind: "none"; rule: string; runId?: string }>;
   hasBlocker(): Promise<boolean>;
@@ -467,8 +416,6 @@ function carriedIdentity(payload: Record<string, unknown> | null) {
     : null;
 }
 
-/** W1: the periodic pass's continuation wake. W2: the same-submission review
- * request (the author's own wake or its delayed copy). W3: everything else. */
 export function classifyDecidedReviewWake(wake: DecidedReviewWake, currentParticipantAgentId: string | null) {
   if (wake.source === "automation" && wake.requestedByActorType === "system" &&
       wake.reason === REVIEW_REQUEST_REASON && carriedIdentity(wake.payload)) return "W1" as const;
@@ -477,11 +424,6 @@ export function classifyDecidedReviewWake(wake: DecidedReviewWake, currentPartic
   return "W3" as const;
 }
 
-/**
- * Admission order for one wake. Consumption is checked before source
- * selection, so a served submission stays served whatever later happened to
- * its successor or to the selector's answer.
- */
 export async function decideDecidedReviewAdmission(
   wakeClass: "W1" | "W2" | "W3", wake: Pick<DecidedReviewWake, "payload">, reads: DecidedReviewAdmissionReads,
 ): Promise<DecidedReviewAdmissionOutcome> {
@@ -501,8 +443,6 @@ export async function decideDecidedReviewAdmission(
       ? { kind: "coalesce", runId: consumed.successorRunId }
       : { kind: "skip", reason: "decided_review_continuation_consumed", detail: { successorRunId: consumed.successorRunId, ...identity } };
   }
-  // A review request that starts an ordinary turn records the submission it
-  // serves, so a later copy from either entry point finds that turn above.
   const ordinary = async (): Promise<DecidedReviewAdmissionOutcome> =>
     await reads.continued() ? { kind: "continue", serves: identity } : { kind: "continue" };
   const selected = await reads.select(identity);
@@ -521,7 +461,6 @@ export async function decideDecidedReviewAdmission(
   return { kind: "admit", identity };
 }
 
-/** Wire the admission order to the database. The caller holds the issue lock. */
 export async function decidedReviewAdmission(db: Db, input: {
   companyId: string; issueId: string; wake: DecidedReviewWake;
 }): Promise<DecidedReviewAdmissionOutcome> {
@@ -529,9 +468,6 @@ export async function decidedReviewAdmission(db: Db, input: {
   if (!task) return { kind: "continue" };
   const state = readState(task);
   const participant = state?.currentParticipant?.type === "agent" ? state.currentParticipant.agentId ?? null : null;
-  // Any wake on a held decided review may follow the event that settles its
-  // proof (an answer, an approval, a cleared dependency), so it asks the pass
-  // to reconsider this task.
   if (participant && await hasDecidedReviewCandidate(db, task)) {
     await notifyDeliveryWork(db, DELIVERY_QUEUES.executionContinuation, task.id);
   }
@@ -553,12 +489,6 @@ export async function decidedReviewAdmission(db: Db, input: {
   });
 }
 
-/**
- * Release-drain check for a parked review request (W2) on a continued review.
- * The current submission gets one turn whichever entry point starts it first:
- * a request whose submission already has a turn is superseded, and any other
- * is promoted as that submission's turn.
- */
 export async function parkedReviewRequestSubmission(
   db: Db, input: { companyId: string; issueId: string; wakeId: string },
 ): Promise<{ kind: "superseded" } | { kind: "serves"; submission: SubmissionIdentity } | null> {
@@ -570,10 +500,8 @@ export async function parkedReviewRequestSubmission(
   const payload = evidenceObject(wake.payload);
   const state = readState(task);
   const participant = state?.currentParticipant?.type === "agent" ? state.currentParticipant.agentId ?? null : null;
-  // A parked row keeps its original reason in the deferred wake context.
   const deferredContext = evidenceObject(payload?._paperclipWakeContext);
   const reason = typeof deferredContext?.wakeReason === "string" ? deferredContext.wakeReason : wake.reason;
-  // Same notion of new input as the admission gate: any of it makes this W3.
   const carriesInput = wake.idempotencyKey?.startsWith("chat-inbound:") ||
     ["commentId", "wakeCommentId", "failedRunId", "taskRetryRequestId", "nativeStatusWakeIntentId",
       "interactionId", "interactionKind", "interactionStatus", "continuationPolicy"]
@@ -587,7 +515,6 @@ export async function parkedReviewRequestSubmission(
   return await findSubmissionTurn(db, task, identity) ? { kind: "superseded" } : { kind: "serves", submission: identity };
 }
 
-/** The pass's wake. Exported so tests can send the exact production shape. */
 export function buildDecidedReviewContinuationWakeup(input: {
   issueId: string; sourceRunId: string; decisionId: string; resubmissionActivityId: string;
 }) {
@@ -615,11 +542,6 @@ class RestoreNotProved extends Error {}
 
 type Wakeup = (agentId: string, options: ReturnType<typeof buildDecidedReviewContinuationWakeup>) => Promise<unknown>;
 
-/**
- * Periodic pass. Restores an unchanged system projection to in_review, then
- * sends one continuation wake per proved submission. Admission itself happens
- * in the wake gate, which proves everything again under the issue lock.
- */
 function decidedReviewCandidate() {
   return and(
     eq(issueRecoveryActions.cause, LEGACY_RECOVERY_CAUSE),
@@ -628,8 +550,6 @@ function decidedReviewCandidate() {
         sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`)),
     sql`not (${issueRecoveryActions.evidence} ? 'decidedReviewContinuation')`,
     inArray(issues.status, ["in_review", "blocked"]),
-    // Only a pending review an agent already decided can ever prove, so other
-    // legacy holds never keep the pass scheduled.
     sql`${issues.executionState}->>'status' = 'pending'`,
     sql`${issues.executionState}->>'currentStageType' = 'review'`,
     sql`${issues.executionState}->'currentParticipant'->>'type' = 'agent'`,
@@ -645,8 +565,6 @@ async function hasDecidedReviewCandidate(db: Db, task: Pick<Task, "companyId" | 
 }
 
 const SCAN_PAGE = 25;
-/** Proof failures that settle on their own: a stop still finishing, or a run
- * still owning the task. Only these keep a retry deadline, and only briefly. */
 const SETTLING = new Set(["P2_process_running", "P2_lease_unreleased", "P6_execution_active"]);
 export const DECIDED_REVIEW_SETTLE_RETRIES = 20;
 export type DecidedReviewScan = {
@@ -655,18 +573,11 @@ export type DecidedReviewScan = {
 };
 const defaultScan: DecidedReviewScan = { after: null, settling: new Map() };
 
-/**
- * Whether the pass owes another run without a new event: the rest of a
- * rotation that hit a full page, or a settling proof within its retry bound.
- * Reads no database, so an idle or permanently held system stays quiet.
- */
 export function decidedReviewRetryPending(scan: DecidedReviewScan = defaultScan) {
   return scan.after !== null || [...scan.settling.values()].some(attempts => attempts < DECIDED_REVIEW_SETTLE_RETRIES);
 }
 
 export async function continueDecidedReviewReassignments(db: Db, wakeup: Wakeup, scan: DecidedReviewScan = defaultScan) {
-  // Pages rotate through every candidate in key order, so holds that never
-  // prove cannot keep any other issue out of the pass.
   const after = scan.after;
   const candidates = await db.selectDistinct({
     companyId: issueRecoveryActions.companyId, issueId: issueRecoveryActions.sourceIssueId,
@@ -691,8 +602,6 @@ export async function continueDecidedReviewReassignments(db: Db, wakeup: Wakeup,
       let proof = await proveDecidedReviewContinuation(tx as unknown as Db, { task });
       if (proof.kind !== "proved") { held = proof.reason; return null; }
       if (proof.shape === "blocked_projection") {
-        // Restore only the unchanged projection this incident's sweep made.
-        // The issue service still enforces assignee and dependency readiness.
         await issueService(tx as unknown as Db).update(task.id, { status: "in_review" }, tx);
         await persistActivity(tx as unknown as Db, {
           companyId: task.companyId, actorType: "system", actorId: "execution-recovery",
@@ -705,7 +614,6 @@ export async function continueDecidedReviewReassignments(db: Db, wakeup: Wakeup,
           eq(issues.companyId, task.companyId), eq(issues.id, task.id),
         ));
         proof = await proveDecidedReviewContinuation(tx as unknown as Db, { task: restored! });
-        // Never keep a restore the proof no longer justifies.
         if (proof.kind !== "proved" || proof.shape !== "in_review") throw new RestoreNotProved();
       }
       return proof;
@@ -725,12 +633,6 @@ export async function continueDecidedReviewReassignments(db: Db, wakeup: Wakeup,
   return { scanned: candidates.length, woken };
 }
 
-/**
- * Terminalizer guard. A hold adds no safety for this incident when it was
- * already admitted, when it would only hide the decided reviewer behind one of
- * its own unused attempts, or when the reviewer is proved and merely awaiting
- * admission. Every other run keeps today's conservative hold.
- */
 export async function decidedReviewHoldIsRedundant(db: Db, task: Task, run: Pick<Run, "id" | "agentId">) {
   const [admitted] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, task.companyId), eq(issueRecoveryActions.sourceIssueId, task.id),

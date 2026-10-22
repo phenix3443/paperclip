@@ -3146,8 +3146,6 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             if (previousRetry) return { kind: "replayed" as const, run: previousRetry };
           }
 
-          // Recognise an already served review submission before any blocker
-          // or active-run check, so a late copy can never start a second turn.
           const decidedReview = await decidedReviewAdmission(tx as unknown as Db, {
             companyId: issue.companyId,
             issueId: issue.id,
@@ -3204,7 +3202,6 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             });
             return { kind: "coalesced" as const, run: successor! };
           }
-          // Kept so a wake that fails the final proof is parked as it arrived.
           const contextBeforeDecidedReview = {
             forceFreshSession: enrichedContextSnapshot.forceFreshSession,
             previousRunId: enrichedContextSnapshot.previousRunId,
@@ -3213,7 +3210,6 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             enrichedContextSnapshot.decidedReviewSubmission = decidedReview.serves;
           }
           if (decidedReview.kind === "admit") {
-            // A fresh review of the new submission, never a resume of the stopped run.
             enrichedContextSnapshot.forceFreshSession = true;
             delete enrichedContextSnapshot.previousRunId;
           }
@@ -4205,8 +4201,6 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             return { kind: "skipped" as const };
           }
 
-          // Prove again at the real admission point. Hold settlement and the
-          // successor insert below commit together under the issue lock.
           let decidedReviewAdmitted: Awaited<ReturnType<typeof admitDecidedReviewContinuation>> | null = null;
           if (decidedReview.kind === "admit") {
             const [current] = await tx.select().from(issues).where(and(
@@ -4281,10 +4275,6 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // A resumed receipt already passed admission under this issue lock.
           // Consume it with its successor even when chat keeps other messages
           // in separate turns, or finalization will deliver it a second time.
-          // Work parked behind the settled holds is offered to their successor,
-          // also on conversations that keep other messages in separate turns.
-          // It still passes the normal adoption filter below, so dedicated
-          // interaction wakes keep their own promotion and context.
           const adoptableWakeIds = [
             ...(executionWaitRequestId ? [executionWaitRequestId] : []),
             ...(decidedReviewAdmitted?.foldedWakeIds ?? []),
@@ -4321,8 +4311,6 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               isInteractionResolutionWakePayload(deferredPayload) ||
               hasInteractionContinuationWakeContext(deferredContext);
             if (dedicated) return false;
-            // Parked review wakes of the served submission carry nothing the
-            // successor does not already review.
             if (decidedReviewAdmitted?.foldedWakeIds.includes(wake.id)) return true;
             return (
               ["issue_commented", "issue_reopened_via_comment"].includes(String(deferredContext.wakeReason ?? wake.reason)) &&

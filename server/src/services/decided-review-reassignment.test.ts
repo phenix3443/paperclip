@@ -29,8 +29,6 @@ function reviewRequest(overrides: Partial<DecidedReviewWake> = {}): DecidedRevie
   };
 }
 
-/** In-memory reads. Every read not configured for a case throws, so a test
- * fails if the admission order consults something it must not. */
 function reads(overrides: Partial<DecidedReviewAdmissionReads>): DecidedReviewAdmissionReads {
   const unexpected = (name: string) => async () => { throw new Error(`unexpected read: ${name}`); };
   return {
