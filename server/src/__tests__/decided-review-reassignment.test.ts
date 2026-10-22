@@ -17,7 +17,9 @@ import {
   approvals,
   authUsers,
   companies,
+  companyMemberships,
   companySkills,
+  costEvents,
   createDb,
   environmentLeases,
   heartbeatRunEvents,
@@ -119,6 +121,7 @@ describeEmbeddedPostgres("decided review continuation after an expected reviewer
     await db.delete(issueExecutionDecisions);
     await db.delete(activityLog);
     await db.delete(heartbeatRunEvents);
+    await db.delete(costEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(agentTaskSessions);
@@ -126,6 +129,7 @@ describeEmbeddedPostgres("decided review continuation after an expected reviewer
     await db.delete(agentRuntimeState);
     await db.delete(agents);
     await db.delete(companySkills);
+    await db.delete(companyMemberships);
     await db.delete(companies);
     await db.delete(authUsers);
   }, 30_000);
@@ -169,6 +173,7 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     await fs.chmod(cli, 0o755);
     await db.insert(authUsers).values({ id: userId, name: "Operator", email: `${userId}@example.test`, emailVerified: true, createdAt: new Date(), updatedAt: new Date() });
     await db.insert(companies).values({ id: companyId, name: "Review Co", issuePrefix: prefix, requireBoardApprovalForNewAgents: false, defaultResponsibleUserId: userId });
+    await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member" });
     await db.insert(agents).values([
       { id: authorId, companyId, name: "Author", role: "engineer", status: "idle", adapterType: "process",
         adapterConfig: { command: process.execPath, args: ["-e", "setInterval(() => {}, 1000)"] }, runtimeConfig: {}, permissions: {} },
