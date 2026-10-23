@@ -7,8 +7,6 @@ import { materializePublishManifest, prepareBundledPackage } from '../prepare-bu
 import { stopPrefetches } from '../prefetch-child.mjs';
 import { PREPARE_BUNDLED_PACKAGE_SCRIPT, bundledInstallTimings, bundledPackageSlug, stagePublicInstallSource, startBundledInstalls } from '../stage-bundled-packages.mjs';
 
-// The concurrency tests use a small local script in place of for `prepare-bundled-package.mjs`; no test
-// there needs npm or a network.
 const withScratch = async body => {
   const root = mkdtempSync(join(tmpdir(), 'stage-bundled-packages-'));
   try { await body(root); } finally { rmSync(root, { recursive: true, force: true }); }
@@ -127,8 +125,6 @@ test('staged release sources resolve workspace ranges without workspace links', 
   stagePublicInstallSource({ dir, manifest, stagedSource }, { repo: root, releaseVersion: '2026.1023.0' });
   assert.equal(existsSync(join(stagedSource, 'node_modules')), false);
   const staged = JSON.parse(readFileSync(join(stagedSource, 'package.json'), 'utf8'));
-  // This is the real materializer called by bundled preparation with sourceDir.
-  // Unresolved workspace specs here reproduce the missing shared package ENOENT.
   const publish = materializePublishManifest(staged, { sourceDir: stagedSource });
   const expected = { exact: '2026.1023.0', caret: '^2026.1023.0', tilde: '~2026.1023.0' };
   assert.deepEqual(staged.dependencies, { ...expected, external: '^4.0.0', 'local-bundle': localDependency });

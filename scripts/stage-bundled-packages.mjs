@@ -33,7 +33,6 @@ export function startBundledInstalls(entries, { logDir, cwd, env = process.env, 
 // installs, so the exit is observed as it happens.
 export const bundledInstallTimings = installs => Object.fromEntries(installs.map(({ slug, handle }) => [`stage_bundled_${slug}_ms`, handle.durationMs]));
 
-// Stage the verifier's unified release source without changing checkout manifests.
 export function stagePublicInstallSource({ dir, manifest, stagedSource }, { repo, releaseVersion }) {
   mkdirSync(stagedSource);
   for (const file of manifest.files ?? ['dist']) {

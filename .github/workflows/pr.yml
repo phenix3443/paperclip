@@ -14,5 +14,4 @@ permissions:
 jobs:
   ci:
     if: github.event.action != 'labeled' || github.event.label.name == 'profile-ci'
-    # Keep the workflow and checked-out source on the same caller commit.
     uses: ./.github/workflows/pr-trusted.yml
