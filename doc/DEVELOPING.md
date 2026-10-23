@@ -138,14 +138,16 @@ are prohibited, with no ruleset bypass actors.
 
 ## Trusted PR Workflow
 
-The PR caller uses `paperclipai/paperclip/.github/workflows/pr-trusted.yml@master`.
+The PR caller uses `./.github/workflows/pr-trusted.yml`, and that workflow calls
+`./.github/workflows/ci-routing.yml`. Both resolve from the caller commit, so CI
+cannot drift ahead of the source under review.
 The AWS runner group `paperclip-public-pr` must allow
 `paperclipai/paperclip/.github/workflows/pr-trusted.yml@refs/heads/master`.
 New workflow versions merged into master then receive runner access without a
 separate SHA allowlist update. Dependabot leaves this first-party reference on
 master.
 
-Runner selection calls `ci-routing.yml@master` on the dedicated
+For upstream, runner selection uses the dedicated
 `paperclip-ci-routing-x64` AWS Fleet. The `paperclip-ci-routing` runner group
 admits only `paperclipai/paperclip/.github/workflows/ci-routing.yml@refs/heads/master`
 and repository ID `1170821064`. GitHub evaluates the canonical repository, author, and sender checks before
@@ -158,6 +160,22 @@ approved manual canaries on master can use the reserved pool. The routing
 workflow reads GitHub metadata without checking out or executing PR code. Its author, sender, rerun actor,
 repository, head, and merge validation still decide whether tests can use AWS.
 Unapproved test workloads continue to use GitHub-hosted runners.
+
+In the `phenix3443/paperclip` fork, the existing repository identity checks keep
+routing and workloads on GitHub-hosted runners. The upstream `commitperclip`
+review job is skipped by repository identity: the fork does not enable Dependency
+Review or the upstream bot credentials. This forgoes that dependency security
+check; policy, typecheck, build and test gates still apply. Because this review
+uses `pull_request_target`, its guard takes effect only after the base branch
+contains it. A repair PR can still show the old base-branch failure.
+
+Public-install verification materializes unified release versions before writing
+temporary source manifests. Bundled preparation can then read those manifests
+without workspace links. Checkout manifests and the lockfile stay unchanged.
+The slow CPU chat test retains its 30-second readiness waits and 120-second case
+limit. To verify the repaired baseline after merge, use an ordinary documentation
+PR outside the release-note paths below and record its run and head SHA, plus
+fresh runs of dependent PRs rebased by their owners.
 
 The routing workflow also selects the CI scope. Middle PRs in a stack and PRs
 whose diff changes only release notes (`releases/v*.md` or
