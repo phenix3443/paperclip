@@ -34,6 +34,7 @@ import {
   admitExplicitNativeContinuation,
   undeliveredLegacyUserCommentIds,
 } from "../explicit-native-continuation.js";
+import { admitDecidedReviewContinuation, decidedReviewAdmission, proveDecidedReviewContinuation } from "../decided-review-reassignment.js";
 import { canRetryStoppedRun } from "../cancelled-native-startup.js";
 import { getExecutionBlocker, hasPendingRunCleanup } from "../execution-blocker.js";
 import { validateNativeWorkspaceReconstruction } from "../native-runtime/native-workspace-reconstruction.js";
@@ -3145,6 +3146,74 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             if (previousRetry) return { kind: "replayed" as const, run: previousRetry };
           }
 
+          const decidedReview = await decidedReviewAdmission(tx as unknown as Db, {
+            companyId: issue.companyId,
+            issueId: issue.id,
+            wake: {
+              agentId,
+              reason,
+              source,
+              requestedByActorType: opts.requestedByActorType,
+              payload,
+              carriesInput: Boolean(
+                wakeCommentId || durableRequest || opts.failedRunId ||
+                opts.queuedCommentInterruptId || opts.queuedCommentRequestId || opts.taskRetryRequestId ||
+                queuedCommentIdsFromRunContext(enrichedContextSnapshot).length ||
+                hasInteractionContinuationWakeContext(enrichedContextSnapshot) ||
+                readNonEmptyString(enrichedContextSnapshot.nativeStatusWakeIntentId),
+              ),
+            },
+          });
+          if (decidedReview.kind === "skip") {
+            await tx.insert(agentWakeupRequests).values({
+              ...durableReceiptFields,
+              companyId: agent.companyId,
+              agentId,
+              source,
+              triggerDetail,
+              reason: decidedReview.reason,
+              payload: { ...(payload ?? {}), issueId: issue.id, decidedReviewContinuationOutcome: decidedReview.detail },
+              status: "skipped",
+              requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+              idempotencyKey: opts.idempotencyKey ?? null,
+              finishedAt: new Date(),
+            });
+            return { kind: "skipped" as const };
+          }
+          if (decidedReview.kind === "coalesce") {
+            const [successor] = await tx.select().from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, decidedReview.runId),
+            ));
+            await tx.insert(agentWakeupRequests).values({
+              ...durableReceiptFields,
+              companyId: agent.companyId,
+              agentId,
+              source,
+              triggerDetail,
+              reason,
+              payload,
+              status: "coalesced",
+              runId: successor!.id,
+              requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+              idempotencyKey: opts.idempotencyKey ?? null,
+              finishedAt: new Date(),
+            });
+            return { kind: "coalesced" as const, run: successor! };
+          }
+          const contextBeforeDecidedReview = {
+            forceFreshSession: enrichedContextSnapshot.forceFreshSession,
+            previousRunId: enrichedContextSnapshot.previousRunId,
+          };
+          if (decidedReview.kind === "continue" && decidedReview.serves) {
+            enrichedContextSnapshot.decidedReviewSubmission = decidedReview.serves;
+          }
+          if (decidedReview.kind === "admit") {
+            enrichedContextSnapshot.forceFreshSession = true;
+            delete enrichedContextSnapshot.previousRunId;
+          }
+
           let reconciledSourceRunId: string | null = null;
           let reconciledRestoreRetryCount: number | null = null;
           if (executionReconciliationWake) {
@@ -3332,7 +3401,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // failed-run retry actions on their separate exact-request path.
           const ownsReconstructionContinuation = reconciledSourceRunId && executionBlocker?.runId === reconciledSourceRunId
             && executionBlocker.recoveryActionId === enrichedContextSnapshot.recoveryActionId;
-          if (executionBlocker && !ownsReconstructionContinuation && !(await admitExplicitNativeContinuation({
+          if (executionBlocker && !ownsReconstructionContinuation && decidedReview.kind !== "admit" && !(await admitExplicitNativeContinuation({
             db: tx as unknown as Db, companyId: issue.companyId, issueId: issue.id,
             agentId, actorType: taskRetryActorId ? "user" : opts.requestedByActorType, actorId: taskRetryActorId ?? opts.requestedByActorId,
             reason: taskRetryActorId ? "task_retry" : durableRequest && !failedChatRetry ? "issue_commented" : reason,
@@ -4132,7 +4201,29 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             return { kind: "skipped" as const };
           }
 
-          const explicitContinuation = await admitExplicitNativeContinuation({
+          let decidedReviewAdmitted: Awaited<ReturnType<typeof admitDecidedReviewContinuation>> | null = null;
+          if (decidedReview.kind === "admit") {
+            const [current] = await tx.select().from(issues).where(and(
+              eq(issues.companyId, issue.companyId), eq(issues.id, issue.id),
+            ));
+            const proof = current ? await proveDecidedReviewContinuation(tx as unknown as Db, { task: current }) : null;
+            if (proof?.kind === "proved" && proof.shape === "in_review") {
+              decidedReviewAdmitted = await admitDecidedReviewContinuation(tx as unknown as Db, proof, {
+                successorRunId: explicitContinuationRunId,
+              });
+              enrichedContextSnapshot.decidedReviewContinuation = {
+                sourceRunId: proof.source.id,
+                decisionId: proof.decisionId,
+                resubmissionActivityId: proof.resubmissionActivityId,
+              };
+            } else {
+              for (const [key, value] of Object.entries(contextBeforeDecidedReview)) {
+                if (value === undefined) delete enrichedContextSnapshot[key];
+                else enrichedContextSnapshot[key] = value;
+              }
+            }
+          }
+          const explicitContinuation = decidedReviewAdmitted ? null : await admitExplicitNativeContinuation({
             db: tx as unknown as Db, companyId: issue.companyId, issueId: issue.id,
             agentId, actorType: taskRetryActorId ? "user" : opts.requestedByActorType, actorId: taskRetryActorId ?? opts.requestedByActorId,
             reason: taskRetryActorId ? "task_retry" : durableRequest && !failedChatRetry ? "issue_commented" : reason,
@@ -4141,7 +4232,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             queuedCommentRequestId: opts.queuedCommentRequestId,
             taskRetryRequestId: opts.taskRetryRequestId,
           });
-          if (!explicitContinuation && executionBlocker && !ownsReconstructionContinuation) return deferBlockedExecution(executionBlocker);
+          if (!explicitContinuation && !decidedReviewAdmitted && executionBlocker && !ownsReconstructionContinuation) return deferBlockedExecution(executionBlocker);
           if (explicitContinuation) {
             enrichedContextSnapshot.forceFreshSession = true;
             enrichedContextSnapshot.previousRunId = explicitContinuation.previousRunId;
@@ -4184,8 +4275,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // A resumed receipt already passed admission under this issue lock.
           // Consume it with its successor even when chat keeps other messages
           // in separate turns, or finalization will deliver it a second time.
+          const adoptableWakeIds = [
+            ...(executionWaitRequestId ? [executionWaitRequestId] : []),
+            ...(decidedReviewAdmitted?.foldedWakeIds ?? []),
+          ];
           const pendingComments =
-            (executionWaitRequestId || canCoalesceComments) &&
+            (adoptableWakeIds.length > 0 || canCoalesceComments) &&
             (ownsReconstructionContinuation || !(await getExecutionBlocker(tx as unknown as Db, issue.companyId, issue.id)))
               ? await tx
                   .select()
@@ -4196,7 +4291,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                       inArray(agentWakeupRequests.agentId, handoffSource ? [agentId, handoffSource.agentId] : [agentId]),
                       eq(agentWakeupRequests.status, "deferred_issue_execution"),
                       sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
-                      canCoalesceComments || opts.taskRetryRequestId ? undefined : eq(agentWakeupRequests.id, executionWaitRequestId!),
+                      canCoalesceComments || opts.taskRetryRequestId ? undefined : inArray(agentWakeupRequests.id, adoptableWakeIds),
                     ),
                   )
                   .orderBy(asc(agentWakeupRequests.requestedAt))
@@ -4210,12 +4305,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             );
             // Dedicated interaction wakes carry their own source and session
             // contract. ID-only adoption must not erase that continuation.
+            // Durable chat work must keep its receipt, actor, source, and
+            // session contract through normal promotion and authorization.
+            const dedicated = wake.idempotencyKey?.startsWith("chat-inbound:") ||
+              isInteractionResolutionWakePayload(deferredPayload) ||
+              hasInteractionContinuationWakeContext(deferredContext);
+            if (dedicated) return false;
+            if (decidedReviewAdmitted?.foldedWakeIds.includes(wake.id)) return true;
             return (
-              // Durable chat work must keep its receipt, actor, source, and
-              // session contract through normal promotion and authorization.
-              !wake.idempotencyKey?.startsWith("chat-inbound:") &&
-              !isInteractionResolutionWakePayload(deferredPayload) &&
-              !hasInteractionContinuationWakeContext(deferredContext) &&
               ["issue_commented", "issue_reopened_via_comment"].includes(String(deferredContext.wakeReason ?? wake.reason)) &&
               queuedCommentIdsFromWakePayload(wake.payload).length > 0
             );
@@ -4235,7 +4332,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           const newRun = await tx
             .insert(heartbeatRuns)
             .values({
-              ...(explicitContinuation ? { id: explicitContinuationRunId } : {}),
+              ...(explicitContinuation || decidedReviewAdmitted ? { id: explicitContinuationRunId } : {}),
               companyId: agent.companyId,
               agentId,
             scopeKind: readNonEmptyString(enrichedContextSnapshot.issueId) ? "issue" : "company",
@@ -4255,7 +4352,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                     adoptedComments.map((wake) => wake.id),
                   )
                 : enrichedContextSnapshot,
-              sessionIdBefore: explicitContinuation ? null : sessionBefore,
+              sessionIdBefore: explicitContinuation || decidedReviewAdmitted ? null : sessionBefore,
               continuationAttempt,
               ...(reconciledSourceRunId
                 ? { retryOfRunId: reconciledSourceRunId }
