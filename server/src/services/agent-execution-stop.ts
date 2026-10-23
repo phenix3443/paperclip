@@ -35,6 +35,11 @@ export const hostProcessProbe: HostProcessProbe = {
   processStartedAt: pid => readProcessStartedAt(pid).catch(() => null),
 };
 
+function isReleasedSshLease(lease: typeof environmentLeases.$inferSelect) {
+  return lease.provider === "ssh" && Boolean(lease.releasedAt) &&
+    ["released", "expired", "failed"].includes(lease.status) && lease.cleanupStatus !== "failed";
+}
+
 /** Cancellation changes admission. Process and lease evidence controls cleanup. */
 export async function agentExecutionsHaveStopped(db: Db, agentIds: string[], host: HostProcessProbe = hostProcessProbe) {
   if (!agentIds.length) return true;
@@ -55,24 +60,8 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[], hos
     try { process.kill(pid, 0); return false; }
     catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
   };
-  for (const coordinator of abandoned) {
-    if (!coordinator.controllerPid || absent(coordinator.controllerPid)) continue;
-    const observed = await readProcessStartedAt(coordinator.controllerPid).catch(() => null);
-    if (!observed || !coordinator.controllerProcessStartedAt ||
-        new Date(observed).getTime() === coordinator.controllerProcessStartedAt.getTime()) return false;
-  }
-  for (const run of runs) {
-    if (!["succeeded", "failed", "cancelled", "timed_out", "interrupted"].includes(run.status)) return false;
-    if (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date()) return false;
-    const runLeases = leases.filter(lease => lease.heartbeatRunId === run.id);
-    if (runLeases.some(lease => lease.provider && lease.provider !== "local")) {
-      if (run.status === "cancelled" && !runLeases.every(hasRemoteTerminationReceipt)) return false;
-      continue;
-    }
-    // No local process outlives a host restart, and PIDs recorded before it may belong to anything now.
-    // Superseded by paperclipai/paperclip#17204 once it merges.
-    const bootedAt = run.finishedAt ? host.bootedAt() : null;
-    if (bootedAt && run.finishedAt && bootedAt.getTime() > run.finishedAt.getTime()) continue;
+  /** The run's recorded local process or process group still exists; a reused PID or group does not count. */
+  const localProcessAlive = async (run: typeof runs[number]) => {
     let processAlive = Boolean(run.processPid && !absent(run.processPid));
     let groupAlive = Boolean(run.processGroupId && !absent(-run.processGroupId));
     if (processAlive && run.processStartedAt) {
@@ -89,7 +78,31 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[], hos
       const started = members?.length ? await Promise.all(members.map(pid => host.processStartedAt(pid))) : null;
       if (started?.every(at => at && new Date(at).getTime() > run.finishedAt!.getTime())) groupAlive = false;
     }
-    if (processAlive || groupAlive) return false;
+    return processAlive || groupAlive;
+  };
+  for (const coordinator of abandoned) {
+    if (!coordinator.controllerPid || absent(coordinator.controllerPid)) continue;
+    const observed = await readProcessStartedAt(coordinator.controllerPid).catch(() => null);
+    if (!observed || !coordinator.controllerProcessStartedAt ||
+        new Date(observed).getTime() === coordinator.controllerProcessStartedAt.getTime()) return false;
+  }
+  for (const run of runs) {
+    if (!["succeeded", "failed", "cancelled", "timed_out", "interrupted"].includes(run.status)) return false;
+    if (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date()) return false;
+    const runLeases = leases.filter(lease => lease.heartbeatRunId === run.id);
+    if (runLeases.some(lease => lease.provider && lease.provider !== "local")) {
+      // The SSH driver writes no termination receipt (#16346). A released SSH lease whose run has no
+      // live local process keeps the proof that applied before receipts were required.
+      if (run.status === "cancelled" && !runLeases.every(hasRemoteTerminationReceipt) &&
+          !(runLeases.every(lease => hasRemoteTerminationReceipt(lease) || isReleasedSshLease(lease)) &&
+            !await localProcessAlive(run))) return false;
+      continue;
+    }
+    // No local process outlives a host restart, and PIDs recorded before it may belong to anything now.
+    // Superseded by paperclipai/paperclip#17204 once it merges.
+    const bootedAt = run.finishedAt ? host.bootedAt() : null;
+    if (bootedAt && run.finishedAt && bootedAt.getTime() > run.finishedAt.getTime()) continue;
+    if (await localProcessAlive(run)) return false;
     if (run.status !== "cancelled" || !run.startedAt) continue;
     if (run.runtimeMode === "native" && !run.processPid && !run.processGroupId &&
         !await hasNativeLocalProcessStop(db, run.companyId, run.id) &&

@@ -17,7 +17,7 @@ import { publicInstallClosure } from './public-install-closure.mjs';
 import { GROK_PUBLIC_INSTALL_IMAGE, GROK_PUBLIC_INSTALL_LIFECYCLE, assertInstalledNativeConsumerContinuity, assertNoBundledCodexPayloads, grokConsumerDockerArgs, installedClaudeProbeSource, installedCodexProbeSource, installedDaemonProbeSource, macNodeHeadersDirectory, macPublicInstallLifecycleProfile, macInstalledStartupProbeSource, runMacInitialInstallWithDiagnostics } from './grok-public-install-sandbox.mjs';
 import { startPrefetch, stopPrefetches } from './prefetch-child.mjs';
 import { retainRunnerQualificationPackages } from './retain-runner-qualification-packages.mjs';
-import { bundledInstallTimings, startBundledInstalls } from './stage-bundled-packages.mjs';
+import { bundledInstallTimings, stagePublicInstallSource, startBundledInstalls } from './stage-bundled-packages.mjs';
 import { writePackedRegistryCatalog } from './public-install-registry.mjs';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 async function verifyMacConsumer(packageDirectory, sourceRevision, receiptPath) {
@@ -280,20 +280,7 @@ try {
     const bundled = (manifest.bundleDependencies ?? manifest.bundledDependencies ?? []).length > 0;
     return { name, index, dir, manifest, bundled, target: join(root, `package-${index}`), stagedSource: join(root, `source-${index}`), destination: join(root, `pack-${index}`) };
   });
-  const stageSource = ({ dir, manifest, stagedSource }) => {
-    mkdirSync(stagedSource);
-    for (const file of manifest.files ?? ['dist']) {
-      // release.sh stages runtime skills into these public packages before pack.
-      const releaseSkills = file === 'skills' && ['server', 'packages/adapters/claude-local', 'packages/adapters/codex-local'].includes(dir);
-      // Other adapters declare an optional skills directory that npm pack omits
-      // when absent. Do not fabricate extra release payloads for those adapters.
-      if (file === 'skills' && !releaseSkills && !existsSync(join(repo, dir, file))) continue;
-      cpSync(releaseSkills ? join(repo, 'skills') : join(repo, dir, file), join(stagedSource, file), { recursive: true });
-    }
-    const releaseManifest = { ...manifest, version: releaseVersion };
-    writeFileSync(join(stagedSource, 'package.json'), JSON.stringify(releaseManifest));
-    return releaseManifest;
-  };
+  const stageSource = entry => stagePublicInstallSource(entry, { repo, releaseVersion });
   const sourcesStarted = performance.now();
   for (const entry of entries.filter(entry => entry.bundled)) stageSource(entry);
   const installsStarted = performance.now();
