@@ -1,8 +1,6 @@
 name: Trusted PR CI
 
-# Rollout is intentionally two-step: merge this reusable workflow first, then
-# replace pr.yml with an immutable-SHA caller so the active CI definition cannot
-# drift from this file.
+# The PR caller and nested routing workflow use the same source commit.
 on:
   workflow_call:
 
@@ -22,7 +20,7 @@ concurrency:
 
 jobs:
   gate:
-    uses: paperclipai/paperclip/.github/workflows/ci-routing.yml@master
+    uses: ./.github/workflows/ci-routing.yml
 
   policy:
     needs: [gate]
