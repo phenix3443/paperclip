@@ -57,6 +57,7 @@ import {
   chatConversations,
   caseHandoffs,
   companies,
+  heartbeatRunEvents,
   heartbeatRunWatchdogDecisions,
   heartbeatRuns,
   issueAttachments,
@@ -65,6 +66,7 @@ import {
   issueRecoveryActions,
   issueRelations,
   issueThreadInteractions,
+  issueWorkProducts,
   issues,
   nativeRunFinalizations,
   nativeRunResults,
@@ -80,7 +82,7 @@ import {
   nativeRunnerOwnershipNotHeldCondition,
 } from "../native-runtime/native-runner-ownership.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
-import { forbidden, notFound } from "../../errors.js";
+import { conflict, forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import {
   isPidAlive,
@@ -152,6 +154,15 @@ import {
 import { withRecoveryContext } from "./status-only-context.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import {
+  OWNER_REPAIR_CONTINUATION_REASON,
+  OWNER_REPAIR_SETTLEMENT_SCHEMA,
+  isCompletedScheduledOwnerRepair,
+  ownerRepairContinuationKey,
+  readOwnerRepairSettlement,
+  type OwnerRepairSettlement,
+} from "./owner-repair-continuation.js";
+import { randomUUID } from "node:crypto";
+import {
   collectDispositionRepairSourceState,
   dispositionRepairDelayMs,
   DISPOSITION_REPAIR_MAX_ATTEMPTS,
@@ -214,6 +225,16 @@ type RecoveryWakeupOptions = {
   issueStateGuard?: {
     statuses: string[];
     assigneeAgentId: string;
+    statusVersion?: number;
+  };
+  durableOwnerRepairContinuationRequest?: {
+    actionId: string;
+    repairRunId: string;
+    issueId: string;
+    wakeupRequestId: string;
+    continuationKey: string;
+    expectedIssueStatusVersion: number;
+    requestedAt: Date;
   };
 };
 
@@ -3459,6 +3480,278 @@ export function recoveryService(
     return Boolean(run || wake);
   }
 
+  type OwnerRepairContinuationOutcome =
+    | "admitted"
+    | "existing"
+    | "waiting"
+    | "pending_settlement"
+    | "stale";
+
+  async function durableRepairSettlementEvent(run: typeof heartbeatRuns.$inferSelect) {
+    return db
+      .select({ seq: heartbeatRunEvents.seq })
+      .from(heartbeatRunEvents)
+      .where(and(
+        eq(heartbeatRunEvents.companyId, run.companyId),
+        eq(heartbeatRunEvents.runId, run.id),
+        sql`${heartbeatRunEvents.payload} ->> 'phase' = 'task.run.measured'`,
+        sql`${heartbeatRunEvents.payload} ->> 'durableSettlement' = 'true'`,
+      ))
+      .orderBy(desc(heartbeatRunEvents.seq))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  /**
+   * Settle a completed bounded owner repair and reserve its single business
+   * continuation. Returns null when this action is not a completed repair, so
+   * ordinary disposition-repair reconciliation keeps ownership of it.
+   */
+  async function reconcileCompletedOwnerRepair(
+    action: typeof issueRecoveryActions.$inferSelect,
+  ): Promise<OwnerRepairContinuationOutcome | null> {
+    let settlement = readOwnerRepairSettlement(action.evidence);
+    if (!settlement) {
+      const scheduledRunId = readNonEmptyString(parseObject(action.wakePolicy).scheduledRunId);
+      if (!scheduledRunId) return null;
+      const repairRun = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.id, scheduledRunId), eq(heartbeatRuns.companyId, action.companyId)))
+        .then((rows) => rows[0] ?? null);
+      if (!isCompletedScheduledOwnerRepair(action, repairRun)) return null;
+      // Success is not release. Until the executor durably settled the run,
+      // neither a successor nor another repair may start.
+      const settledEvent = await durableRepairSettlementEvent(repairRun!);
+      if (!settledEvent) return "pending_settlement";
+      const reserved = await reserveOwnerRepairContinuation(action, repairRun!, settledEvent.seq);
+      if (reserved === "fallback") return null;
+      if (reserved === "waiting" || reserved === "stale") return reserved;
+      settlement = reserved;
+    }
+    if (settlement.state !== "pending_dispatch") return "existing";
+    return deliverOwnerRepairContinuation(action, settlement);
+  }
+
+  async function reserveOwnerRepairContinuation(
+    observedAction: typeof issueRecoveryActions.$inferSelect,
+    repairRun: typeof heartbeatRuns.$inferSelect,
+    durableSettlementEventSeq: number,
+  ): Promise<OwnerRepairSettlement | "fallback" | "waiting" | "stale"> {
+    const ownerAgentId = observedAction.ownerAgentId!;
+    const observedIssue = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.id, observedAction.sourceIssueId), eq(issues.companyId, observedAction.companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (!observedIssue) return "stale";
+    // Native typed waits and live execution keep their own owners; the
+    // ordinary reconciliation resolves this action as covered by them.
+    const sourceState = await collectDispositionRepairSourceState(db, { issue: observedIssue });
+    if (sourceState.hasDurableWaitingPath || sourceState.hasActiveExecutionPath) return "fallback";
+    if (await isAutomaticRecoverySuppressedByPauseHold(db, observedIssue.companyId, observedIssue.id, treeControlSvc))
+      return "waiting";
+    const ownerAgent = await getAgent(ownerAgentId);
+    if (!ownerAgent || ownerAgent.companyId !== observedIssue.companyId) return "stale";
+    if (!(await isAgentInvokable(ownerAgent)) || !isHeartbeatWakeOnDemandEnabled(ownerAgent)
+      || await isInvocationBudgetBlocked(observedIssue, ownerAgentId)) return "waiting";
+    const completedWorkProductIds = await db
+      .select({ id: issueWorkProducts.id })
+      .from(issueWorkProducts)
+      .where(and(eq(issueWorkProducts.companyId, observedIssue.companyId), eq(issueWorkProducts.issueId, observedIssue.id)))
+      .then((rows) => rows.map((row) => row.id).sort());
+
+    const publications: ActivityPublication[] = [];
+    const postCommitActions: IssuePostCommitAction[] = [];
+    const result = await db.transaction(async (tx) => {
+      const issue = await tx.select().from(issues).where(and(
+        eq(issues.id, observedIssue.id), eq(issues.companyId, observedIssue.companyId),
+      )).for("update").then((rows) => rows[0] ?? null);
+      const action = await tx.select().from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.id, observedAction.id), eq(issueRecoveryActions.companyId, observedAction.companyId),
+      )).for("update").then((rows) => rows[0] ?? null);
+      if (!action || action.status !== "active") return "stale" as const;
+      const existing = readOwnerRepairSettlement(action.evidence);
+      if (existing) return existing;
+      if (!issue || issue.hiddenAt || ["done", "cancelled"].includes(issue.status)
+        || issue.statusVersion !== observedIssue.statusVersion
+        || issue.assigneeAgentId !== ownerAgentId || issue.assigneeUserId
+        || action.fingerprint !== observedAction.fingerprint
+        || action.ownerAgentId !== ownerAgentId || action.returnOwnerAgentId !== ownerAgentId
+        || parseObject(action.wakePolicy).scheduledRunId !== repairRun.id) {
+        return "stale" as const;
+      }
+      let expectedIssueStatusVersion = issue.statusVersion;
+      if (issue.status === "blocked") {
+        // The durable-path check above proved no first-class blocker, human
+        // wait, or review stage holds this task: the completed repair's own
+        // recovery park is the only reason it is blocked.
+        const updated = await issuesSvc.update(issue.id, {
+          status: "todo",
+          companyGuard: issue.companyId,
+        }, tx, publications, postCommitActions);
+        if (!updated || updated.status !== "todo") throw conflict("Owner repair continuation could not reopen the parked task");
+        expectedIssueStatusVersion = updated.statusVersion;
+      } else if (!["todo", "in_progress"].includes(issue.status)) {
+        return "fallback" as const;
+      }
+      const settlement: OwnerRepairSettlement = {
+        schema: OWNER_REPAIR_SETTLEMENT_SCHEMA,
+        state: "pending_dispatch",
+        continuationKey: ownerRepairContinuationKey({ issueId: issue.id, actionId: action.id, repairRunId: repairRun.id }),
+        wakeupRequestId: randomUUID(),
+        repairRunId: repairRun.id,
+        ownerAgentId,
+        actionFingerprint: action.fingerprint,
+        expectedIssueStatusVersion,
+        terminalEvidence: {
+          runStatus: repairRun.status,
+          finishedAt: repairRun.finishedAt!.toISOString(),
+          durableSettlementEventSeq,
+        },
+        completedWorkProductIds,
+        settledAt: new Date().toISOString(),
+      };
+      await tx.update(issueRecoveryActions).set({
+        evidence: sql`coalesce(${issueRecoveryActions.evidence}, '{}'::jsonb) || ${JSON.stringify({ ownerRepairSettlement: settlement })}::jsonb`,
+        updatedAt: new Date(),
+      }).where(and(eq(issueRecoveryActions.id, action.id), eq(issueRecoveryActions.status, "active")));
+      await logActivity(tx as unknown as Db, {
+        companyId: issue.companyId,
+        actorType: "system",
+        actorId: "recovery",
+        agentId: null,
+        runId: repairRun.id,
+        action: "issue.owner_repair_settled",
+        entityType: "issue_recovery_action",
+        entityId: action.id,
+        details: {
+          sourceIssueId: issue.id,
+          ownerAgentId,
+          repairRunId: repairRun.id,
+          continuationKey: settlement.continuationKey,
+          wakeupRequestId: settlement.wakeupRequestId,
+          attemptCount: action.attemptCount,
+          maxAttempts: action.maxAttempts,
+        },
+      });
+      return settlement;
+    });
+    if (typeof result !== "string") {
+      for (const publication of publications) publishActivity(publication);
+      await executeIssuePostCommitActions(db, postCommitActions);
+    }
+    return result;
+  }
+
+  async function markOwnerRepairSettlement(
+    action: typeof issueRecoveryActions.$inferSelect,
+    settlement: OwnerRepairSettlement,
+    patch: Partial<OwnerRepairSettlement>,
+    resolution: { status: "resolved" | "cancelled"; outcome: "restored" | "cancelled"; note: string },
+  ) {
+    const next = { ...settlement, ...patch };
+    const [updated] = await db.update(issueRecoveryActions).set({
+      evidence: sql`coalesce(${issueRecoveryActions.evidence}, '{}'::jsonb) || ${JSON.stringify({ ownerRepairSettlement: next })}::jsonb`,
+      updatedAt: new Date(),
+    }).where(and(
+      eq(issueRecoveryActions.id, action.id),
+      eq(issueRecoveryActions.companyId, action.companyId),
+      eq(issueRecoveryActions.status, "active"),
+      sql`${issueRecoveryActions.evidence} -> 'ownerRepairSettlement' ->> 'wakeupRequestId' = ${settlement.wakeupRequestId}`,
+      sql`${issueRecoveryActions.evidence} -> 'ownerRepairSettlement' ->> 'state' = 'pending_dispatch'`,
+    )).returning({ id: issueRecoveryActions.id });
+    if (!updated) return;
+    await recoveryActionsSvc.resolveActiveForIssue({
+      companyId: action.companyId,
+      sourceIssueId: action.sourceIssueId,
+      actionId: action.id,
+      status: resolution.status,
+      outcome: resolution.outcome,
+      resolutionNote: resolution.note,
+    });
+  }
+
+  async function acceptedOwnerRepairReceipt(action: typeof issueRecoveryActions.$inferSelect, settlement: OwnerRepairSettlement) {
+    return db
+      .select({ id: agentWakeupRequests.id, runId: agentWakeupRequests.runId })
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.id, settlement.wakeupRequestId),
+        eq(agentWakeupRequests.companyId, action.companyId),
+        eq(agentWakeupRequests.agentId, settlement.ownerAgentId),
+        eq(agentWakeupRequests.idempotencyKey, settlement.continuationKey),
+      ))
+      .then((rows) => rows[0] ?? null);
+  }
+
+  async function deliverOwnerRepairContinuation(
+    action: typeof issueRecoveryActions.$inferSelect,
+    settlement: OwnerRepairSettlement,
+  ): Promise<OwnerRepairContinuationOutcome> {
+    // Recover the commit/ack gap first: an accepted receipt is the successor.
+    let receipt = await acceptedOwnerRepairReceipt(action, settlement);
+    if (!receipt) {
+      try {
+        await deps.enqueueWakeup(settlement.ownerAgentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: OWNER_REPAIR_CONTINUATION_REASON,
+          requestedByActorType: "system",
+          requestedByActorId: null,
+          idempotencyKey: settlement.continuationKey,
+          payload: { issueId: action.sourceIssueId, taskId: action.sourceIssueId, mutation: OWNER_REPAIR_CONTINUATION_REASON },
+          contextSnapshot: {
+            issueId: action.sourceIssueId,
+            taskId: action.sourceIssueId,
+            wakeReason: OWNER_REPAIR_CONTINUATION_REASON,
+            source: "recovery.owner_repair_continuation",
+            // Completed effects are recorded facts, not authority to replay them.
+            ownerRepairContinuation: {
+              actionId: action.id,
+              repairRunId: settlement.repairRunId,
+              completedWorkProductIds: settlement.completedWorkProductIds,
+            },
+          },
+          durableOwnerRepairContinuationRequest: {
+            actionId: action.id,
+            repairRunId: settlement.repairRunId,
+            issueId: action.sourceIssueId,
+            wakeupRequestId: settlement.wakeupRequestId,
+            continuationKey: settlement.continuationKey,
+            expectedIssueStatusVersion: settlement.expectedIssueStatusVersion,
+            requestedAt: new Date(settlement.settledAt),
+          },
+        });
+      } catch (error) {
+        const status = typeof error === "object" && error && "status" in error ? Number(error.status) : null;
+        const details = typeof error === "object" && error && "details" in error && error.details && typeof error.details === "object"
+          ? error.details as { code?: unknown } : null;
+        if (details?.code === "case_handoff_admission_wait") return "waiting";
+        if (status !== 409 && status !== 404) throw error;
+        // A newer decision (owner, status, or settlement) consumed this slot.
+        // Keep the reserved key so it can never be admitted again.
+        if (await acceptedOwnerRepairReceipt(action, settlement)) {
+          receipt = await acceptedOwnerRepairReceipt(action, settlement);
+        } else {
+          await markOwnerRepairSettlement(action, settlement, {
+            state: "denied",
+            deniedReason: error instanceof Error ? error.message : "superseded",
+          }, { status: "cancelled", outcome: "cancelled", note: "owner_repair_continuation_denied" });
+          return "stale";
+        }
+      }
+      receipt ??= await acceptedOwnerRepairReceipt(action, settlement);
+    }
+    if (!receipt) return "waiting";
+    await markOwnerRepairSettlement(action, settlement, {
+      state: "delivered",
+      deliveredAt: new Date().toISOString(),
+      deliveredRunId: receipt.runId ?? null,
+    }, { status: "resolved", outcome: "restored", note: "owner_repair_continuation_admitted" });
+    return "admitted";
+  }
+
   async function reconcileActiveRecoveryActions() {
     const rows = await db
       .select({ action: issueRecoveryActions, issue: issues })
@@ -3508,6 +3801,20 @@ export function recoveryService(
           result.issueIds.push(issue.id);
         }
         continue;
+      }
+
+      if (wakePolicyType === "bounded_owner_disposition_repair") {
+        // A completed repair is settled once; it never schedules itself again.
+        const continuation = await reconcileCompletedOwnerRepair(action);
+        if (continuation === "admitted") {
+          result.resolved += 1;
+          result.issueIds.push(issue.id);
+          continue;
+        }
+        if (continuation !== null) {
+          result.skipped += 1;
+          continue;
+        }
       }
 
       // A queued comment or healthy child cannot establish what the stopped

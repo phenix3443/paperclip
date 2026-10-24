@@ -28,4 +28,17 @@ describe("agent wakeup request schema", () => {
     ]);
     expect(index?.config.where).toBeDefined();
   });
+
+  it("keeps one owner-repair continuation receipt per company and key, including terminal receipts", () => {
+    const index = getTableConfig(agentWakeupRequests).indexes.find(
+      (candidate) => candidate.config.name === "agent_wakeup_requests_owner_repair_continuation_uq",
+    );
+
+    expect(index?.config.unique).toBe(true);
+    expect(index?.config.columns.map((column) => (column as { name: string }).name)).toEqual([
+      "company_id",
+      "idempotency_key",
+    ]);
+    expect(index?.config.where).toBeDefined();
+  });
 });

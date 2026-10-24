@@ -7800,6 +7800,107 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("admits one business successor after a completed owner repair instead of repeating the repair", async () => {
+    const { companyId, agentId, runId: repairRunId, issueId } =
+      await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "succeeded",
+        retryReason: "issue_continuation_needed",
+        resultJson: { summary: "Pushed the fix commit; remaining work continues." },
+      });
+    await db
+      .update(issues)
+      .set({ status: "blocked", checkoutRunId: null })
+      .where(eq(issues.id, issueId));
+    const sourceIssue = await selectRecoveryIssueById(issueId);
+    const sourceState = await collectDispositionRepairSourceState(db, {
+      issue: sourceIssue!,
+    });
+    const action = await db
+      .insert(issueRecoveryActions)
+      .values({
+        companyId,
+        sourceIssueId: issueId,
+        kind: "deliberate_wait_without_target",
+        status: "active",
+        ownerType: "agent",
+        ownerAgentId: agentId,
+        previousOwnerAgentId: agentId,
+        returnOwnerAgentId: agentId,
+        cause: "deliberate_wait_without_target",
+        fingerprint: sourceState.fingerprint,
+        evidence: { sourceStateFingerprint: sourceState.fingerprint },
+        nextAction: "Record a durable disposition.",
+        wakePolicy: {
+          type: "bounded_owner_disposition_repair",
+          attempt: 1,
+          maxAttempts: 2,
+        },
+        attemptCount: 1,
+        maxAttempts: 2,
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+    // The fixture run is the scheduled repair. It succeeded after a known,
+    // already-performed external effect.
+    await db
+      .update(heartbeatRuns)
+      .set({
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_disposition_repair",
+          retryReason: "issue_disposition_repair",
+          recoveryActionId: action.id,
+          dispositionRepairFingerprint: sourceState.fingerprint,
+          dispositionRepairAttempt: 1,
+          dispositionRepairMaxAttempts: 2,
+        },
+      })
+      .where(eq(heartbeatRuns.id, repairRunId));
+    await db
+      .update(issueRecoveryActions)
+      .set({ wakePolicy: { type: "bounded_owner_disposition_repair", attempt: 1, maxAttempts: 2, scheduledRunId: repairRunId } })
+      .where(eq(issueRecoveryActions.id, action.id));
+    await db.insert(heartbeatRunEvents).values({
+      companyId,
+      agentId,
+      runId: repairRunId,
+      seq: 10,
+      eventType: "lifecycle",
+      payload: { phase: "task.run.measured", outcome: "succeeded", durableSettlement: true },
+    });
+
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    const [afterAction, ownerRuns] = await Promise.all([
+      db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id))
+        .then((rows) => rows[0]!),
+      selectRecoveryRunsByAgent(agentId),
+    ]);
+    const newRuns = ownerRuns.filter((run) => run.id !== repairRunId);
+    const repeatedRepairs = newRuns.filter(
+      (run) => run.contextSnapshot?.recoveryActionId === action.id,
+    );
+    const businessSuccessors = newRuns.filter(
+      (run) => run.contextSnapshot?.recoveryActionId !== action.id,
+    );
+    expect({
+      repeatedRepairs: repeatedRepairs.length,
+      businessSuccessors: businessSuccessors.length,
+      attemptCount: afterAction.attemptCount,
+      maxAttempts: afterAction.maxAttempts,
+    }).toEqual({
+      repeatedRepairs: 0,
+      businessSuccessors: 1,
+      attemptCount: 1,
+      maxAttempts: 2,
+    });
+  });
+
   it("atomically deduplicates concurrent disposition-repair reconciliation", async () => {
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",

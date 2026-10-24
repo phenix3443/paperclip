@@ -73,6 +73,13 @@ export const agentWakeupRequests = pgTable(
       .where(
         sql`${table.idempotencyKey} LIKE 'issue_disposition_repair:%' AND ${table.status} <> 'skipped'`,
       ),
+    // One business continuation per completed owner repair. Terminal receipts
+    // stay in the fence so a cancelled or failed slot can never be reopened.
+    ownerRepairContinuationUq: uniqueIndex(
+      "agent_wakeup_requests_owner_repair_continuation_uq",
+    )
+      .on(table.companyId, table.idempotencyKey)
+      .where(sql`${table.idempotencyKey} LIKE 'owner-repair-continuation:%'`),
     questionResponseDeliveryIdempotencyUq: uniqueIndex(
       "agent_wakeup_requests_question_response_delivery_idempotency_uq",
     )
