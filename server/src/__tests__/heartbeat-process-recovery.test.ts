@@ -7862,6 +7862,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .update(issueRecoveryActions)
       .set({ wakePolicy: { type: "bounded_owner_disposition_repair", attempt: 1, maxAttempts: 2, scheduledRunId: repairRunId } })
       .where(eq(issueRecoveryActions.id, action.id));
+    await db.insert(heartbeatRunEvents).values({
+      companyId,
+      agentId,
+      runId: repairRunId,
+      seq: 10,
+      eventType: "lifecycle",
+      payload: { phase: "task.run.measured", outcome: "succeeded", durableSettlement: true },
+    });
 
     await heartbeatService(db).reconcileStrandedAssignedIssues();
 

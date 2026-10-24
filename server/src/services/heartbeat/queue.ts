@@ -57,6 +57,7 @@ import {
 import { agentService } from "../agents.js";
 import { normalizeLegacyRunnerProvider } from "@paperclipai/adapter-utils";
 import { randomUUID } from "node:crypto";
+import { OWNER_REPAIR_CONTINUATION_REASON, readOwnerRepairSettlement } from "../recovery/owner-repair-continuation.js";
 import {
   and,
   asc,
@@ -2286,6 +2287,22 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       opts = { ...opts, allowRunCoalescing: false, idempotencyKey: `case-handoff:${handoff.id}`,
         issueStateGuard: { assigneeAgentId: agentId, statuses: ["todo", "in_progress"], statusVersion: caseRequest.expectedIssueStatusVersion } };
     }
+    const ownerRepairRequest = opts.durableOwnerRepairContinuationRequest;
+    let ownerRepairReceipt: { id: string; requestedAt: Date } | undefined;
+    if (ownerRepairRequest) {
+      if (caseRequest || opts.taskRetryRequestId || opts.durableChatRequest || opts.durableDotRequest || opts.durableMuseRequest ||
+          reason !== OWNER_REPAIR_CONTINUATION_REASON || opts.requestedByActorType !== "system" || issueId !== ownerRepairRequest.issueId)
+        throw conflict("Invalid owner repair continuation authority");
+      ownerRepairReceipt = { id: ownerRepairRequest.wakeupRequestId, requestedAt: ownerRepairRequest.requestedAt };
+      // The settled repair is never this successor. Do not merge the business
+      // continuation into another run, and admit it only for the observed version.
+      opts = { ...opts, allowRunCoalescing: false, idempotencyKey: ownerRepairRequest.continuationKey,
+        issueStateGuard: { assigneeAgentId: agentId, statuses: ["todo", "in_progress"],
+          statusVersion: ownerRepairRequest.expectedIssueStatusVersion } };
+    }
+    // Ledger-owned receipts (case handoffs, owner-repair continuations) retry
+    // from their own outbox. A temporary refusal must not consume the receipt.
+    const outboxRequest = caseRequest ?? ownerRepairRequest;
     if (durableRequest) {
       assertDurableChatWakeupRequest(durableRequest, {
         agentId,
@@ -2328,7 +2345,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         opts.idempotencyKey !== museRequest.idempotencyKey)) {
       throw conflict("Muse work request does not match its admission authority.");
     }
-    const receiptRequest = durableRequest ?? dotRequest ?? museRequest ?? caseReceipt;
+    const receiptRequest = durableRequest ?? dotRequest ?? museRequest ?? caseReceipt ?? ownerRepairReceipt;
     const durableReceiptFields = receiptRequest
       ? { id: receiptRequest.id, requestedAt: receiptRequest.requestedAt }
       : {};
@@ -2344,6 +2361,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       if (receipt && caseRequest && (receipt.companyId !== agent.companyId || receipt.agentId !== agentId ||
           receipt.payload?.issueId !== caseRequest.issueId || receipt.idempotencyKey !== `case-handoff:${caseRequest.handoffId}`))
         throw conflict("Case handoff wake receipt identity changed");
+      if (receipt && ownerRepairRequest && (receipt.companyId !== agent.companyId || receipt.agentId !== agentId ||
+          receipt.payload?.issueId !== ownerRepairRequest.issueId || receipt.idempotencyKey !== ownerRepairRequest.continuationKey))
+        throw conflict("Owner repair continuation receipt identity changed");
       if (receipt && dotRequest && (receipt.companyId !== dotRequest.companyId ||
           receipt.agentId !== dotRequest.agentId || receipt.source !== "assignment" ||
           receipt.requestedByActorType !== "agent" || receipt.requestedByActorId !== dotRequest.agentId ||
@@ -2399,7 +2419,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     ) => {
       // A temporary refusal must leave the handoff retryable, without burning
       // its one durable receipt ID on a skipped wake.
-      if (caseRequest) return { created: false };
+      if (outboxRequest) return { created: false };
       if (executionWaitRequestId) {
         await db.update(agentWakeupRequests).set({
           payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), '{executionWait}',
@@ -2485,7 +2505,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       .then((rows) => rows[0] ?? null);
 
     if (!company || company.status !== "active") {
-      if (caseRequest) return null;
+      if (outboxRequest) return null;
       const companyStatus = company?.status ?? "missing";
       if (opts.requestedByActorType === "user") {
         throw conflict("Company is not active", { status: companyStatus });
@@ -2666,7 +2686,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       await writeSkippedRequest("budget.blocked", { error: budgetBlock.reason }, {
         scopeType: budgetBlock.scopeType, scopeId: budgetBlock.scopeId,
       });
-      if (caseRequest) return null;
+      if (outboxRequest) return null;
       throw conflict(budgetBlock.reason, {
         scopeType: budgetBlock.scopeType,
         scopeId: budgetBlock.scopeId,
@@ -2676,7 +2696,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     // Setup delays execution, but must not discard work accepted by a caller.
     const invokability = await getAgentInvokability(isAgentAwaitingSetup(agent) ? { ...agent, status: "idle" } : agent);
     if (!invokability.invokable) {
-      if (caseRequest) return null;
+      if (outboxRequest) return null;
       if (opts.requestedByActorType !== "user" || executionWaitRequestId) {
         await writeSkippedRequest("agent.not_invokable", {
           error: invokability.message,
@@ -2941,6 +2961,21 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             if (!handoff || handoff.appliedIssueStatusVersion !== caseRequest.expectedIssueStatusVersion)
               throw conflict("Case handoff delivery was superseded");
           }
+          if (ownerRepairRequest) {
+            const [action] = await tx.select().from(issueRecoveryActions).where(and(
+              eq(issueRecoveryActions.id, ownerRepairRequest.actionId),
+              eq(issueRecoveryActions.companyId, agent.companyId),
+              eq(issueRecoveryActions.sourceIssueId, ownerRepairRequest.issueId),
+              eq(issueRecoveryActions.status, "active"))).for("update");
+            const settlement = readOwnerRepairSettlement(action?.evidence);
+            if (!settlement || settlement.state !== "pending_dispatch" ||
+                settlement.wakeupRequestId !== ownerRepairRequest.wakeupRequestId ||
+                settlement.repairRunId !== ownerRepairRequest.repairRunId ||
+                settlement.continuationKey !== ownerRepairRequest.continuationKey ||
+                settlement.ownerAgentId !== agentId ||
+                settlement.expectedIssueStatusVersion !== ownerRepairRequest.expectedIssueStatusVersion)
+              throw conflict("Owner repair continuation was superseded");
+          }
           const failedChatRetry = await authorizeFailedChatRunRetryWake(
             db,
             tx as unknown as Db,
@@ -3061,6 +3096,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
           if (!issue) {
             if (caseRequest) throw conflict("Case handoff task no longer exists");
+            if (ownerRepairRequest) throw conflict("Owner repair continuation task no longer exists");
             await tx.insert(agentWakeupRequests).values({
               ...durableReceiptFields,
               companyId: agent.companyId,
@@ -3103,6 +3139,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               )))
           ) {
             if (caseRequest) throw conflict("Case handoff task changed before admission");
+            if (ownerRepairRequest) throw conflict("Owner repair continuation task changed before admission");
             // A deferred monitor retains its schedule; do not create a receipt
             // that could suppress its next admission attempt.
             if (issueStateGuard.monitorNextCheckAt !== undefined) return { kind: "skipped" as const };
@@ -3273,7 +3310,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           const deferBlockedExecution = async (
             executionBlocker: NonNullable<Awaited<ReturnType<typeof getExecutionBlocker>>>,
           ) => {
-            if (caseRequest) waitForCaseAdmission("execution_reconciliation_required", executionBlocker.nextAction);
+            if (outboxRequest) waitForCaseAdmission("execution_reconciliation_required", executionBlocker.nextAction);
             opts.issueStateGuard?.onExecutionDeferred?.(executionBlocker.cause);
             const condition = { recoveryActionId: executionBlocker.recoveryActionId, ...continuationWait };
             if (executionWaitRequestId) {
@@ -3349,7 +3386,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             worktreeExecutionCutoff &&
             issue.createdAt < worktreeExecutionCutoff
           ) {
-            if (caseRequest) waitForCaseAdmission("heartbeat.worktree_execution_cutoff", "Case handoff is waiting for workspace execution to be enabled");
+            if (outboxRequest) waitForCaseAdmission("heartbeat.worktree_execution_cutoff", "Case handoff is waiting for workspace execution to be enabled");
             await tx.insert(agentWakeupRequests).values({
               ...durableReceiptFields,
               companyId: agent.companyId,
@@ -3659,7 +3696,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             !dependencyReadiness.isDependencyReady &&
             !blockedInteractionWake
           ) {
-            if (caseRequest) waitForCaseAdmission("issue_dependencies_blocked", "Case handoff is waiting for task dependencies to resolve");
+            if (outboxRequest) waitForCaseAdmission("issue_dependencies_blocked", "Case handoff is waiting for task dependencies to resolve");
             await recordExecutionWait(tx as unknown as Db, {
               issueId: issue.id,
               coalesce: coalesceExecutionWait,
@@ -3751,7 +3788,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 hasResolvablePriorSessionWorkspace,
               })
             ) {
-              if (caseRequest) waitForCaseAdmission(WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE, WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE);
+              if (outboxRequest) waitForCaseAdmission(WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE, WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE);
               const now = new Date();
               const issueLabel = formatIssueIdentifierLink(
                 issue.identifier,
@@ -3833,7 +3870,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           if (activeExecutionRun) {
             // The case ledger owns retry. Do not place its exact receipt in a
             // generic deferred queue that cannot retain handoff authority.
-            if (caseRequest) return { kind: "deferred" as const };
+            if (outboxRequest) return { kind: "deferred" as const };
             // The resolved action is already a durable retry outbox. Do not merge
             // its fresh-session contract into unrelated work or create a second
             // deferred wake that could later replay the same reconciliation.
@@ -3959,7 +3996,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // this gate. A verified durable case receipt carries a new phase;
           // its agent-authored instruction comment is not an event-free wake.
           if (
-            !caseRequest &&
+            !outboxRequest &&
             isThrottleCandidateIssueRewake({
               reason,
               wakeCommentId: wakeCommentId ?? null,
@@ -4091,7 +4128,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             tx,
           );
           if (dailyCapBlock) {
-            if (caseRequest) waitForCaseAdmission(dailyCapBlock.reason, "Case handoff is waiting for the agent's daily limit to clear");
+            if (outboxRequest) waitForCaseAdmission(dailyCapBlock.reason, "Case handoff is waiting for the agent's daily limit to clear");
             if (executionWaitRequestId && executionBlocker) {
               continuationWait = { reason: dailyCapBlock.reason,
                 message: "The agent has reached its daily limit. Your message is saved until work can resume." };
