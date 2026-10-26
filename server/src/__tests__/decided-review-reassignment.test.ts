@@ -1136,6 +1136,31 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     await drain(b.f);
   }, 60_000);
 
+  it.each(["the author's own review request", "the task being cancelled"])(
+    "drops a settling retry once %s takes its candidate out of the scan",
+    async (exit) => {
+      const b = await heldBase();
+      const retry = { after: null, settling: new Map<string, number>() };
+      await continueDecidedReviewReassignments(db, heartbeat.wakeup, retry);
+      expect(decidedReviewRetryPending(retry)).toBe(true);
+
+      if (exit === "the task being cancelled") {
+        await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, b.f.issueId));
+      } else {
+        await b.releaseLease();
+        await heartbeat.wakeup(b.f.reviewerId, await authorReviewRequest(b.f));
+        await drain(b.f);
+        await expectOneSuccessor(b.f, b.resubmittedAt);
+      }
+      await continueDecidedReviewReassignments(db, heartbeat.wakeup, retry);
+      expect(retry.settling.size).toBe(0);
+      expect(decidedReviewRetryPending(retry)).toBe(false);
+      await fs.writeFile(b.f.gate, "open");
+      await drain(b.f);
+    },
+    60_000,
+  );
+
   it("gives a submission one turn when an older parked review request promotes before its own request arrives", async () => {
     const b = await heldBase();
     await fs.rm(b.f.gate, { force: true });
