@@ -320,6 +320,8 @@ describe("isSameRepository", () => {
     ["git@github.com:phenix3443/paperclip.git", "https://github.com/phenix3443/paperclip.git"],
     ["ssh://git@github.com/phenix3443/paperclip.git", "https://github.com/phenix3443/paperclip"],
     ["https://GitHub.com/phenix3443/paperclip/", "https://github.com/phenix3443/paperclip.git"],
+    ["ssh://git@github.com:22/phenix3443/paperclip.git", "https://github.com/phenix3443/paperclip.git"],
+    ["https://git.example:8443/owner/repo.git", "https://git.example:8443/owner/repo"],
   ])("treats %s and %s as one repository", (origin, recorded) => {
     expect(isSameRepository(origin, recorded)).toBe(true);
   });
@@ -329,6 +331,10 @@ describe("isSameRepository", () => {
     ["git@github.com:phenix3443/paperclip.git", "https://gitlab.com/phenix3443/paperclip.git"],
     ["git@github.com:Phenix3443/paperclip.git", "https://github.com/phenix3443/paperclip.git"],
     ["file:///repos/paperclip.git", "https://github.com/phenix3443/paperclip.git"],
+    ["https://git.example:8443/owner/repo.git", "https://git.example:9443/owner/repo.git"],
+    ["ssh://git@git.example:2222/owner/repo.git", "ssh://git@git.example/owner/repo.git"],
+    ["git@git.example:owner/repo.git", "ssh://git@git.example/owner/repo.git"],
+    ["git@git.example:owner/repo.git", "https://git.example:8443/owner/repo.git"],
   ])("keeps %s and %s distinct", (origin, recorded) => {
     expect(isSameRepository(origin, recorded)).toBe(false);
   });
