@@ -175,7 +175,7 @@ function isBlockingHold(hold: Hold) {
 }
 
 export async function selectDecidedReviewSource(
-  db: Db, task: Task, identity?: SubmissionIdentity | null,
+  db: Db, task: Pick<Task, "companyId" | "id" | "status" | "executionState">, identity?: SubmissionIdentity | null,
 ): Promise<DecidedReviewSelection> {
   const state = readState(task);
   if (state?.currentParticipant?.type !== "agent" || !state.currentParticipant.agentId) return { kind: "none", rule: "participant_not_agent" };
