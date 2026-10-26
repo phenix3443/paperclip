@@ -119,6 +119,7 @@ describeEmbeddedPostgres("decided review continuation after an expected reviewer
     await db.delete(issueThreadInteractions);
     await db.delete(issueApprovals);
     await db.delete(approvals);
+    await db.delete(decisions);
     await db.delete(issueRelations);
     await db.delete(issueComments);
     await db.delete(issueExecutionDecisions);
