@@ -29,15 +29,19 @@ jobs:
     env:
       SHA: ${{ github.sha }}
       REPO: ${{ github.repository }}
-      PACKAGES_DIR: ${{ runner.temp }}/packages
-      MEMORY_LOG: ${{ runner.temp }}/memory.log
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      # The service host runs Node 26; keep the packaging and smoke check on it.
+      # The packages are Node-version independent; the service host installs
+      # them with its own Node, which also builds their native modules.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: 26
+          node-version: 24
+
+      - name: Locate working paths
+        run: |
+          echo "PACKAGES_DIR=$RUNNER_TEMP/packages" >> "$GITHUB_ENV"
+          echo "MEMORY_LOG=$RUNNER_TEMP/memory.log" >> "$GITHUB_ENV"
 
       - name: Build this commit's CLI
         run: |
