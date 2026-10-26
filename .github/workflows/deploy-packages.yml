@@ -43,17 +43,54 @@ jobs:
           echo "PACKAGES_DIR=$RUNNER_TEMP/packages" >> "$GITHUB_ENV"
           echo "MEMORY_LOG=$RUNNER_TEMP/memory.log" >> "$GITHUB_ENV"
 
+      # Diagnostics only. Every second, record each process of this user: pid,
+      # ppid, RSS (KiB), comm, working directory and the full command line,
+      # read from /proc so nothing is truncated. It starts before the workspace
+      # install so that install is sampled too.
+      - name: Sample process memory
+        run: |
+          cat > "$RUNNER_TEMP/sample-memory.py" <<'PY'
+          import os, sys, time
+          uid, page_kib = os.getuid(), os.sysconf("SC_PAGE_SIZE") // 1024
+          clean = lambda text: text.replace("\t", " ").replace("\n", " ")
+          with open(sys.argv[1], "a") as log:
+              while True:
+                  lines = ["@ %.3f" % time.time()]
+                  for pid in os.listdir("/proc"):
+                      if not pid.isdigit():
+                          continue
+                      base = f"/proc/{pid}"
+                      try:
+                          if os.stat(base).st_uid != uid:
+                              continue
+                          with open(f"{base}/stat") as f:
+                              stat = f.read()
+                          with open(f"{base}/statm") as f:
+                              rss = int(f.read().split()[1]) * page_kib
+                          with open(f"{base}/cmdline", "rb") as f:
+                              cmdline = f.read().replace(b"\0", b" ").decode(errors="replace").strip()
+                      except (OSError, ValueError, IndexError):
+                          continue
+                      try:
+                          cwd = os.readlink(f"{base}/cwd")
+                      except OSError:
+                          cwd = "?"
+                      comm = stat[stat.index("(") + 1:stat.rindex(")")]
+                      ppid = stat[stat.rindex(")") + 2:].split()[1]
+                      lines.append("\t".join([pid, ppid, str(rss), clean(comm), clean(cwd), clean(cmdline)]))
+                  log.write("\n".join(lines) + "\n")
+                  log.flush()
+                  time.sleep(1)
+          PY
+          nohup python3 -I "$RUNNER_TEMP/sample-memory.py" "$MEMORY_LOG" >/dev/null 2>&1 &
+          echo "SAMPLER_PID=$!" >> "$GITHUB_ENV"
+
       # The CLI runs from source like the root `paperclipai` script; its esbuild
       # bundle only resolves dependencies once it is packed and installed.
       - name: Install this commit's workspace
         run: |
           corepack enable
           corepack pnpm install --frozen-lockfile
-
-      - name: Sample process memory
-        run: |
-          nohup bash -c 'while :; do ps -u "$(id -u)" -o rss=,args= >> "$MEMORY_LOG"; echo --- >> "$MEMORY_LOG"; sleep 2; done' >/dev/null 2>&1 &
-          echo "SAMPLER_PID=$!" >> "$GITHUB_ENV"
 
       # A transient unit reports the peak memory of the whole build tree.
       # The token is imported by name so it never appears in process arguments,
@@ -82,10 +119,245 @@ jobs:
           '
           du -sh "$PACKAGES_DIR"
 
+      # Diagnostics only: the report never fails the job.
       - name: Report memory
         if: always()
+        continue-on-error: true
         run: |
           kill "$SAMPLER_PID" 2>/dev/null || true
+          cat > "$RUNNER_TEMP/report-memory.py" <<'PY'
+          import json, os, re, sys
+          from collections import defaultdict
+
+          log_path, manifest_path = sys.argv[1], sys.argv[2]
+          package_dirs = {entry["dir"] for entry in json.load(open(manifest_path))}
+          PHASES = ["outer workspace install", "ref resolution", "source download", "extract", "corepack enable",
+                    "inner pnpm install", "CLI bundle", "workspace build", "packaging", "final npm install", "smoke",
+                    "install CLI only", "after install", "unknown"]
+          REQUIRED = ["outer workspace install", "inner pnpm install", "CLI bundle", "workspace build", "packaging", "final npm install"]
+          STAGING_RE = re.compile(r"/\S*?/installs/git/\.[0-9a-f]{12}\.tmp-\d+-\d+")
+          CLI_MARK = "cli/src/index.ts install --repo"
+          # tsx starts esbuild's long-lived transform service as a child of the CLI; it is not an install step.
+          HELPER_RE = re.compile(r"(^|/)esbuild --service=")
+
+          def snapshots():
+              ts, procs = None, {}
+              for line in open(log_path, errors="replace"):
+                  line = line.rstrip("\n")
+                  if line.startswith("@ "):
+                      if ts is not None:
+                          yield ts, procs
+                      ts, procs = float(line[2:]), {}
+                  elif line and ts is not None:
+                      parts = line.split("\t", 5)
+                      if len(parts) == 6:
+                          pid, ppid, rss, comm, cwd, cmd = parts
+                          procs[pid] = dict(pid=pid, ppid=ppid, rss=int(rss), comm=comm, cwd=cwd, cmd=cmd)
+              if ts is not None:
+                  yield ts, procs
+
+          def npm_args(cmd):
+              tokens = cmd.split()
+              if tokens and tokens[0] == "npm":
+                  tokens = tokens[1:]
+              elif len(tokens) > 1 and os.path.basename(tokens[0]) == "node" and os.path.basename(tokens[1]) in ("npm", "npm-cli.js"):
+                  tokens = tokens[2:]
+              else:
+                  return None
+              positional, skip = [], False
+              for token in tokens:
+                  if skip:
+                      skip = False
+                  elif token in ("--prefix", "--pack-destination"):
+                      skip = True
+                  elif not token.startswith("-"):
+                      positional.append(token)
+              return positional
+
+          class Stat:
+              def __init__(self):
+                  self.first = self.last = None
+                  self.count = 0
+                  self.peak = None
+                  self.concurrent = 0
+              def add(self, ts, procs):
+                  self.first = ts if self.first is None else self.first
+                  self.last = ts
+                  self.count += 1
+                  for proc in procs:
+                      if self.peak is None or proc["rss"] > self.peak["rss"]:
+                          self.peak = proc
+                  self.concurrent = max(self.concurrent, sum(proc["rss"] for proc in procs))
+
+          phase_stats = defaultdict(Stat)
+          package_stats = defaultdict(Stat)
+          unknown_reasons = defaultdict(int)
+          top = {}
+          staging = None
+          seen_cli = False
+          workspace_package_dirs = {}
+          helper_snapshots = 0
+
+          def step_matches(step):
+              cmd, out = step["cmd"], []
+              checkout = f"{staging}/source" if staging else None
+              if cmd.startswith("curl") and "api.github.com/repos/" in cmd: out.append(("ref resolution", None))
+              if cmd.startswith("curl") and "codeload.github.com/" in cmd: out.append(("source download", None))
+              if staging and cmd.startswith("tar -xzf") and f"{staging}/source.tar.gz" in cmd: out.append(("extract", None))
+              if "corepack enable pnpm" in cmd: out.append(("corepack enable", None))
+              if "corepack pnpm install --frozen-lockfile" in cmd: out.append(("inner pnpm install", None))
+              if "scripts/build-npm.sh --skip-checks --skip-typecheck" in cmd: out.append(("CLI bundle", None))
+              if "corepack pnpm -r --filter @paperclipai/server..." in cmd and "run build" in cmd: out.append(("workspace build", None))
+              if staging:
+                  prepare = re.search(re.escape(f"{checkout}/scripts/prepare-bundled-package.mjs") + r" (\S+) " + re.escape(staging) + r"/workspace-package-(\d+)(\s|$)", cmd)
+                  if prepare:
+                      package = prepare.group(1)[len(checkout) + 1:] if prepare.group(1).startswith(checkout + "/") else None
+                      if package:
+                          workspace_package_dirs[prepare.group(2)] = package
+                      out.append(("packaging", package))
+                  pnpm_pack = re.search(r"corepack pnpm --dir (\S+) pack --pack-destination " + re.escape(staging) + r"(\s|$)", cmd)
+                  if pnpm_pack:
+                      out.append(("packaging", pnpm_pack.group(1)))
+                  args = npm_args(cmd)
+                  if args is not None and args[:1] == ["pack"]:
+                      rest = args[1:]
+                      staged = re.fullmatch(re.escape(staging) + r"/workspace-package-(\d+)", rest[0]) if len(rest) == 1 else None
+                      if staged:
+                          index = staged.group(1)
+                          out.append(("packaging", workspace_package_dirs.get(index, f"workspace-package-{index} (package unknown)")))
+                      elif not rest and step["cwd"] == f"{checkout}/cli":
+                          out.append(("packaging", "cli"))
+                  if (args is not None and args[:1] == ["install"] and step["cwd"] == staging and len(args) > 1
+                          and all(a.startswith(staging + "/") and a.endswith(".tgz") for a in args[1:])):
+                      out.append(("final npm install", None))
+                  if f"{staging}/payload/node_modules/paperclipai/dist/index.js --version" in cmd: out.append(("smoke", None))
+              return out
+
+          for ts, procs in snapshots():
+              children = defaultdict(list)
+              for proc in procs.values():
+                  children[proc["ppid"]].append(proc["pid"])
+              def subtree(root):
+                  result, stack = [], [root]
+                  while stack:
+                      pid = stack.pop()
+                      result.append(procs[pid])
+                      stack.extend(children[pid])
+                  return result
+              for proc in procs.values():
+                  key = (proc["comm"], proc["cmd"][:200])
+                  top[key] = max(top.get(key, 0), proc["rss"])
+              if staging is None:
+                  for proc in procs.values():
+                      found = STAGING_RE.search(proc["cwd"]) or STAGING_RE.search(proc["cmd"])
+                      if found:
+                          staging = found.group(0)
+                          break
+              matches = {pid for pid, proc in procs.items() if CLI_MARK in proc["cmd"]}
+              ancestors = set()
+              for pid in matches:
+                  parent = procs[pid]["ppid"]
+                  while parent in procs:
+                      ancestors.add(parent)
+                      parent = procs[parent]["ppid"]
+              innermost = sorted(matches - ancestors)
+              if not innermost:
+                  phase_stats["after install" if seen_cli else "outer workspace install"].add(ts, list(procs.values()))
+                  continue
+              if len(innermost) > 1:
+                  unknown_reasons["more than one install CLI: " + " || ".join(procs[pid]["cmd"] for pid in innermost)] += 1
+                  phase_stats["unknown"].add(ts, list(procs.values()))
+                  continue
+              cli = innermost[0]
+              seen_cli = True
+              tree = subtree(cli)
+              steps = [procs[pid] for pid in children[cli] if not HELPER_RE.search(procs[pid]["cmd"])]
+              if len(steps) != len(children[cli]):
+                  helper_snapshots += 1
+              if not steps:
+                  phase_stats["install CLI only"].add(ts, tree)
+                  continue
+              if len(steps) > 1:
+                  unknown_reasons["more than one step process: " + " || ".join(step["cmd"] for step in steps)] += 1
+                  phase_stats["unknown"].add(ts, tree)
+                  continue
+              step = steps[0]
+              found = step_matches(step)
+              if len(found) != 1 or (found[0][0] == "packaging" and not found[0][1]):
+                  reason = "no rule" if not found else "packaging names no package" if len(found) == 1 else "several rules: " + ", ".join(p for p, _ in found)
+                  unknown_reasons[f"{reason}: cwd={step['cwd']} cmd={step['cmd']}"] += 1
+                  phase_stats["unknown"].add(ts, tree)
+                  continue
+              phase, package = found[0]
+              phase_stats[phase].add(ts, tree)
+              if phase == "packaging":
+                  package_stats[(phase, package)].add(ts, subtree(step["pid"]))
+              elif phase == "workspace build":
+                  checkout = f"{staging}/source"
+                  by_package = defaultdict(list)
+                  for proc in subtree(step["pid"]):
+                      owner, current = "(no package directory)", proc
+                      while True:
+                          if current["cwd"].startswith(checkout + "/") and current["cwd"][len(checkout) + 1:] in package_dirs:
+                              owner = current["cwd"][len(checkout) + 1:]
+                              break
+                          if current["pid"] == step["pid"] or current["ppid"] not in procs:
+                              break
+                          current = procs[current["ppid"]]
+                      by_package[owner].append(proc)
+                  for owner, owned in by_package.items():
+                      package_stats[(phase, owner)].add(ts, owned)
+
+          mib = lambda kib: f"{kib / 1024:.0f}"
+          cell = lambda text, width=200: (text[:width] + ("…" if len(text) > width else "")).replace("|", "\\|")
+          def row(name, stat):
+              duration = f"{stat.last - stat.first:.0f}" if stat.count > 1 else "0"
+              peak = stat.peak or dict(rss=0, comm="", cmd="", cwd="")
+              return f"| {cell(name)} | {duration} | {mib(peak['rss'])} | {cell(peak['comm'])} | `{cell(peak['cmd'])}` | `{cell(peak['cwd'])}` | {mib(stat.concurrent)} | {stat.count} |"
+          header = ["| Phase | Duration (s, ±1) | Largest process (MiB) | comm | Command line | Working directory | Concurrent upper bound (MiB) | Snapshots |",
+                    "|---|---|---|---|---|---|---|---|"]
+
+          print("### Memory by phase")
+          print()
+          print(f"Staging directory: `{staging or 'not found'}`")
+          print()
+          print("\n".join(header))
+          for phase in PHASES:
+              if phase in phase_stats:
+                  print(row(phase, phase_stats[phase]))
+              else:
+                  print(f"| {phase} | not sampled | | | | | | 0 |")
+          for phase in ("workspace build", "packaging"):
+              print()
+              print(f"### {phase} by package")
+              print()
+              print("\n".join(header).replace("| Phase |", "| Package |", 1))
+              for (owner_phase, owner), stat in sorted(package_stats.items(), key=lambda item: -(item[1].peak or {"rss": 0})["rss"]):
+                  if owner_phase == phase:
+                      print(row(owner, stat))
+          print()
+          unknown_count = phase_stats["unknown"].count if "unknown" in phase_stats else 0
+          print(f"Unknown snapshots: {unknown_count}")
+          print(f"Snapshots with the esbuild service child ignored as a step: {helper_snapshots}")
+          for reason, count in sorted(unknown_reasons.items(), key=lambda item: -item[1])[:20]:
+              print(f"- {count} × `{cell(reason, 400)}`")
+          failures = []
+          if unknown_count:
+              failures.append(f"{unknown_count} unknown snapshots")
+          failures += [f"{phase} not sampled" for phase in REQUIRED if phase not in phase_stats]
+          if ("workspace build", "server") not in package_stats:
+              failures.append("no server row in workspace build")
+          failures += [f"packaging package unknown: {owner}" for (phase, owner) in package_stats if phase == "packaging" and "(package unknown)" in owner]
+          print()
+          print("Attribution gate: " + ("pass" if not failures else "FAIL (" + "; ".join(failures) + ")"))
+          print()
+          print("### Largest processes (peak RSS, MiB)")
+          print()
+          print("```")
+          for (comm, cmd), rss in sorted(top.items(), key=lambda item: -item[1])[:15]:
+              print(f"{rss / 1024:8.0f}  {comm[:15]:15}  {cmd}")
+          print("```")
+          PY
           {
             echo "## Build memory"
             echo
@@ -93,12 +365,7 @@ jobs:
             grep -E "Memory peak|CPU time consumed|Service runtime" "$RUNNER_TEMP/unit.log" || echo "no unit summary"
             echo '```'
             echo
-            echo "Largest processes (peak RSS, MiB):"
-            echo
-            echo '```'
-            awk '$0 != "---" { rss = $1; $1 = ""; cmd = substr($0, 2, 100); if (rss > peak[cmd]) peak[cmd] = rss }
-                 END { for (cmd in peak) printf "%8.0f  %s\n", peak[cmd] / 1024, cmd }' "$MEMORY_LOG" | sort -rn | head -15
-            echo '```'
+            python3 -I "$RUNNER_TEMP/report-memory.py" "$MEMORY_LOG" scripts/release-package-manifest.json
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -109,3 +376,13 @@ jobs:
           # The tarballs are already gzip-compressed.
           compression-level: 0
           if-no-files-found: error
+
+      # The raw samples, so the phase attribution can be checked offline.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        continue-on-error: true
+        with:
+          name: build-memory-${{ github.sha }}
+          path: ${{ runner.temp }}/memory.log
+          retention-days: 30
+          if-no-files-found: warn
