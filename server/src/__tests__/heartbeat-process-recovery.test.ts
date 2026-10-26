@@ -8111,6 +8111,119 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     },
   );
 
+  it("admits no owner-repair successor after review escalated to the responsible human", async () => {
+    const fixture = await seedCompletedOwnerRepairFixture();
+    const responsibleUserId = `user-${randomUUID()}`;
+    const reviewerAgentId = randomUUID();
+    const stageId = randomUUID();
+    const executionPolicy = {
+      mode: "normal",
+      commentRequired: true,
+      stages: [{ id: stageId, type: "review", approvalsNeeded: 1,
+        participants: [{ id: randomUUID(), type: "agent", agentId: reviewerAgentId, userId: null }] }],
+    };
+    // Third changes-requested round: the stage stays pending with the human.
+    const executionState = {
+      status: "pending",
+      currentStageId: stageId,
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "user", userId: responsibleUserId },
+      returnAssignee: { type: "agent", agentId: fixture.agentId },
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: "changes_requested",
+      changesRequestedCount: 3,
+    };
+    await db.update(issues).set({
+      status: "in_review",
+      assigneeAgentId: null,
+      assigneeUserId: responsibleUserId,
+      responsibleUserId,
+      executionPolicy,
+      executionState,
+    }).where(eq(issues.id, fixture.issueId));
+    const before = await selectRecoveryIssueById(fixture.issueId);
+
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    const after = await observeOwnerRepairContinuation(fixture);
+    expect(after.repeatedRepairs).toHaveLength(0);
+    expect(after.businessSuccessors).toHaveLength(0);
+    expect(after.receipts).toHaveLength(0);
+    expect(after.action.attemptCount).toBe(1);
+    expect(after.settlement).toBeNull();
+    expect({
+      status: after.issue.status,
+      assigneeAgentId: after.issue.assigneeAgentId,
+      assigneeUserId: after.issue.assigneeUserId,
+      responsibleUserId: after.issue.responsibleUserId,
+      executionPolicy: after.issue.executionPolicy,
+      executionState: after.issue.executionState,
+    }).toEqual({
+      status: before!.status,
+      assigneeAgentId: before!.assigneeAgentId,
+      assigneeUserId: before!.assigneeUserId,
+      responsibleUserId: before!.responsibleUserId,
+      executionPolicy: before!.executionPolicy,
+      executionState: before!.executionState,
+    });
+  });
+
+  it("lets a Stop that lands after reservation win until the owner is resumed", async () => {
+    const fixture = await seedCompletedOwnerRepairFixture();
+    // The settlement committed and reserved its receipt id ...
+    const reservedId = randomUUID();
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, fixture.issueId));
+    const reopened = await selectRecoveryIssueById(fixture.issueId);
+    const action = await db.select().from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, fixture.actionId)).then((rows) => rows[0]!);
+    await db.update(issueRecoveryActions).set({
+      evidence: {
+        ...(action.evidence as Record<string, unknown>),
+        ownerRepairSettlement: {
+          schema: "paperclip.owner-repair-settlement.v1",
+          state: "pending_dispatch",
+          continuationKey: `owner-repair-continuation:${fixture.issueId}:${fixture.actionId}:${fixture.repairRunId}:business`,
+          wakeupRequestId: reservedId,
+          repairRunId: fixture.repairRunId,
+          ownerAgentId: fixture.agentId,
+          actionFingerprint: action.fingerprint,
+          expectedIssueStatusVersion: reopened!.statusVersion,
+          terminalEvidence: { runStatus: "succeeded", finishedAt: new Date().toISOString(), durableSettlementEventSeq: 10 },
+          completedWorkProductIds: [],
+          settledAt: new Date().toISOString(),
+        },
+      },
+    }).where(eq(issueRecoveryActions.id, fixture.actionId));
+    // ... and the owner was stopped before the queue admitted it.
+    await db.update(agents).set({ status: "paused", pauseReason: "manual", pausedAt: new Date() })
+      .where(eq(agents.id, fixture.agentId));
+
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    const stopped = await observeOwnerRepairContinuation(fixture);
+    expect(stopped.businessSuccessors).toHaveLength(0);
+    expect(stopped.repeatedRepairs).toHaveLength(0);
+    expect(stopped.receipts).toHaveLength(0);
+    expect(stopped.settlement).toMatchObject({ state: "pending_dispatch", wakeupRequestId: reservedId });
+    expect(stopped.action).toMatchObject({ status: "active", attemptCount: 1 });
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+
+    await db.update(agents).set({ status: "idle", pauseReason: null, pausedAt: null })
+      .where(eq(agents.id, fixture.agentId));
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    const resumed = await observeOwnerRepairContinuation(fixture);
+    expect(resumed.repeatedRepairs).toHaveLength(0);
+    expect(resumed.businessSuccessors).toHaveLength(1);
+    expect(resumed.receipts.map((receipt) => receipt.id)).toEqual([reservedId]);
+    expect(resumed.receipts[0]!.runId).toBe(resumed.businessSuccessors[0]!.id);
+    expect(resumed.action).toMatchObject({ status: "resolved", attemptCount: 1 });
+  });
+
   it("holds an owner-repair continuation behind a budget block without consuming its receipt", async () => {
     const fixture = await seedCompletedOwnerRepairFixture();
     const [policy] = await db.insert(budgetPolicies).values({
