@@ -159,7 +159,9 @@ import {
   OWNER_REPAIR_SETTLEMENT_SCHEMA,
   isCompletedScheduledOwnerRepair,
   ownerRepairContinuationKey,
+  ownerRepairIssueBinding,
   readOwnerRepairSettlement,
+  sameOwnerRepairIssueBinding,
   type OwnerRepairSettlement,
 } from "./owner-repair-continuation.js";
 import { randomUUID } from "node:crypto";
@@ -3588,12 +3590,14 @@ export function recoveryService(
       if (!issue || issue.hiddenAt || ["done", "cancelled"].includes(issue.status)
         || issue.statusVersion !== observedIssue.statusVersion
         || issue.assigneeAgentId !== ownerAgentId || issue.assigneeUserId
+        || !sameOwnerRepairIssueBinding(ownerRepairIssueBinding(issue), ownerRepairIssueBinding(observedIssue))
         || action.fingerprint !== observedAction.fingerprint
         || action.ownerAgentId !== ownerAgentId || action.returnOwnerAgentId !== ownerAgentId
         || parseObject(action.wakePolicy).scheduledRunId !== repairRun.id) {
         return "stale" as const;
       }
       let expectedIssueStatusVersion = issue.statusVersion;
+      let issueBinding = ownerRepairIssueBinding(issue);
       if (issue.status === "blocked") {
         // The durable-path check above proved no first-class blocker, human
         // wait, or review stage holds this task: the completed repair's own
@@ -3604,6 +3608,7 @@ export function recoveryService(
         }, tx, publications, postCommitActions);
         if (!updated || updated.status !== "todo") throw conflict("Owner repair continuation could not reopen the parked task");
         expectedIssueStatusVersion = updated.statusVersion;
+        issueBinding = ownerRepairIssueBinding(updated);
       } else if (!["todo", "in_progress"].includes(issue.status)) {
         return "fallback" as const;
       }
@@ -3616,6 +3621,7 @@ export function recoveryService(
         ownerAgentId,
         actionFingerprint: action.fingerprint,
         expectedIssueStatusVersion,
+        issueBinding,
         terminalEvidence: {
           runStatus: repairRun.status,
           finishedAt: repairRun.finishedAt!.toISOString(),
@@ -3675,6 +3681,24 @@ export function recoveryService(
         sql`${issueRecoveryActions.evidence} -> 'ownerRepairSettlement' ->> 'state' = 'pending_dispatch'`,
       )).returning({ id: issueRecoveryActions.id });
       if (!updated) return;
+      if (next.state === "denied") {
+        // A terminal refusal keeps its receipt row: the unique key fences the
+        // slot even if the action evidence is later compacted.
+        await tx.insert(agentWakeupRequests).values({
+          id: settlement.wakeupRequestId,
+          companyId: action.companyId,
+          agentId: settlement.ownerAgentId,
+          source: "automation",
+          triggerDetail: "system",
+          reason: OWNER_REPAIR_CONTINUATION_REASON,
+          payload: { issueId: action.sourceIssueId, actionId: action.id, repairRunId: settlement.repairRunId,
+            deniedReason: next.deniedReason ?? null },
+          status: "skipped",
+          requestedByActorType: "system",
+          idempotencyKey: settlement.continuationKey,
+          finishedAt: new Date(),
+        }).onConflictDoNothing();
+      }
       await recoveryActionsSvc.resolveActiveForIssue({
         companyId: action.companyId,
         sourceIssueId: action.sourceIssueId,
@@ -3745,9 +3769,8 @@ export function recoveryService(
         if (status !== 409 && status !== 404) throw error;
         // A newer decision (owner, status, or settlement) consumed this slot.
         // Keep the reserved key so it can never be admitted again.
-        if (await acceptedOwnerRepairReceipt(action, settlement)) {
-          receipt = await acceptedOwnerRepairReceipt(action, settlement);
-        } else {
+        receipt = await acceptedOwnerRepairReceipt(action, settlement);
+        if (!receipt) {
           await markOwnerRepairSettlement(action, settlement, {
             state: "denied",
             deniedReason: error instanceof Error ? error.message : "superseded",

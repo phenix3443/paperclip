@@ -3896,7 +3896,7 @@ export function heartbeatService(
       // A completed owner repair settles as soon as its executor is released.
       // The recovery sweep repeats the same settlement if this attempt is lost.
       if (latestRun?.status === "succeeded" && !nativeOwnershipHeld &&
-          latestRun.contextSnapshot?.wakeReason === "issue_disposition_repair") {
+          latestRun.contextSnapshot?.wakeReason === ISSUE_DISPOSITION_REPAIR_RETRY_REASON) {
         await recovery.settleCompletedOwnerRepairRun(latestRun)
           .catch(error => logger.warn({ runId: run.id, error }, "Could not settle completed owner repair; the recovery sweep will retry"));
       }

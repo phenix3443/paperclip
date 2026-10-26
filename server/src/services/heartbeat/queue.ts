@@ -58,7 +58,13 @@ import {
 import { agentService } from "../agents.js";
 import { normalizeLegacyRunnerProvider } from "@paperclipai/adapter-utils";
 import { randomUUID } from "node:crypto";
-import { OWNER_REPAIR_CONTINUATION_REASON, readOwnerRepairSettlement } from "../recovery/owner-repair-continuation.js";
+import {
+  OWNER_REPAIR_CONTINUATION_REASON,
+  ownerRepairIssueBinding,
+  readOwnerRepairSettlement,
+  sameOwnerRepairIssueBinding,
+  type OwnerRepairIssueBinding,
+} from "../recovery/owner-repair-continuation.js";
 import {
   and,
   asc,
@@ -2962,6 +2968,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             if (!handoff || handoff.appliedIssueStatusVersion !== caseRequest.expectedIssueStatusVersion)
               throw conflict("Case handoff delivery was superseded");
           }
+          let ownerRepairIssueBindingGuard: OwnerRepairIssueBinding | null = null;
           if (ownerRepairRequest) {
             const [action] = await tx.select().from(issueRecoveryActions).where(and(
               eq(issueRecoveryActions.id, ownerRepairRequest.actionId),
@@ -2969,6 +2976,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               eq(issueRecoveryActions.sourceIssueId, ownerRepairRequest.issueId),
               eq(issueRecoveryActions.status, "active"))).for("update");
             const settlement = readOwnerRepairSettlement(action?.evidence);
+            ownerRepairIssueBindingGuard = settlement?.issueBinding ?? null;
             if (!settlement || settlement.state !== "pending_dispatch" ||
                 settlement.wakeupRequestId !== ownerRepairRequest.wakeupRequestId ||
                 settlement.repairRunId !== ownerRepairRequest.repairRunId ||
@@ -3084,6 +3092,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               monitorWakeRequestedAt: issues.monitorWakeRequestedAt,
               executionRunId: issues.executionRunId,
               executionAgentNameKey: issues.executionAgentNameKey,
+              responsibleUserId: issues.responsibleUserId,
+              lastStatusDecisionId: issues.lastStatusDecisionId,
+              workspaceBindingRevision: issues.workspaceBindingRevision,
+              executionState: issues.executionState,
               createdAt: issues.createdAt,
             })
             .from(issues)
@@ -3122,6 +3134,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               sourceRunId: readNonEmptyString(enrichedContextSnapshot.previousRunId)!,
             })) return { kind: "deferred" as const };
           }
+          // Responsible human, status decision, workspace binding and review
+          // stage must still match what the settlement observed.
+          if (ownerRepairRequest && (!ownerRepairIssueBindingGuard ||
+              !sameOwnerRepairIssueBinding(ownerRepairIssueBinding(issue), ownerRepairIssueBindingGuard)))
+            throw conflict("Owner repair continuation task changed before admission");
           const issueStateGuard = opts.issueStateGuard;
           const activeMonitorRun = issueStateGuard?.monitorNextCheckAt === undefined ? null
             : await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(

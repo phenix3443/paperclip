@@ -31,6 +31,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { and, eq, or, inArray, sql } from "drizzle-orm";
+import { ownerRepairIssueBinding } from "../services/recovery/owner-repair-continuation.js";
 import {
   afterAll,
   afterEach,
@@ -8019,6 +8020,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           ownerAgentId: fixture.agentId,
           actionFingerprint: action.fingerprint,
           expectedIssueStatusVersion: reopened!.statusVersion,
+          issueBinding: ownerRepairIssueBinding(reopened!),
           terminalEvidence: { runStatus: "succeeded", finishedAt: new Date().toISOString(), durableSettlementEventSeq: 10 },
           completedWorkProductIds: [],
           settledAt: new Date().toISOString(),
@@ -8191,6 +8193,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           ownerAgentId: fixture.agentId,
           actionFingerprint: action.fingerprint,
           expectedIssueStatusVersion: reopened!.statusVersion,
+          issueBinding: ownerRepairIssueBinding(reopened!),
           terminalEvidence: { runStatus: "succeeded", finishedAt: new Date().toISOString(), durableSettlementEventSeq: 10 },
           completedWorkProductIds: [],
           settledAt: new Date().toISOString(),
@@ -8273,7 +8276,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(after.action).toMatchObject({ status: "resolved", attemptCount: 1 });
   });
 
-  it("denies a reserved owner-repair continuation after reassignment and never reopens its slot", async () => {
+  it.each(["reassignment", "responsible human", "workspace binding", "review stage"] as const)(
+    "denies a reserved owner-repair continuation after a %s change and never reopens its slot",
+    async (change) => {
     const fixture = await seedCompletedOwnerRepairFixture();
     // Reserve while the owner cannot be invoked; then hand the task to someone else.
     const action = await db.select().from(issueRecoveryActions)
@@ -8294,6 +8299,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           ownerAgentId: fixture.agentId,
           actionFingerprint: action.fingerprint,
           expectedIssueStatusVersion: reopened!.statusVersion,
+          issueBinding: ownerRepairIssueBinding(reopened!),
           terminalEvidence: { runStatus: "succeeded", finishedAt: new Date().toISOString(), durableSettlementEventSeq: 10 },
           completedWorkProductIds: [],
           settledAt: new Date().toISOString(),
@@ -8302,15 +8308,32 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }).where(eq(issueRecoveryActions.id, fixture.actionId));
     const otherAgentId = randomUUID();
     await db.insert(agents).values(recoveryAgentRow(otherAgentId, fixture.companyId, "ReplacementOwner", "engineer", "idle"));
-    await db.update(issues).set({ assigneeAgentId: otherAgentId }).where(eq(issues.id, fixture.issueId));
+    if (change === "reassignment") {
+      await db.update(issues).set({ assigneeAgentId: otherAgentId }).where(eq(issues.id, fixture.issueId));
+    } else if (change === "responsible human") {
+      await db.update(issues).set({ responsibleUserId: `user-${randomUUID()}` }).where(eq(issues.id, fixture.issueId));
+    } else if (change === "workspace binding") {
+      await db.update(issues).set({ workspaceBindingRevision: reopened!.workspaceBindingRevision + 1 })
+        .where(eq(issues.id, fixture.issueId));
+    } else {
+      await db.update(issues).set({ executionState: { status: "pending", currentStageId: randomUUID() } })
+        .where(eq(issues.id, fixture.issueId));
+    }
 
     await heartbeatService(db).reconcileStrandedAssignedIssues();
     await heartbeatService(db).reconcileStrandedAssignedIssues();
 
     const after = await observeOwnerRepairContinuation(fixture);
     expect(after.repeatedRepairs).toHaveLength(0);
-    expect(after.businessSuccessors).toHaveLength(0);
-    expect(after.receipts).toHaveLength(0);
+    // The old completion admits nothing. A still-assigned owner may only get
+    // a fresh disposition repair under a new recovery action.
+    expect(after.businessSuccessors.filter((run) => run.contextSnapshot?.wakeReason !== "issue_disposition_repair"))
+      .toHaveLength(0);
+    for (const run of after.businessSuccessors) expect(run.contextSnapshot?.recoveryActionId).not.toBe(fixture.actionId);
+    if (change === "reassignment") expect(after.businessSuccessors).toHaveLength(0);
+    // The terminal refusal keeps its receipt so the key stays consumed.
+    expect(after.receipts).toHaveLength(1);
+    expect(after.receipts[0]).toMatchObject({ id: reservedId, idempotencyKey: continuationKey, status: "skipped", runId: null });
     expect(after.settlement).toMatchObject({ state: "denied", wakeupRequestId: reservedId, continuationKey });
     expect(after.action).toMatchObject({ status: "cancelled", attemptCount: 1, maxAttempts: 2 });
     const otherRuns = await selectRecoveryRunsByAgent(otherAgentId);

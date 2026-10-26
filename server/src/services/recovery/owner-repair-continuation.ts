@@ -1,3 +1,4 @@
+import { ISSUE_DISPOSITION_REPAIR_RETRY_REASON } from "@paperclipai/shared";
 import { parseObject } from "../../adapters/utils.js";
 
 /**
@@ -13,7 +14,6 @@ import { parseObject } from "../../adapters/utils.js";
  */
 export const OWNER_REPAIR_SETTLEMENT_SCHEMA = "paperclip.owner-repair-settlement.v1";
 export const OWNER_REPAIR_CONTINUATION_REASON = "owner_repair_continuation";
-export const OWNER_REPAIR_CONTINUATION_INDEX = "agent_wakeup_requests_owner_repair_continuation_uq";
 
 export type OwnerRepairSettlementState =
   /** Receipt id reserved; the queue has not accepted it yet. */
@@ -32,6 +32,8 @@ export type OwnerRepairSettlement = {
   ownerAgentId: string;
   actionFingerprint: string;
   expectedIssueStatusVersion: number;
+  /** Issue binding observed under the settlement lock; admission re-checks it. */
+  issueBinding: OwnerRepairIssueBinding;
   terminalEvidence: { runStatus: string; finishedAt: string; durableSettlementEventSeq: number };
   completedWorkProductIds: string[];
   settledAt: string;
@@ -39,6 +41,35 @@ export type OwnerRepairSettlement = {
   deliveredRunId?: string | null;
   deniedReason?: string | null;
 };
+
+export type OwnerRepairIssueBinding = {
+  responsibleUserId: string | null;
+  lastStatusDecisionId: string | null;
+  workspaceBindingRevision: number;
+  executionStageId: string | null;
+};
+
+export function ownerRepairIssueBinding(issue: {
+  responsibleUserId: string | null;
+  lastStatusDecisionId: string | null;
+  workspaceBindingRevision: number;
+  executionState: unknown;
+}): OwnerRepairIssueBinding {
+  const stageId = parseObject(issue.executionState).currentStageId;
+  return {
+    responsibleUserId: issue.responsibleUserId,
+    lastStatusDecisionId: issue.lastStatusDecisionId,
+    workspaceBindingRevision: issue.workspaceBindingRevision,
+    executionStageId: typeof stageId === "string" && stageId ? stageId : null,
+  };
+}
+
+export function sameOwnerRepairIssueBinding(left: OwnerRepairIssueBinding, right: OwnerRepairIssueBinding) {
+  return left.responsibleUserId === right.responsibleUserId
+    && left.lastStatusDecisionId === right.lastStatusDecisionId
+    && left.workspaceBindingRevision === right.workspaceBindingRevision
+    && left.executionStageId === right.executionStageId;
+}
 
 export function ownerRepairContinuationKey(input: {
   issueId: string;
@@ -57,6 +88,8 @@ export function readOwnerRepairSettlement(evidence: unknown): OwnerRepairSettlem
     if (typeof record[field] !== "string" || !record[field]) return null;
   }
   if (!Number.isSafeInteger(record.expectedIssueStatusVersion)) return null;
+  const binding = parseObject(record.issueBinding);
+  if (!Number.isSafeInteger(binding.workspaceBindingRevision)) return null;
   return record as unknown as OwnerRepairSettlement;
 }
 
@@ -96,7 +129,7 @@ export function isCompletedScheduledOwnerRepair(action: RepairActionShape, run: 
     && run.companyId === action.companyId
     && context.recoveryActionId === action.id
     && (context.issueId ?? context.taskId) === action.sourceIssueId
-    && context.retryReason === "issue_disposition_repair"
+    && context.retryReason === ISSUE_DISPOSITION_REPAIR_RETRY_REASON
     && Boolean(action.ownerAgentId)
     && action.ownerAgentId === action.returnOwnerAgentId
     && run.agentId === action.ownerAgentId
