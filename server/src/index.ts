@@ -153,7 +153,7 @@ import {
   loadWithoutCoordinatedShutdownSignalHooks,
 } from "./shutdown.js";
 import { initializeCloudRuntimeIdentity } from "./services/cloud-runtime-identity.js";
-import { systemdNotify } from "./services/systemd-notify.js";
+import { captureSystemdNotifySocket, systemdNotify } from "./services/systemd-notify.js";
 import { flushInFlightRunLogMirrors } from "./services/run-log-store.js";
 import {
   createEmbeddedPostgresSupervisor,
@@ -219,6 +219,7 @@ async function endDatabaseClient(client: unknown, timeoutSeconds: number): Promi
 }
 
 export async function startServer(): Promise<StartedServer> {
+  captureSystemdNotifySocket();
   const startupDatabase: StartupDatabaseTeardown = { close: null };
   try {
     return await startServerWithDatabaseTeardown(startupDatabase);
