@@ -7972,6 +7972,17 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       })],
       remainingScope: expect.stringContaining("do not repeat"),
     });
+
+    // Once settled, later sweeps leave the history untouched.
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+    const quiet = await observeOwnerRepairContinuation(fixture);
+    expect(quiet.action.updatedAt).toEqual(after.action.updatedAt);
+    expect(quiet.action.evidence).toEqual(after.action.evidence);
+    expect(quiet.receipts.map((receipt) => [receipt.id, receipt.status, receipt.runId]))
+      .toEqual(after.receipts.map((receipt) => [receipt.id, receipt.status, receipt.runId]));
+    expect(quiet.repeatedRepairs).toHaveLength(0);
+    expect(quiet.businessSuccessors.map((run) => run.id)).toEqual([successor!.id]);
   });
 
   it("keeps an owner repair with an unknown effect on its own recovery without continuing", async () => {
@@ -8001,6 +8012,47 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(after.settlement).toBeNull();
     expect(after.action).toMatchObject({ status: "active", attemptCount: 1 });
     expect(after.issue.status).toBe("blocked");
+  });
+
+  it("rolls back an owner-repair settlement that fails before commit and settles once on retry", async () => {
+    const fixture = await seedCompletedOwnerRepairFixture();
+    const originalTransaction = db.transaction.bind(db);
+    let failedOnce = false;
+    // Fail exactly the transaction that wrote the settlement, after its writes.
+    const transaction = vi.spyOn(db, "transaction").mockImplementation((async (callback: any, config?: any) =>
+      originalTransaction(async (tx: any) => {
+        const result = await callback(tx);
+        if (!failedOnce) {
+          const [row] = await tx.select({ evidence: issueRecoveryActions.evidence }).from(issueRecoveryActions)
+            .where(eq(issueRecoveryActions.id, fixture.actionId));
+          if ((row?.evidence as Record<string, unknown> | null)?.ownerRepairSettlement) {
+            failedOnce = true;
+            throw new Error("Simulated crash before commit");
+          }
+        }
+        return result;
+      }, config)) as typeof db.transaction);
+    try {
+      await heartbeatService(db).reconcileStrandedAssignedIssues().catch(() => undefined);
+    } finally {
+      transaction.mockRestore();
+    }
+    expect(failedOnce).toBe(true);
+    const rolledBack = await observeOwnerRepairContinuation(fixture);
+    expect(rolledBack.settlement).toBeNull();
+    expect(rolledBack.issue.status).toBe("blocked");
+    expect(rolledBack.receipts).toHaveLength(0);
+    expect(rolledBack.businessSuccessors).toHaveLength(0);
+    expect(rolledBack.repeatedRepairs).toHaveLength(0);
+    expect(rolledBack.action).toMatchObject({ status: "active", attemptCount: 1 });
+
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    const after = await observeOwnerRepairContinuation(fixture);
+    expect(after.repeatedRepairs).toHaveLength(0);
+    expect(after.businessSuccessors).toHaveLength(1);
+    expect(after.receipts).toHaveLength(1);
+    expect(after.action).toMatchObject({ status: "resolved", attemptCount: 1 });
   });
 
   it("keeps one owner-repair continuation across repeated and concurrent reconciliation", async () => {
