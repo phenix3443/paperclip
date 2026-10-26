@@ -156,8 +156,10 @@ import {
   armShutdownWatchdog,
   createShutdownBudget,
   resolveShutdownWorkDeadlineMs,
+  runHotRestartPreparationStep,
 } from "./shutdown-budget.js";
 import { SHUTDOWN_WATCHDOG_MS } from "@paperclipai/shared/shutdown-budget";
+import { revokeHotRestartAdoptionForProcess } from "./services/hot-restart.js";
 import { initializeCloudRuntimeIdentity } from "./services/cloud-runtime-identity.js";
 import { captureSystemdNotifySocket, systemdNotify } from "./services/systemd-notify.js";
 import { flushInFlightRunLogMirrors } from "./services/run-log-store.js";
@@ -1195,7 +1197,11 @@ async function startServerWithDatabaseTeardown(
     runIds?: readonly string[] | null,
   ) => Promise<unknown>) | null = null;
   let drainHeartbeatExecutionFinalizers: (() => Promise<void>) | null = null;
-  let prepareHotRestartShutdown: ((signal: "SIGINT" | "SIGTERM") => Promise<{
+  let prepareHotRestartShutdown: ((
+    signal: "SIGINT" | "SIGTERM",
+    now?: Date,
+    options?: { abortSignal?: AbortSignal },
+  ) => Promise<{
     skipDrain: boolean;
     drainRunIds?: string[];
   }>) | null = null;
@@ -2089,21 +2095,14 @@ async function startServerWithDatabaseTeardown(
     const heartbeatShutdown = await coordinateHeartbeatSchedulerShutdown({
       signal,
       prepareHotRestartShutdown: prepareHotRestartShutdown
-        ? async (preparationSignal) => {
-            // The last 5 s before the deadline are reserved for the
-            // preparation fence; with less left, preparation is skipped and
-            // the drain runs.
-            const capMs = Math.min(20_000, budget.remainingWorkMs() - 5_000);
-            if (capMs <= 0) {
-              throw new Error("hot-restart preparation skipped: less than 5000ms left before the shutdown deadline");
-            }
-            const prepared = await budget.workStep("hot_restart_preparation", capMs, () =>
-              prepareHotRestartShutdown!(preparationSignal),
-            );
-            if (prepared.outcome === "done") return prepared.value;
-            if (prepared.outcome === "failed") throw prepared.error;
-            throw new Error(`hot-restart preparation abandoned: ${prepared.outcome}`);
-          }
+        ? (preparationSignal) =>
+            runHotRestartPreparationStep({
+              budget,
+              log: logger,
+              prepare: (abortSignal) =>
+                prepareHotRestartShutdown!(preparationSignal, new Date(), { abortSignal }),
+              fence: () => revokeHotRestartAdoptionForProcess({ reason: "preparation_abandoned" }),
+            })
         : null,
       waitForHeartbeatSchedulerIdle: async () => {
         await budget.workStep("scheduler_quiesce", 60_000, async () => {

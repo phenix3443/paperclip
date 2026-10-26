@@ -263,6 +263,7 @@ import {
   readProcessStartedAt,
   resolveLegacyHotRestartIntentPath,
   resolveHotRestartReportPath,
+  revokeHotRestartAdoptionForProcess,
   writeHotRestartIntent,
 } from "../services/hot-restart.ts";
 import { secretService } from "../services/secrets.ts";
@@ -4143,6 +4144,86 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       await shutdown;
       await finalizers;
     }
+  });
+
+  it("publishes nothing from a hot-restart preparation whose signal has fired", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: child.pid ?? null,
+      processGroupId: null,
+      contextSnapshot: { executionEngine: "cli", processTopology: "detached" },
+    });
+
+    await withTempPaperclipHome(async () => {
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "old-cut-version",
+        requestedAt: new Date("2026-10-26T00:05:00.000Z"),
+      });
+      const heartbeat = heartbeatService(db);
+      const controller = new AbortController();
+      controller.abort(new Error("hot-restart preparation cut"));
+
+      await expect(heartbeat.prepareHotRestartShutdown(
+        "SIGTERM",
+        new Date("2026-10-26T00:06:00.000Z"),
+        { abortSignal: controller.signal },
+      )).rejects.toThrow("hot-restart preparation cut");
+
+      expect((await readHotRestartIntent())?.shutdownSnapshot).toBeUndefined();
+      const events = await db
+        .select()
+        .from(heartbeatRunEvents)
+        .where(and(
+          eq(heartbeatRunEvents.runId, runId),
+          eq(heartbeatRunEvents.message, "Hot restart requested; leaving child process alive for startup adoption"),
+        ));
+      expect(events).toEqual([]);
+    });
+  });
+
+  it("adopts nothing from a request whose adoption was revoked by the preparation fence", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: child.pid ?? null,
+      processGroupId: null,
+      contextSnapshot: { executionEngine: "cli", processTopology: "detached" },
+    });
+
+    await withTempPaperclipHome(async (home) => {
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "old-revoked-version",
+        requestedAt: new Date("2026-10-26T00:15:00.000Z"),
+        preflightActiveRunIds: [runId],
+      });
+      const heartbeat = heartbeatService(db);
+      // The snapshot landed, then the preparation was abandoned and fenced.
+      await heartbeat.prepareHotRestartShutdown("SIGTERM", new Date("2026-10-26T00:16:00.000Z"));
+      await expect(revokeHotRestartAdoptionForProcess({ reason: "preparation_abandoned" }))
+        .resolves.toBe(true);
+
+      const reconciliation = await heartbeat.reconcileHotRestartAdoption(
+        new Date("2026-10-26T00:17:00.000Z"),
+      );
+      expect(reconciliation).toMatchObject({
+        adoptedRunIds: [],
+        lostRunIds: [],
+        skippedRunIds: [runId],
+      });
+      const report = JSON.parse(
+        await fs.readFile(resolveHotRestartReportPath(home), "utf8"),
+      ) as { runs: Array<{ runId: string; classification: string; reason: string }> };
+      expect(report.runs).toContainEqual(expect.objectContaining({
+        runId,
+        classification: "skipped",
+        reason: "preparation_abandoned",
+      }));
+    });
   });
 
   it("reports a selectively drained ACP run as lost when terminal persistence fails", async () => {

@@ -11,7 +11,10 @@ import {
   removeHotRestartIntent,
   resolveHotRestartIntentPath,
   resolveLegacyHotRestartIntentPath,
+  revokeHotRestartAdoption,
+  revokeHotRestartAdoptionForProcess,
   writeHotRestartIntent,
+  writeHotRestartShutdownSnapshot,
 } from "./hot-restart.js";
 
 const originalInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
@@ -533,5 +536,161 @@ describe("hot-restart path compatibility", () => {
         }],
       },
     })).toEqual(["missing-run"]);
+  });
+});
+
+describe("hot-restart preparation fence", () => {
+  async function writeRequest(homeDir: string) {
+    process.env.PAPERCLIP_INSTANCE_ID = "default";
+    return writeHotRestartIntent({
+      homeDir,
+      previousServerPid: process.pid,
+      requestedAt: new Date("2026-10-26T01:00:00.000Z"),
+      requestedByRunId: "deploy-run",
+      preflightActiveRunIds: ["run-1"],
+    });
+  }
+
+  const activeRuns = [{
+    runId: "run-1",
+    companyId: "company-1",
+    agentId: "agent-1",
+    adapterType: "claude_local",
+    status: "running",
+    processPid: 4242,
+    processGroupId: 4242,
+    issueId: null,
+  }];
+
+  async function readRaw(filePath: string) {
+    return JSON.parse(await fs.readFile(filePath, "utf8")) as Record<string, unknown>;
+  }
+
+  it("does not publish a snapshot once the preparation signal has fired", async () => {
+    await withTempHome(async (homeDir) => {
+      const intent = await writeRequest(homeDir);
+      const controller = new AbortController();
+      controller.abort(new Error("preparation cut"));
+
+      await expect(writeHotRestartShutdownSnapshot({
+        homeDir,
+        intent,
+        signal: "SIGTERM",
+        activeRuns,
+        abortSignal: controller.signal,
+      })).rejects.toThrow("preparation cut");
+
+      expect((await readHotRestartIntent(homeDir))?.shutdownSnapshot).toBeUndefined();
+      expect((await readRaw(resolveLegacyHotRestartIntentPath(homeDir))).shutdownSnapshot).toBeUndefined();
+      const leftovers = (await fs.readdir(path.dirname(resolveHotRestartIntentPath(homeDir))))
+        .filter((name) => name.endsWith(".tmp"));
+      expect(leftovers).toEqual([]);
+    });
+  });
+
+  it("checks the signal inside the path lock, so a write held on the lock never lands after the cut", async () => {
+    await withTempHome(async (homeDir) => {
+      const intent = await writeRequest(homeDir);
+      const instancePath = resolveHotRestartIntentPath(homeDir);
+      const lockDir = `${instancePath}.lock`;
+      await fs.mkdir(lockDir);
+      await fs.writeFile(
+        path.join(lockDir, "owner.json"),
+        JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }),
+      );
+      const controller = new AbortController();
+
+      const write = writeHotRestartShutdownSnapshot({
+        homeDir,
+        intent,
+        signal: "SIGTERM",
+        activeRuns,
+        abortSignal: controller.signal,
+      });
+      const outcome = write.then(() => "resolved", (err: Error) => err.message);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      controller.abort(new Error("preparation cut while waiting for the lock"));
+      await fs.rm(lockDir, { recursive: true, force: true });
+
+      await expect(outcome).resolves.toBe("preparation cut while waiting for the lock");
+      expect((await readHotRestartIntent(homeDir))?.shutdownSnapshot).toBeUndefined();
+    });
+  });
+
+  it("revokes adoption on both paths and stays the last writer for the same request", async () => {
+    await withTempHome(async (homeDir) => {
+      const intent = await writeRequest(homeDir);
+      // The snapshot rename was already issued before the cut and landed.
+      await writeHotRestartShutdownSnapshot({ homeDir, intent, signal: "SIGTERM", activeRuns });
+
+      await revokeHotRestartAdoption({
+        homeDir,
+        intent,
+        reason: "preparation_abandoned",
+        at: new Date("2026-10-26T01:00:30.000Z"),
+      });
+
+      const read = await readHotRestartIntent(homeDir);
+      expect(read?.shutdownSnapshot?.activeRuns.map((run) => run.runId)).toEqual(["run-1"]);
+      expect(read?.adoptionRevoked).toEqual({
+        at: "2026-10-26T01:00:30.000Z",
+        reason: "preparation_abandoned",
+      });
+      expect((await readRaw(resolveLegacyHotRestartIntentPath(homeDir))).adoptionRevoked).toEqual({
+        at: "2026-10-26T01:00:30.000Z",
+        reason: "preparation_abandoned",
+      });
+    });
+  });
+
+  it("revokes adoption even when no snapshot was written, and leaves another request alone", async () => {
+    await withTempHome(async (homeDir) => {
+      const intent = await writeRequest(homeDir);
+      const legacyPath = resolveLegacyHotRestartIntentPath(homeDir);
+      const other = { ...(await readRaw(legacyPath)), requestedAt: "2026-10-26T02:00:00.000Z" };
+      await fs.writeFile(legacyPath, `${JSON.stringify(other)}\n`, "utf8");
+
+      await revokeHotRestartAdoption({ homeDir, intent, reason: "preparation_abandoned" });
+
+      expect((await readHotRestartIntent(homeDir))?.adoptionRevoked?.reason).toBe("preparation_abandoned");
+      expect((await readRaw(legacyPath)).adoptionRevoked).toBeUndefined();
+    });
+  });
+
+  it("does not let adoptionRevoked change request identity", () => {
+    const base = {
+      version: 1,
+      requestedAt: "2026-10-26T01:00:00.000Z",
+      previousServerPid: 101,
+      drainRequired: false,
+      requestedByRunId: null,
+    };
+    expect(parseHotRestartIntent({ ...base, adoptionRevoked: { at: "2026-10-26T01:00:30.000Z", reason: "x" } }))
+      .toMatchObject({ adoptionRevoked: { at: "2026-10-26T01:00:30.000Z", reason: "x" } });
+    expect(parseHotRestartIntent({ ...base, adoptionRevoked: { reason: "x" } })?.adoptionRevoked).toBeUndefined();
+  });
+});
+
+describe("hot-restart preparation fence for this process", () => {
+  it("revokes only a request that targets this server process", async () => {
+    await withTempHome(async (homeDir) => {
+      process.env.PAPERCLIP_INSTANCE_ID = "default";
+      await writeHotRestartIntent({
+        homeDir,
+        previousServerPid: 2_147_483_000,
+        previousServerStartedAt: "2026-10-26T00:00:00.000Z",
+        requestedAt: new Date("2026-10-26T01:00:00.000Z"),
+      });
+      await expect(revokeHotRestartAdoptionForProcess({ homeDir, reason: "preparation_abandoned" }))
+        .resolves.toBe(false);
+      expect((await readHotRestartIntent(homeDir))?.adoptionRevoked).toBeUndefined();
+    });
+  });
+
+  it("returns false when there is no request", async () => {
+    await withTempHome(async (homeDir) => {
+      await expect(revokeHotRestartAdoptionForProcess({ homeDir, reason: "preparation_abandoned" }))
+        .resolves.toBe(false);
+    });
   });
 });

@@ -468,7 +468,16 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
   async function prepareHotRestartShutdown(
     signal: "SIGINT" | "SIGTERM",
     now = new Date(),
+    options: {
+      /**
+       * The shutdown preparation signal. Every publish point (snapshot rename,
+       * run event, native detach) checks it in the same tick, so nothing new
+       * is published once it fires; the shutdown fence then revokes adoption.
+       */
+      abortSignal?: AbortSignal;
+    } = {},
   ) {
+    const abortSignal = options.abortSignal;
     enterShutdown();
     const idleSessions = await closeIdleWarmNativeSessionsForRestart();
     if (idleSessions.failed > 0) {
@@ -538,6 +547,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         drainReason: "active_acp_run",
         drainRunIds: activeServerStdioRunIds,
         capturedAt: now,
+        abortSignal,
       });
 
       logger.warn(
@@ -566,9 +576,11 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       signal,
       activeRuns: snapshotRuns,
       capturedAt: now,
+      abortSignal,
     });
 
     for (const { run } of activeRuns) {
+      abortSignal?.throwIfAborted();
       await appendRunEvent(run, {
         eventType: "lifecycle",
         stream: "system",
@@ -592,8 +604,19 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           isNativeSessionId(run.nativeSessionId),
       )
       .map(({ run }) => run.id);
-    const detachedNativeSessions =
-      await detachNativeSessionsForRestart(nativeRunIds);
+    abortSignal?.throwIfAborted();
+    const detachedNativeSessions = await detachNativeSessionsForRestart(nativeRunIds, {
+      abortSignal,
+      // A run the fallback drain already settled must not be detached again.
+      isStillRunning: async (runId) => {
+        const row = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId))
+          .then((rows) => rows[0] ?? null);
+        return row?.status === "running";
+      },
+    });
 
     logger.info(
       {
@@ -749,6 +772,13 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           `run_status_${run.status}`,
           patch,
         );
+        continue;
+      }
+
+      if (intent.adoptionRevoked) {
+        // The stopping server abandoned its preparation; the orphan sweep
+        // recovers these runs.
+        classify(candidate, "skipped", "preparation_abandoned", patch);
         continue;
       }
 

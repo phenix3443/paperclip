@@ -223,3 +223,59 @@ export function armShutdownWatchdog(input: {
   timer.unref?.();
   return () => clearTimeout(timer);
 }
+
+const HOT_RESTART_PREPARATION_CAP_MS = 20_000;
+const HOT_RESTART_FENCE_CAP_MS = 5_000;
+
+/**
+ * Runs the hot-restart preparation as a work step and, if it was abandoned
+ * (its cap, the deadline, or an error), the adoption fence as a second work
+ * step before the caller falls back to the drain.
+ *
+ * The preparation gets the smaller of 20 s and the time left to the deadline
+ * minus 5 s, so the fence always has its 5 s. With less than 5 s left the
+ * preparation is skipped and nothing is written. The fence first aborts the
+ * preparation signal, so no publish point runs after it, then revokes adoption
+ * for this process. A fence that fails or is cut is logged and the work stage
+ * goes on; the next boot's process checks still keep a dead run from being
+ * adopted.
+ */
+export async function runHotRestartPreparationStep<T>(input: {
+  budget: ShutdownBudget;
+  log: Pick<BudgetLogger, "warn" | "error">;
+  prepare: (signal: AbortSignal) => Promise<T>;
+  fence: () => Promise<boolean>;
+}): Promise<T | { skipDrain: false }> {
+  const { budget, log } = input;
+  const remainingMs = budget.remainingWorkMs();
+  const capMs = Math.min(HOT_RESTART_PREPARATION_CAP_MS, remainingMs - HOT_RESTART_FENCE_CAP_MS);
+  if (capMs <= 0) {
+    log.warn(
+      { mode: "deadline_skipped", remainingMs },
+      `hot-restart preparation skipped: less than ${HOT_RESTART_FENCE_CAP_MS}ms left before the shutdown deadline`,
+    );
+    return { skipDrain: false };
+  }
+
+  const preparationAbort = new AbortController();
+  const prepared = await budget.workStep("hot_restart_preparation", capMs, (stepSignal) =>
+    input.prepare(AbortSignal.any([stepSignal, preparationAbort.signal])),
+  );
+  if (prepared.outcome === "done") return prepared.value;
+
+  preparationAbort.abort(new Error(`hot-restart preparation abandoned: ${prepared.outcome}`));
+  const fence = await budget.workStep("hot_restart_adoption_fence", HOT_RESTART_FENCE_CAP_MS, () =>
+    input.fence(),
+  );
+  if (fence.outcome !== "done") {
+    log.error(
+      {
+        outcome: fence.outcome,
+        ...(fence.outcome === "failed" ? { err: fence.error } : {}),
+      },
+      "hot-restart adoption fence not written",
+    );
+  }
+  if (prepared.outcome === "failed") throw prepared.error;
+  throw new Error(`hot-restart preparation abandoned: ${prepared.outcome}`);
+}

@@ -3,6 +3,7 @@ import {
   armShutdownWatchdog,
   createShutdownBudget,
   resolveShutdownWorkDeadlineMs,
+  runHotRestartPreparationStep,
 } from "./shutdown-budget.js";
 
 function stubLogger() {
@@ -211,5 +212,118 @@ describe("armShutdownWatchdog", () => {
     disarm();
     await vi.advanceTimersByTimeAsync(300_000);
     expect(exit).not.toHaveBeenCalled();
+  });
+});
+
+describe("runHotRestartPreparationStep", () => {
+  function setup(workDeadlineMs = 200_000) {
+    const log = stubLogger();
+    const budget = createShutdownBudget({ signal: "SIGTERM", workDeadlineMs, log, now: () => Date.now() });
+    return { log, budget, t0: Date.now() };
+  }
+
+  it("returns the preparation result on the fast path and writes no fence", async () => {
+    const { log, budget } = setup();
+    const fence = vi.fn(async () => true);
+    const result = await runHotRestartPreparationStep({
+      budget,
+      log,
+      prepare: async () => ({ skipDrain: true }),
+      fence,
+    });
+    expect(result).toEqual({ skipDrain: true });
+    expect(fence).not.toHaveBeenCalled();
+  });
+
+  it("cuts a hung preparation at 20 s, aborts its signal, and fences before the drain", async () => {
+    const { log, budget, t0 } = setup();
+    let preparationSignal: AbortSignal | null = null;
+    let fencedAt: number | null = null;
+    let signalAbortedAtFence = false;
+    const outcome = runHotRestartPreparationStep({
+      budget,
+      log,
+      prepare: (signal) => {
+        preparationSignal = signal;
+        return never();
+      },
+      fence: async () => {
+        fencedAt = Date.now() - t0;
+        signalAbortedAtFence = preparationSignal?.aborted ?? false;
+        return true;
+      },
+    }).then(() => "resolved", (err: Error) => err.message);
+
+    await vi.advanceTimersByTimeAsync(20_000);
+    await expect(outcome).resolves.toMatch(/hot-restart preparation abandoned/);
+    expect(fencedAt).toBe(20_000);
+    expect(signalAbortedAtFence).toBe(true);
+  });
+
+  it("fences after a preparation that failed", async () => {
+    const { log, budget } = setup();
+    const fence = vi.fn(async () => true);
+    await expect(runHotRestartPreparationStep({
+      budget,
+      log,
+      prepare: async () => {
+        throw new Error("snapshot write failed");
+      },
+      fence,
+    })).rejects.toThrow("snapshot write failed");
+    expect(fence).toHaveBeenCalledOnce();
+  });
+
+  it("reserves the last 5 s before the deadline for the fence", async () => {
+    const { log, budget, t0 } = setup(30_000);
+    await vi.advanceTimersByTimeAsync(12_000);
+    let fencedAt: number | null = null;
+    const outcome = runHotRestartPreparationStep({
+      budget,
+      log,
+      prepare: never,
+      fence: async () => {
+        fencedAt = Date.now() - t0;
+        return true;
+      },
+    }).catch(() => undefined);
+    // 18 s left: the preparation gets 13 s, the fence starts at 25 s.
+    await vi.advanceTimersByTimeAsync(13_000);
+    await outcome;
+    expect(fencedAt).toBe(25_000);
+  });
+
+  it("cuts a hung fence at 5 s, logs it, and lets the work stage continue", async () => {
+    const { log, budget, t0 } = setup();
+    const outcome = runHotRestartPreparationStep({
+      budget,
+      log,
+      prepare: never,
+      fence: never,
+    }).catch(() => undefined);
+    await vi.advanceTimersByTimeAsync(25_000);
+    await outcome;
+    expect(Date.now() - t0).toBe(25_000);
+    expect(log.error).toHaveBeenCalledWith(
+      expect.objectContaining({ outcome: "timed_out" }),
+      "hot-restart adoption fence not written",
+    );
+    const drain = await budget.workStep("run_drain", 90_000, async () => "drained");
+    expect(drain).toEqual({ outcome: "done", value: "drained" });
+  });
+
+  it("skips the preparation with less than 5 s to the deadline and writes nothing", async () => {
+    const { log, budget } = setup(10_000);
+    await vi.advanceTimersByTimeAsync(5_500);
+    const prepare = vi.fn(async () => ({ skipDrain: true }));
+    const fence = vi.fn(async () => true);
+    await expect(runHotRestartPreparationStep({ budget, log, prepare, fence }))
+      .resolves.toEqual({ skipDrain: false });
+    expect(prepare).not.toHaveBeenCalled();
+    expect(fence).not.toHaveBeenCalled();
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ mode: "deadline_skipped" }),
+      "hot-restart preparation skipped: less than 5000ms left before the shutdown deadline",
+    );
   });
 });

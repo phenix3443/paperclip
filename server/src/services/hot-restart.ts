@@ -49,6 +49,15 @@ export type HotRestartIntent = {
     signal: "SIGINT" | "SIGTERM";
     activeRuns: HotRestartIntentRun[];
   };
+  /**
+   * Written by the shutdown preparation fence when the preparation was
+   * abandoned. The next boot adopts no run of a revoked request. Not part of
+   * the request identity.
+   */
+  adoptionRevoked?: {
+    at: string;
+    reason: string;
+  };
 };
 
 export type HotRestartReportRun = HotRestartIntentRun & {
@@ -97,10 +106,20 @@ export function resolveHotRestartReportPath(homeDir?: string) {
   return resolveHotRestartPath(HOT_RESTART_REPORT_FILENAME, homeDir);
 }
 
-async function writeJsonFileAtomic(filePath: string, value: unknown) {
+async function writeJsonFileAtomic(
+  filePath: string,
+  value: unknown,
+  abortSignal?: AbortSignal,
+) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
   await fs.writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  // Checked in the same tick as the rename that publishes the file, so a
+  // write that was cut never lands after the signal fired.
+  if (abortSignal?.aborted) {
+    await fs.unlink(tempPath).catch(() => undefined);
+    abortSignal.throwIfAborted();
+  }
   await fs.rename(tempPath, filePath);
 }
 
@@ -446,6 +465,13 @@ export function parseHotRestartIntent(value: unknown): HotRestartIntent | null {
     intent.shutdownSnapshot = { capturedAt, signal, activeRuns };
   }
 
+  const revoked = isRecord(value.adoptionRevoked) ? value.adoptionRevoked : null;
+  const revokedAt = asString(revoked?.at);
+  const revokedReason = asString(revoked?.reason);
+  if (revokedAt && revokedReason) {
+    intent.adoptionRevoked = { at: revokedAt, reason: revokedReason };
+  }
+
   return intent;
 }
 
@@ -481,9 +507,12 @@ export async function readHotRestartIntent(homeDir?: string) {
   // A pre-instance server rewrites only the legacy marker when it captures
   // its shutdown snapshot. Preserve the instance-scoped request fields while
   // importing that snapshot only after the immutable request identity matches.
-  return legacyIntent.shutdownSnapshot
+  const merged = legacyIntent.shutdownSnapshot
     ? { ...instanceIntent, shutdownSnapshot: legacyIntent.shutdownSnapshot }
     : instanceIntent;
+  // A revocation on either path wins: the fence may have reached only one.
+  const adoptionRevoked = instanceIntent.adoptionRevoked ?? legacyIntent.adoptionRevoked;
+  return adoptionRevoked ? { ...merged, adoptionRevoked } : merged;
 }
 
 export function findMissingHotRestartSnapshotRunIds(intent: HotRestartIntent) {
@@ -553,7 +582,10 @@ export async function writeHotRestartShutdownSnapshot(input: {
   drainRunIds?: string[];
   capturedAt?: Date;
   homeDir?: string;
+  /** The shutdown preparation signal; nothing is published after it fires. */
+  abortSignal?: AbortSignal;
 }) {
+  input.abortSignal?.throwIfAborted();
   const updated: HotRestartIntent = {
     ...input.intent,
     ...(input.drainReason
@@ -570,15 +602,43 @@ export async function writeHotRestartShutdownSnapshot(input: {
     },
   };
   const instancePath = resolveHotRestartIntentPath(input.homeDir);
-  await withHotRestartPathLock(instancePath, () => writeJsonFileAtomic(instancePath, updated));
+  await withHotRestartPathLock(
+    instancePath,
+    () => writeJsonFileAtomic(instancePath, updated, input.abortSignal),
+  );
   const legacyPath = resolveLegacyHotRestartIntentPath(input.homeDir);
   await withHotRestartPathLock(legacyPath, async () => {
     const legacyIntent = await readHotRestartIntentAtPath(legacyPath).catch(() => null);
     if (legacyIntent && isSameHotRestartRequest(legacyIntent, input.intent)) {
-      await writeJsonFileAtomic(legacyPath, updated);
+      await writeJsonFileAtomic(legacyPath, updated, input.abortSignal);
     }
   });
   return updated;
+}
+
+/**
+ * The shutdown preparation fence. Marks the request as not adoptable on both
+ * paths, under the same path lock the snapshot write takes. The snapshot write
+ * re-checks its signal inside that lock, and the caller aborts that signal
+ * before calling this, so this is the last writer for the request.
+ */
+export async function revokeHotRestartAdoption(input: {
+  intent: HotRestartIntent;
+  reason: string;
+  at?: Date;
+  homeDir?: string;
+}) {
+  const adoptionRevoked = { at: (input.at ?? new Date()).toISOString(), reason: input.reason };
+  for (const filePath of [
+    resolveHotRestartIntentPath(input.homeDir),
+    resolveLegacyHotRestartIntentPath(input.homeDir),
+  ]) {
+    await withHotRestartPathLock(filePath, async () => {
+      const current = await readHotRestartIntentAtPath(filePath).catch(() => null);
+      if (!current || !isSameHotRestartRequest(current, input.intent)) return;
+      await writeJsonFileAtomic(filePath, { ...current, adoptionRevoked });
+    });
+  }
 }
 
 export async function writeHotRestartReport(report: HotRestartReport, homeDir?: string) {
@@ -639,4 +699,26 @@ export function shouldHonorHotRestartIntentForProcess(
   pid = process.pid,
 ) {
   return !intent.drainRequired && intent.previousServerPid === pid;
+}
+
+/**
+ * The fence step of a shutdown whose hot-restart preparation was abandoned:
+ * revokes adoption for the request that targets this server process, if any.
+ * Returns whether a request was revoked.
+ */
+export async function revokeHotRestartAdoptionForProcess(input: {
+  reason: string;
+  at?: Date;
+  pid?: number;
+  homeDir?: string;
+}) {
+  const intent = await readHotRestartIntent(input.homeDir);
+  if (!intent || intent.previousServerPid !== (input.pid ?? process.pid)) return false;
+  await revokeHotRestartAdoption({
+    intent,
+    reason: input.reason,
+    at: input.at,
+    homeDir: input.homeDir,
+  });
+  return true;
 }
