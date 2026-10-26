@@ -2970,6 +2970,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           }
           let ownerRepairIssueBindingGuard: OwnerRepairIssueBinding | null = null;
           if (ownerRepairRequest) {
+            // Settlement locks the issue before its action; take them in the
+            // same order so the two transactions cannot deadlock.
+            await tx.select({ id: issues.id }).from(issues).where(and(
+              eq(issues.id, ownerRepairRequest.issueId), eq(issues.companyId, agent.companyId))).for("update");
             const [action] = await tx.select().from(issueRecoveryActions).where(and(
               eq(issueRecoveryActions.id, ownerRepairRequest.actionId),
               eq(issueRecoveryActions.companyId, agent.companyId),
