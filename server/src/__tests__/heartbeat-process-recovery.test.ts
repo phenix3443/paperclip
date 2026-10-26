@@ -1,5 +1,6 @@
 import { enableRunFailureReporting } from "./helpers/run-failure-reporting.js";
 import { EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
+import { agentExecutionsHaveStopped } from "../services/agent-execution-stop.js";
 import * as conversationContinuation from "../services/conversation-continuation.js";
 import { classifyEnvironmentCapabilities, environmentRuntimeService } from "../services/environment-runtime.js";
 import * as workspaceRuntime from "../services/workspace-runtime.js";
@@ -3610,8 +3611,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect(await heartbeat.getRun(runId)).toMatchObject({ status: "cancelled", runtimeMode: "legacy",
         runtimeModeResolvedAt: null, nativeSessionId: null,
         resultJson: { startupCancellation: { beforeNativeSelection: true },
-          startupPreparationSettledAt: expect.any(String) },
+          startupPreparationSettledAt: expect.any(String), legacyAdapterNotEnteredAt: expect.any(String) },
       });
+      expect(await agentExecutionsHaveStopped(db, [agentId])).toBe(true);
       expect(await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId))).toHaveLength(0);
       expect(factory).not.toHaveBeenCalled();
       expect(mockAdapterExecute).not.toHaveBeenCalled();
