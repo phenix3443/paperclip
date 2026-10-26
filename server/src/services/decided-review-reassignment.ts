@@ -3,6 +3,8 @@ import {
   activityLog,
   agentWakeupRequests,
   approvals,
+  decisions,
+  decisionTargetIssues,
   environmentLeases,
   heartbeatRuns,
   issueApprovals,
@@ -34,6 +36,7 @@ type Decision = typeof issueExecutionDecisions.$inferSelect;
 const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
 export const DECIDED_REVIEW_CONTINUATION_REPLAY = "decided_review_continuation_v1";
 const REVIEW_REQUEST_REASON = "execution_review_requested";
+const MAX_PARKED_ATTEMPTS = 10;
 export const SUBMISSION_STAMP = "decidedReviewSubmission";
 
 export type SubmissionIdentity = { decisionId: string; resubmissionActivityId: string };
@@ -151,14 +154,24 @@ export async function findSubmissionTurn(
   db: Db, task: Pick<Task, "companyId" | "id">, identity: SubmissionIdentity,
 ): Promise<{ successorRunId: string } | null> {
   const consumed = await findConsumption(db, task, identity);
-  if (consumed) return { successorRunId: consumed.successorRunId };
+  if (consumed) {
+    const [released] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, task.companyId), eq(heartbeatRuns.id, consumed.successorRunId), cancelledBeforeStart(),
+    )).limit(1);
+    if (!released) return { successorRunId: consumed.successorRunId };
+  }
   const [run] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, task.companyId),
     or(eq(heartbeatRuns.nativeIssueId, task.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${task.id}`),
     sql`${heartbeatRuns.contextSnapshot}->'decidedReviewSubmission'->>'decisionId' = ${identity.decisionId}`,
     sql`${heartbeatRuns.contextSnapshot}->'decidedReviewSubmission'->>'resubmissionActivityId' = ${identity.resubmissionActivityId}`,
+    sql`not (${cancelledBeforeStart()})`,
   )).orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id)).limit(1);
   return run ? { successorRunId: run.id } : null;
+}
+
+function cancelledBeforeStart() {
+  return and(eq(heartbeatRuns.status, "cancelled"), isNull(heartbeatRuns.startedAt), isNull(heartbeatRuns.processPid))!;
 }
 
 async function isContinuedReview(db: Db, task: Pick<Task, "companyId" | "id">) {
@@ -175,7 +188,7 @@ function isBlockingHold(hold: Hold) {
 }
 
 export async function selectDecidedReviewSource(
-  db: Db, task: Task, identity?: SubmissionIdentity | null,
+  db: Db, task: Pick<Task, "companyId" | "id" | "status" | "executionState">, identity?: SubmissionIdentity | null,
 ): Promise<DecidedReviewSelection> {
   const state = readState(task);
   if (state?.currentParticipant?.type !== "agent" || !state.currentParticipant.agentId) return { kind: "none", rule: "participant_not_agent" };
@@ -190,20 +203,23 @@ export async function selectDecidedReviewSource(
     eq(heartbeatRuns.companyId, task.companyId), eq(heartbeatRuns.agentId, agentId),
     or(eq(heartbeatRuns.nativeIssueId, task.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${task.id}`),
     sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (select created_at, id from heartbeat_runs where company_id = ${task.companyId} and id = ${source.id})`,
-  )).orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id));
+  )).orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id)).limit(MAX_PARKED_ATTEMPTS + 1);
+  if (newer.length > MAX_PARKED_ATTEMPTS) return { kind: "none", rule: "newer_runs_exceed_bound" };
   const fingerprints = (ids: string[]) => ids.map(id => `legacy-execution:${id}`);
+  const parentIds = newer.map(run => evidenceObject(run.resultJson?.executionWait)?.recoveryActionId)
+    .filter((id): id is string => typeof id === "string");
+  const parents = new Map((parentIds.length ? await db.select({ id: issueRecoveryActions.id, evidence: issueRecoveryActions.evidence })
+    .from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.companyId, task.companyId), eq(issueRecoveryActions.sourceIssueId, task.id),
+      inArray(sql`${issueRecoveryActions.id}::text`, parentIds),
+    )) : []).map(row => [row.id, row.evidence.runId]));
   const chain: Run[] = [];
   for (const run of newer) {
     const wait = evidenceObject(run.resultJson?.executionWait);
     const accepted = [source.id, ...chain.map(q => q.id)];
-    const [parent] = typeof wait?.recoveryActionId === "string" ? await db.select({ id: issueRecoveryActions.id })
-      .from(issueRecoveryActions).where(and(
-        eq(issueRecoveryActions.companyId, task.companyId), eq(issueRecoveryActions.sourceIssueId, task.id),
-        sql`${issueRecoveryActions.id}::text = ${wait.recoveryActionId}`,
-        inArray(sql`${issueRecoveryActions.evidence}->>'runId'`, accepted),
-      )).limit(1) : [];
-    if (!(await isPreDispatchExecutionWaitVerified(db, run)) || !parent || !source.finishedAt ||
-        run.createdAt < source.finishedAt) {
+    const parentRunId = typeof wait?.recoveryActionId === "string" ? parents.get(wait.recoveryActionId) : undefined;
+    if (!(typeof parentRunId === "string" && accepted.includes(parentRunId)) || !source.finishedAt ||
+        run.createdAt < source.finishedAt || !(await isPreDispatchExecutionWaitVerified(db, run))) {
       return { kind: "none", rule: "newer_run_not_verified_pre_dispatch_wait", runId: run.id };
     }
     chain.push(run);
@@ -305,7 +321,11 @@ export async function proveDecidedReviewContinuation(db: Db, input: { task: Task
     eq(approvals.id, issueApprovals.approvalId), eq(approvals.companyId, task.companyId),
   )).where(and(eq(issueApprovals.companyId, task.companyId), eq(issueApprovals.issueId, task.id),
     inArray(approvals.status, ["pending", "revision_requested"]))).limit(1);
-  if (interaction || approval) return { kind: "hold", reason: "P6_decision_pending" };
+  const [choice] = await db.select({ id: decisions.id }).from(decisions).where(and(
+    eq(decisions.companyId, task.companyId), eq(decisions.status, "open"),
+    or(eq(decisions.originIssueId, task.id), sql`exists (select 1 from ${decisionTargetIssues} where ${decisionTargetIssues.decisionId} = ${decisions.id} and ${decisionTargetIssues.issueId} = ${task.id})`),
+  )).limit(1);
+  if (interaction || approval || choice) return { kind: "hold", reason: "P6_decision_pending" };
   if ((await readChatControlRecoveryStop(db, {
     companyId: task.companyId, issueId: task.id, agentId: source.agentId, sourceRunId: source.id,
   })).kind !== "clear") return { kind: "hold", reason: "P6_chat_control_stop" };
