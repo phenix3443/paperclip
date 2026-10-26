@@ -86,17 +86,26 @@ async function handleMcpGatewayProtocol(
     const body = (req.body ?? {}) as { jsonrpc?: string; id?: unknown; method?: string; params?: Record<string, unknown> };
     const id = body.id ?? null;
     if (body.method === "initialize") {
-      await toolGateway.initializeNamedGatewayProtocol({
+      const session = await toolGateway.initializeNamedGatewayProtocol({
         ...locator,
         bearerToken: token,
         callerHeaders: headers,
       });
+      // Advertise only what the token may list: clients request every advertised
+      // capability, and some drop the whole connection on the resulting 403.
+      const allowedActions = session.gatewayTokenAllowedActions;
+      const canList = (action: "tools/list" | "resources/list" | "prompts/list") =>
+        !allowedActions || allowedActions.includes(action);
       res.json({
         jsonrpc: "2.0",
         id,
         result: {
           protocolVersion: "2025-03-26",
-          capabilities: { tools: {}, resources: {}, prompts: {} },
+          capabilities: {
+            ...(canList("tools/list") ? { tools: {} } : {}),
+            ...(canList("resources/list") ? { resources: {} } : {}),
+            ...(canList("prompts/list") ? { prompts: {} } : {}),
+          },
           serverInfo: { name: "Paperclip MCP Gateway", version: "1.0.0" },
           _meta: {
             "paperclip/mcp-app-ui": "unsupported",

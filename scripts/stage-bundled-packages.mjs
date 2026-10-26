@@ -5,8 +5,10 @@
 // concurrent children instead of one after another inside the staging loop.
 // Each child is the CLI entry of `prepare-bundled-package.mjs`, the same path
 // release.sh runs, with its output in a log file that a failure reports.
+import { cpSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { materializePublishManifest } from './prepare-bundled-package.mjs';
 import { startPrefetch } from './prefetch-child.mjs';
 
 export const PREPARE_BUNDLED_PACKAGE_SCRIPT = fileURLToPath(new URL('./prepare-bundled-package.mjs', import.meta.url));
@@ -30,3 +32,18 @@ export function startBundledInstalls(entries, { logDir, cwd, env = process.env, 
 // start to the child's last output; the parent is idle while it waits for the
 // installs, so the exit is observed as it happens.
 export const bundledInstallTimings = installs => Object.fromEntries(installs.map(({ slug, handle }) => [`stage_bundled_${slug}_ms`, handle.durationMs]));
+
+export function stagePublicInstallSource({ dir, manifest, stagedSource }, { repo, releaseVersion }) {
+  mkdirSync(stagedSource);
+  for (const file of manifest.files ?? ['dist']) {
+    // release.sh stages runtime skills into these public packages before pack.
+    const releaseSkills = file === 'skills' && ['server', 'packages/adapters/claude-local', 'packages/adapters/codex-local'].includes(dir);
+    // Other adapters declare an optional skills directory that npm pack omits
+    // when absent. Do not fabricate extra release payloads for those adapters.
+    if (file === 'skills' && !releaseSkills && !existsSync(join(repo, dir, file))) continue;
+    cpSync(releaseSkills ? join(repo, 'skills') : join(repo, dir, file), join(stagedSource, file), { recursive: true });
+  }
+  const releaseManifest = materializePublishManifest({ ...manifest, version: releaseVersion });
+  writeFileSync(join(stagedSource, 'package.json'), JSON.stringify(releaseManifest));
+  return releaseManifest;
+}

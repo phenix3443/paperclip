@@ -9,6 +9,7 @@ import { approvalService } from "../../../services/approvals.js";
 import { updateAgentConfigurationInTransaction } from "../../../services/agent-configuration-transaction.js";
 import { agentService as agentConfiguration } from "../../../services/agents.js";
 import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import express from "express";
 import request from "supertest";
 import { agentRoutes } from "../../../routes/agents.js";
@@ -348,6 +349,44 @@ const support = await getEmbeddedPostgresTestSupport();
     expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, run.id)))[0]).toMatchObject({ leaseOwner: null, leaseExpiresAt: null });
   });
 
+  it("treats a host restart after a run ended as proof that its local process is gone", async () => {
+    const agent = await hire();
+    const finishedAt = new Date(Date.now() - 60_000);
+    await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, status: "succeeded", invocationSource: "on_demand",
+      runtimeMode: "legacy", startedAt: finishedAt, finishedAt, processPid: process.pid, processGroupId: process.pid });
+    const probe = (bootedAt: Date) => ({ bootedAt: () => bootedAt, groupMemberPids: async () => [process.pid],
+      processStartedAt: async () => new Date(0).toISOString() });
+    expect(await agentExecutionsHaveStopped(db, [agent.id], probe(new Date(finishedAt.getTime() - 1_000)))).toBe(false);
+    expect(await agentExecutionsHaveStopped(db, [agent.id], probe(new Date()))).toBe(true);
+  });
+
+  it("ignores a reused process group whose members all started after the run ended", async () => {
+    const agent = await hire();
+    const finishedAt = new Date(Date.now() - 60_000);
+    // The recorded leader is gone; an unrelated process now holds a group with the same ID.
+    const processGroupId = Number(execFileSync("ps", ["-o", "pgid=", "-p", String(process.pid)], { encoding: "utf8" }).trim());
+    await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, status: "succeeded", invocationSource: "on_demand",
+      runtimeMode: "legacy", startedAt: finishedAt, finishedAt, processPid: 2_000_000_000, processGroupId });
+    const probe = (memberStartedAt: Date) => ({ bootedAt: () => null, groupMemberPids: async () => [process.pid],
+      processStartedAt: async () => memberStartedAt.toISOString() });
+    expect(await agentExecutionsHaveStopped(db, [agent.id], probe(new Date(finishedAt.getTime() - 1_000)))).toBe(false);
+    expect(await agentExecutionsHaveStopped(db, [agent.id], { ...probe(new Date()), groupMemberPids: async () => null })).toBe(false);
+    expect(await agentExecutionsHaveStopped(db, [agent.id], probe(new Date()))).toBe(true);
+  });
+
+  it("accepts a cancelled legacy run that never left preparation under an expired foreign controller", async () => {
+    const agent = await hire();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, status: "cancelled", invocationSource: "on_demand",
+      runtimeMode: "legacy", executionStage: "dispatching", startedAt: new Date(), finishedAt: new Date(),
+      controllerBootId: randomUUID(), controllerLeaseExpiresAt: new Date(Date.now() - 1_000) }).returning();
+    const probe = { bootedAt: () => null, groupMemberPids: async () => null, processStartedAt: async () => null };
+    expect(await agentExecutionsHaveStopped(db, [agent.id], probe)).toBe(false);
+    await db.update(heartbeatRuns).set({ executionStage: "preparing", controllerBootId: null }).where(eq(heartbeatRuns.id, run.id));
+    expect(await agentExecutionsHaveStopped(db, [agent.id], probe)).toBe(false);
+    await db.update(heartbeatRuns).set({ controllerBootId: randomUUID() }).where(eq(heartbeatRuns.id, run.id));
+    expect(await agentExecutionsHaveStopped(db, [agent.id], probe)).toBe(true);
+  });
+
   it("does not advance termination while a cancelled process still runs", async () => {
     const agent = await hire();
     const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id,
@@ -363,6 +402,24 @@ const support = await getEmbeddedPostgresTestSupport();
     await createAgentLifecycle(db).retry(agent.id);
     await work.process(agent.id);
     expect((await current(agent.id)).lifecycleState).toBe("terminated");
+  });
+
+  it("completes pause after a legacy run cancelled before its adapter was entered", async () => {
+    const agent = await hire();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id,
+      status: "cancelled", invocationSource: "on_demand", runtimeMode: "legacy", executionStage: "settled",
+      runnerProfileJson: { adapterDispatch: { adapterType: "claude_local" } },
+      startedAt: new Date(), finishedAt: new Date(),
+      resultJson: { executionCancellation: { state: "requested" } } }).returning();
+    const work = worker(createLifecycleDriver(db, {} as never).runHost);
+    await createAgentLifecycle(db).pauseAgent(agent.id);
+    await work.process(agent.id);
+    expect((await current(agent.id)).lifecycleState).toBe("pausing");
+    await db.update(heartbeatRuns).set({ resultJson: { executionCancellation: { state: "requested" },
+      legacyAdapterNotEnteredAt: new Date().toISOString() } }).where(eq(heartbeatRuns.id, run.id));
+    await createAgentLifecycle(db).retry(agent.id);
+    await work.process(agent.id);
+    expect((await current(agent.id)).lifecycleState).toBe("paused");
   });
 
   it("does not cancel a reporting agent when its manager pauses", async () => {
@@ -503,6 +560,23 @@ const support = await getEmbeddedPostgresTestSupport();
       await Promise.allSettled([deletion, hiring]);
       pause.mockRestore();
     }
+  });
+
+  it("accepts a released SSH lease without a receipt once the run's local process is gone", async () => {
+    const agent = await hire();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id,
+      status: "cancelled", invocationSource: "on_demand", runtimeMode: "native",
+      startedAt: new Date(), finishedAt: new Date(), processPid: process.pid }).returning();
+    const [lease] = await db.insert(environmentLeases).values({ companyId, heartbeatRunId: run.id,
+      provider: "ssh", providerLeaseId: "ssh://user@host:22/home/user", status: "expired",
+      releasedAt: new Date() }).returning();
+    // The local SSH client of the run is still alive.
+    expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(false);
+    await db.update(heartbeatRuns).set({ processPid: 2_000_000_000 }).where(eq(heartbeatRuns.id, run.id));
+    expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(true);
+    // A failed cleanup still blocks, as before.
+    await db.update(environmentLeases).set({ cleanupStatus: "failed" }).where(eq(environmentLeases.id, lease.id));
+    expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(false);
   });
 
   it("requires cleanup proof after a remote run is already cancelled", async () => {

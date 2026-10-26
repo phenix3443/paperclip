@@ -52,6 +52,17 @@ describe("managed install commands", () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
+  // Uninstall tests must inject the service manager: the default one drives the
+  // host's real systemd user manager, where the default instance may be live.
+  const installedServiceManager = () => {
+    const uninstallService = vi.fn(async () => undefined);
+    const detectServiceManager = vi.fn(async () => ({
+      supported: true as const,
+      manager: { status: vi.fn(async () => ({ installed: true, active: true })), uninstall: uninstallService } as never,
+    }));
+    return { detectServiceManager, uninstallService };
+  };
+
   it("selects stable, canary, and exact-version npm sources", () => {
     expect(resolveNpmInstallRequest({})).toEqual({ spec: "latest", channel: "latest" });
     expect(resolveNpmInstallRequest({ canary: true })).toEqual({ spec: "canary", channel: "canary" });
@@ -196,6 +207,27 @@ describe("managed install commands", () => {
     }
     const uiPackCall = buildCalls.find(([file, , options]) => file === "corepack" && options?.env?.PAPERCLIP_RELEASE_REUSE_UI_DIST === "1");
     expect(uiPackCall).toBeDefined();
+  });
+
+  it("exports the verified packages with checksums when a packages directory is requested", async () => {
+    const sha = "e".repeat(40);
+    const destination = path.join(root, "packages");
+    process.env.PAPERCLIP_INSTALL_PACKAGES_DIR = destination;
+    await installGitPayload("phenix3443/paperclip", sha, createGitCheckoutRunCommand(sha), resolveInstallStorePaths());
+    const exported = JSON.parse(fs.readFileSync(path.join(destination, "payload-packages.json"), "utf8"));
+    expect(exported).toMatchObject({ schemaVersion: 1, repo: "phenix3443/paperclip", sha, version: "0.3.1" });
+    expect(exported.files.map((entry: { file: string }) => entry.file)[0]).toBe("paperclipai-0.3.1.tgz");
+    expect(exported.files).toHaveLength(4);
+    for (const entry of exported.files) {
+      expect(fs.readFileSync(path.join(destination, entry.file), "utf8")).toBe("package");
+      expect(entry.sha256).toMatch(/^[0-9a-f]{64}$/);
+    }
+  });
+
+  it("exports nothing without a packages directory", async () => {
+    const sha = "f".repeat(40);
+    await installGitPayload("phenix3443/paperclip", sha, createGitCheckoutRunCommand(sha), resolveInstallStorePaths());
+    expect(fs.readdirSync(root)).toEqual(["home"]);
   });
 
   it("resolves the complete server workspace dependency closure in dependency order", () => {
@@ -345,8 +377,11 @@ describe("managed install commands", () => {
     fs.mkdirSync(paths.cliRoot, { recursive: true });
     fs.writeFileSync(unrelatedFile, "keep");
 
-    await expect(uninstallCommand()).rejects.toThrow("unverified install store");
+    const { detectServiceManager, uninstallService } = installedServiceManager();
+
+    await expect(uninstallCommand({ detectServiceManager })).rejects.toThrow("unverified install store");
     expect(fs.readFileSync(unrelatedFile, "utf8")).toBe("keep");
+    expect(uninstallService).not.toHaveBeenCalled();
   });
 
   it("refuses to uninstall while another store mutation holds the lock", async () => {
@@ -365,13 +400,16 @@ describe("managed install commands", () => {
       previous: [],
     }, paths);
 
+    const { detectServiceManager, uninstallService } = installedServiceManager();
+
     await withInstallStoreLock(
       async () => {
-        await expect(uninstallCommand()).rejects.toThrow("already running");
+        await expect(uninstallCommand({ detectServiceManager })).rejects.toThrow("already running");
       },
       paths,
     );
     expect(fs.existsSync(paths.lockPath)).toBe(false);
+    expect(uninstallService).not.toHaveBeenCalled();
   });
 
   it("refuses a symlinked git payload root before downloading", async () => {

@@ -269,7 +269,7 @@ test('the bundled-dependency installs run together while the other packages are 
   // The installs are children of the script's own CLI entry through the helper
   // covered by stage-bundled-packages.test.mjs, never in-process calls.
   assert.doesNotMatch(source, /prepareBundledPackage/);
-  assert.ok(source.includes("import { bundledInstallTimings, startBundledInstalls } from './stage-bundled-packages.mjs'"));
+  assert.ok(source.includes("import { bundledInstallTimings, stagePublicInstallSource, startBundledInstalls } from './stage-bundled-packages.mjs'"));
   // Only the bundled packages' sources are staged before the installs start;
   // the installs are registered for cleanup at once, before anything else can
   // fail; the other packages are copied while the installs run; the join comes

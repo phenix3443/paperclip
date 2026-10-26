@@ -3,11 +3,10 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { materializePublishManifest, prepareBundledPackage } from '../prepare-bundled-package.mjs';
 import { stopPrefetches } from '../prefetch-child.mjs';
-import { PREPARE_BUNDLED_PACKAGE_SCRIPT, bundledInstallTimings, bundledPackageSlug, startBundledInstalls } from '../stage-bundled-packages.mjs';
+import { PREPARE_BUNDLED_PACKAGE_SCRIPT, bundledInstallTimings, bundledPackageSlug, stagePublicInstallSource, startBundledInstalls } from '../stage-bundled-packages.mjs';
 
-// A small local script stands in for `prepare-bundled-package.mjs`; no test
-// here needs npm or a network.
 const withScratch = async body => {
   const root = mkdtempSync(join(tmpdir(), 'stage-bundled-packages-'));
   try { await body(root); } finally { rmSync(root, { recursive: true, force: true }); }
@@ -101,4 +100,51 @@ test('a failed install rejects with the tail of its own log and leaves the other
   assert.equal(installs[0].handle.child.exitCode, null, 'the other install is still running when the failure surfaces');
   await stopPrefetches(installs.map(({ handle }) => handle));
   assert.notEqual(installs[0].handle.child.signalCode ?? installs[0].handle.child.exitCode, null);
+}));
+
+
+test('staged release sources resolve workspace ranges without workspace links', async () => withScratch(async root => {
+  mkdirSync(join(root, 'dependency'));
+  writeFileSync(join(root, 'dependency/package.json'), JSON.stringify({ name: 'local-bundle', version: '1.0.0' }));
+  writeFileSync(join(root, 'package.json'), '{}');
+  const localDependency = `file:${join(root, 'dependency')}`;
+  const manifest = {
+    name: '@paperclipai/staging-fixture', version: '0.1.0', files: ['dist'],
+    dependencies: { exact: 'workspace:*', caret: 'workspace:^', tilde: 'workspace:~', external: '^4.0.0', 'local-bundle': localDependency },
+    optionalDependencies: { exact: 'workspace:*', caret: 'workspace:^', tilde: 'workspace:~' },
+    peerDependencies: { exact: 'workspace:*', caret: 'workspace:^', tilde: 'workspace:~' },
+    bundleDependencies: ['local-bundle'],
+    publishConfig: { main: './dist/index.js' },
+  };
+  const original = structuredClone(manifest);
+  const dir = 'fixture', source = join(root, dir), stagedSource = join(root, 'source-0');
+  mkdirSync(join(source, 'dist'), { recursive: true });
+  writeFileSync(join(source, 'dist/index.js'), 'export const ready = true;');
+  const sourceJson = JSON.stringify(manifest);
+  writeFileSync(join(source, 'package.json'), sourceJson);
+  stagePublicInstallSource({ dir, manifest, stagedSource }, { repo: root, releaseVersion: '2026.1023.0' });
+  assert.equal(existsSync(join(stagedSource, 'node_modules')), false);
+  const staged = JSON.parse(readFileSync(join(stagedSource, 'package.json'), 'utf8'));
+  const publish = materializePublishManifest(staged, { sourceDir: stagedSource });
+  const expected = { exact: '2026.1023.0', caret: '^2026.1023.0', tilde: '~2026.1023.0' };
+  assert.deepEqual(staged.dependencies, { ...expected, external: '^4.0.0', 'local-bundle': localDependency });
+  assert.deepEqual(staged.optionalDependencies, expected);
+  assert.deepEqual(staged.peerDependencies, expected);
+  assert.deepEqual(publish, staged);
+  const target = join(root, 'package-0');
+  const previousInstallLinks = process.env.npm_config_install_links;
+  process.env.npm_config_install_links = 'true';
+  try {
+    prepareBundledPackage(stagedSource, target, { sourceRoot: root });
+  } finally {
+    if (previousInstallLinks === undefined) delete process.env.npm_config_install_links;
+    else process.env.npm_config_install_links = previousInstallLinks;
+  }
+  assert.deepEqual(JSON.parse(readFileSync(join(target, 'package.json'), 'utf8')), staged);
+  assert.equal(JSON.parse(readFileSync(join(target, 'node_modules/local-bundle/package.json'), 'utf8')).version, '1.0.0');
+  assert.equal(staged.main, './dist/index.js');
+  assert.equal(staged.publishConfig, undefined);
+  assert.equal(readFileSync(join(stagedSource, 'dist/index.js'), 'utf8'), 'export const ready = true;');
+  assert.equal(readFileSync(join(source, 'package.json'), 'utf8'), sourceJson);
+  assert.deepEqual(manifest, original);
 }));
