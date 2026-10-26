@@ -183,6 +183,11 @@ const ORPHANED_ACTIVE_LEASE_SWEEP_PAGE_SIZE = 20;
 const PENDING_CLEANUP_RETRY_ERROR_KIND = "destroy_failed";
 
 const PENDING_CLEANUP_SWEEP_ERROR_KIND = "sweep_failed";
+// The shutdown CAS writes this marker with the interrupted status; the
+// settlement clears it last. A marker from an earlier boot names a run whose
+// drain settlement was cut after the CAS, and the next boot replays it.
+const SHUTDOWN_SETTLEMENT_SCHEMA = "paperclip.shutdown-run-settlement.v1";
+const SHUTDOWN_SETTLEMENT_SWEEP_PAGE_SIZE = 50;
 
 const ORPHANED_ACTIVE_LEASE_SWEEP_ERROR_KIND = "orphaned_active_lease_sweep_failed";
 
@@ -468,7 +473,16 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
   async function prepareHotRestartShutdown(
     signal: "SIGINT" | "SIGTERM",
     now = new Date(),
+    options: {
+      /**
+       * The shutdown preparation signal. Every publish point (snapshot rename,
+       * run event, native detach) checks it in the same tick, so nothing new
+       * is published once it fires; the shutdown fence then revokes adoption.
+       */
+      abortSignal?: AbortSignal;
+    } = {},
   ) {
+    const abortSignal = options.abortSignal;
     enterShutdown();
     const idleSessions = await closeIdleWarmNativeSessionsForRestart();
     if (idleSessions.failed > 0) {
@@ -538,6 +552,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         drainReason: "active_acp_run",
         drainRunIds: activeServerStdioRunIds,
         capturedAt: now,
+        abortSignal,
       });
 
       logger.warn(
@@ -566,9 +581,11 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       signal,
       activeRuns: snapshotRuns,
       capturedAt: now,
+      abortSignal,
     });
 
     for (const { run } of activeRuns) {
+      abortSignal?.throwIfAborted();
       await appendRunEvent(run, {
         eventType: "lifecycle",
         stream: "system",
@@ -592,8 +609,19 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           isNativeSessionId(run.nativeSessionId),
       )
       .map(({ run }) => run.id);
-    const detachedNativeSessions =
-      await detachNativeSessionsForRestart(nativeRunIds);
+    abortSignal?.throwIfAborted();
+    const detachedNativeSessions = await detachNativeSessionsForRestart(nativeRunIds, {
+      abortSignal,
+      // A run the fallback drain already settled must not be detached again.
+      isStillRunning: async (runId) => {
+        const row = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId))
+          .then((rows) => rows[0] ?? null);
+        return row?.status === "running";
+      },
+    });
 
     logger.info(
       {
@@ -749,6 +777,13 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           `run_status_${run.status}`,
           patch,
         );
+        continue;
+      }
+
+      if (intent.adoptionRevoked) {
+        // The stopping server abandoned its preparation; the orphan sweep
+        // recovers these runs.
+        classify(candidate, "skipped", "preparation_abandoned", patch);
         continue;
       }
 
@@ -1065,11 +1100,138 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     };
   }
 
+  /**
+   * Every step after the shutdown CAS is idempotent: the wakeup update skips a
+   * cancelled request, the retry reuses an existing successor, lease release
+   * and agent status read current rows. The marker is cleared last, so a cut
+   * anywhere before it leaves the run for the next boot's replay.
+   */
+  async function completeShutdownSettlement(
+    interruptedRun: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+    input: {
+      now: Date;
+      message: string;
+      signal: string;
+      processPid: number | null;
+      processGroupId: number | null;
+      wasFirstHeartbeat: boolean | undefined;
+      replayed?: boolean;
+    },
+  ) {
+    await setWakeupStatus(interruptedRun.wakeupRequestId, "cancelled", {
+      finishedAt: input.now,
+      error: null,
+    });
+    const interrupted =
+      (await classifyAndPersistRunLiveness(
+        interruptedRun,
+        parseObject(interruptedRun.resultJson),
+      )) ?? interruptedRun;
+
+    await releaseEnvironmentLeasesForRun({
+      runId: interrupted.id,
+      companyId: interrupted.companyId,
+      agentId: interrupted.agentId,
+      status: interrupted.status,
+      failureReason: interrupted.error ?? undefined,
+    });
+
+    const retry = await enqueueProcessLossRetry(interrupted, agent, input.now);
+    if (!retry) await releaseIssueExecutionAndPromote(interrupted);
+
+    await appendRunEvent(interrupted, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message: input.message,
+      payload: {
+        signal: input.signal,
+        ...(input.processPid ? { processPid: input.processPid } : {}),
+        ...(input.processGroupId ? { processGroupId: input.processGroupId } : {}),
+        ...(retry ? { retryRunId: retry.id } : {}),
+        ...(input.replayed ? { shutdownSettlementReplayed: true } : {}),
+      },
+    });
+
+    await finalizeAgentStatus(interrupted.agentId, "interrupted", input.message, {
+      wasFirstHeartbeat: input.wasFirstHeartbeat,
+    });
+
+    await db
+      .update(heartbeatRuns)
+      .set({
+        resultJson: sql`jsonb_set(${heartbeatRuns.resultJson}, '{shutdownSettlement,state}', '"settled"'::jsonb)`,
+      })
+      .where(
+        and(
+          eq(heartbeatRuns.id, interrupted.id),
+          sql`${heartbeatRuns.resultJson}->'shutdownSettlement'->>'state' = 'pending'`,
+        ),
+      );
+    return retry;
+  }
+
+  /** Replays shutdown settlements an earlier boot's stop cut after the CAS. */
+  async function replayPendingShutdownSettlements() {
+    const pending = await db.select().from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.status, "interrupted"),
+        eq(heartbeatRuns.errorCode, "server_shutdown_interrupted"),
+        sql`${heartbeatRuns.resultJson}->'shutdownSettlement'->>'schema' = ${SHUTDOWN_SETTLEMENT_SCHEMA}`,
+        sql`${heartbeatRuns.resultJson}->'shutdownSettlement'->>'state' = 'pending'`,
+        sql`${heartbeatRuns.resultJson}->'shutdownSettlement'->>'controllerBootId' is distinct from ${legacyControllerBootId}`,
+      ))
+      .orderBy(asc(heartbeatRuns.updatedAt), asc(heartbeatRuns.id))
+      .limit(SHUTDOWN_SETTLEMENT_SWEEP_PAGE_SIZE);
+    const replayedRunIds: string[] = [];
+    for (const run of pending) {
+      try {
+        const [agent] = await db.select().from(agents).where(eq(agents.id, run.agentId));
+        if (!agent) continue;
+        const marker = parseObject(parseObject(run.resultJson).shutdownSettlement);
+        await completeShutdownSettlement(run, agent, {
+          now: new Date(),
+          message: run.error ?? "Interrupted by graceful server shutdown",
+          signal: readNonEmptyString(marker.signal) ?? run.signal ?? "unknown",
+          processPid: run.processPid ?? null,
+          processGroupId: run.processGroupId ?? null,
+          wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+          replayed: true,
+        });
+        replayedRunIds.push(run.id);
+      } catch (error) {
+        // The marker stays pending for the next bounded sweep.
+        logger.warn({ err: error, runId: run.id }, "failed to replay shutdown run settlement");
+      }
+    }
+    if (replayedRunIds.length > 0) {
+      logger.warn({ runIds: replayedRunIds }, "replayed shutdown run settlements cut by the previous stop");
+    }
+    return replayedRunIds;
+  }
+
   async function drainRunningRunsForShutdown(
     signal: "SIGINT" | "SIGTERM",
     now = new Date(),
     runIds: readonly string[] | null = null,
+    options: {
+      /**
+       * The drain step's signal (its cap or the shutdown deadline). Each run
+       * checks it before its first settlement write; once it fires no new
+       * settlement starts, and the run stays `running` for the next boot's
+       * orphan sweep.
+       */
+      abortSignal?: AbortSignal;
+    } = {},
   ) {
+    const abortSignal = options.abortSignal;
+    const notReachedRunIds: string[] = [];
+    const reachedBeforeSignal = (runId: string) => {
+      if (!abortSignal?.aborted) return true;
+      notReachedRunIds.push(runId);
+      return false;
+    };
     const selectedRunIds = runIds ? [...new Set(runIds)] : null;
     if (selectedRunIds?.length === 0) {
       return {
@@ -1106,6 +1268,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       if (run.runtimeMode === "legacy" && run.controllerBootId &&
           run.controllerBootId !== legacyControllerBootId) return;
       if (isNativeRunnerOwnershipHeld(run)) return;
+      if (!reachedBeforeSignal(run.id)) return;
       if (
         run.runtimeMode === "native" &&
         agent.adapterType === "paperclip_runner"
@@ -1115,6 +1278,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         // finalizer interrupt/suspend Claude while the next server is adopting
         // the same turn.
         await detachNativeSessionsForRestart([run.id]);
+        if (!reachedBeforeSignal(run.id)) return;
         const recoveryHistoryEntry = JSON.stringify({
           at: now.toISOString(),
           restartKind: "graceful",
@@ -1192,6 +1356,9 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         if (!control && runningProcesses.get(run.id) === running) runningProcesses.delete(run.id);
       }
 
+      // Termination can take the run's grace; re-check before the status CAS,
+      // the first write of this run's settlement.
+      if (!control && !reachedBeforeSignal(run.id)) return;
       const persistedCancellationResult =
         run.runtimeMode === "native"
           ? await getRun(run.id).then((current) =>
@@ -1207,12 +1374,20 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           error: message,
           errorCode: "server_shutdown_interrupted",
           signal,
-          resultJson: mergeRunStopMetadataForAgent(agent, "interrupted", {
-            conversationContinuationEligible: await runUsedConversationAdapter(db, run),
-            resultJson: persistedCancellationResult,
-            errorCode: "server_shutdown_interrupted",
-            errorMessage: message,
-          }),
+          resultJson: {
+            ...mergeRunStopMetadataForAgent(agent, "interrupted", {
+              conversationContinuationEligible: await runUsedConversationAdapter(db, run),
+              resultJson: persistedCancellationResult,
+              errorCode: "server_shutdown_interrupted",
+              errorMessage: message,
+            }),
+            shutdownSettlement: {
+              schema: SHUTDOWN_SETTLEMENT_SCHEMA,
+              state: "pending",
+              controllerBootId: legacyControllerBootId,
+              signal,
+            },
+          },
         },
       );
       if (interruptedStatus.updated && interruptedStatus.run) interruptedRunIds.push(run.id);
@@ -1232,48 +1407,16 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           return;
         }
         // Settlement can save restore-failure evidence after the shutdown CAS.
-        let interrupted = (control && await getRun(run.id, { includeExecutionEvidence: true })) ?? interruptedStatus.run;
-        await setWakeupStatus(run.wakeupRequestId, "cancelled", {
-          finishedAt: now,
-          error: null,
-        });
-        interrupted =
-          (await classifyAndPersistRunLiveness(
-            interrupted,
-            parseObject(interrupted.resultJson),
-          )) ?? interrupted;
-
-        await releaseEnvironmentLeasesForRun({
-          runId: interrupted.id,
-          companyId: interrupted.companyId,
-          agentId: interrupted.agentId,
-          status: interrupted.status,
-          failureReason: interrupted.error ?? undefined,
-        });
-
-        const retry = await enqueueProcessLossRetry(interrupted, agent, now);
-        if (!retry) {
-          await releaseIssueExecutionAndPromote(interrupted);
-        } else {
-          retryRunIds.push(retry.id);
-        }
-
-        await appendRunEvent(interrupted, {
-          eventType: "lifecycle",
-          stream: "system",
-          level: "warn",
+        const interrupted = (control && await getRun(run.id, { includeExecutionEvidence: true })) ?? interruptedStatus.run;
+        const retry = await completeShutdownSettlement(interrupted, agent, {
+          now,
           message,
-          payload: {
-            signal,
-            ...(run.processPid ? { processPid: run.processPid } : {}),
-            ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
-            ...(retry ? { retryRunId: retry.id } : {}),
-          },
-        });
-
-        await finalizeAgentStatus(run.agentId, "interrupted", message, {
+          signal,
+          processPid: run.processPid ?? null,
+          processGroupId: run.processGroupId ?? null,
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
         });
+        if (retry) retryRunIds.push(retry.id);
       };
       if (!control) {
         await finishInterruptedRun();
@@ -1298,6 +1441,13 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     for (const [index, settlement] of settlements.entries()) {
       if (settlement.status === "rejected") logger.warn({ runId: activeRuns[index]!.run.id,
         errorKind: "shutdown_settlement_failed" }, "Shutdown settlement failed; durable cleanup protection remains in place");
+    }
+
+    if (notReachedRunIds.length > 0) {
+      logger.warn(
+        { signal, notReachedRunIds },
+        "shutdown drain stopped at its signal; runs left for the next boot's orphan sweep",
+      );
     }
 
     if (interruptedRunIds.length > 0) {
@@ -1959,6 +2109,9 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         logger.warn({ err: error, runId: run.id }, "failed to finish interrupted retry cancellation");
       }
     }
+    await replayPendingShutdownSettlements().catch(error => {
+      logger.warn({ err: error }, "failed to list pending shutdown run settlements");
+    });
     // Recovery never launches a provider or infers stopped ownership from
     // terminal status. Uncaptured local copies require durable stop evidence.
     await instructionCopies.recoverStopped().catch(error => {

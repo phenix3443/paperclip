@@ -3,6 +3,12 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  SHUTDOWN_STOP_MARGIN_MS,
+  SHUTDOWN_TEARDOWN_CAPS_MS,
+  SHUTDOWN_WATCHDOG_MS,
+  SHUTDOWN_WORK_DEADLINE_MAX_MS,
+} from "@paperclipai/shared/shutdown-budget";
+import {
   assertForegroundRunAllowed,
   detectServiceManager,
   LaunchdServiceManager,
@@ -35,6 +41,23 @@ describe("service definition generation", () => {
     expect(unit).toContain("Restart=always");
     expect(unit).toContain("TimeoutStopSec=300");
     expect(unit).not.toContain("API_KEY");
+  });
+
+  it("sends the stop signal to the main process only, so it can stop embedded PostgreSQL last", () => {
+    const unit = renderSystemdUnit({ instanceId: "team-a", shimPath: "/home/alice/.local/bin/paperclipai", homeDir: "/home/alice/.paperclip" });
+    expect(unit).toMatch(/^KillMode=mixed$/m);
+    expect(unit).toMatch(/^TimeoutStopSec=300$/m);
+    expect(unit.match(/^KillMode=/gm)).toHaveLength(1);
+  });
+
+  it("gives the server's whole stop budget plus its margin exactly the unit's stop timeout", () => {
+    const unit = renderSystemdUnit({ instanceId: "team-a", shimPath: "/home/alice/.local/bin/paperclipai", homeDir: "/home/alice/.paperclip" });
+    const timeoutStopSec = Number(unit.match(/^TimeoutStopSec=(\d+)$/m)?.[1]);
+    const teardown = Object.values(SHUTDOWN_TEARDOWN_CAPS_MS).reduce((sum, cap) => sum + cap, 0);
+    expect(SHUTDOWN_WATCHDOG_MS).toBe(SHUTDOWN_WORK_DEADLINE_MAX_MS + teardown);
+    // Equality, not "at most": raising either the budget or the stop timeout
+    // alone must fail here, so the two are always changed together.
+    expect(SHUTDOWN_WATCHDOG_MS + SHUTDOWN_STOP_MARGIN_MS).toBe(timeoutStopSec * 1000);
   });
 
   it("escapes systemd variable and specifier expansion in configured values", () => {

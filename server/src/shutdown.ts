@@ -1,3 +1,5 @@
+import { SHUTDOWN_TEARDOWN_CAPS_MS } from "@paperclipai/shared/shutdown-budget";
+
 type HotRestartShutdownPreparation = {
   skipDrain: boolean;
 };
@@ -128,15 +130,24 @@ export async function finalizeServerShutdown(input: {
   stopEmbeddedPostgres: (() => Promise<void>) | null;
   shutdownInstrumentation: () => Promise<void>;
   shutdownSentry: () => Promise<void>;
+  /**
+   * Runs one teardown step under its fixed cap (see `createShutdownBudget`).
+   * It must reject when the step rejects, so the step's own error log below
+   * still fires; a step cut at its cap resolves and the teardown moves on.
+   * Defaults to running the step without a cap.
+   */
+  runStep?: (phase: string, capMs: number, run: () => Promise<unknown>) => Promise<unknown>;
   log: ShutdownLogger;
 }): Promise<void> {
   const { signal } = input;
+  const step = input.runStep ?? ((_phase, _capMs, run) => run());
+  const caps = SHUTDOWN_TEARDOWN_CAPS_MS;
 
   // Stop accepting requests and drain the open ones before any service goes
   // away, so a request that is still in flight sees a fully working server.
   if (input.closeHttpListener) {
     try {
-      await input.closeHttpListener();
+      await step("http_listener_close", caps.httpListenerClose, input.closeHttpListener);
     } catch (err) {
       input.log.error({ err, signal }, "HTTP listener shutdown failed");
     }
@@ -146,7 +157,9 @@ export async function finalizeServerShutdown(input: {
   // releases its sandbox lease before the database and the provider stop. A
   // rejected cleanup stays durable for the reaper; it does not block the exit.
   try {
-    await input.shutdownAppServices?.();
+    if (input.shutdownAppServices) {
+      await step("app_services", caps.appServices, input.shutdownAppServices);
+    }
   } catch (err) {
     input.log.error({ err, signal }, "Application service shutdown failed");
   }
@@ -157,7 +170,7 @@ export async function finalizeServerShutdown(input: {
   // the pool end below, or lose its Sentry call to the flush further down.
   if (input.drainPendingRunFailureReports) {
     try {
-      await input.drainPendingRunFailureReports();
+      await step("pending_failure_reports", caps.pendingFailureReports, input.drainPendingRunFailureReports);
     } catch (err) {
       input.log.error({ err, signal }, "run-failure report drain failed");
     }
@@ -169,7 +182,7 @@ export async function finalizeServerShutdown(input: {
   // `max_connections` before the next boot gets a connection.
   if (input.closeDatabase) {
     try {
-      await input.closeDatabase();
+      await step("database_close", caps.databaseClose, input.closeDatabase);
     } catch (err) {
       input.log.error({ err, signal }, "Database client shutdown failed");
     }
@@ -178,19 +191,22 @@ export async function finalizeServerShutdown(input: {
   if (input.stopEmbeddedPostgres) {
     input.log.info({ signal }, "Stopping embedded PostgreSQL");
     try {
-      await input.stopEmbeddedPostgres();
+      await step("embedded_postgres_stop", caps.embeddedPostgresStop, input.stopEmbeddedPostgres);
     } catch (err) {
       input.log.error({ err }, "Failed to stop embedded PostgreSQL cleanly");
     }
   }
 
-  // Flush buffered OTel spans before the process goes away; without this await
-  // the exporter's final batch is dropped on exit.
-  await input.shutdownInstrumentation();
-
-  // Flush buffered Sentry events before the process goes away; without this
-  // await the last events are dropped on exit.
-  await input.shutdownSentry();
+  // Flush buffered OTel spans and Sentry events before the process goes away;
+  // without this await the exporter's final batch and the last events are
+  // dropped on exit. They share one slot, so they run together.
+  try {
+    await step("telemetry_flush", caps.flush, () =>
+      Promise.all([input.shutdownInstrumentation(), input.shutdownSentry()]),
+    );
+  } catch (err) {
+    input.log.error({ err, signal }, "OTel or Sentry flush failed");
+  }
 }
 
 const COORDINATED_SHUTDOWN_SIGNALS = ["SIGINT", "SIGTERM"] as const;

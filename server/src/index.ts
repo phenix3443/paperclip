@@ -154,8 +154,19 @@ import {
   finalizeServerShutdown,
   loadWithoutCoordinatedShutdownSignalHooks,
 } from "./shutdown.js";
+import {
+  armShutdownWatchdog,
+  createShutdownBudget,
+  readShutdownTestHooks,
+  resolveShutdownWorkDeadlineMs,
+  runHotRestartPreparationStep,
+} from "./shutdown-budget.js";
+import { SHUTDOWN_WATCHDOG_MS } from "@paperclipai/shared/shutdown-budget";
+import { fenceHeartbeatRunDispatch } from "./services/heartbeat-dispatch-fence.js";
+import { isEmbeddedPostgresLifecycleLine } from "./embedded-postgres-lifecycle-log.js";
+import { revokeHotRestartAdoptionForProcess } from "./services/hot-restart.js";
 import { initializeCloudRuntimeIdentity } from "./services/cloud-runtime-identity.js";
-import { systemdNotify } from "./services/systemd-notify.js";
+import { captureSystemdNotifySocket, systemdNotify } from "./services/systemd-notify.js";
 import { flushInFlightRunLogMirrors } from "./services/run-log-store.js";
 import {
   createEmbeddedPostgresSupervisor,
@@ -221,6 +232,7 @@ async function endDatabaseClient(client: unknown, timeoutSeconds: number): Promi
 }
 
 export async function startServer(): Promise<StartedServer> {
+  captureSystemdNotifySocket();
   const startupDatabase: StartupDatabaseTeardown = { close: null };
   try {
     return await startServerWithDatabaseTeardown(startupDatabase);
@@ -488,9 +500,6 @@ async function startServerWithDatabaseTeardown(
     const verboseEmbeddedPostgresLogs = process.env.PAPERCLIP_EMBEDDED_POSTGRES_VERBOSE === "true";
     const appendEmbeddedPostgresLog = (message: unknown) => {
       logBuffer.append(message);
-      if (!verboseEmbeddedPostgresLogs) {
-        return;
-      }
       const lines = typeof message === "string"
         ? message.split(/\r?\n/)
         : message instanceof Error
@@ -499,6 +508,7 @@ async function startServerWithDatabaseTeardown(
       for (const lineRaw of lines) {
         const line = lineRaw.trim();
         if (!line) continue;
+        if (!verboseEmbeddedPostgresLogs && !isEmbeddedPostgresLifecycleLine(line)) continue;
         logger.info({ embeddedPostgresLog: line }, "embedded-postgres");
       }
     };
@@ -627,6 +637,10 @@ async function startServerWithDatabaseTeardown(
           onUnexpectedExit: (code, signal) => logger.error(
             { code, signal, recentLogs: logBuffer.getRecentLogs() },
             "Embedded PostgreSQL exited unexpectedly; attempting recovery",
+          ),
+          onExitDuringShutdown: (code, signal) => logger.warn(
+            { code, signal, recentLogs: logBuffer.getRecentLogs() },
+            "Embedded PostgreSQL exited during server shutdown",
           ),
           onRestartAttemptFailed: (err, attempt) => logger.error(
             { err, attempt, recentLogs: logBuffer.getRecentLogs() },
@@ -1184,9 +1198,14 @@ async function startServerWithDatabaseTeardown(
   let drainHeartbeatRunsForShutdown: ((
     signal: "SIGINT" | "SIGTERM",
     runIds?: readonly string[] | null,
+    abortSignal?: AbortSignal,
   ) => Promise<unknown>) | null = null;
   let drainHeartbeatExecutionFinalizers: (() => Promise<void>) | null = null;
-  let prepareHotRestartShutdown: ((signal: "SIGINT" | "SIGTERM") => Promise<{
+  let prepareHotRestartShutdown: ((
+    signal: "SIGINT" | "SIGTERM",
+    now?: Date,
+    options?: { abortSignal?: AbortSignal },
+  ) => Promise<{
     skipDrain: boolean;
     drainRunIds?: string[];
   }>) | null = null;
@@ -1463,8 +1482,8 @@ async function startServerWithDatabaseTeardown(
     const retentionExecutor = decisionRetentionService(db as any, {
       notifyOriginAgent: createDecisionRetentionNotifyOriginAgent(heartbeat.wakeup),
     });
-    drainHeartbeatRunsForShutdown = (signal, runIds) => (
-      heartbeat.drainRunningRunsForShutdown(signal, new Date(), runIds)
+    drainHeartbeatRunsForShutdown = (signal, runIds, abortSignal) => (
+      heartbeat.drainRunningRunsForShutdown(signal, new Date(), runIds, { abortSignal })
     );
     drainHeartbeatExecutionFinalizers = () =>
       heartbeat.drainActiveRunExecutions();
@@ -2045,11 +2064,36 @@ async function startServerWithDatabaseTeardown(
     );
   }
   
+  // Read once at startup, so an out-of-range value is logged before any stop.
+  const shutdownWorkDeadlineMs = resolveShutdownWorkDeadlineMs(
+    process.env.PAPERCLIP_SHUTDOWN_WORK_DEADLINE_MS,
+    logger,
+  );
+
   const shutdown = async (
     signal: "SIGINT" | "SIGTERM",
     exitProcess: boolean,
   ) => {
-    await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
+    // The work stage shares one deadline; the teardown steps each have a fixed
+    // slot after it, and the watchdog exits before systemd's SIGKILL if a
+    // promise in the sequence never settles. See `createShutdownBudget`.
+    const shutdownTestHooks = readShutdownTestHooks(process.env);
+    const budget = createShutdownBudget({
+      signal, workDeadlineMs: shutdownWorkDeadlineMs, log: logger, testHooks: shutdownTestHooks,
+    });
+    const disarmWatchdog = exitProcess
+      ? armShutdownWatchdog({
+          timeoutMs: SHUTDOWN_WATCHDOG_MS,
+          currentPhase: budget.currentPhase,
+          exit: (code) => process.exit(code),
+          log: logger,
+        })
+      : () => {};
+
+    await budget.workStep("systemd_notify_stopping", 5_000, () =>
+      systemdNotify(["--stopping", `--status=Stopping after ${signal}`]),
+    );
+    embeddedPostgresSupervisor?.beginShutdown();
     heartbeatSchedulerStopped = true;
     clearInterval(skillVersionRetentionInterval);
     clearTimeout(skillVersionRetentionStartup);
@@ -2057,10 +2101,7 @@ async function startServerWithDatabaseTeardown(
     clearInterval(nativeHarnessBackupExpirationInterval);
     clearTimeout(nativeHarnessBackupExpirationStartup);
     clearTimeout(nativeHarnessBackupExpirationContinuation);
-    await skillVersionRetention.dispose();
-    await skillSourceSync.stop();
     unsubscribeChatCompletions();
-    await deliveryWork.stop();
     unregisterTerminalWorkspaceProbe?.();
     if (heartbeatSchedulerInterval) {
       clearInterval(heartbeatSchedulerInterval);
@@ -2069,8 +2110,29 @@ async function startServerWithDatabaseTeardown(
 
     const heartbeatShutdown = await coordinateHeartbeatSchedulerShutdown({
       signal,
-      prepareHotRestartShutdown,
-      waitForHeartbeatSchedulerIdle,
+      prepareHotRestartShutdown: prepareHotRestartShutdown
+        ? (preparationSignal) =>
+            runHotRestartPreparationStep({
+              budget,
+              log: logger,
+              prepare: (abortSignal) =>
+                prepareHotRestartShutdown!(preparationSignal, new Date(), { abortSignal }),
+              fence: () => revokeHotRestartAdoptionForProcess({ reason: "preparation_abandoned" }),
+            })
+        : null,
+      waitForHeartbeatSchedulerIdle: async () => {
+        await budget.workStep("scheduler_quiesce", 60_000, async (abortSignal) => {
+          // A claim that commits after this step's signal is not dispatched.
+          abortSignal.addEventListener("abort", fenceHeartbeatRunDispatch, { once: true });
+          await skillVersionRetention.dispose();
+          await skillSourceSync.stop();
+          await deliveryWork.stop();
+          await waitForHeartbeatSchedulerIdle();
+        });
+        // The idle wait has ended either way: every dispatched run is now
+        // visible to the drain, and later claims are left for the next boot.
+        fenceHeartbeatRunDispatch();
+      },
     });
     const skipHeartbeatDrain = heartbeatShutdown.hotRestart?.skipDrain === true;
     const selectiveDrainRunIds = heartbeatShutdown.hotRestart?.drainRunIds ?? null;
@@ -2089,41 +2151,52 @@ async function startServerWithDatabaseTeardown(
     const telemetryClient = getTelemetryClient();
     if (telemetryClient) {
       telemetryClient.stop();
-      await telemetryClient.flush();
+      await budget.workStep("product_telemetry_flush", 5_000, () => telemetryClient.flush());
     }
 
     if (!skipHeartbeatDrain && drainHeartbeatRunsForShutdown) {
-      try {
-        const drain = await drainHeartbeatRunsForShutdown(signal, selectiveDrainRunIds);
-        logger.info({ signal, drain }, "graceful heartbeat run drain complete");
-      } catch (err) {
-        logger.error({ err, signal }, "graceful heartbeat run drain failed");
+      const drain = await budget.workStep("run_drain", 90_000, (abortSignal) =>
+        drainHeartbeatRunsForShutdown!(signal, selectiveDrainRunIds, abortSignal),
+      );
+      if (drain.outcome === "done") {
+        logger.info({ signal, drain: drain.value }, "graceful heartbeat run drain complete");
+      } else if (drain.outcome === "failed") {
+        logger.error({ err: drain.error, signal }, "graceful heartbeat run drain failed");
       }
     }
 
     if (!skipHeartbeatDrain) {
-      await drainRunExecutionFinalizersForShutdown({
-        signal,
-        drain: drainHeartbeatExecutionFinalizers,
-        timeoutMs: 30_000,
-        log: logger,
-      });
+      await budget.workStep("execution_finalizers", 30_000, () =>
+        drainRunExecutionFinalizersForShutdown({
+          signal,
+          drain: drainHeartbeatExecutionFinalizers,
+          timeoutMs: 30_000,
+          log: logger,
+        }),
+      );
     }
 
     // Whatever the drain did not finalize (timed-out runs, the hot-restart
     // skip path) still has a local-only tail when the in-flight run-log
     // mirror is enabled; upload those tails now so an orderly restart
     // never loses run output. No-op when the mirror is off.
-    try {
-      await flushInFlightRunLogMirrors();
-    } catch (err) {
-      logger.error({ err, signal }, "run-log in-flight mirror flush failed");
+    const mirrorFlush = await budget.workStep("run_log_mirror_flush", 15_000, () =>
+      flushInFlightRunLogMirrors(),
+    );
+    if (mirrorFlush.outcome === "failed") {
+      logger.error({ err: mirrorFlush.error, signal }, "run-log in-flight mirror flush failed");
     }
+
+    budget.endWorkStage();
 
     const appShutdown = (app as { locals?: { paperclipShutdown?: () => Promise<void> } }).locals
       ?.paperclipShutdown;
     const stopEmbeddedPostgres = embeddedPostgres && embeddedPostgresStartedByThisProcess
-      ? () => embeddedPostgresSupervisor?.shutdown() ?? embeddedPostgres!.stop()
+      ? async () => {
+          const delayMs = shutdownTestHooks.delayPostgresStopMs;
+          if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs));
+          await (embeddedPostgresSupervisor?.shutdown() ?? embeddedPostgres!.stop());
+        }
       : null;
 
     // Await the ordered application teardown before the process exits. A live
@@ -2133,7 +2206,8 @@ async function startServerWithDatabaseTeardown(
     // The HTTP listener closes first, while every service is still up, so a
     // request in flight is drained against a working server and none reaches
     // a route once the pool is gone; the programmatic close below then finds
-    // the listener already closed and skips.
+    // the listener already closed and skips. Every step always starts, each
+    // under its fixed cap, so a hung step cannot skip the PostgreSQL stop.
     await finalizeServerShutdown({
       signal,
       shutdownAppServices: appShutdown,
@@ -2149,6 +2223,14 @@ async function startServerWithDatabaseTeardown(
       stopEmbeddedPostgres,
       shutdownInstrumentation,
       shutdownSentry,
+      runStep: async (phase, capMs, run) => {
+        const result = await budget.teardownStep(phase, capMs, run, {
+          onTimeout: phase === "embedded_postgres_stop"
+            ? () => logger.fatal({ signal, capMs }, `embedded PostgreSQL did not stop within ${capMs}ms`)
+            : undefined,
+        });
+        if (result.outcome === "failed") throw result.error;
+      },
       log: logger,
     });
 
@@ -2161,7 +2243,12 @@ async function startServerWithDatabaseTeardown(
       });
     }
 
-    if (exitProcess) process.exit(0);
+    disarmWatchdog();
+    const abandoned = budget.abandonedPhases();
+    if (abandoned.length > 0) {
+      logger.error({ signal, abandoned }, "shutdown finished with abandoned phases");
+    }
+    if (exitProcess) process.exit(budget.exitCode());
   };
 
   process.once("SIGINT", () => {

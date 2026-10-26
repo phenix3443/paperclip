@@ -141,6 +141,7 @@ Environment="PAPERCLIP_HOME=${escapeSystemd(input.homeDir)}"
 WorkingDirectory=%h
 Restart=always
 RestartSec=5
+KillMode=mixed
 TimeoutStopSec=300
 
 [Install]

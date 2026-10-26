@@ -257,6 +257,72 @@ describe("finalizeServerShutdown", () => {
   });
 });
 
+describe("finalizeServerShutdown teardown slots", () => {
+  it("runs every teardown step through the capped runner in order, flushing telemetry together", async () => {
+    const calls: Array<[string, number]> = [];
+    const flushes: string[] = [];
+    await finalizeServerShutdown({
+      signal: "SIGTERM",
+      closeHttpListener: async () => {},
+      shutdownAppServices: async () => {},
+      drainPendingRunFailureReports: async () => {},
+      closeDatabase: async () => {},
+      stopEmbeddedPostgres: async () => {},
+      shutdownInstrumentation: async () => {
+        flushes.push("otel");
+      },
+      shutdownSentry: async () => {
+        flushes.push("sentry");
+      },
+      runStep: async (phase, capMs, run) => {
+        calls.push([phase, capMs]);
+        return run();
+      },
+      log: stubLogger(),
+    });
+    expect(calls).toEqual([
+      ["http_listener_close", 5_000],
+      ["app_services", 15_000],
+      ["pending_failure_reports", 10_000],
+      ["database_close", 10_000],
+      ["embedded_postgres_stop", 45_000],
+      ["telemetry_flush", 5_000],
+    ]);
+    expect(flushes.sort()).toEqual(["otel", "sentry"]);
+  });
+
+  it("still starts the PostgreSQL stop when every earlier step is cut at its cap", async () => {
+    const started: string[] = [];
+    await finalizeServerShutdown({
+      signal: "SIGTERM",
+      closeHttpListener: () => new Promise(() => {}),
+      shutdownAppServices: () => new Promise(() => {}),
+      drainPendingRunFailureReports: () => new Promise(() => {}),
+      closeDatabase: () => new Promise(() => {}),
+      stopEmbeddedPostgres: async () => {
+        started.push("pg");
+      },
+      shutdownInstrumentation: async () => {},
+      shutdownSentry: async () => {},
+      // Models a cut: the runner starts the step, then resolves without it.
+      runStep: async (phase, _capMs, run) => {
+        started.push(phase);
+        void run();
+      },
+      log: stubLogger(),
+    });
+    expect(started).toEqual([
+      "http_listener_close",
+      "app_services",
+      "pending_failure_reports",
+      "database_close",
+      "embedded_postgres_stop",
+      "pg",
+      "telemetry_flush",
+    ]);
+  });
+});
+
 describe("closeHttpListenerForShutdown", () => {
   function fakeServer(input: { listening: boolean; closeDelayMs?: number | null }) {
     const closeIdleConnections = vi.fn();

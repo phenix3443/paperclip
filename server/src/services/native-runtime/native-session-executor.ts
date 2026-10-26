@@ -293,6 +293,12 @@ async function waitForNativeSessionStartup(
 
 export async function detachNativeSessionsForRestart(
   runIds: readonly string[],
+  options: {
+    /** Checked before each session; no detach starts once it fires. */
+    abortSignal?: AbortSignal;
+    /** A run whose row is no longer running is left alone. */
+    isStillRunning?: (runId: string) => Promise<boolean>;
+  } = {},
 ): Promise<{
   detachedRunIds: string[];
   inactiveRunIds: string[];
@@ -315,6 +321,11 @@ export async function detachNativeSessionsForRestart(
         })]);
       } finally { clearTimeout(timer); }
     }
+    if (options.isStillRunning && !(await options.isStillRunning(runId))) {
+      inactiveRunIds.push(runId);
+      continue;
+    }
+    options.abortSignal?.throwIfAborted();
     nativeRunsDetachingForRestart.add(runId);
     const active = activeNativeSessions.get(runId) ?? await waitForNativeSessionStartup(runId);
     if (!active) {
