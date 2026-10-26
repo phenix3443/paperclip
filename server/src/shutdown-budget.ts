@@ -240,12 +240,14 @@ const HOT_RESTART_FENCE_CAP_MS = 5_000;
  * goes on; the next boot's process checks still keep a dead run from being
  * adopted.
  */
-export async function runHotRestartPreparationStep<T>(input: {
+export async function runHotRestartPreparationStep<
+  T extends { skipDrain: boolean; drainRunIds?: string[] },
+>(input: {
   budget: ShutdownBudget;
   log: Pick<BudgetLogger, "warn" | "error">;
   prepare: (signal: AbortSignal) => Promise<T>;
   fence: () => Promise<boolean>;
-}): Promise<T | { skipDrain: false }> {
+}): Promise<T | { skipDrain: false; drainRunIds?: undefined }> {
   const { budget, log } = input;
   const remainingMs = budget.remainingWorkMs();
   const capMs = Math.min(HOT_RESTART_PREPARATION_CAP_MS, remainingMs - HOT_RESTART_FENCE_CAP_MS);

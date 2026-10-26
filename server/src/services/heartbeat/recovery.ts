@@ -1099,7 +1099,23 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     signal: "SIGINT" | "SIGTERM",
     now = new Date(),
     runIds: readonly string[] | null = null,
+    options: {
+      /**
+       * The drain step's signal (its cap or the shutdown deadline). Each run
+       * checks it before its first settlement write; once it fires no new
+       * settlement starts, and the run stays `running` for the next boot's
+       * orphan sweep.
+       */
+      abortSignal?: AbortSignal;
+    } = {},
   ) {
+    const abortSignal = options.abortSignal;
+    const notReachedRunIds: string[] = [];
+    const reachedBeforeSignal = (runId: string) => {
+      if (!abortSignal?.aborted) return true;
+      notReachedRunIds.push(runId);
+      return false;
+    };
     const selectedRunIds = runIds ? [...new Set(runIds)] : null;
     if (selectedRunIds?.length === 0) {
       return {
@@ -1136,6 +1152,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       if (run.runtimeMode === "legacy" && run.controllerBootId &&
           run.controllerBootId !== legacyControllerBootId) return;
       if (isNativeRunnerOwnershipHeld(run)) return;
+      if (!reachedBeforeSignal(run.id)) return;
       if (
         run.runtimeMode === "native" &&
         agent.adapterType === "paperclip_runner"
@@ -1145,6 +1162,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         // finalizer interrupt/suspend Claude while the next server is adopting
         // the same turn.
         await detachNativeSessionsForRestart([run.id]);
+        if (!reachedBeforeSignal(run.id)) return;
         const recoveryHistoryEntry = JSON.stringify({
           at: now.toISOString(),
           restartKind: "graceful",
@@ -1222,6 +1240,9 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         if (!control && runningProcesses.get(run.id) === running) runningProcesses.delete(run.id);
       }
 
+      // Termination can take the run's grace; re-check before the status CAS,
+      // the first write of this run's settlement.
+      if (!control && !reachedBeforeSignal(run.id)) return;
       const persistedCancellationResult =
         run.runtimeMode === "native"
           ? await getRun(run.id).then((current) =>
@@ -1328,6 +1349,13 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     for (const [index, settlement] of settlements.entries()) {
       if (settlement.status === "rejected") logger.warn({ runId: activeRuns[index]!.run.id,
         errorKind: "shutdown_settlement_failed" }, "Shutdown settlement failed; durable cleanup protection remains in place");
+    }
+
+    if (notReachedRunIds.length > 0) {
+      logger.warn(
+        { signal, notReachedRunIds },
+        "shutdown drain stopped at its signal; runs left for the next boot's orphan sweep",
+      );
     }
 
     if (interruptedRunIds.length > 0) {

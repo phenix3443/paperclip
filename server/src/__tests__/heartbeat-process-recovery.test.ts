@@ -4146,6 +4146,38 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
+  it("starts no settlement once the drain signal has fired and leaves the run for the orphan sweep", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { runId, agentId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: child.pid ?? null,
+      processGroupId: null,
+      contextSnapshot: { executionEngine: "cli", processTopology: "detached" },
+    });
+    const heartbeat = heartbeatService(db);
+    const controller = new AbortController();
+    controller.abort(new Error("shutdown deadline reached"));
+
+    const drain = await heartbeat.drainRunningRunsForShutdown(
+      "SIGTERM",
+      new Date("2026-10-26T00:20:00.000Z"),
+      [runId],
+      { abortSignal: controller.signal },
+    );
+
+    expect(drain).toEqual({
+      interrupted: 0,
+      interruptedRunIds: [],
+      retryRunIds: [],
+      restartSuspendedRunIds: [],
+    });
+    const runs = await selectRecoveryRunsByAgent(agentId);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({ id: runId, status: "running" });
+    expect(() => process.kill(child.pid!, 0)).not.toThrow();
+  });
+
   it("publishes nothing from a hot-restart preparation whose signal has fired", async () => {
     const child = spawnAliveProcess();
     childProcesses.add(child);

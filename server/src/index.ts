@@ -1195,6 +1195,7 @@ async function startServerWithDatabaseTeardown(
   let drainHeartbeatRunsForShutdown: ((
     signal: "SIGINT" | "SIGTERM",
     runIds?: readonly string[] | null,
+    abortSignal?: AbortSignal,
   ) => Promise<unknown>) | null = null;
   let drainHeartbeatExecutionFinalizers: (() => Promise<void>) | null = null;
   let prepareHotRestartShutdown: ((
@@ -1469,8 +1470,8 @@ async function startServerWithDatabaseTeardown(
     const retentionExecutor = decisionRetentionService(db as any, {
       notifyOriginAgent: createDecisionRetentionNotifyOriginAgent(heartbeat.wakeup),
     });
-    drainHeartbeatRunsForShutdown = (signal, runIds) => (
-      heartbeat.drainRunningRunsForShutdown(signal, new Date(), runIds)
+    drainHeartbeatRunsForShutdown = (signal, runIds, abortSignal) => (
+      heartbeat.drainRunningRunsForShutdown(signal, new Date(), runIds, { abortSignal })
     );
     drainHeartbeatExecutionFinalizers = () =>
       heartbeat.drainActiveRunExecutions();
@@ -2134,8 +2135,8 @@ async function startServerWithDatabaseTeardown(
     }
 
     if (!skipHeartbeatDrain && drainHeartbeatRunsForShutdown) {
-      const drain = await budget.workStep("run_drain", 90_000, () =>
-        drainHeartbeatRunsForShutdown!(signal, selectiveDrainRunIds),
+      const drain = await budget.workStep("run_drain", 90_000, (abortSignal) =>
+        drainHeartbeatRunsForShutdown!(signal, selectiveDrainRunIds, abortSignal),
       );
       if (drain.outcome === "done") {
         logger.info({ signal, drain: drain.value }, "graceful heartbeat run drain complete");
