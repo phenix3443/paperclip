@@ -58,4 +58,59 @@ describe("embedded PostgreSQL supervisor", () => {
     expect(onRecoveryExhausted).toHaveBeenCalledOnce();
     expect(onRecoveryExhausted).toHaveBeenCalledWith(expect.objectContaining({ message: "third" }));
   });
+  it("does not restart PostgreSQL that exits after shutdown began, and still stops it once", async () => {
+    const initial = createInstance();
+    const createReplacement = vi.fn(() => createInstance().instance);
+    const onExitDuringShutdown = vi.fn();
+    const onUnexpectedExit = vi.fn();
+    const supervisor = createEmbeddedPostgresSupervisor({
+      initialInstance: initial.instance,
+      createInstance: createReplacement,
+      restartDelaysMs: [0],
+      onUnexpectedExit,
+      onExitDuringShutdown,
+    });
+
+    supervisor.beginShutdown();
+    initial.process.emit("exit", 0, "SIGTERM");
+    await supervisor.waitForRecovery();
+
+    expect(createReplacement).not.toHaveBeenCalled();
+    expect(onUnexpectedExit).not.toHaveBeenCalled();
+    expect(onExitDuringShutdown).toHaveBeenCalledWith(0, "SIGTERM");
+    await supervisor.shutdown();
+    expect(initial.instance.stop).not.toHaveBeenCalled();
+  });
+
+  it("stops the live instance when shutdown follows beginShutdown", async () => {
+    const initial = createInstance();
+    const supervisor = createEmbeddedPostgresSupervisor({
+      initialInstance: initial.instance,
+      createInstance: () => createInstance().instance,
+      restartDelaysMs: [0],
+    });
+
+    supervisor.beginShutdown();
+    await supervisor.shutdown();
+    await supervisor.shutdown();
+
+    expect(initial.instance.stop).toHaveBeenCalledOnce();
+  });
+
+  it("still recovers an exit that happens before beginShutdown", async () => {
+    const initial = createInstance();
+    const replacement = createInstance();
+    const supervisor = createEmbeddedPostgresSupervisor({
+      initialInstance: initial.instance,
+      createInstance: () => replacement.instance,
+      restartDelaysMs: [0],
+    });
+
+    initial.process.emit("exit", 137, "SIGKILL");
+    await supervisor.waitForRecovery();
+    supervisor.beginShutdown();
+
+    expect(replacement.instance.start).toHaveBeenCalledOnce();
+    expect(supervisor.current()).toBe(replacement.instance);
+  });
 });

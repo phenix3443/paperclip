@@ -627,6 +627,10 @@ async function startServerWithDatabaseTeardown(
             { code, signal, recentLogs: logBuffer.getRecentLogs() },
             "Embedded PostgreSQL exited unexpectedly; attempting recovery",
           ),
+          onExitDuringShutdown: (code, signal) => logger.warn(
+            { code, signal, recentLogs: logBuffer.getRecentLogs() },
+            "Embedded PostgreSQL exited during server shutdown",
+          ),
           onRestartAttemptFailed: (err, attempt) => logger.error(
             { err, attempt, recentLogs: logBuffer.getRecentLogs() },
             "Embedded PostgreSQL recovery attempt failed",
@@ -2040,6 +2044,7 @@ async function startServerWithDatabaseTeardown(
     exitProcess: boolean,
   ) => {
     await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
+    embeddedPostgresSupervisor?.beginShutdown();
     heartbeatSchedulerStopped = true;
     clearInterval(skillVersionRetentionInterval);
     clearTimeout(skillVersionRetentionStartup);

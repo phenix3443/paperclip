@@ -8,6 +8,8 @@ export interface SupervisedEmbeddedPostgres {
 
 export interface EmbeddedPostgresSupervisor {
   current(): SupervisedEmbeddedPostgres;
+  /** Stop restarting PostgreSQL without stopping it. Server shutdown calls this first. */
+  beginShutdown(): void;
   shutdown(): Promise<void>;
   waitForRecovery(): Promise<void>;
 }
@@ -19,6 +21,7 @@ type Options = {
   restartDelaysMs?: number[];
   delay?: (milliseconds: number) => Promise<void>;
   onUnexpectedExit?: EmbeddedPostgresExitListener;
+  onExitDuringShutdown?: EmbeddedPostgresExitListener;
   onRestartAttemptFailed?: (error: unknown, attempt: number) => void;
   onRestarted?: (attempt: number) => void;
   onRecoveryExhausted?: (error: unknown) => void;
@@ -32,6 +35,7 @@ export function createEmbeddedPostgresSupervisor(options: Options): EmbeddedPost
   let activeInstance = options.initialInstance;
   let activeInstanceExited = false;
   let shuttingDown = false;
+  let stopRequested = false;
   let recoveryPromise: Promise<void> | null = null;
 
   const recover = async () => {
@@ -72,7 +76,10 @@ export function createEmbeddedPostgresSupervisor(options: Options): EmbeddedPost
     child.once("exit", (code, signal) => {
       if (activeInstance !== instance) return;
       activeInstanceExited = true;
-      if (shuttingDown) return;
+      if (shuttingDown) {
+        options.onExitDuringShutdown?.(code, signal);
+        return;
+      }
       options.onUnexpectedExit?.(code, signal);
       recoveryPromise = recover().finally(() => { recoveryPromise = null; });
     });
@@ -82,8 +89,12 @@ export function createEmbeddedPostgresSupervisor(options: Options): EmbeddedPost
   return {
     current: () => activeInstance,
     waitForRecovery: async () => { await recoveryPromise; },
+    beginShutdown: () => {
+      shuttingDown = true;
+    },
     shutdown: async () => {
-      if (shuttingDown) return;
+      if (stopRequested) return;
+      stopRequested = true;
       shuttingDown = true;
       await recoveryPromise;
       if (!activeInstanceExited) await activeInstance.stop();
