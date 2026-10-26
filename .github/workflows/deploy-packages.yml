@@ -63,7 +63,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           sudo --preserve-env=GITHUB_TOKEN systemd-run --wait --pipe --collect --uid="$(id -u)" --gid="$(id -g)" \
-            -p WorkingDirectory="$GITHUB_WORKSPACE" -p UMask=0022 -E GITHUB_TOKEN \
+            -p WorkingDirectory="$GITHUB_WORKSPACE" -p UMask=0022 -p MemoryAccounting=yes -E GITHUB_TOKEN \
             -E HOME="$RUNNER_TEMP/home" -E PATH="$PATH" -E RUSTUP_HOME="$HOME/.rustup" -E CARGO_HOME="$HOME/.cargo" \
             -E PAPERCLIP_BUILD_COMMIT="$SHA" -E PAPERCLIP_INSTALL_PACKAGES_DIR="$PACKAGES_DIR" \
             "$(command -v node)" cli/node_modules/tsx/dist/cli.mjs cli/src/index.ts install --repo "$REPO" --ref "$SHA" --yes 2> >(tee "$RUNNER_TEMP/unit.log" >&2)
@@ -99,7 +99,7 @@ jobs:
             awk '$0 != "---" { rss = $1; $1 = ""; cmd = substr($0, 2, 100); if (rss > peak[cmd]) peak[cmd] = rss }
                  END { for (cmd in peak) printf "%8.0f  %s\n", peak[cmd] / 1024, cmd }' "$MEMORY_LOG" | sort -rn | head -15
             echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
