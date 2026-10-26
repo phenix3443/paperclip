@@ -152,6 +152,12 @@ import {
   finalizeServerShutdown,
   loadWithoutCoordinatedShutdownSignalHooks,
 } from "./shutdown.js";
+import {
+  armShutdownWatchdog,
+  createShutdownBudget,
+  resolveShutdownWorkDeadlineMs,
+} from "./shutdown-budget.js";
+import { SHUTDOWN_WATCHDOG_MS } from "@paperclipai/shared/shutdown-budget";
 import { initializeCloudRuntimeIdentity } from "./services/cloud-runtime-identity.js";
 import { captureSystemdNotifySocket, systemdNotify } from "./services/systemd-notify.js";
 import { flushInFlightRunLogMirrors } from "./services/run-log-store.js";
@@ -2039,11 +2045,32 @@ async function startServerWithDatabaseTeardown(
     );
   }
   
+  // Read once at startup, so an out-of-range value is logged before any stop.
+  const shutdownWorkDeadlineMs = resolveShutdownWorkDeadlineMs(
+    process.env.PAPERCLIP_SHUTDOWN_WORK_DEADLINE_MS,
+    logger,
+  );
+
   const shutdown = async (
     signal: "SIGINT" | "SIGTERM",
     exitProcess: boolean,
   ) => {
-    await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
+    // The work stage shares one deadline; the teardown steps each have a fixed
+    // slot after it, and the watchdog exits before systemd's SIGKILL if a
+    // promise in the sequence never settles. See `createShutdownBudget`.
+    const budget = createShutdownBudget({ signal, workDeadlineMs: shutdownWorkDeadlineMs, log: logger });
+    const disarmWatchdog = exitProcess
+      ? armShutdownWatchdog({
+          timeoutMs: SHUTDOWN_WATCHDOG_MS,
+          currentPhase: budget.currentPhase,
+          exit: (code) => process.exit(code),
+          log: logger,
+        })
+      : () => {};
+
+    await budget.workStep("systemd_notify_stopping", 5_000, () =>
+      systemdNotify(["--stopping", `--status=Stopping after ${signal}`]),
+    );
     embeddedPostgresSupervisor?.beginShutdown();
     heartbeatSchedulerStopped = true;
     clearInterval(skillVersionRetentionInterval);
@@ -2052,10 +2079,7 @@ async function startServerWithDatabaseTeardown(
     clearInterval(nativeHarnessBackupExpirationInterval);
     clearTimeout(nativeHarnessBackupExpirationStartup);
     clearTimeout(nativeHarnessBackupExpirationContinuation);
-    await skillVersionRetention.dispose();
-    await skillSourceSync.stop();
     unsubscribeChatCompletions();
-    await deliveryWork.stop();
     unregisterTerminalWorkspaceProbe?.();
     if (heartbeatSchedulerInterval) {
       clearInterval(heartbeatSchedulerInterval);
@@ -2064,8 +2088,31 @@ async function startServerWithDatabaseTeardown(
 
     const heartbeatShutdown = await coordinateHeartbeatSchedulerShutdown({
       signal,
-      prepareHotRestartShutdown,
-      waitForHeartbeatSchedulerIdle,
+      prepareHotRestartShutdown: prepareHotRestartShutdown
+        ? async (preparationSignal) => {
+            // The last 5 s before the deadline are reserved for the
+            // preparation fence; with less left, preparation is skipped and
+            // the drain runs.
+            const capMs = Math.min(20_000, budget.remainingWorkMs() - 5_000);
+            if (capMs <= 0) {
+              throw new Error("hot-restart preparation skipped: less than 5000ms left before the shutdown deadline");
+            }
+            const prepared = await budget.workStep("hot_restart_preparation", capMs, () =>
+              prepareHotRestartShutdown!(preparationSignal),
+            );
+            if (prepared.outcome === "done") return prepared.value;
+            if (prepared.outcome === "failed") throw prepared.error;
+            throw new Error(`hot-restart preparation abandoned: ${prepared.outcome}`);
+          }
+        : null,
+      waitForHeartbeatSchedulerIdle: async () => {
+        await budget.workStep("scheduler_quiesce", 60_000, async () => {
+          await skillVersionRetention.dispose();
+          await skillSourceSync.stop();
+          await deliveryWork.stop();
+          await waitForHeartbeatSchedulerIdle();
+        });
+      },
     });
     const skipHeartbeatDrain = heartbeatShutdown.hotRestart?.skipDrain === true;
     const selectiveDrainRunIds = heartbeatShutdown.hotRestart?.drainRunIds ?? null;
@@ -2084,36 +2131,43 @@ async function startServerWithDatabaseTeardown(
     const telemetryClient = getTelemetryClient();
     if (telemetryClient) {
       telemetryClient.stop();
-      await telemetryClient.flush();
+      await budget.workStep("product_telemetry_flush", 5_000, () => telemetryClient.flush());
     }
 
     if (!skipHeartbeatDrain && drainHeartbeatRunsForShutdown) {
-      try {
-        const drain = await drainHeartbeatRunsForShutdown(signal, selectiveDrainRunIds);
-        logger.info({ signal, drain }, "graceful heartbeat run drain complete");
-      } catch (err) {
-        logger.error({ err, signal }, "graceful heartbeat run drain failed");
+      const drain = await budget.workStep("run_drain", 90_000, () =>
+        drainHeartbeatRunsForShutdown!(signal, selectiveDrainRunIds),
+      );
+      if (drain.outcome === "done") {
+        logger.info({ signal, drain: drain.value }, "graceful heartbeat run drain complete");
+      } else if (drain.outcome === "failed") {
+        logger.error({ err: drain.error, signal }, "graceful heartbeat run drain failed");
       }
     }
 
     if (!skipHeartbeatDrain) {
-      await drainRunExecutionFinalizersForShutdown({
-        signal,
-        drain: drainHeartbeatExecutionFinalizers,
-        timeoutMs: 30_000,
-        log: logger,
-      });
+      await budget.workStep("execution_finalizers", 30_000, () =>
+        drainRunExecutionFinalizersForShutdown({
+          signal,
+          drain: drainHeartbeatExecutionFinalizers,
+          timeoutMs: 30_000,
+          log: logger,
+        }),
+      );
     }
 
     // Whatever the drain did not finalize (timed-out runs, the hot-restart
     // skip path) still has a local-only tail when the in-flight run-log
     // mirror is enabled; upload those tails now so an orderly restart
     // never loses run output. No-op when the mirror is off.
-    try {
-      await flushInFlightRunLogMirrors();
-    } catch (err) {
-      logger.error({ err, signal }, "run-log in-flight mirror flush failed");
+    const mirrorFlush = await budget.workStep("run_log_mirror_flush", 15_000, () =>
+      flushInFlightRunLogMirrors(),
+    );
+    if (mirrorFlush.outcome === "failed") {
+      logger.error({ err: mirrorFlush.error, signal }, "run-log in-flight mirror flush failed");
     }
+
+    budget.endWorkStage();
 
     const appShutdown = (app as { locals?: { paperclipShutdown?: () => Promise<void> } }).locals
       ?.paperclipShutdown;
@@ -2128,7 +2182,8 @@ async function startServerWithDatabaseTeardown(
     // The HTTP listener closes first, while every service is still up, so a
     // request in flight is drained against a working server and none reaches
     // a route once the pool is gone; the programmatic close below then finds
-    // the listener already closed and skips.
+    // the listener already closed and skips. Every step always starts, each
+    // under its fixed cap, so a hung step cannot skip the PostgreSQL stop.
     await finalizeServerShutdown({
       signal,
       shutdownAppServices: appShutdown,
@@ -2144,6 +2199,14 @@ async function startServerWithDatabaseTeardown(
       stopEmbeddedPostgres,
       shutdownInstrumentation,
       shutdownSentry,
+      runStep: async (phase, capMs, run) => {
+        const result = await budget.teardownStep(phase, capMs, run, {
+          onTimeout: phase === "embedded_postgres_stop"
+            ? () => logger.fatal({ signal, capMs }, `embedded PostgreSQL did not stop within ${capMs}ms`)
+            : undefined,
+        });
+        if (result.outcome === "failed") throw result.error;
+      },
       log: logger,
     });
 
@@ -2156,7 +2219,12 @@ async function startServerWithDatabaseTeardown(
       });
     }
 
-    if (exitProcess) process.exit(0);
+    disarmWatchdog();
+    const abandoned = budget.abandonedPhases();
+    if (abandoned.length > 0) {
+      logger.error({ signal, abandoned }, "shutdown finished with abandoned phases");
+    }
+    if (exitProcess) process.exit(budget.exitCode());
   };
 
   process.once("SIGINT", () => {
