@@ -20,7 +20,9 @@ function deferred() {
   return { promise, resolve };
 }
 
-function request(port: number, path: string, agent?: http.Agent) {
+// Without an explicit agent each request opens a new connection; the global
+// agent's keep-alive pool would reuse a socket from before teardown 1.
+function request(port: number, path: string, agent: http.Agent | false = false) {
   return new Promise<{ status: number; body: string }>((resolve, reject) => {
     const req = http.get({ host: "127.0.0.1", port, path, agent }, (res) => {
       let body = "";
