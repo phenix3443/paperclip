@@ -7,6 +7,8 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { createPostgresWakeQueueAdapter } from "../../modules/wake-queue/adapters/postgres.js";
 import { createReleaseIssueExecution } from "../../modules/wake-queue/application/use-cases.js";
 import { createHeartbeatQueue, type HeartbeatQueueDependencies } from "./queue.js";
+import { fenceHeartbeatRunDispatch, resetHeartbeatRunDispatchFenceForTests } from "../heartbeat-dispatch-fence.js";
+import { legacyControllerBootId } from "../legacy-controller-lease.js";
 
 import { createHeartbeatQueueTestDependencies as callbacks } from "../../__tests__/helpers/heartbeat-queue.js";
 
@@ -260,6 +262,23 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     expect((await db.select().from(issues).where(eq(issues.id, issue.id)))[0].status).toBe("todo");
     expect(deps.executeRun).not.toHaveBeenCalled();
     expect(deps.setRunStatus).not.toHaveBeenCalled();
+  });
+
+  it("leaves a run claimed after the shutdown claim fence running and undispatched", async () => {
+    const { run, agent } = await fixture("queued");
+    const deps = callbacks(db);
+    deps.getAgent.mockResolvedValue(agent);
+    fenceHeartbeatRunDispatch();
+    try {
+      expect(await createHeartbeatQueue(db, deps).startNextQueuedRunForAgent(agent.id))
+        .toEqual([expect.objectContaining({ id: run.id, status: "running" })]);
+    } finally {
+      resetHeartbeatRunDispatchFenceForTests();
+    }
+    expect(deps.executeRun).not.toHaveBeenCalled();
+    const [claimed] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+    expect(claimed).toMatchObject({ status: "running", processPid: null });
+    if (claimed.runtimeMode !== "native") expect(claimed.controllerBootId).toBe(legacyControllerBootId);
   });
 
   it("admits the same queued input after the external connection is repaired", async () => {

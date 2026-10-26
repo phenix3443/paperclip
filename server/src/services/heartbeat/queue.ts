@@ -30,6 +30,7 @@ import {
   isWaitingConversation,
 } from "../agent-conversations.js";
 import { legacyControllerClaim } from "../legacy-controller-lease.js";
+import { heartbeatRunDispatchFenced } from "../heartbeat-dispatch-fence.js";
 import {
   admitExplicitNativeContinuation,
   undeliveredLegacyUserCommentIds,
@@ -2080,6 +2081,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       if (claimedRuns.length === 0) return [];
 
       for (const claimedRun of claimedRuns) {
+        // Checked synchronously after the claim committed; nothing more is
+        // written for the run, because the pool may already be closing.
+        if (heartbeatRunDispatchFenced()) {
+          logger.warn({ runId: claimedRun.id }, `claimed run not dispatched: shutting down ${claimedRun.id}`);
+          continue;
+        }
         const execution = executeRun(claimedRun.id).catch((err) => {
           logger.error(
             { err, runId: claimedRun.id },

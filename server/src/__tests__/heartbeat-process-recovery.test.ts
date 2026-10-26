@@ -4247,6 +4247,22 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .toHaveLength(retries.length);
   });
 
+  it("requeues a run an earlier boot claimed but did not dispatch while shutting down", async () => {
+    const { runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: null,
+      processGroupId: null,
+    });
+    await db.update(heartbeatRuns).set({ controllerBootId: randomUUID(), controllerLeaseExpiresAt: new Date(0) })
+      .where(eq(heartbeatRuns.id, runId));
+
+    await heartbeatService(db).reapOrphanedRuns();
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run.status).not.toBe("running");
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId))).toHaveLength(1);
+  });
+
   it("does not replay a shutdown settlement this boot is still running", async () => {
     const { runId, wakeupRequestId } = await seedRunFixture({
       agentStatus: "running",

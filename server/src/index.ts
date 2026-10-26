@@ -159,6 +159,7 @@ import {
   runHotRestartPreparationStep,
 } from "./shutdown-budget.js";
 import { SHUTDOWN_WATCHDOG_MS } from "@paperclipai/shared/shutdown-budget";
+import { fenceHeartbeatRunDispatch } from "./services/heartbeat-dispatch-fence.js";
 import { revokeHotRestartAdoptionForProcess } from "./services/hot-restart.js";
 import { initializeCloudRuntimeIdentity } from "./services/cloud-runtime-identity.js";
 import { captureSystemdNotifySocket, systemdNotify } from "./services/systemd-notify.js";
@@ -2106,12 +2107,17 @@ async function startServerWithDatabaseTeardown(
             })
         : null,
       waitForHeartbeatSchedulerIdle: async () => {
-        await budget.workStep("scheduler_quiesce", 60_000, async () => {
+        await budget.workStep("scheduler_quiesce", 60_000, async (abortSignal) => {
+          // A claim that commits after this step's signal is not dispatched.
+          abortSignal.addEventListener("abort", fenceHeartbeatRunDispatch, { once: true });
           await skillVersionRetention.dispose();
           await skillSourceSync.stop();
           await deliveryWork.stop();
           await waitForHeartbeatSchedulerIdle();
         });
+        // The idle wait has ended either way: every dispatched run is now
+        // visible to the drain, and later claims are left for the next boot.
+        fenceHeartbeatRunDispatch();
       },
     });
     const skipHeartbeatDrain = heartbeatShutdown.hotRestart?.skipDrain === true;
