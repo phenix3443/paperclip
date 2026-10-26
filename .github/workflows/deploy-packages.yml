@@ -134,7 +134,8 @@ jobs:
           PHASES = ["outer workspace install", "ref resolution", "source download", "extract", "corepack enable",
                     "inner pnpm install", "CLI bundle", "workspace build", "packaging", "final npm install", "smoke",
                     "install CLI only", "after install", "unknown"]
-          REQUIRED = ["outer workspace install", "inner pnpm install", "CLI bundle", "workspace build", "packaging", "final npm install"]
+          # The CLI bundle usually finishes within one sampling interval, so like smoke it may be not sampled.
+          REQUIRED = ["outer workspace install", "inner pnpm install", "workspace build", "packaging", "final npm install"]
           STAGING_RE = re.compile(r"/\S*?/installs/git/\.[0-9a-f]{12}\.tmp-\d+-\d+")
           CLI_MARK = "cli/src/index.ts install --repo"
           # tsx starts esbuild's long-lived transform service as a child of the CLI; it is not an install step.
@@ -271,7 +272,8 @@ jobs:
               cli = innermost[0]
               seen_cli = True
               tree = subtree(cli)
-              steps = [procs[pid] for pid in children[cli] if not HELPER_RE.search(procs[pid]["cmd"])]
+              # A child with an empty command line has exited (zombie) and is no longer running a step.
+              steps = [procs[pid] for pid in children[cli] if procs[pid]["cmd"] and not HELPER_RE.search(procs[pid]["cmd"])]
               if len(steps) != len(children[cli]):
                   helper_snapshots += 1
               if not steps:
@@ -338,7 +340,7 @@ jobs:
           print()
           unknown_count = phase_stats["unknown"].count if "unknown" in phase_stats else 0
           print(f"Unknown snapshots: {unknown_count}")
-          print(f"Snapshots with the esbuild service child ignored as a step: {helper_snapshots}")
+          print(f"Snapshots with the esbuild service or an exited child ignored as a step: {helper_snapshots}")
           for reason, count in sorted(unknown_reasons.items(), key=lambda item: -item[1])[:20]:
               print(f"- {count} × `{cell(reason, 400)}`")
           failures = []
