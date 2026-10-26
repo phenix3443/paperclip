@@ -8078,6 +8078,39 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(otherActions).toHaveLength(0);
   });
 
+  it.each(["blocked", "in_review"] as const)(
+    "admits no owner-repair successor while a human confirmation is pending on a %s task",
+    async (status) => {
+      const fixture = await seedCompletedOwnerRepairFixture();
+      await db.update(issues).set({ status }).where(eq(issues.id, fixture.issueId));
+      const interactionId = randomUUID();
+      await db.insert(issueThreadInteractions).values({
+        id: interactionId,
+        companyId: fixture.companyId,
+        issueId: fixture.issueId,
+        kind: "request_confirmation",
+        status: "pending",
+        continuationPolicy: "wake_assignee",
+        payload: { version: 1, prompt: "Confirm the remaining scope." },
+      });
+      const before = await selectRecoveryIssueById(fixture.issueId);
+
+      await heartbeatService(db).reconcileStrandedAssignedIssues();
+      await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+      const after = await observeOwnerRepairContinuation(fixture);
+      expect(after.repeatedRepairs).toHaveLength(0);
+      expect(after.businessSuccessors).toHaveLength(0);
+      expect(after.receipts).toHaveLength(0);
+      expect(after.action.attemptCount).toBe(1);
+      expect(after.issue.status).toBe(before!.status);
+      expect(after.issue.assigneeAgentId).toBe(before!.assigneeAgentId);
+      const interaction = await db.select().from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.id, interactionId)).then((rows) => rows[0]!);
+      expect(interaction.status).toBe("pending");
+    },
+  );
+
   it("holds an owner-repair continuation behind a budget block without consuming its receipt", async () => {
     const fixture = await seedCompletedOwnerRepairFixture();
     const [policy] = await db.insert(budgetPolicies).values({
