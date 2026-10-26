@@ -570,6 +570,7 @@ export const DECIDED_REVIEW_SETTLE_RETRIES = 20;
 export type DecidedReviewScan = {
   after: { companyId: string; issueId: string } | null;
   settling: Map<string, number>;
+  visited?: Set<string>;
 };
 const defaultScan: DecidedReviewScan = { after: null, settling: new Map() };
 
@@ -579,6 +580,8 @@ export function decidedReviewRetryPending(scan: DecidedReviewScan = defaultScan)
 
 export async function continueDecidedReviewReassignments(db: Db, wakeup: Wakeup, scan: DecidedReviewScan = defaultScan) {
   const after = scan.after;
+  if (!after || !scan.visited) scan.visited = new Set();
+  const visited = scan.visited;
   const candidates = await db.selectDistinct({
     companyId: issueRecoveryActions.companyId, issueId: issueRecoveryActions.sourceIssueId,
   })
@@ -593,6 +596,7 @@ export async function continueDecidedReviewReassignments(db: Db, wakeup: Wakeup,
   let woken = 0;
   for (const candidate of candidates) {
     const key = `${candidate.companyId}:${candidate.issueId}`;
+    visited.add(key);
     let held: string | null = null;
     const proved = await db.transaction(async tx => {
       const [task] = await tx.select().from(issues).where(and(
@@ -629,6 +633,9 @@ export async function continueDecidedReviewReassignments(db: Db, wakeup: Wakeup,
       decisionId: proved.decisionId, resubmissionActivityId: proved.resubmissionActivityId,
     }));
     woken += 1;
+  }
+  if (scan.after === null) {
+    for (const key of scan.settling.keys()) if (!visited.has(key)) scan.settling.delete(key);
   }
   return { scanned: candidates.length, woken };
 }
