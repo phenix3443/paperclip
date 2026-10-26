@@ -296,6 +296,7 @@ vi.mock("../services/native-runtime/native-safe-replacement.js", () => ({
 
 vi.mock("../services/decided-review-reassignment.js", () => ({
   continueDecidedReviewReassignments: vi.fn(async () => ({ scanned: 0, woken: 0 })),
+  decidedReviewRetryPending: vi.fn(() => false),
 }));
 
 vi.mock("../config.js", () => ({
@@ -480,6 +481,7 @@ vi.mock("../auth/better-auth.js", () => ({
 
 import { startServer } from "../index.ts";
 import { reconcileSafeNativeReplacements } from "../services/native-runtime/native-safe-replacement.js";
+import { decidedReviewRetryPending } from "../services/decided-review-reassignment.js";
 import { EXECUTION_RECONCILIATION_INTERVAL_MS } from "../services/execution-control-deadline.js";
 
 // Startup housekeeping runs after readiness and starts the heartbeat scheduler
@@ -791,6 +793,25 @@ describe("startServer feedback export wiring", () => {
     } finally {
       delete (runtime as Partial<typeof runtime>).reconcileProductivityReviews;
       setIntervalSpy.mockRestore();
+    }
+  });
+
+  it("finishes the execution continuation duty, including its decided review retry check", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({ heartbeatSchedulerEnabled: true }));
+    const original = deliveryWorkRegisterMock.getMockImplementation()!;
+    let continuation: Promise<unknown> | undefined;
+    deliveryWorkRegisterMock.mockImplementation((queue, task) => {
+      const ready = task.run(new AbortController().signal);
+      if (queue === DELIVERY_QUEUES.executionContinuation) continuation = ready;
+      return { ready: ready.catch(() => undefined), wake: vi.fn() };
+    });
+    try {
+      await startServer();
+      expect(continuation).toBeDefined();
+      await expect(continuation).resolves.toBeUndefined();
+      expect(decidedReviewRetryPending).toHaveBeenCalled();
+    } finally {
+      deliveryWorkRegisterMock.mockImplementation(original);
     }
   });
 

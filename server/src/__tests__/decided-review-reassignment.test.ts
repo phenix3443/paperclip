@@ -21,6 +21,7 @@ import {
   companySkills,
   costEvents,
   createDb,
+  decisions,
   environmentLeases,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -51,6 +52,7 @@ import {
   type DecidedReviewScan,
   currentSubmissionIdentity,
   findConsumption,
+  findSubmissionTurn,
   proveDecidedReviewContinuation,
   selectDecidedReviewSource,
   DECIDED_REVIEW_SETTLE_RETRIES,
@@ -670,6 +672,12 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
         cause: "uncertain_provider_action", fingerprint: `other:${randomUUID()}`, nextAction: "Reconcile the provider action.",
         evidence: { runId: randomUUID(), automaticRecovery: { policy: "preserve_without_replay_v1", replay: "blocked", actionOutcome: "unknown" } } });
     }],
+    ["an open decision on the issue", async (b: HeldBase) => {
+      await db.insert(decisions).values({ companyId: b.f.companyId, originAgentId: b.f.reviewerId, originIssueId: b.f.issueId,
+        originRunId: b.r.runId, title: "Pick the null handling", body: "Which behavior should the fix keep?",
+        options: [{ id: "keep", label: "Keep", effects: [] }, { id: "drop", label: "Drop", effects: [] }],
+        expiresAt: new Date(Date.now() + 86_400_000) });
+    }],
     ["a parked attempt whose environment lease is not released", async (b: HeldBase) => {
       const q = await seedReviewerRun(b, {});
       await heartbeat.resumeQueuedRuns();
@@ -681,6 +689,33 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     const seeded = await change(b);
     await b.releaseLease();
     await expectHeldWithoutSuccessor(b, typeof seeded === "string" ? [seeded] : []);
+  }, 60_000);
+
+  it("holds the review when the reviewer history is longer than the bounded read", async () => {
+    const b = await heldBase();
+    for (let i = 0; i < 11; i += 1) {
+      await seedReviewerRun(b, { status: "cancelled", runtimeMode: "legacy", errorCode: "execution_reconciliation_required", finishedAt: new Date() });
+    }
+    expect(await selectDecidedReviewSource(db, await readTask(b.f))).toEqual({ kind: "none", rule: "newer_runs_exceed_bound" });
+  }, 60_000);
+
+  it("releases a submission whose recorded turn was cancelled before it started, and keeps a queued turn", async () => {
+    const b = await heldBase();
+    const identity = (await readIdentity(b.f))!;
+    const task = await readTask(b.f);
+    const stamped = { issueId: b.f.issueId, taskId: b.f.issueId, wakeReason: "execution_review_requested", decidedReviewSubmission: identity };
+    const unstarted = await seedReviewerRun(b, { status: "cancelled", errorCode: "cancelled", finishedAt: new Date(), contextSnapshot: stamped });
+    expect(await findSubmissionTurn(db, task, identity)).toBeNull();
+
+    await db.insert(issueRecoveryActions).values({ companyId: b.f.companyId, sourceIssueId: b.f.issueId, kind: "active_run_watchdog",
+      status: "resolved", outcome: "blocked", resolvedAt: new Date(), ownerType: "board", returnOwnerAgentId: b.f.reviewerId,
+      cause: "uncertain_provider_action", fingerprint: `other:${randomUUID()}`, nextAction: "Reconcile the provider action.",
+      evidence: { runId: randomUUID(), decidedReviewContinuation: { ...identity, sourceRunId: b.r.runId, successorRunId: unstarted } } });
+    expect(await findConsumption(db, task, identity)).toMatchObject({ successorRunId: unstarted });
+    expect(await findSubmissionTurn(db, task, identity)).toBeNull();
+
+    const queued = await seedReviewerRun(b, { status: "queued", contextSnapshot: stamped });
+    expect(await findSubmissionTurn(db, task, identity)).toEqual({ successorRunId: queued });
   }, 60_000);
 
   async function patchRun(runId: string, change: (run: typeof heartbeatRuns.$inferSelect) => Partial<typeof heartbeatRuns.$inferInsert>) {
