@@ -266,7 +266,8 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
 
   it("leaves a run claimed after the shutdown claim fence running and undispatched", async () => {
     const { run, agent } = await fixture("queued");
-    const deps = callbacks(db);
+    await db.update(heartbeatRuns).set({ responsibleUserId: "queue-test-user" }).where(eq(heartbeatRuns.id, run.id));
+    const deps = { ...callbacks(db), canStartNewExternalBotWork: vi.fn(async () => true) };
     deps.getAgent.mockResolvedValue(agent);
     fenceHeartbeatRunDispatch();
     try {
