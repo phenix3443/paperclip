@@ -37,6 +37,13 @@ describe("service definition generation", () => {
     expect(unit).not.toContain("API_KEY");
   });
 
+  it("sends the stop signal to the main process only, so it can stop embedded PostgreSQL last", () => {
+    const unit = renderSystemdUnit({ instanceId: "team-a", shimPath: "/home/alice/.local/bin/paperclipai", homeDir: "/home/alice/.paperclip" });
+    expect(unit).toMatch(/^KillMode=mixed$/m);
+    expect(unit).toMatch(/^TimeoutStopSec=300$/m);
+    expect(unit.match(/^KillMode=/gm)).toHaveLength(1);
+  });
+
   it("escapes systemd variable and specifier expansion in configured values", () => {
     const unit = renderSystemdUnit({
       instanceId: "team-$USER-%i",
