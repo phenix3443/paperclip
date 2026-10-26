@@ -8039,6 +8039,55 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(after.action).toMatchObject({ status: "resolved", attemptCount: 1 });
   });
 
+  it("holds an owner-repair continuation behind a budget block without consuming its receipt", async () => {
+    const fixture = await seedCompletedOwnerRepairFixture();
+    const [policy] = await db.insert(budgetPolicies).values({
+      companyId: fixture.companyId,
+      scopeType: "agent",
+      scopeId: fixture.agentId,
+      metric: "billed_cents",
+      windowKind: "calendar_month_utc",
+      amount: 1,
+      hardStopEnabled: true,
+      isActive: true,
+    }).returning();
+    await db.insert(costEvents).values({
+      companyId: fixture.companyId,
+      agentId: fixture.agentId,
+      issueId: fixture.issueId,
+      provider: "test",
+      biller: "test",
+      billingType: "tokens",
+      model: "test-model",
+      costCents: 1,
+      occurredAt: new Date(),
+    });
+
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    const held = await observeOwnerRepairContinuation(fixture);
+    expect(held.repeatedRepairs).toHaveLength(0);
+    expect(held.businessSuccessors).toHaveLength(0);
+    expect(held.receipts).toHaveLength(0);
+    expect(held.action).toMatchObject({ status: "active", attemptCount: 1 });
+
+    // The hard stop paused the owner. Lifting the budget clears both.
+    const pausedOwner = await db.select().from(agents).where(eq(agents.id, fixture.agentId)).then((rows) => rows[0]!);
+    expect(pausedOwner).toMatchObject({ status: "paused", pauseReason: "budget" });
+    await db.update(budgetPolicies).set({ isActive: false }).where(eq(budgetPolicies.id, policy!.id));
+    await db.update(agents).set({ status: "idle", pauseReason: null, pausedAt: null }).where(eq(agents.id, fixture.agentId));
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    const after = await observeOwnerRepairContinuation(fixture);
+    expect(after.repeatedRepairs).toHaveLength(0);
+    expect(after.businessSuccessors).toHaveLength(1);
+    expect(after.receipts).toHaveLength(1);
+    expect(after.receipts[0]!.runId).toBe(after.businessSuccessors[0]!.id);
+    if (held.settlement) expect(after.receipts[0]!.id).toBe(held.settlement.wakeupRequestId);
+    expect(after.action).toMatchObject({ status: "resolved", attemptCount: 1 });
+  });
+
   it("denies a reserved owner-repair continuation after reassignment and never reopens its slot", async () => {
     const fixture = await seedCompletedOwnerRepairFixture();
     // Reserve while the owner cannot be invoked; then hand the task to someone else.
