@@ -160,6 +160,7 @@ import {
 } from "./shutdown-budget.js";
 import { SHUTDOWN_WATCHDOG_MS } from "@paperclipai/shared/shutdown-budget";
 import { fenceHeartbeatRunDispatch } from "./services/heartbeat-dispatch-fence.js";
+import { isEmbeddedPostgresLifecycleLine } from "./embedded-postgres-lifecycle-log.js";
 import { revokeHotRestartAdoptionForProcess } from "./services/hot-restart.js";
 import { initializeCloudRuntimeIdentity } from "./services/cloud-runtime-identity.js";
 import { captureSystemdNotifySocket, systemdNotify } from "./services/systemd-notify.js";
@@ -496,9 +497,6 @@ async function startServerWithDatabaseTeardown(
     const verboseEmbeddedPostgresLogs = process.env.PAPERCLIP_EMBEDDED_POSTGRES_VERBOSE === "true";
     const appendEmbeddedPostgresLog = (message: unknown) => {
       logBuffer.append(message);
-      if (!verboseEmbeddedPostgresLogs) {
-        return;
-      }
       const lines = typeof message === "string"
         ? message.split(/\r?\n/)
         : message instanceof Error
@@ -507,6 +505,7 @@ async function startServerWithDatabaseTeardown(
       for (const lineRaw of lines) {
         const line = lineRaw.trim();
         if (!line) continue;
+        if (!verboseEmbeddedPostgresLogs && !isEmbeddedPostgresLifecycleLine(line)) continue;
         logger.info({ embeddedPostgresLog: line }, "embedded-postgres");
       }
     };
