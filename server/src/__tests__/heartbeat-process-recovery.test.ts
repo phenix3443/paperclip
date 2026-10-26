@@ -8039,6 +8039,45 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(after.action).toMatchObject({ status: "resolved", attemptCount: 1 });
   });
 
+  it("settles a completed owner repair from its run completion without waiting for the sweep", async () => {
+    const fixture = await seedCompletedOwnerRepairFixture({ durableSettlement: false });
+    // Replay the scheduled repair through the real executor instead of seeding
+    // its terminal row: completion itself must settle the action.
+    await db.update(heartbeatRuns).set({
+      status: "queued", startedAt: null, finishedAt: null, resultJson: null, exitCode: null,
+    }).where(eq(heartbeatRuns.id, fixture.repairRunId));
+
+    // As reported, the repair pushes its fix and leaves the task blocked.
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, fixture.issueId));
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+        summary: "Pushed the fix commit; remaining work continues.", provider: "test", model: "test-model" };
+    });
+    // The admitted business successor finishes the remaining work.
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, fixture.issueId));
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+        summary: "Finished the remaining work.", provider: "test", model: "test-model" };
+    });
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+
+    const repairRun = await db.select().from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, fixture.repairRunId)).then((rows) => rows[0]!);
+    expect(repairRun.status).toBe("succeeded");
+    const after = await observeOwnerRepairContinuation(fixture);
+    expect(after.repeatedRepairs).toHaveLength(0);
+    expect(after.businessSuccessors).toHaveLength(1);
+    expect(after.receipts).toHaveLength(1);
+    expect(after.receipts[0]!.runId).toBe(after.businessSuccessors[0]!.id);
+    expect(after.settlement).toMatchObject({ state: "delivered", repairRunId: fixture.repairRunId });
+    expect(after.action).toMatchObject({ status: "resolved", attemptCount: 1 });
+    const otherActions = await db.select().from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.sourceIssueId, fixture.issueId), eq(issueRecoveryActions.status, "active")));
+    expect(otherActions).toHaveLength(0);
+  });
+
   it("holds an owner-repair continuation behind a budget block without consuming its receipt", async () => {
     const fixture = await seedCompletedOwnerRepairFixture();
     const [policy] = await db.insert(budgetPolicies).values({

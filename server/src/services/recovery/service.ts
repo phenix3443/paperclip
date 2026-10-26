@@ -3765,6 +3765,36 @@ export function recoveryService(
     return "admitted";
   }
 
+  /**
+   * Completion-event entry for one settled repair run. It applies the same
+   * settlement as the sweep, which remains the backstop after a lost event or
+   * restart.
+   */
+  async function settleCompletedOwnerRepairRun(run: { id: string; companyId: string }) {
+    const row = await db
+      .select({ action: issueRecoveryActions, issueStatus: issues.status })
+      .from(issueRecoveryActions)
+      .innerJoin(
+        issues,
+        and(
+          eq(issues.id, issueRecoveryActions.sourceIssueId),
+          eq(issues.companyId, issueRecoveryActions.companyId),
+        ),
+      )
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, run.companyId),
+          eq(issueRecoveryActions.status, "active"),
+          sql`${issueRecoveryActions.wakePolicy}->>'type' = 'bounded_owner_disposition_repair'`,
+          sql`${issueRecoveryActions.wakePolicy}->>'scheduledRunId' = ${run.id}`,
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    if (!row || row.issueStatus === "done" || row.issueStatus === "cancelled") return null;
+    if (await hasUnverifiedNativeWorkspaceFinalizationOwner(db, row.action)) return null;
+    return reconcileCompletedOwnerRepair(row.action);
+  }
+
   async function reconcileActiveRecoveryActions() {
     const rows = await db
       .select({ action: issueRecoveryActions, issue: issues })
@@ -6772,6 +6802,7 @@ export function recoveryService(
     recordWatchdogDecision,
     scanSilentActiveRuns,
     reconcileStrandedAssignedIssues,
+    settleCompletedOwnerRepairRun,
     reconcileLegacyContinuation,
     legacyRepairDispatchBlock,
     sweepStaleIssueLocks,

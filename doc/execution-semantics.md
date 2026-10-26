@@ -560,7 +560,7 @@ This rule is intentionally conservative: local watcher evidence can help the rec
 
 #### Settling a completed owner repair
 
-A bounded owner disposition repair is finished once its own scheduled repair run has succeeded and recorded a durable settlement event. Recovery then settles the action instead of scheduling another repair:
+A bounded owner disposition repair is finished once its own scheduled repair run has succeeded and recorded a durable settlement event. Recovery then settles the action instead of scheduling another repair. Settlement starts when the repair run's executor is released; the recovery sweep and startup reconcile apply the same settlement if that event is lost:
 
 1. Only the run recorded as the action's `scheduledRunId` counts. A succeeded run without a durable settlement event, a run for another action, or a stale owner/fingerprint leaves the action as it is.
 2. Under the issue and action row locks, recovery re-checks the owner, return owner, fingerprint, and status version. A task that is blocked only by this recovery returns to `todo` in the same transaction, and the action records `evidence.ownerRepairSettlement` with a pre-generated wakeup request id. That id is the undelivered receipt.

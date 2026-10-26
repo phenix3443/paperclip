@@ -3893,6 +3893,13 @@ export function heartbeatService(
         const handoff = await pendingCaseHandoffForRun(db, run.id);
         if (handoff) await recordCaseHandoffExecutionReleased(db, run.id, handoff.issueId);
       }
+      // A completed owner repair settles as soon as its executor is released.
+      // The recovery sweep repeats the same settlement if this attempt is lost.
+      if (latestRun?.status === "succeeded" && !nativeOwnershipHeld &&
+          latestRun.contextSnapshot?.wakeReason === "issue_disposition_repair") {
+        await recovery.settleCompletedOwnerRepairRun(latestRun)
+          .catch(error => logger.warn({ runId: run.id, error }, "Could not settle completed owner repair; the recovery sweep will retry"));
+      }
       // Terminalization precedes lease and adapter cleanup. Only now is the
       // owner gone; retry pending input for ordinary completions as well as Stop.
       if (latestRun?.runtimeMode === "legacy" && ["failed", "timed_out"].includes(latestRun.status) &&
