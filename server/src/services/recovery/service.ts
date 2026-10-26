@@ -164,6 +164,7 @@ import {
   unknownEffectRecoveryFingerprints,
   readOwnerRepairSettlement,
   sameOwnerRepairIssueBinding,
+  type OwnerRepairContinuationRequest,
   type OwnerRepairSettlement,
 } from "./owner-repair-continuation.js";
 import { randomUUID } from "node:crypto";
@@ -232,15 +233,7 @@ type RecoveryWakeupOptions = {
     assigneeAgentId: string;
     statusVersion?: number;
   };
-  durableOwnerRepairContinuationRequest?: {
-    actionId: string;
-    repairRunId: string;
-    issueId: string;
-    wakeupRequestId: string;
-    continuationKey: string;
-    expectedIssueStatusVersion: number;
-    requestedAt: Date;
-  };
+  durableOwnerRepairContinuationRequest?: OwnerRepairContinuationRequest;
 };
 
 type RecoveryWakeup = (
@@ -3811,13 +3804,16 @@ export function recoveryService(
         const status = typeof error === "object" && error && "status" in error ? Number(error.status) : null;
         const details = typeof error === "object" && error && "details" in error && error.details && typeof error.details === "object"
           ? error.details as { code?: unknown } : null;
+        // The queue reports a dispatch-gate wait for every ledger-owned outbox
+        // (case handoffs and owner-repair continuations) with this code.
         if (details?.code === "case_handoff_admission_wait") {
           await recordOwnerRepairWait(action, settlement, error instanceof Error ? error.message : "admission_wait");
           return "waiting";
         }
         if (status !== 409 && status !== 404) throw error;
-        // A newer decision (owner, status, or settlement) consumed this slot.
-        // Keep the reserved key so it can never be admitted again.
+        // Temporary gates arrive as the wait above. A 409/404 here means the
+        // bound owner, issue version, issue binding, or settlement changed;
+        // the old request is stale and never reopens. Keep the reserved key.
         receipt = await acceptedOwnerRepairReceipt(action, settlement);
         if (!receipt) {
           await markOwnerRepairSettlement(action, settlement, {
@@ -3925,7 +3921,8 @@ export function recoveryService(
       if (wakePolicyType === "bounded_owner_disposition_repair") {
         // A completed repair is settled once; it never schedules itself again.
         const continuation = await reconcileCompletedOwnerRepair(action);
-        if (continuation === "admitted") {
+        // "existing" finishes an interrupted resolve of a decided settlement.
+        if (continuation === "admitted" || continuation === "existing") {
           result.resolved += 1;
           result.issueIds.push(issue.id);
           continue;

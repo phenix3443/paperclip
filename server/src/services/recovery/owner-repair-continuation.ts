@@ -46,6 +46,17 @@ export type OwnerRepairSettlement = {
   lastWait?: { reason: string; at: string } | null;
 };
 
+/** Queue admission request for one reserved owner-repair continuation. */
+export type OwnerRepairContinuationRequest = {
+  actionId: string;
+  repairRunId: string;
+  issueId: string;
+  wakeupRequestId: string;
+  continuationKey: string;
+  expectedIssueStatusVersion: number;
+  requestedAt: Date;
+};
+
 export type OwnerRepairCompletedWorkProduct = {
   id: string;
   type: string;
