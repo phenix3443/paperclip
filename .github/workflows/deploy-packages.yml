@@ -231,6 +231,12 @@ jobs:
                   if (args is not None and args[:1] == ["install"] and step["cwd"] == staging and len(args) > 1
                           and all(a.startswith(staging + "/") and a.endswith(".tgz") for a in args[1:])):
                       out.append(("final npm install", None))
+                  # npm shows the bare title `npm` while it starts. Only the final install runs in the
+                  # staging directory, and only the CLI pack runs in the CLI directory.
+                  if args == [] and step["cmd"] == "npm" and step["cwd"] == staging:
+                      out.append(("final npm install", None))
+                  if args == [] and step["cmd"] == "npm" and step["cwd"] == f"{checkout}/cli":
+                      out.append(("packaging", "cli"))
                   if f"{staging}/payload/node_modules/paperclipai/dist/index.js --version" in cmd: out.append(("smoke", None))
               return out
 
