@@ -294,6 +294,23 @@ vi.mock("../services/native-runtime/native-safe-replacement.js", () => ({
   reconcileSafeNativeReplacements: vi.fn(async () => ({ scanned: 0, scheduled: 0 })),
 }));
 
+const scheduleStub = vi.hoisted(() => ({ enabled: false }));
+
+vi.mock("../services/execution-recovery-resolution.js", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../services/execution-recovery-resolution.js")>(),
+  deliverReconciledExecutions: vi.fn(async () => undefined),
+}));
+
+vi.mock("../services/execution-control-work.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/execution-control-work.js")>();
+  return {
+    ...actual,
+    executionControlSchedule: (db: Parameters<typeof actual.executionControlSchedule>[0]) => scheduleStub.enabled
+      ? new Proxy({}, { get: () => async () => null }) as ReturnType<typeof actual.executionControlSchedule>
+      : actual.executionControlSchedule(db),
+  };
+});
+
 vi.mock("../services/decided-review-reassignment.js", () => ({
   continueDecidedReviewReassignments: vi.fn(async () => ({ scanned: 0, woken: 0 })),
   decidedReviewRetryPending: vi.fn(() => false),
@@ -805,12 +822,14 @@ describe("startServer feedback export wiring", () => {
       if (queue === DELIVERY_QUEUES.executionContinuation) continuation = ready;
       return { ready: ready.catch(() => undefined), wake: vi.fn() };
     });
+    scheduleStub.enabled = true;
     try {
       await startServer();
       expect(continuation).toBeDefined();
       await expect(continuation).resolves.toBeUndefined();
       expect(decidedReviewRetryPending).toHaveBeenCalled();
     } finally {
+      scheduleStub.enabled = false;
       deliveryWorkRegisterMock.mockImplementation(original);
     }
   });

@@ -676,7 +676,7 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
       await db.insert(decisions).values({ companyId: b.f.companyId, originAgentId: b.f.reviewerId, originIssueId: b.f.issueId,
         originRunId: b.r.runId, title: "Pick the null handling", body: "Which behavior should the fix keep?",
         options: [{ id: "keep", label: "Keep", effects: [] }, { id: "drop", label: "Drop", effects: [] }],
-        expiresAt: new Date(Date.now() + 86_400_000) });
+        signedSpec: "test", targetSnapshots: {}, expiresAt: new Date(Date.now() + 86_400_000) });
     }],
     ["a parked attempt whose environment lease is not released", async (b: HeldBase) => {
       const q = await seedReviewerRun(b, {});
