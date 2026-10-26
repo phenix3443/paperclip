@@ -8055,6 +8055,41 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(after.action).toMatchObject({ status: "resolved", attemptCount: 1 });
   });
 
+  it("re-checks native waits under the settlement lock when one appears after the pre-check", async () => {
+    const fixture = await seedCompletedOwnerRepairFixture();
+    const originalTransaction = db.transaction.bind(db);
+    let injected = false;
+    // A human question lands between the unlocked checks and the settlement lock.
+    const transaction = vi.spyOn(db, "transaction").mockImplementation((async (callback: any, config?: any) =>
+      originalTransaction(async (tx: any) => {
+        if (!injected) {
+          const [locked] = await tx.select({ evidence: issueRecoveryActions.evidence }).from(issueRecoveryActions)
+            .where(eq(issueRecoveryActions.id, fixture.actionId));
+          if (locked && !(locked.evidence as Record<string, unknown> | null)?.ownerRepairSettlement) {
+            injected = true;
+            await db.insert(issueThreadInteractions).values({
+              id: randomUUID(), companyId: fixture.companyId, issueId: fixture.issueId,
+              kind: "request_confirmation", status: "pending", continuationPolicy: "wake_assignee",
+              payload: { version: 1, prompt: "Confirm the remaining scope." },
+            });
+          }
+        }
+        return callback(tx);
+      }, config)) as typeof db.transaction);
+    try {
+      await heartbeatService(db).reconcileStrandedAssignedIssues();
+    } finally {
+      transaction.mockRestore();
+    }
+    expect(injected).toBe(true);
+    const after = await observeOwnerRepairContinuation(fixture);
+    expect(after.settlement).toBeNull();
+    expect(after.receipts).toHaveLength(0);
+    expect(after.businessSuccessors).toHaveLength(0);
+    expect(after.repeatedRepairs).toHaveLength(0);
+    expect(after.issue.status).not.toBe("todo");
+  });
+
   it("keeps one owner-repair continuation across repeated and concurrent reconciliation", async () => {
     const fixture = await seedCompletedOwnerRepairFixture();
 

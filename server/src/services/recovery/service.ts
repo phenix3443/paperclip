@@ -3612,6 +3612,10 @@ export function recoveryService(
         || parseObject(action.wakePolicy).scheduledRunId !== repairRun.id) {
         return "stale" as const;
       }
+      // Re-check native waits and live execution under the issue lock: a
+      // pending interaction or blocker need not change the status version.
+      const lockedState = await collectDispositionRepairSourceState(tx as unknown as Db, { issue });
+      if (lockedState.hasDurableWaitingPath || lockedState.hasActiveExecutionPath) return "fallback" as const;
       let expectedIssueStatusVersion = issue.statusVersion;
       let issueBinding = ownerRepairIssueBinding(issue);
       if (issue.status === "blocked") {
