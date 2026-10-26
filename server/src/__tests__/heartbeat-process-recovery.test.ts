@@ -7824,7 +7824,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
-  it("admits one business successor after a completed owner repair instead of repeating the repair", async () => {
+  async function seedCompletedOwnerRepairFixture(opts: { durableSettlement?: boolean } = {}) {
     const { companyId, agentId, runId: repairRunId, issueId } =
       await seedStrandedIssueFixture({
         status: "in_progress",
@@ -7886,43 +7886,201 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .update(issueRecoveryActions)
       .set({ wakePolicy: { type: "bounded_owner_disposition_repair", attempt: 1, maxAttempts: 2, scheduledRunId: repairRunId } })
       .where(eq(issueRecoveryActions.id, action.id));
-    await db.insert(heartbeatRunEvents).values({
-      companyId,
-      agentId,
-      runId: repairRunId,
-      seq: 10,
-      eventType: "lifecycle",
-      payload: { phase: "task.run.measured", outcome: "succeeded", durableSettlement: true },
-    });
+    if (opts.durableSettlement !== false) {
+      await db.insert(heartbeatRunEvents).values({
+        companyId,
+        agentId,
+        runId: repairRunId,
+        seq: 10,
+        eventType: "lifecycle",
+        payload: { phase: "task.run.measured", outcome: "succeeded", durableSettlement: true },
+      });
+    }
+    return { companyId, agentId, repairRunId, issueId, actionId: action.id };
+  }
 
-    await heartbeatService(db).reconcileStrandedAssignedIssues();
-
-    const [afterAction, ownerRuns] = await Promise.all([
+  async function observeOwnerRepairContinuation(input: { agentId: string; repairRunId: string; actionId: string; issueId: string }) {
+    const [action, ownerRuns, receipts, issue] = await Promise.all([
       db
         .select()
         .from(issueRecoveryActions)
-        .where(eq(issueRecoveryActions.id, action.id))
+        .where(eq(issueRecoveryActions.id, input.actionId))
         .then((rows) => rows[0]!),
-      selectRecoveryRunsByAgent(agentId),
+      selectRecoveryRunsByAgent(input.agentId),
+      db
+        .select()
+        .from(agentWakeupRequests)
+        .where(sql`${agentWakeupRequests.idempotencyKey} like 'owner-repair-continuation:%'`),
+      selectRecoveryIssueById(input.issueId),
     ]);
-    const newRuns = ownerRuns.filter((run) => run.id !== repairRunId);
-    const repeatedRepairs = newRuns.filter(
-      (run) => run.contextSnapshot?.recoveryActionId === action.id,
-    );
-    const businessSuccessors = newRuns.filter(
-      (run) => run.contextSnapshot?.recoveryActionId !== action.id,
-    );
+    const newRuns = ownerRuns.filter((run) => run.id !== input.repairRunId);
+    const settlement = (action.evidence as Record<string, any> | null)?.ownerRepairSettlement ?? null;
+    return {
+      action,
+      issue: issue!,
+      settlement,
+      receipts,
+      repeatedRepairs: newRuns.filter((run) => run.contextSnapshot?.recoveryActionId === input.actionId),
+      businessSuccessors: newRuns.filter((run) => run.contextSnapshot?.recoveryActionId !== input.actionId),
+    };
+  }
+
+  it("admits one business successor after a completed owner repair instead of repeating the repair", async () => {
+    const fixture = await seedCompletedOwnerRepairFixture();
+
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    const after = await observeOwnerRepairContinuation(fixture);
     expect({
-      repeatedRepairs: repeatedRepairs.length,
-      businessSuccessors: businessSuccessors.length,
-      attemptCount: afterAction.attemptCount,
-      maxAttempts: afterAction.maxAttempts,
+      repeatedRepairs: after.repeatedRepairs.length,
+      businessSuccessors: after.businessSuccessors.length,
+      attemptCount: after.action.attemptCount,
+      maxAttempts: after.action.maxAttempts,
     }).toEqual({
       repeatedRepairs: 0,
       businessSuccessors: 1,
       attemptCount: 1,
       maxAttempts: 2,
     });
+    const [successor] = after.businessSuccessors;
+    expect(successor!.agentId).toBe(fixture.agentId);
+    expect(successor!.id).not.toBe(fixture.repairRunId);
+    expect(after.receipts).toHaveLength(1);
+    expect(after.receipts[0]!.runId).toBe(successor!.id);
+    expect(after.receipts[0]!.id).toBe(after.settlement.wakeupRequestId);
+    expect(after.settlement).toMatchObject({ state: "delivered", deliveredRunId: successor!.id, repairRunId: fixture.repairRunId });
+    expect(after.action).toMatchObject({ status: "resolved", outcome: "restored" });
+  });
+
+  it("keeps one owner-repair continuation across repeated and concurrent reconciliation", async () => {
+    const fixture = await seedCompletedOwnerRepairFixture();
+
+    await Promise.all([
+      heartbeatService(db).reconcileStrandedAssignedIssues(),
+      heartbeatService(db).reconcileStrandedAssignedIssues(),
+    ]);
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    const after = await observeOwnerRepairContinuation(fixture);
+    expect(after.repeatedRepairs).toHaveLength(0);
+    expect(after.businessSuccessors).toHaveLength(1);
+    expect(after.receipts).toHaveLength(1);
+    expect(after.receipts[0]!.runId).toBe(after.businessSuccessors[0]!.id);
+    expect(after.action).toMatchObject({ status: "resolved", attemptCount: 1, maxAttempts: 2 });
+  });
+
+  it("neither repeats nor continues an owner repair that succeeded without durable settlement", async () => {
+    const fixture = await seedCompletedOwnerRepairFixture({ durableSettlement: false });
+
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    const after = await observeOwnerRepairContinuation(fixture);
+    expect(after.repeatedRepairs).toHaveLength(0);
+    expect(after.businessSuccessors).toHaveLength(0);
+    expect(after.receipts).toHaveLength(0);
+    expect(after.settlement).toBeNull();
+    expect(after.issue.status).toBe("blocked");
+    expect(after.action).toMatchObject({ status: "active", attemptCount: 1, maxAttempts: 2 });
+  });
+
+  it("redelivers a committed owner-repair settlement with its reserved receipt after a crash before dispatch", async () => {
+    const fixture = await seedCompletedOwnerRepairFixture();
+    // Settle while the owner is paused: the settlement must wait, not reserve.
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, fixture.agentId));
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+    const waiting = await observeOwnerRepairContinuation(fixture);
+    expect(waiting.settlement).toBeNull();
+    expect(waiting.receipts).toHaveLength(0);
+    expect(waiting.businessSuccessors).toHaveLength(0);
+    expect(waiting.repeatedRepairs).toHaveLength(0);
+    expect(waiting.action).toMatchObject({ status: "active", attemptCount: 1 });
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, fixture.agentId));
+
+    // The settlement transaction committed (task reopened, receipt id reserved)
+    // but the process died before the queue accepted the receipt.
+    const reservedId = randomUUID();
+    const issue = await selectRecoveryIssueById(fixture.issueId);
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, fixture.issueId));
+    const reopened = await selectRecoveryIssueById(fixture.issueId);
+    expect(reopened!.statusVersion).toBeGreaterThanOrEqual(issue!.statusVersion);
+    const action = await db.select().from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, fixture.actionId)).then((rows) => rows[0]!);
+    const continuationKey = `owner-repair-continuation:${fixture.issueId}:${fixture.actionId}:${fixture.repairRunId}:business`;
+    await db.update(issueRecoveryActions).set({
+      evidence: {
+        ...(action.evidence as Record<string, unknown>),
+        ownerRepairSettlement: {
+          schema: "paperclip.owner-repair-settlement.v1",
+          state: "pending_dispatch",
+          continuationKey,
+          wakeupRequestId: reservedId,
+          repairRunId: fixture.repairRunId,
+          ownerAgentId: fixture.agentId,
+          actionFingerprint: action.fingerprint,
+          expectedIssueStatusVersion: reopened!.statusVersion,
+          terminalEvidence: { runStatus: "succeeded", finishedAt: new Date().toISOString(), durableSettlementEventSeq: 10 },
+          completedWorkProductIds: [],
+          settledAt: new Date().toISOString(),
+        },
+      },
+    }).where(eq(issueRecoveryActions.id, fixture.actionId));
+
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    const after = await observeOwnerRepairContinuation(fixture);
+    expect(after.repeatedRepairs).toHaveLength(0);
+    expect(after.businessSuccessors).toHaveLength(1);
+    expect(after.receipts.map((receipt) => receipt.id)).toEqual([reservedId]);
+    expect(after.receipts[0]!.idempotencyKey).toBe(continuationKey);
+    expect(after.receipts[0]!.runId).toBe(after.businessSuccessors[0]!.id);
+    expect(after.settlement).toMatchObject({ state: "delivered", wakeupRequestId: reservedId });
+    expect(after.action).toMatchObject({ status: "resolved", attemptCount: 1 });
+  });
+
+  it("denies a reserved owner-repair continuation after reassignment and never reopens its slot", async () => {
+    const fixture = await seedCompletedOwnerRepairFixture();
+    // Reserve while the owner cannot be invoked; then hand the task to someone else.
+    const action = await db.select().from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, fixture.actionId)).then((rows) => rows[0]!);
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, fixture.issueId));
+    const reopened = await selectRecoveryIssueById(fixture.issueId);
+    const reservedId = randomUUID();
+    const continuationKey = `owner-repair-continuation:${fixture.issueId}:${fixture.actionId}:${fixture.repairRunId}:business`;
+    await db.update(issueRecoveryActions).set({
+      evidence: {
+        ...(action.evidence as Record<string, unknown>),
+        ownerRepairSettlement: {
+          schema: "paperclip.owner-repair-settlement.v1",
+          state: "pending_dispatch",
+          continuationKey,
+          wakeupRequestId: reservedId,
+          repairRunId: fixture.repairRunId,
+          ownerAgentId: fixture.agentId,
+          actionFingerprint: action.fingerprint,
+          expectedIssueStatusVersion: reopened!.statusVersion,
+          terminalEvidence: { runStatus: "succeeded", finishedAt: new Date().toISOString(), durableSettlementEventSeq: 10 },
+          completedWorkProductIds: [],
+          settledAt: new Date().toISOString(),
+        },
+      },
+    }).where(eq(issueRecoveryActions.id, fixture.actionId));
+    const otherAgentId = randomUUID();
+    await db.insert(agents).values(recoveryAgentRow(otherAgentId, fixture.companyId, "ReplacementOwner", "engineer", "idle"));
+    await db.update(issues).set({ assigneeAgentId: otherAgentId }).where(eq(issues.id, fixture.issueId));
+
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    const after = await observeOwnerRepairContinuation(fixture);
+    expect(after.repeatedRepairs).toHaveLength(0);
+    expect(after.businessSuccessors).toHaveLength(0);
+    expect(after.receipts).toHaveLength(0);
+    expect(after.settlement).toMatchObject({ state: "denied", wakeupRequestId: reservedId, continuationKey });
+    expect(after.action).toMatchObject({ status: "cancelled", attemptCount: 1, maxAttempts: 2 });
+    const otherRuns = await selectRecoveryRunsByAgent(otherAgentId);
+    expect(otherRuns).toHaveLength(0);
   });
 
   it("atomically deduplicates concurrent disposition-repair reconciliation", async () => {

@@ -3529,7 +3529,18 @@ export function recoveryService(
       if (reserved === "waiting" || reserved === "stale") return reserved;
       settlement = reserved;
     }
-    if (settlement.state !== "pending_dispatch") return "existing";
+    if (settlement.state !== "pending_dispatch") {
+      // The ledger decision committed but resolving the action did not.
+      await recoveryActionsSvc.resolveActiveForIssue({
+        companyId: action.companyId,
+        sourceIssueId: action.sourceIssueId,
+        actionId: action.id,
+        ...(settlement.state === "delivered"
+          ? { status: "resolved" as const, outcome: "restored" as const, resolutionNote: "owner_repair_continuation_admitted" }
+          : { status: "cancelled" as const, outcome: "cancelled" as const, resolutionNote: "owner_repair_continuation_denied" }),
+      });
+      return "existing";
+    }
     return deliverOwnerRepairContinuation(action, settlement);
   }
 
@@ -3651,24 +3662,26 @@ export function recoveryService(
     resolution: { status: "resolved" | "cancelled"; outcome: "restored" | "cancelled"; note: string },
   ) {
     const next = { ...settlement, ...patch };
-    const [updated] = await db.update(issueRecoveryActions).set({
-      evidence: sql`coalesce(${issueRecoveryActions.evidence}, '{}'::jsonb) || ${JSON.stringify({ ownerRepairSettlement: next })}::jsonb`,
-      updatedAt: new Date(),
-    }).where(and(
-      eq(issueRecoveryActions.id, action.id),
-      eq(issueRecoveryActions.companyId, action.companyId),
-      eq(issueRecoveryActions.status, "active"),
-      sql`${issueRecoveryActions.evidence} -> 'ownerRepairSettlement' ->> 'wakeupRequestId' = ${settlement.wakeupRequestId}`,
-      sql`${issueRecoveryActions.evidence} -> 'ownerRepairSettlement' ->> 'state' = 'pending_dispatch'`,
-    )).returning({ id: issueRecoveryActions.id });
-    if (!updated) return;
-    await recoveryActionsSvc.resolveActiveForIssue({
-      companyId: action.companyId,
-      sourceIssueId: action.sourceIssueId,
-      actionId: action.id,
-      status: resolution.status,
-      outcome: resolution.outcome,
-      resolutionNote: resolution.note,
+    await db.transaction(async (tx) => {
+      const [updated] = await tx.update(issueRecoveryActions).set({
+        evidence: sql`coalesce(${issueRecoveryActions.evidence}, '{}'::jsonb) || ${JSON.stringify({ ownerRepairSettlement: next })}::jsonb`,
+        updatedAt: new Date(),
+      }).where(and(
+        eq(issueRecoveryActions.id, action.id),
+        eq(issueRecoveryActions.companyId, action.companyId),
+        eq(issueRecoveryActions.status, "active"),
+        sql`${issueRecoveryActions.evidence} -> 'ownerRepairSettlement' ->> 'wakeupRequestId' = ${settlement.wakeupRequestId}`,
+        sql`${issueRecoveryActions.evidence} -> 'ownerRepairSettlement' ->> 'state' = 'pending_dispatch'`,
+      )).returning({ id: issueRecoveryActions.id });
+      if (!updated) return;
+      await recoveryActionsSvc.resolveActiveForIssue({
+        companyId: action.companyId,
+        sourceIssueId: action.sourceIssueId,
+        actionId: action.id,
+        status: resolution.status,
+        outcome: resolution.outcome,
+        resolutionNote: resolution.note,
+      }, tx as unknown as Db);
     });
   }
 
@@ -4159,6 +4172,11 @@ export function recoveryService(
       .then((rows) => rows[0] ?? null);
     if (!current || current.status === "done" || current.status === "cancelled")
       return "skipped";
+    // A settled owner repair already owns this task's next step through its
+    // reserved continuation receipt. Its reopened status must not read as a
+    // new disposition gap that resets the action or schedules another repair.
+    const settledRepair = await recoveryActionsSvc.getActiveForIssue(current.companyId, current.id);
+    if (settledRepair && readOwnerRepairSettlement(settledRepair.evidence)) return "skipped";
 
     const episode = options.legacyEpisode ?? (
       parseObject(parseObject(latestRun?.contextSnapshot).legacyDispositionEpisode).id && latestRun
