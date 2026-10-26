@@ -134,11 +134,9 @@ jobs:
           PHASES = ["outer workspace install", "ref resolution", "source download", "extract", "corepack enable",
                     "inner pnpm install", "CLI bundle", "workspace build", "packaging", "final npm install", "smoke",
                     "install CLI only", "after install", "unknown"]
-          # The CLI bundle usually finishes within one sampling interval, so like smoke it may be not sampled.
           REQUIRED = ["outer workspace install", "inner pnpm install", "workspace build", "packaging", "final npm install"]
           STAGING_RE = re.compile(r"/\S*?/installs/git/\.[0-9a-f]{12}\.tmp-\d+-\d+")
           CLI_MARK = "cli/src/index.ts install --repo"
-          # tsx starts esbuild's long-lived transform service as a child of the CLI; it is not an install step.
           HELPER_RE = re.compile(r"(^|/)esbuild --service=")
 
           def snapshots():
@@ -200,6 +198,8 @@ jobs:
           helper_snapshots = 0
 
           def step_matches(step):
+              if step["cmd"] == "npm" and (step["pid"], step["ppid"]) in npm_titles:
+                  step = dict(step, cmd=npm_titles[(step["pid"], step["ppid"])])
               cmd, out = step["cmd"], []
               checkout = f"{staging}/source" if staging else None
               if cmd.startswith("curl") and "api.github.com/repos/" in cmd: out.append(("ref resolution", None))
@@ -231,14 +231,18 @@ jobs:
                   if (args is not None and args[:1] == ["install"] and step["cwd"] == staging and len(args) > 1
                           and all(a.startswith(staging + "/") and a.endswith(".tgz") for a in args[1:])):
                       out.append(("final npm install", None))
-                  # npm shows the bare title `npm` while it starts. Only the final install runs in the
-                  # staging directory, and only the CLI pack runs in the CLI directory.
                   if args == [] and step["cmd"] == "npm" and step["cwd"] == staging:
                       out.append(("final npm install", None))
                   if args == [] and step["cmd"] == "npm" and step["cwd"] == f"{checkout}/cli":
                       out.append(("packaging", "cli"))
                   if f"{staging}/payload/node_modules/paperclipai/dist/index.js --version" in cmd: out.append(("smoke", None))
               return out
+
+          npm_titles = {}
+          for _, procs in snapshots():
+              for proc in procs.values():
+                  if proc["cmd"].startswith("npm "):
+                      npm_titles.setdefault((proc["pid"], proc["ppid"]), proc["cmd"])
 
           for ts, procs in snapshots():
               children = defaultdict(list)
@@ -278,7 +282,6 @@ jobs:
               cli = innermost[0]
               seen_cli = True
               tree = subtree(cli)
-              # A child with an empty command line has exited (zombie) and is no longer running a step.
               steps = [procs[pid] for pid in children[cli] if procs[pid]["cmd"] and not HELPER_RE.search(procs[pid]["cmd"])]
               if len(steps) != len(children[cli]):
                   helper_snapshots += 1
