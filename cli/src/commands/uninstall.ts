@@ -62,16 +62,18 @@ export async function uninstallCommand(
       );
     }
   }
-  if (detection.supported) {
-    const status = await detection.manager.status();
-    if (status.installed || status.active) await detection.manager.uninstall();
-  }
 
   const paths = resolveInstallStorePaths();
   const hadStore = fs.existsSync(paths.cliRoot);
+  // Verify the store and take its lock before stopping the service, so a
+  // refused uninstall leaves the running service and its definition intact.
   if (hadStore) assertManagedInstallStore(paths);
   const shimRemoved = await withInstallStoreLock(async () => {
     if (hadStore) assertManagedInstallStore(paths);
+    if (detection.supported) {
+      const status = await detection.manager.status();
+      if (status.installed || status.active) await detection.manager.uninstall();
+    }
     const removed = removeManagedShim(paths);
 
     const home = process.env.HOME;
