@@ -630,6 +630,19 @@ Apply it with `pnpm db:migrate` on a direct connection before enabling the new
 sleep guard. The executor retries interrupted invalid builds and records history
 only after the index is valid. It does not delete delivery or wake records.
 
+## Owner-repair continuation receipts
+
+A completed bounded owner repair admits at most one business continuation. Its
+receipt is an `agent_wakeup_requests` row whose `idempotency_key` starts with
+`owner-repair-continuation:`. The unique index
+`agent_wakeup_requests_owner_repair_continuation_uq` on
+`(company_id, idempotency_key)` covers every such row, including failed,
+cancelled, and skipped receipts, so a consumed slot is never reopened.
+Migration `0372` creates it concurrently through the standard migration
+executor; apply it with `pnpm db:migrate` on a direct connection. The settlement
+ledger itself lives in the recovery action's `evidence.ownerRepairSettlement`
+JSON and needs no new table.
+
 ## Plugin database namespaces
 
 The plugin runtime tracks plugin-owned database namespaces and migrations in `plugin_database_namespaces` and `plugin_migrations`. Hosted deployments that separate runtime and migration connections should set `DATABASE_MIGRATION_URL`; plugin namespace migration work uses the migration connection when present.
