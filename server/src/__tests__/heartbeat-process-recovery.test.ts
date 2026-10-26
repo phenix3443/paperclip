@@ -4178,6 +4178,98 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(() => process.kill(child.pid!, 0)).not.toThrow();
   });
 
+  it("clears the shutdown settlement marker only after the drain's settlement completes", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: child.pid ?? null,
+      processGroupId: null,
+      contextSnapshot: { executionEngine: "cli", processTopology: "detached" },
+    });
+
+    const drain = await heartbeatService(db).drainRunningRunsForShutdown(
+      "SIGTERM",
+      new Date("2026-10-26T00:20:00.000Z"),
+      [runId],
+    );
+
+    expect(drain.interruptedRunIds).toEqual([runId]);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run).toMatchObject({ status: "interrupted", errorCode: "server_shutdown_interrupted" });
+    expect(run.resultJson?.shutdownSettlement).toMatchObject({
+      schema: "paperclip.shutdown-run-settlement.v1",
+      state: "settled",
+      signal: "SIGTERM",
+    });
+  });
+
+  it("replays a shutdown settlement that an earlier boot's stop cut after the status change", async () => {
+    const { runId, agentId, wakeupRequestId } = await seedRunFixture({
+      agentStatus: "running",
+      runStatus: "interrupted",
+      runErrorCode: "server_shutdown_interrupted",
+      runError: "Interrupted by graceful server shutdown (SIGTERM)",
+      processPid: null,
+      processGroupId: null,
+    });
+    const pendingMarker = {
+      schema: "paperclip.shutdown-run-settlement.v1",
+      state: "pending",
+      controllerBootId: randomUUID(),
+      signal: "SIGTERM",
+    };
+    await db.update(heartbeatRuns).set({ resultJson: { shutdownSettlement: pendingMarker } })
+      .where(eq(heartbeatRuns.id, runId));
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.reapOrphanedRuns();
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run.status).toBe("interrupted");
+    expect(run.resultJson?.shutdownSettlement).toMatchObject({ ...pendingMarker, state: "settled" });
+    const [wakeup] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeupRequestId));
+    expect(wakeup.status).toBe("cancelled");
+    const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+    expect(agent.status).not.toBe("running");
+    const replayEvents = (await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId)))
+      .filter(event => (event.payload as Record<string, unknown> | null)?.shutdownSettlementReplayed === true);
+    expect(replayEvents).toHaveLength(1);
+    const retries = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
+    expect(retries.length).toBeLessThanOrEqual(1);
+
+    // A settled marker is not replayed again, and nothing is duplicated.
+    await heartbeat.reapOrphanedRuns();
+    const replayEventsAfter = (await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId)))
+      .filter(event => (event.payload as Record<string, unknown> | null)?.shutdownSettlementReplayed === true);
+    expect(replayEventsAfter).toHaveLength(1);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId)))
+      .toHaveLength(retries.length);
+  });
+
+  it("does not replay a shutdown settlement this boot is still running", async () => {
+    const { runId, wakeupRequestId } = await seedRunFixture({
+      agentStatus: "running",
+      runStatus: "interrupted",
+      runErrorCode: "server_shutdown_interrupted",
+      processPid: null,
+      processGroupId: null,
+    });
+    await db.update(heartbeatRuns).set({ resultJson: { shutdownSettlement: {
+      schema: "paperclip.shutdown-run-settlement.v1",
+      state: "pending",
+      controllerBootId: controllerLeases.legacyControllerBootId,
+      signal: "SIGTERM",
+    } } }).where(eq(heartbeatRuns.id, runId));
+
+    await heartbeatService(db).reapOrphanedRuns();
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run.resultJson?.shutdownSettlement).toMatchObject({ state: "pending" });
+    const [wakeup] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeupRequestId));
+    expect(wakeup.status).not.toBe("cancelled");
+  });
+
   it("publishes nothing from a hot-restart preparation whose signal has fired", async () => {
     const child = spawnAliveProcess();
     childProcesses.add(child);
