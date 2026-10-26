@@ -43,11 +43,12 @@ jobs:
           echo "PACKAGES_DIR=$RUNNER_TEMP/packages" >> "$GITHUB_ENV"
           echo "MEMORY_LOG=$RUNNER_TEMP/memory.log" >> "$GITHUB_ENV"
 
-      - name: Build this commit's CLI
+      # The CLI runs from source like the root `paperclipai` script; its esbuild
+      # bundle only resolves dependencies once it is packed and installed.
+      - name: Install this commit's workspace
         run: |
           corepack enable
           corepack pnpm install --frozen-lockfile
-          corepack pnpm --filter paperclipai build
 
       - name: Sample process memory
         run: |
@@ -62,10 +63,10 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           sudo --preserve-env=GITHUB_TOKEN systemd-run --wait --pipe --collect --uid="$(id -u)" --gid="$(id -g)" \
-            -p WorkingDirectory="$RUNNER_TEMP" -p UMask=0022 -E GITHUB_TOKEN \
+            -p WorkingDirectory="$GITHUB_WORKSPACE" -p UMask=0022 -E GITHUB_TOKEN \
             -E HOME="$RUNNER_TEMP/home" -E PATH="$PATH" -E RUSTUP_HOME="$HOME/.rustup" -E CARGO_HOME="$HOME/.cargo" \
             -E PAPERCLIP_BUILD_COMMIT="$SHA" -E PAPERCLIP_INSTALL_PACKAGES_DIR="$PACKAGES_DIR" \
-            "$(command -v node)" "$GITHUB_WORKSPACE/cli/dist/index.js" install --repo "$REPO" --ref "$SHA" --yes 2> >(tee "$RUNNER_TEMP/unit.log" >&2)
+            "$(command -v node)" cli/node_modules/tsx/dist/cli.mjs cli/src/index.ts install --repo "$REPO" --ref "$SHA" --yes 2> >(tee "$RUNNER_TEMP/unit.log" >&2)
 
       - name: Verify the exported packages
         run: |
