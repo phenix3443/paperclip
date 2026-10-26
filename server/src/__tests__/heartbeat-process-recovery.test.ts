@@ -8083,6 +8083,60 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(otherRuns).toHaveLength(0);
   });
 
+  it("leaves a completed owner repair behind a typed blocker wait without settling a successor", async () => {
+    const fixture = await seedCompletedOwnerRepairFixture();
+    const blockerId = randomUUID();
+    const issuePrefix = `T${fixture.companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(issues).values({
+      id: blockerId,
+      companyId: fixture.companyId,
+      title: "Upstream dependency",
+      status: "todo",
+      priority: "medium",
+      issueNumber: 9,
+      identifier: `${issuePrefix}-9`,
+    });
+    await db.insert(issueRelations).values({
+      companyId: fixture.companyId,
+      issueId: blockerId,
+      relatedIssueId: fixture.issueId,
+      type: "blocks",
+    });
+
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    const after = await observeOwnerRepairContinuation(fixture);
+    expect(after.repeatedRepairs).toHaveLength(0);
+    expect(after.businessSuccessors).toHaveLength(0);
+    expect(after.receipts).toHaveLength(0);
+    expect(after.settlement).toBeNull();
+    expect(after.issue.status).toBe("blocked");
+    expect(after.action.attemptCount).toBe(1);
+  });
+
+  it("does not admit a second owner-repair successor while the owner already has queued work on the task", async () => {
+    const fixture = await seedCompletedOwnerRepairFixture();
+    const existingRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: existingRunId,
+      companyId: fixture.companyId,
+      agentId: fixture.agentId,
+      status: "queued",
+      contextSnapshot: { issueId: fixture.issueId, taskId: fixture.issueId, wakeReason: "issue_commented" },
+    });
+
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    const after = await observeOwnerRepairContinuation(fixture);
+    expect(after.repeatedRepairs).toHaveLength(0);
+    expect(after.receipts).toHaveLength(0);
+    expect(after.settlement).toBeNull();
+    expect(after.businessSuccessors.map((run) => run.id)).toEqual([existingRunId]);
+    expect(after.action.attemptCount).toBe(1);
+  });
+
   it("atomically deduplicates concurrent disposition-repair reconciliation", async () => {
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
