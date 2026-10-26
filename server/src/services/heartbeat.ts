@@ -3845,6 +3845,18 @@ export function heartbeatService(
               ${JSON.stringify({ startupPreparationSettledAt: new Date().toISOString() })}::jsonb`,
           }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "cancelled")));
         }
+        if (latestRun?.status === "cancelled" && latestRun.runtimeMode === "legacy" &&
+            !legacyAdapterEntered && !nativeDispatchStarted && !nativeOwnershipHeld) {
+          // This executor settled without entering the adapter, so no provider
+          // process exists to acknowledge Stop. Agent stop checks accept this
+          // receipt instead of waiting forever for an acknowledgement.
+          await db.update(heartbeatRuns).set({
+            resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ||
+              ${JSON.stringify({ legacyAdapterNotEnteredAt: new Date().toISOString() })}::jsonb`,
+          }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "cancelled"),
+            eq(heartbeatRuns.runtimeMode, "legacy"), eq(heartbeatRuns.controllerBootId, legacyControllerBootId),
+            isNull(heartbeatRuns.processPid), isNull(heartbeatRuns.processGroupId)));
+        }
         await db.update(heartbeatRuns).set({
           executionStage: sql`case when ${heartbeatRuns.status} = 'cancelled' then 'settled' else ${heartbeatRuns.executionStage} end`,
           controllerLeaseExpiresAt: null,
@@ -3880,6 +3892,13 @@ export function heartbeatService(
           !nativeOwnershipHeld && isHeartbeatRunTerminalStatus(latestRun.status)) {
         const handoff = await pendingCaseHandoffForRun(db, run.id);
         if (handoff) await recordCaseHandoffExecutionReleased(db, run.id, handoff.issueId);
+      }
+      // A completed owner repair settles as soon as its executor is released.
+      // The recovery sweep repeats the same settlement if this attempt is lost.
+      if (latestRun?.status === "succeeded" && !nativeOwnershipHeld &&
+          latestRun.contextSnapshot?.wakeReason === ISSUE_DISPOSITION_REPAIR_RETRY_REASON) {
+        await recovery.settleCompletedOwnerRepairRun(latestRun)
+          .catch(error => logger.warn({ runId: run.id, error }, "Could not settle completed owner repair; the recovery sweep will retry"));
       }
       // Terminalization precedes lease and adapter cleanup. Only now is the
       // owner gone; retry pending input for ordinary completions as well as Stop.

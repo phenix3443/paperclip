@@ -166,6 +166,9 @@ export interface WakeQueueTransaction {
     wakeAgentId: string;
     commentIds: string[];
   }): Promise<boolean>;
+  parkedReviewRequestSubmission(input: { companyId: string; issueId: string; wakeId: string }): Promise<
+    { kind: "superseded" } | { kind: "serves"; submission: { decisionId: string; resubmissionActivityId: string } } | null
+  >;
   reopenIssue(input: { companyId: string; issueId: string; runId: string }): Promise<IssueSnapshot | null>;
   /** Verifies a Done onboarding parent's completion wake against its own completed children. */
   isCompletedOnboardingHandoffWake(input: { companyId: string; issueId: string; agentId: string;

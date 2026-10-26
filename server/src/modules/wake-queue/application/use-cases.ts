@@ -307,6 +307,25 @@ async function runReleaseDrain(
       continue;
     }
 
+    const reviewRequest = await ports.transaction.parkedReviewRequestSubmission({
+      companyId: run.companyId, issueId: issue.id, wakeId: workingCandidate.id,
+    });
+    if (reviewRequest?.kind === "superseded") {
+      await ports.transaction.cancelDeferredWake({
+        companyId: run.companyId,
+        wakeId: workingCandidate.id,
+        reason: "Superseded by the current submission's review turn",
+        now: input.now,
+      });
+      continue;
+    }
+    if (reviewRequest?.kind === "serves") {
+      workingCandidate = {
+        ...workingCandidate,
+        deferredContextSeed: { ...workingCandidate.deferredContextSeed, decidedReviewSubmission: reviewRequest.submission },
+      };
+    }
+
     // Unreachable: decideWakeOutcome only returns "promote" when agentFound and invokable are both true.
     if (!deferredAgent) throw new Error("wake-queue: promoted a deferred wake with no invokable agent");
 
