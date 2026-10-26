@@ -50,35 +50,44 @@ async function readOrigin(cwd: string): Promise<string | null> {
   }).catch(() => null);
 }
 
-// A repository is the same one over HTTPS or SSH. Compare host and owner/repo path,
-// keeping the path case-sensitive; anything unrecognized must match exactly.
-function repositoryIdentity(url: string): string | null {
+type RepositoryIdentity = { kind: "https" | "ssh" | "scp"; host: string; port: string; repository: string };
+
+function repositoryIdentity(url: string): RepositoryIdentity | null {
   const value = url.trim();
   const scp = /^[A-Za-z0-9._-]+@([A-Za-z0-9.-]+):(?!\/)(.+)$/.exec(value);
+  let kind: RepositoryIdentity["kind"];
   let host: string;
+  let port = "";
   let pathname: string;
   if (scp) {
+    kind = "scp";
     host = scp[1]!;
     pathname = scp[2]!;
   } else {
     let parsed: URL;
     try { parsed = new URL(value); } catch { return null; }
     if (!["https:", "ssh:"].includes(parsed.protocol) || parsed.search || parsed.hash) return null;
+    kind = parsed.protocol === "https:" ? "https" : "ssh";
     host = parsed.hostname;
+    port = kind === "ssh" && parsed.port === "22" ? "" : parsed.port;
     pathname = parsed.pathname;
   }
   const repository = pathname.replace(/^\/+/, "").replace(/\/+$/, "").replace(/\.git$/, "");
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) || repository.split("/").some(part => part === "." || part === "..")) {
     return null;
   }
-  return `${host.toLowerCase()}/${repository}`;
+  return { kind, host: host.toLowerCase(), port, repository };
 }
 
 export function isSameRepository(origin: string | null, recorded: string): boolean {
   if (origin === null) return false;
   if (origin.trim() === recorded.trim()) return true;
-  const originIdentity = repositoryIdentity(origin);
-  return originIdentity !== null && originIdentity === repositoryIdentity(recorded);
+  const left = repositoryIdentity(origin);
+  const right = repositoryIdentity(recorded);
+  if (!left || !right || left.host !== right.host || left.repository !== right.repository) return false;
+  if (left.kind === right.kind) return left.port === right.port;
+  if (left.kind !== "https" && right.kind !== "https") return false;
+  return left.port === "" && right.port === "";
 }
 
 async function gitDirectory(cwd: string, flag: "--absolute-git-dir" | "--git-common-dir"): Promise<string | null> {
