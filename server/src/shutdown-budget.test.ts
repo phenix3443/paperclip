@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   armShutdownWatchdog,
   createShutdownBudget,
+  readShutdownTestHooks,
   resolveShutdownWorkDeadlineMs,
   runHotRestartPreparationStep,
 } from "./shutdown-budget.js";
@@ -325,5 +326,31 @@ describe("runHotRestartPreparationStep", () => {
       expect.objectContaining({ mode: "deadline_skipped" }),
       "hot-restart preparation skipped: less than 5000ms left before the shutdown deadline",
     );
+  });
+});
+
+describe("readShutdownTestHooks", () => {
+  it("ignores the hook variables unless the test switch is on", () => {
+    expect(readShutdownTestHooks({ PAPERCLIP_SHUTDOWN_TEST_HANG_STEP: "run_drain" })).toEqual({});
+    expect(readShutdownTestHooks({
+      PAPERCLIP_SHUTDOWN_TEST_HOOKS: "1",
+      PAPERCLIP_SHUTDOWN_TEST_HANG_STEP: "run_drain",
+      PAPERCLIP_SHUTDOWN_TEST_DELAY_PG_STOP_MS: "60000",
+    })).toEqual({ hangWorkStep: "run_drain", delayPostgresStopMs: 60_000 });
+  });
+
+  it("makes the named work step hang until the deadline cuts it", async () => {
+    const log = stubLogger();
+    const budget = createShutdownBudget({
+      signal: "SIGTERM", workDeadlineMs: 10_000, log, now: () => Date.now(),
+      testHooks: { hangWorkStep: "run_drain" },
+    });
+    const ran = vi.fn(async () => "drained");
+    const drain = budget.workStep("run_drain", 90_000, ran);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(await drain).toEqual({ outcome: "deadline" });
+    expect(ran).not.toHaveBeenCalled();
+    expect(log.error).toHaveBeenCalledWith(expect.anything(), "shutdown deadline reached");
+    budget.endWorkStage();
   });
 });

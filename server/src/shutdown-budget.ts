@@ -60,12 +60,28 @@ export function resolveShutdownWorkDeadlineMs(
  * step that is cut keeps running in the background: its late result or
  * rejection is logged once and otherwise ignored.
  */
+export type ShutdownTestHooks = { hangWorkStep?: string; delayPostgresStopMs?: number };
+
+/**
+ * Hooks for the isolated systemd stop tests (graceful-stop plan, T3). They do
+ * nothing unless PAPERCLIP_SHUTDOWN_TEST_HOOKS=1 is set on the test unit.
+ */
+export function readShutdownTestHooks(env: NodeJS.ProcessEnv): ShutdownTestHooks {
+  if (env.PAPERCLIP_SHUTDOWN_TEST_HOOKS !== "1") return {};
+  const hooks: ShutdownTestHooks = {};
+  if (env.PAPERCLIP_SHUTDOWN_TEST_HANG_STEP) hooks.hangWorkStep = env.PAPERCLIP_SHUTDOWN_TEST_HANG_STEP;
+  const delay = Number(env.PAPERCLIP_SHUTDOWN_TEST_DELAY_PG_STOP_MS);
+  if (Number.isFinite(delay) && delay > 0) hooks.delayPostgresStopMs = delay;
+  return hooks;
+}
+
 export function createShutdownBudget(input: {
   signal: "SIGINT" | "SIGTERM";
   workDeadlineMs: number;
   log: BudgetLogger;
   /** Monotonic milliseconds. */
   now?: () => number;
+  testHooks?: ShutdownTestHooks;
 }) {
   const now = input.now ?? (() => performance.now());
   const log = input.log;
@@ -171,11 +187,12 @@ export function createShutdownBudget(input: {
         return { outcome: "skipped" };
       }
       const limitedByDeadline = remaining <= capMs;
+      const hang = input.testHooks?.hangWorkStep === name;
       return race(
         name,
         Math.min(capMs, remaining),
         [stage.signal],
-        run,
+        hang ? () => new Promise<never>(() => {}) : run,
         () => (stage.signal.aborted || limitedByDeadline ? "deadline" : "timed_out"),
       );
     },

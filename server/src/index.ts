@@ -155,6 +155,7 @@ import {
 import {
   armShutdownWatchdog,
   createShutdownBudget,
+  readShutdownTestHooks,
   resolveShutdownWorkDeadlineMs,
   runHotRestartPreparationStep,
 } from "./shutdown-budget.js";
@@ -2065,7 +2066,10 @@ async function startServerWithDatabaseTeardown(
     // The work stage shares one deadline; the teardown steps each have a fixed
     // slot after it, and the watchdog exits before systemd's SIGKILL if a
     // promise in the sequence never settles. See `createShutdownBudget`.
-    const budget = createShutdownBudget({ signal, workDeadlineMs: shutdownWorkDeadlineMs, log: logger });
+    const shutdownTestHooks = readShutdownTestHooks(process.env);
+    const budget = createShutdownBudget({
+      signal, workDeadlineMs: shutdownWorkDeadlineMs, log: logger, testHooks: shutdownTestHooks,
+    });
     const disarmWatchdog = exitProcess
       ? armShutdownWatchdog({
           timeoutMs: SHUTDOWN_WATCHDOG_MS,
@@ -2177,7 +2181,11 @@ async function startServerWithDatabaseTeardown(
     const appShutdown = (app as { locals?: { paperclipShutdown?: () => Promise<void> } }).locals
       ?.paperclipShutdown;
     const stopEmbeddedPostgres = embeddedPostgres && embeddedPostgresStartedByThisProcess
-      ? () => embeddedPostgresSupervisor?.shutdown() ?? embeddedPostgres!.stop()
+      ? async () => {
+          const delayMs = shutdownTestHooks.delayPostgresStopMs;
+          if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs));
+          await (embeddedPostgresSupervisor?.shutdown() ?? embeddedPostgres!.stop());
+        }
       : null;
 
     // Await the ordered application teardown before the process exits. A live
