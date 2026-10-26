@@ -36,11 +36,37 @@ export type OwnerRepairSettlement = {
   issueBinding: OwnerRepairIssueBinding;
   terminalEvidence: { runStatus: string; finishedAt: string; durableSettlementEventSeq: number };
   completedWorkProductIds: string[];
+  /** Repository/PR/commit evidence of work already done; never a replay grant. */
+  completedWorkProducts?: OwnerRepairCompletedWorkProduct[];
   settledAt: string;
   deliveredAt?: string | null;
   deliveredRunId?: string | null;
   deniedReason?: string | null;
+  /** Latest temporary refusal; it never consumes the reserved receipt. */
+  lastWait?: { reason: string; at: string } | null;
 };
+
+export type OwnerRepairCompletedWorkProduct = {
+  id: string;
+  type: string;
+  provider: string;
+  externalId: string | null;
+  url: string | null;
+  status: string;
+  createdByRunId: string | null;
+};
+
+export const OWNER_REPAIR_CONTINUATION_REMAINING_SCOPE =
+  "Continue the remaining work of this task. The completed work products listed here are already done; " +
+  "do not repeat their pushes, merges, or publications.";
+
+/**
+ * Recovery-action fingerprints that record an unknown outcome for a run
+ * (workspace restore or execution reconciliation still owed).
+ */
+export function unknownEffectRecoveryFingerprints(runId: string) {
+  return [`legacy-execution:${runId}`, `native-workspace:${runId}`];
+}
 
 export type OwnerRepairIssueBinding = {
   responsibleUserId: string | null;

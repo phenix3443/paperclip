@@ -158,8 +158,10 @@ import {
   OWNER_REPAIR_CONTINUATION_REASON,
   OWNER_REPAIR_SETTLEMENT_SCHEMA,
   isCompletedScheduledOwnerRepair,
+  OWNER_REPAIR_CONTINUATION_REMAINING_SCOPE,
   ownerRepairContinuationKey,
   ownerRepairIssueBinding,
+  unknownEffectRecoveryFingerprints,
   readOwnerRepairSettlement,
   sameOwnerRepairIssueBinding,
   type OwnerRepairSettlement,
@@ -3527,6 +3529,18 @@ export function recoveryService(
       // neither a successor nor another repair may start.
       const settledEvent = await durableRepairSettlementEvent(repairRun!);
       if (!settledEvent) return "pending_settlement";
+      // An unknown effect stays with its own recovery; never continue past it.
+      const unknownEffect = await db
+        .select({ id: issueRecoveryActions.id })
+        .from(issueRecoveryActions)
+        .where(and(
+          eq(issueRecoveryActions.companyId, action.companyId),
+          eq(issueRecoveryActions.sourceIssueId, action.sourceIssueId),
+          inArray(issueRecoveryActions.fingerprint, unknownEffectRecoveryFingerprints(repairRun!.id)),
+        ))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (unknownEffect) return "pending_settlement";
       const reserved = await reserveOwnerRepairContinuation(action, repairRun!, settledEvent.seq);
       if (reserved === "fallback") return null;
       if (reserved === "waiting" || reserved === "stale") return reserved;
@@ -3569,11 +3583,20 @@ export function recoveryService(
     if (!ownerAgent || ownerAgent.companyId !== observedIssue.companyId) return "stale";
     if (!(await isAgentInvokable(ownerAgent)) || !isHeartbeatWakeOnDemandEnabled(ownerAgent)
       || await isInvocationBudgetBlocked(observedIssue, ownerAgentId)) return "waiting";
-    const completedWorkProductIds = await db
-      .select({ id: issueWorkProducts.id })
+    const completedWorkProducts = await db
+      .select({
+        id: issueWorkProducts.id,
+        type: issueWorkProducts.type,
+        provider: issueWorkProducts.provider,
+        externalId: issueWorkProducts.externalId,
+        url: issueWorkProducts.url,
+        status: issueWorkProducts.status,
+        createdByRunId: issueWorkProducts.createdByRunId,
+      })
       .from(issueWorkProducts)
       .where(and(eq(issueWorkProducts.companyId, observedIssue.companyId), eq(issueWorkProducts.issueId, observedIssue.id)))
-      .then((rows) => rows.map((row) => row.id).sort());
+      .orderBy(asc(issueWorkProducts.id));
+    const completedWorkProductIds = completedWorkProducts.map((product) => product.id);
 
     const publications: ActivityPublication[] = [];
     const postCommitActions: IssuePostCommitAction[] = [];
@@ -3628,6 +3651,7 @@ export function recoveryService(
           durableSettlementEventSeq,
         },
         completedWorkProductIds,
+        completedWorkProducts,
         settledAt: new Date().toISOString(),
       };
       await tx.update(issueRecoveryActions).set({
@@ -3710,6 +3734,26 @@ export function recoveryService(
     });
   }
 
+  /** Saves why a reserved continuation is waiting; unchanged reasons write nothing. */
+  async function recordOwnerRepairWait(
+    action: typeof issueRecoveryActions.$inferSelect,
+    settlement: OwnerRepairSettlement,
+    reason: string,
+  ) {
+    const lastWait = { reason: reason.slice(0, 500), at: new Date().toISOString() };
+    await db.update(issueRecoveryActions).set({
+      evidence: sql`jsonb_set(${issueRecoveryActions.evidence}, '{ownerRepairSettlement,lastWait}', ${JSON.stringify(lastWait)}::jsonb)`,
+      updatedAt: new Date(),
+    }).where(and(
+      eq(issueRecoveryActions.id, action.id),
+      eq(issueRecoveryActions.companyId, action.companyId),
+      eq(issueRecoveryActions.status, "active"),
+      sql`${issueRecoveryActions.evidence} -> 'ownerRepairSettlement' ->> 'wakeupRequestId' = ${settlement.wakeupRequestId}`,
+      sql`${issueRecoveryActions.evidence} -> 'ownerRepairSettlement' ->> 'state' = 'pending_dispatch'`,
+      sql`(${issueRecoveryActions.evidence} -> 'ownerRepairSettlement' -> 'lastWait' ->> 'reason') is distinct from ${lastWait.reason}`,
+    ));
+  }
+
   async function acceptedOwnerRepairReceipt(action: typeof issueRecoveryActions.$inferSelect, settlement: OwnerRepairSettlement) {
     return db
       .select({ id: agentWakeupRequests.id, runId: agentWakeupRequests.runId })
@@ -3749,6 +3793,8 @@ export function recoveryService(
               actionId: action.id,
               repairRunId: settlement.repairRunId,
               completedWorkProductIds: settlement.completedWorkProductIds,
+              completedWorkProducts: settlement.completedWorkProducts ?? [],
+              remainingScope: OWNER_REPAIR_CONTINUATION_REMAINING_SCOPE,
             },
           },
           durableOwnerRepairContinuationRequest: {
@@ -3765,7 +3811,10 @@ export function recoveryService(
         const status = typeof error === "object" && error && "status" in error ? Number(error.status) : null;
         const details = typeof error === "object" && error && "details" in error && error.details && typeof error.details === "object"
           ? error.details as { code?: unknown } : null;
-        if (details?.code === "case_handoff_admission_wait") return "waiting";
+        if (details?.code === "case_handoff_admission_wait") {
+          await recordOwnerRepairWait(action, settlement, error instanceof Error ? error.message : "admission_wait");
+          return "waiting";
+        }
         if (status !== 409 && status !== 404) throw error;
         // A newer decision (owner, status, or settlement) consumed this slot.
         // Keep the reserved key so it can never be admitted again.
@@ -3780,7 +3829,10 @@ export function recoveryService(
       }
       receipt ??= await acceptedOwnerRepairReceipt(action, settlement);
     }
-    if (!receipt) return "waiting";
+    if (!receipt) {
+      await recordOwnerRepairWait(action, settlement, "dispatch_deferred");
+      return "waiting";
+    }
     await markOwnerRepairSettlement(action, settlement, {
       state: "delivered",
       deliveredAt: new Date().toISOString(),

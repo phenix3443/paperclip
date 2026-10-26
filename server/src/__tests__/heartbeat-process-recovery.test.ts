@@ -7928,6 +7928,18 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
   it("admits one business successor after a completed owner repair instead of repeating the repair", async () => {
     const fixture = await seedCompletedOwnerRepairFixture();
+    const commitSha = "0123456789abcdef0123456789abcdef01234567";
+    await db.insert(issueWorkProducts).values({
+      companyId: fixture.companyId,
+      issueId: fixture.issueId,
+      type: "pull_request",
+      provider: "github",
+      externalId: commitSha,
+      url: "https://github.com/example/repo/pull/1",
+      title: "Fix commit",
+      status: "ready",
+      createdByRunId: fixture.repairRunId,
+    });
 
     await heartbeatService(db).reconcileStrandedAssignedIssues();
 
@@ -7951,6 +7963,44 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(after.receipts[0]!.id).toBe(after.settlement.wakeupRequestId);
     expect(after.settlement).toMatchObject({ state: "delivered", deliveredRunId: successor!.id, repairRunId: fixture.repairRunId });
     expect(after.action).toMatchObject({ status: "resolved", outcome: "restored" });
+    // The successor sees what is already done and what remains, as data.
+    expect(successor!.contextSnapshot?.ownerRepairContinuation).toMatchObject({
+      repairRunId: fixture.repairRunId,
+      completedWorkProducts: [expect.objectContaining({
+        type: "pull_request", provider: "github", externalId: commitSha,
+        url: "https://github.com/example/repo/pull/1", createdByRunId: fixture.repairRunId,
+      })],
+      remainingScope: expect.stringContaining("do not repeat"),
+    });
+  });
+
+  it("keeps an owner repair with an unknown effect on its own recovery without continuing", async () => {
+    const fixture = await seedCompletedOwnerRepairFixture();
+    // A resolved no-replay hold records that this run's effect is unknown.
+    await db.insert(issueRecoveryActions).values({
+      companyId: fixture.companyId,
+      sourceIssueId: fixture.issueId,
+      kind: "active_run_watchdog",
+      cause: "legacy_execution_requires_reconciliation",
+      fingerprint: `legacy-execution:${fixture.repairRunId}`,
+      status: "resolved",
+      outcome: "blocked",
+      ownerType: "board",
+      nextAction: "Verify the stopped run before any replay.",
+      evidence: { automaticRecovery: { policy: "preserve_without_replay_v1", runId: fixture.repairRunId,
+        replay: "blocked", actionOutcome: "unknown" } },
+    });
+
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    const after = await observeOwnerRepairContinuation(fixture);
+    expect(after.repeatedRepairs).toHaveLength(0);
+    expect(after.businessSuccessors).toHaveLength(0);
+    expect(after.receipts).toHaveLength(0);
+    expect(after.settlement).toBeNull();
+    expect(after.action).toMatchObject({ status: "active", attemptCount: 1 });
+    expect(after.issue.status).toBe("blocked");
   });
 
   it("keeps one owner-repair continuation across repeated and concurrent reconciliation", async () => {
@@ -8211,7 +8261,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(stopped.businessSuccessors).toHaveLength(0);
     expect(stopped.repeatedRepairs).toHaveLength(0);
     expect(stopped.receipts).toHaveLength(0);
-    expect(stopped.settlement).toMatchObject({ state: "pending_dispatch", wakeupRequestId: reservedId });
+    expect(stopped.settlement).toMatchObject({ state: "pending_dispatch", wakeupRequestId: reservedId,
+      lastWait: { reason: expect.any(String) } });
     expect(stopped.action).toMatchObject({ status: "active", attemptCount: 1 });
     expect(mockAdapterExecute).not.toHaveBeenCalled();
 
