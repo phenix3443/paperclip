@@ -114,6 +114,7 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[], hos
         run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt <= new Date());
     if (run.runtimeMode === "legacy" && !run.processPid && !run.processGroupId && !neverDispatched &&
         (run.resultJson?.executionCancellation as Record<string, unknown> | undefined)?.state !== "acknowledged" &&
+        typeof run.resultJson?.legacyAdapterNotEnteredAt !== "string" &&
         !(run.executionStage === "settled" && !await runUsedConversationAdapter(db, run)) &&
         !await isCancelledNativeStartup(db, run, coordinators.find(row => row.runId === run.id))) return false;
   }
