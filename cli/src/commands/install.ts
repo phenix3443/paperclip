@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -236,6 +237,19 @@ export async function installNpmPayload(
   }
 }
 
+// Deployments that build in CI set PAPERCLIP_INSTALL_PACKAGES_DIR so the
+// packages this install verified can be installed on a host that cannot build.
+function exportGitPayloadPackages(stagingRoot: string, tarballs: string[], source: { repo: string; sha: string; version: string }): void {
+  const destination = process.env.PAPERCLIP_INSTALL_PACKAGES_DIR;
+  if (!destination) return;
+  fs.mkdirSync(destination, { recursive: true });
+  const files = tarballs.map((file) => {
+    fs.copyFileSync(path.join(stagingRoot, file), path.join(destination, file));
+    return { file, sha256: createHash("sha256").update(fs.readFileSync(path.join(destination, file))).digest("hex") };
+  });
+  fs.writeFileSync(path.join(destination, "payload-packages.json"), `${JSON.stringify({ schemaVersion: 1, ...source, files }, null, 2)}\n`);
+}
+
 function gitBuildEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const env = { ...process.env, ...extra };
   // Source builds need devDependencies (esbuild, typescript); ambient NODE_ENV=production
@@ -303,6 +317,7 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     }
     await runCommand("npm", ["install", "--prefix", stagedPayload, path.join(stagingRoot, cliTarball), ...workspaceTarballs.map((entry) => path.join(stagingRoot, entry)), "--no-audit", "--no-fund"], { cwd: stagingRoot, maxBuffer: 32 * 1024 * 1024 });
     await smokePayload(stagedPayload, metadata.version, runCommand);
+    exportGitPayloadPackages(stagingRoot, [cliTarball, ...workspaceTarballs], { repo, sha, version: metadata.version });
     fs.renameSync(stagedPayload, payloadPath);
     return { payloadPath, reused: false, version: metadata.version };
   } finally { fs.rmSync(stagingRoot, { recursive: true, force: true }); }

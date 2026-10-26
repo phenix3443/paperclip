@@ -209,6 +209,27 @@ describe("managed install commands", () => {
     expect(uiPackCall).toBeDefined();
   });
 
+  it("exports the verified packages with checksums when a packages directory is requested", async () => {
+    const sha = "e".repeat(40);
+    const destination = path.join(root, "packages");
+    process.env.PAPERCLIP_INSTALL_PACKAGES_DIR = destination;
+    await installGitPayload("phenix3443/paperclip", sha, createGitCheckoutRunCommand(sha), resolveInstallStorePaths());
+    const exported = JSON.parse(fs.readFileSync(path.join(destination, "payload-packages.json"), "utf8"));
+    expect(exported).toMatchObject({ schemaVersion: 1, repo: "phenix3443/paperclip", sha, version: "0.3.1" });
+    expect(exported.files.map((entry: { file: string }) => entry.file)[0]).toBe("paperclipai-0.3.1.tgz");
+    expect(exported.files).toHaveLength(4);
+    for (const entry of exported.files) {
+      expect(fs.readFileSync(path.join(destination, entry.file), "utf8")).toBe("package");
+      expect(entry.sha256).toMatch(/^[0-9a-f]{64}$/);
+    }
+  });
+
+  it("exports nothing without a packages directory", async () => {
+    const sha = "f".repeat(40);
+    await installGitPayload("phenix3443/paperclip", sha, createGitCheckoutRunCommand(sha), resolveInstallStorePaths());
+    expect(fs.readdirSync(root)).toEqual(["home"]);
+  });
+
   it("resolves the complete server workspace dependency closure in dependency order", () => {
     const checkout = path.join(root, "checkout");
     const packages = [

@@ -1,0 +1,111 @@
+# Build the deployable packages for each develop commit, so the service host
+# installs them instead of compiling from source (phenix3443/ai-team deploy.py).
+# The packages come from this commit's own `paperclipai install --ref`, which
+# exports them through PAPERCLIP_INSTALL_PACKAGES_DIR after its smoke check.
+name: deploy-packages
+
+on:
+  push:
+    branches: [develop]
+  # Validates changes to the packaging itself; deploy.py only accepts push runs on develop.
+  pull_request:
+    paths:
+      - .github/workflows/deploy-packages.yml
+      - cli/src/commands/install.ts
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-packages-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  packages:
+    if: github.repository == 'phenix3443/paperclip'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      SHA: ${{ github.sha }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # The packages are Node-version independent; the service host installs
+      # them with its own Node, which also builds their native modules.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+
+      - name: Locate working paths
+        run: |
+          echo "PACKAGES_DIR=$RUNNER_TEMP/packages" >> "$GITHUB_ENV"
+          echo "MEMORY_LOG=$RUNNER_TEMP/memory.log" >> "$GITHUB_ENV"
+
+      # The CLI runs from source like the root `paperclipai` script; its esbuild
+      # bundle only resolves dependencies once it is packed and installed.
+      - name: Install this commit's workspace
+        run: |
+          corepack enable
+          corepack pnpm install --frozen-lockfile
+
+      - name: Sample process memory
+        run: |
+          nohup bash -c 'while :; do ps -u "$(id -u)" -o rss=,args= >> "$MEMORY_LOG"; echo --- >> "$MEMORY_LOG"; sleep 2; done' >/dev/null 2>&1 &
+          echo "SAMPLER_PID=$!" >> "$GITHUB_ENV"
+
+      # A transient unit reports the peak memory of the whole build tree.
+      # The token is imported by name so it never appears in process arguments,
+      # which the memory sampler records.
+      - name: Install from source and export the packages
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          sudo --preserve-env=GITHUB_TOKEN systemd-run --wait --pipe --collect --uid="$(id -u)" --gid="$(id -g)" \
+            -p WorkingDirectory="$GITHUB_WORKSPACE" -p UMask=0022 -p MemoryAccounting=yes -E GITHUB_TOKEN \
+            -E HOME="$RUNNER_TEMP/home" -E PATH="$PATH" -E RUSTUP_HOME="$HOME/.rustup" -E CARGO_HOME="$HOME/.cargo" \
+            -E PAPERCLIP_BUILD_COMMIT="$SHA" -E PAPERCLIP_INSTALL_PACKAGES_DIR="$PACKAGES_DIR" \
+            "$(command -v node)" cli/node_modules/tsx/dist/cli.mjs cli/src/index.ts install --repo "$REPO" --ref "$SHA" --yes 2> >(tee "$RUNNER_TEMP/unit.log" >&2)
+
+      - name: Verify the exported packages
+        run: |
+          node -e '
+            const fs = require("node:fs"), crypto = require("node:crypto"), path = require("node:path");
+            const dir = process.env.PACKAGES_DIR;
+            const manifest = JSON.parse(fs.readFileSync(path.join(dir, "payload-packages.json"), "utf8"));
+            if (manifest.repo !== process.env.REPO || manifest.sha !== process.env.SHA) throw new Error("manifest does not match this commit");
+            for (const { file, sha256 } of manifest.files) {
+              if (crypto.createHash("sha256").update(fs.readFileSync(path.join(dir, file))).digest("hex") !== sha256) throw new Error(`checksum mismatch: ${file}`);
+            }
+            console.log(`${manifest.files.length} packages for ${manifest.sha} (${manifest.version})`);
+          '
+          du -sh "$PACKAGES_DIR"
+
+      - name: Report memory
+        if: always()
+        run: |
+          kill "$SAMPLER_PID" 2>/dev/null || true
+          {
+            echo "## Build memory"
+            echo
+            echo '```'
+            grep -E "Memory peak|CPU time consumed|Service runtime" "$RUNNER_TEMP/unit.log" || echo "no unit summary"
+            echo '```'
+            echo
+            echo "Largest processes (peak RSS, MiB):"
+            echo
+            echo '```'
+            awk '$0 != "---" { rss = $1; $1 = ""; cmd = substr($0, 2, 100); if (rss > peak[cmd]) peak[cmd] = rss }
+                 END { for (cmd in peak) printf "%8.0f  %s\n", peak[cmd] / 1024, cmd }' "$MEMORY_LOG" | sort -rn | head -15
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: paperclip-payload-${{ github.sha }}
+          path: ${{ runner.temp }}/packages
+          retention-days: 30
+          # The tarballs are already gzip-compressed.
+          compression-level: 0
+          if-no-files-found: error
