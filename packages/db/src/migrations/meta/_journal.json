@@ -2591,6 +2591,13 @@
       "when": 1792597792969,
       "tag": "0371_furry_red_shift",
       "breakpoints": true
+    },
+    {
+      "idx": 372,
+      "version": "7",
+      "when": 1792809786245,
+      "tag": "0372_aromatic_loki",
+      "breakpoints": true
     }
   ]
 }
