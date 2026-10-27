@@ -1,4 +1,5 @@
 import { execFile as execFileCallback } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile, access, rename } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,13 +7,15 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { captureDirectorySnapshot, directorySnapshotSha256, serializeDirectorySnapshot } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
-import { agents, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environmentLeases, executionWorkspaces, executionWorkspaceRepositoryAccess, heartbeatRuns, issues, issueAccessGrants, plugins, projects, projectWorkspaces, type Db } from "@paperclipai/db";
+import { activityLog, agentWakeupRequests, agents, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environmentLeases, executionWorkspaces, executionWorkspaceRepositoryAccess, heartbeatRuns, issues, issueAccessGrants, plugins, projects, projectWorkspaces, type Db } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { environmentRunOrchestrator } from "../environment-run-orchestrator.js";
 import { environmentService } from "../environments.js";
-import { executionWorkspaceService, toExecutionWorkspace } from "../execution-workspaces.js";
+import { executionWorkspaceService, readExecutionWorkspaceLifecycleGeneration, toExecutionWorkspace } from "../execution-workspaces.js";
+import { CROSS_TASK_CONTINUATION_COMMITTER_ID, crossTaskContinuationDispatchKey, crossTaskContinuationIntentKey } from "../cross-task-continuation.js";
+import { reopenTargetBoundSuccessorWorkspace } from "./target-bound-successor-reopen.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { workspaceOperationService } from "../workspace-operations.js";
 import { nativeWorkspaceSyncInternals, prepareNativeWorkspaceSync } from "../native-runtime/native-workspace-sync.js";
@@ -642,38 +645,206 @@ describe.skipIf(!support.supported)("heartbeat workspace preparation boundary", 
     expect(await readFile(join(next.executionWorkspace.cwd, "retained.txt"), "utf8")).toBe("keep this work");
   });
 
-  it("does not restore an archived git_worktree for a target-bound successor run (deferred continuation premise R2)", async () => {
+  // Archive a real git_worktree with an unmerged commit, as the real cleanup does,
+  // and move the target to `todo` with its binding unchanged, as the deferred
+  // continuation commit does.
+  async function archivedContinuationTarget(closedStatus: "archived" | "cleanup_failed" = "archived") {
     const { input, source, issue } = await fixture(true);
     const first = await prepareHeartbeatWorkspace(db, input);
     const workspace = first.persistedExecutionWorkspace!;
     await writeFile(join(workspace.cwd!, "archived-branch-work.txt"), "work on the archived branch\n");
     await execFile("git", ["-C", workspace.cwd!, "add", "."]);
     await execFile("git", ["-C", workspace.cwd!, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-m", "Archived work"]);
+    const headBeforeArchive = (await execFile("git", ["-C", workspace.cwd!, "rev-parse", "HEAD"])).stdout.trim();
     const cleanup = await cleanupExecutionWorkspaceArtifacts({ workspace,
       projectWorkspace: { cwd: source, cleanupCommand: null }, runCleanupCommands: false });
     // Archiving keeps the unmerged branch; only the worktree directory is removed.
     expect(cleanup.warnings).toEqual([expect.stringContaining("not fully merged")]);
     await expect(access(workspace.cwd!)).rejects.toMatchObject({ code: "ENOENT" });
-    await db.update(executionWorkspaces).set({ status: "archived" }).where(eq(executionWorkspaces.id, workspace.id));
-    // The deferred continuation commits `todo` and leaves the binding untouched.
+    await db.update(executionWorkspaces).set({ status: closedStatus, closedAt: new Date() }).where(eq(executionWorkspaces.id, workspace.id));
     await db.update(issues).set({ status: "todo" }).where(eq(issues.id, issue.id));
     const target = await readIssue(issue.id);
     expect(target).toMatchObject({ executionWorkspaceId: workspace.id, executionWorkspacePreference: "reuse_existing" });
-    const stored = await executionWorkspaceService(db).getStoredById(issue.companyId, workspace.id);
-    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({ issueExecutionWorkspaceId: target.executionWorkspaceId,
-      issueExecutionWorkspacePreference: target.executionWorkspacePreference, existingExecutionWorkspaceStatus: stored?.status ?? null });
+    const stored = (await executionWorkspaceService(db).getStoredById(issue.companyId, workspace.id))!;
+    return { input, issue, target, workspace: stored, headBeforeArchive,
+      generation: readExecutionWorkspaceLifecycleGeneration(stored.metadata as Record<string, unknown> | null) };
+  }
+
+  // The committed intent and the consumer's dispatch receipt, with the keys and
+  // actor ids that the route and the queue write.
+  async function dispatchedContinuationRun(f: Awaited<ReturnType<typeof archivedContinuationTarget>>,
+    overrides: { payloadIssueId?: string; workspaceGeneration?: number } = {}) {
+    const commentId = randomUUID();
+    const [intent] = await db.insert(agentWakeupRequests).values({
+      companyId: f.issue.companyId, agentId: f.input.agent.id, source: "automation", triggerDetail: "system",
+      reason: "issue_reopened_via_comment", status: "coalesced",
+      requestedByActorType: "system", requestedByActorId: CROSS_TASK_CONTINUATION_COMMITTER_ID,
+      idempotencyKey: crossTaskContinuationIntentKey(overrides.payloadIssueId ?? f.issue.id, commentId),
+      payload: { issueId: overrides.payloadIssueId ?? f.issue.id, commentId, crossTaskContinuation: {
+        workspaceId: f.workspace.id, workspaceGeneration: overrides.workspaceGeneration ?? f.generation,
+        expectedAssigneeAgentId: f.input.agent.id, expectedResponsibleUserId: null } },
+    }).returning();
+    const dispatchKey = crossTaskContinuationDispatchKey(intent!.id);
+    const [receipt] = await db.insert(agentWakeupRequests).values({
+      companyId: f.issue.companyId, agentId: f.input.agent.id, source: "automation", triggerDetail: "system",
+      reason: "issue_reopened_via_comment", status: "claimed",
+      requestedByActorType: "system", requestedByActorId: dispatchKey, idempotencyKey: dispatchKey,
+      payload: { issueId: f.issue.id },
+    }).returning();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.issue.companyId, agentId: f.input.agent.id,
+      issueId: f.issue.id, scopeKind: "issue", status: "running", runtimeMode: "legacy", wakeupRequestId: receipt!.id,
+      contextSnapshot: { issueId: f.issue.id, taskId: f.issue.id, source: "cross_task_continuation", crossTaskContinuationIntentId: intent!.id } }).returning();
+    await db.update(agentWakeupRequests).set({ runId: run!.id }).where(eq(agentWakeupRequests.id, intent!.id));
+    return run!;
+  }
+
+  function successorStep(run: typeof heartbeatRuns.$inferSelect, executionWorkspacesSvc = executionWorkspaceService(db)) {
+    return reopenTargetBoundSuccessorWorkspace(db, {
+      run: { id: run.id, companyId: run.companyId, agentId: run.agentId, wakeupRequestId: run.wakeupRequestId,
+        issueId: run.issueId, nativeIssueId: run.nativeIssueId, contextSnapshot: run.contextSnapshot as Record<string, unknown> },
+      responsibleUserId: null, externalProvider: false, hasPersistedNativeExecutionInput: false,
+      freshIsolatedWorkspaceRequested: false, executionWorkspacesSvc,
+    });
+  }
+
+  it("R2-P / E1: a run that is not the dispatch of a committed intent does not reopen, and preparation fails as before", async () => {
+    const f = await archivedContinuationTarget();
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({ issueExecutionWorkspaceId: f.target.executionWorkspaceId,
+      issueExecutionWorkspacePreference: f.target.executionWorkspacePreference, existingExecutionWorkspaceStatus: f.workspace.status });
     // Same inputs as environment-selection.ts: restore is requested, but an archived row is not "available".
-    expect(reuseRequest).toEqual({ requestedExecutionWorkspaceId: workspace.id, requestedShouldReuseExisting: true, existingExecutionWorkspaceAvailable: false });
-    const [successor] = await db.insert(heartbeatRuns).values({ companyId: issue.companyId, agentId: input.agent.id, issueId: issue.id, scopeKind: "issue", status: "running", runtimeMode: "legacy",
-      contextSnapshot: { issueId: issue.id, source: "cross_task_continuation" } }).returning();
-    input.run = successor;
-    input.task.issueRef = target;
-    input.reuse.requestedShouldReuseExisting = true;
-    input.reuse.existingExecutionWorkspace = stored;
-    input.reuse.reusableExistingExecutionWorkspace = null;
-    input.reuse.workspaceReuseRequest = reuseRequest;
-    await expect(prepareHeartbeatWorkspace(db, input)).rejects.toThrow(/could not be restored/);
-    expect((await executionWorkspaceService(db).getStoredById(issue.companyId, workspace.id))?.status).toBe("archived");
+    expect(reuseRequest).toEqual({ requestedExecutionWorkspaceId: f.workspace.id, requestedShouldReuseExisting: true, existingExecutionWorkspaceAvailable: false });
+    // The context claims a continuation, but the wakeup row is not a dispatch receipt.
+    const [successor] = await db.insert(heartbeatRuns).values({ companyId: f.issue.companyId, agentId: f.input.agent.id, issueId: f.issue.id, scopeKind: "issue", status: "running", runtimeMode: "legacy",
+      contextSnapshot: { issueId: f.issue.id, source: "cross_task_continuation" } }).returning();
+    const svc = executionWorkspaceService(db);
+    const reopen = vi.spyOn(svc, "reopenClosedIsolatedExecutionWorkspaceForIssue");
+    await expect(successorStep(successor!, svc)).resolves.toEqual({ kind: "not_eligible" });
+    expect(reopen).not.toHaveBeenCalled();
+    f.input.run = successor!;
+    f.input.task.issueRef = f.target;
+    f.input.reuse.requestedShouldReuseExisting = true;
+    f.input.reuse.existingExecutionWorkspace = f.workspace;
+    f.input.reuse.reusableExistingExecutionWorkspace = null;
+    f.input.reuse.workspaceReuseRequest = reuseRequest;
+    await expect(prepareHeartbeatWorkspace(db, f.input)).rejects.toThrow(/could not be restored/);
+    expect((await executionWorkspaceService(db).getStoredById(f.issue.companyId, f.workspace.id))?.status).toBe("archived");
+  });
+
+  it.each(["archived", "cleanup_failed"] as const)("R2: the target-bound successor reopens a %s git_worktree with its own identity and ordinary preparation reuses it", async (closedStatus) => {
+    const f = await archivedContinuationTarget(closedStatus);
+    const successor = await dispatchedContinuationRun(f);
+    const svc = executionWorkspaceService(db);
+    const reopen = vi.spyOn(svc, "reopenClosedIsolatedExecutionWorkspaceForIssue");
+    const access = await import("../task-workspace-access.js");
+    const guard = vi.spyOn(access, "assertTaskWorkspaceExecutionAccess");
+    const outcome = await successorStep(successor, svc);
+    expect(outcome).toEqual({ kind: "reopened", workspaceId: f.workspace.id, generation: f.generation + 1, reopened: true });
+    expect(reopen).toHaveBeenCalledTimes(1);
+    expect(reopen.mock.calls[0]![0]).toMatchObject({ workspaceId: f.workspace.id, expectedClosedGeneration: f.generation,
+      issue: { id: f.issue.id }, authorizationActor: { type: "agent", agentId: f.input.agent.id, runId: successor.id } });
+    expect(guard).toHaveBeenCalled();
+    for (const call of guard.mock.calls) expect(call[1]).toMatchObject({ runId: successor.id });
+    const active = (await executionWorkspaceService(db).getStoredById(f.issue.companyId, f.workspace.id))!;
+    expect(active.status).toBe("active");
+    expect(readExecutionWorkspaceLifecycleGeneration(active.metadata as Record<string, unknown> | null)).toBe(f.generation + 1);
+    const reopened = await db.select().from(activityLog).where(eq(activityLog.action, "execution_workspace.reopened"));
+    expect(reopened).toHaveLength(1);
+    expect(reopened[0]!.details).toMatchObject({ issueId: f.issue.id });
+    // Ordinary preparation, with the inputs environment selection builds for an active row (R2-C: no in-place restore of a cleanup_failed row).
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({ issueExecutionWorkspaceId: f.workspace.id,
+      issueExecutionWorkspacePreference: "reuse_existing", existingExecutionWorkspaceStatus: active.status });
+    expect(reuseRequest).toMatchObject({ requestedShouldReuseExisting: true, existingExecutionWorkspaceAvailable: true });
+    f.input.run = successor;
+    f.input.task.issueRef = await readIssue(f.issue.id);
+    f.input.reuse.requestedShouldReuseExisting = true;
+    f.input.reuse.existingExecutionWorkspace = active;
+    f.input.reuse.reusableExistingExecutionWorkspace = active;
+    f.input.reuse.workspaceReuseRequest = reuseRequest;
+    const prepared = await prepareHeartbeatWorkspace(db, f.input);
+    expect(prepared.persistedExecutionWorkspace!.id).toBe(f.workspace.id);
+    expect(prepared.executionWorkspace.cwd).toBe(f.workspace.cwd);
+    expect((await execFile("git", ["-C", f.workspace.cwd!, "rev-parse", "--abbrev-ref", "HEAD"])).stdout.trim()).toBe(f.workspace.branchName);
+    expect((await execFile("git", ["-C", f.workspace.cwd!, "rev-parse", "HEAD"])).stdout.trim()).toBe(f.headBeforeArchive);
+    expect(await readFile(join(f.workspace.cwd!, "archived-branch-work.txt"), "utf8")).toBe("work on the archived branch\n");
+  });
+
+  const failClosedCases: Array<{ name: string; arrange: (f: Awaited<ReturnType<typeof archivedContinuationTarget>>) => Promise<{ payloadIssueId?: string; workspaceGeneration?: number } | void> }> = [
+    { name: "E2 the intent names another issue", arrange: async () => ({ payloadIssueId: randomUUID() }) },
+    { name: "E3 the assignee changed after the commit", arrange: async (f) => {
+      const [other] = await db.insert(agents).values({ companyId: f.issue.companyId, name: "Other agent", status: "idle", adapterType: "process" }).returning();
+      await db.update(issues).set({ assigneeAgentId: other!.id }).where(eq(issues.id, f.issue.id));
+    } },
+    { name: "E3 the responsible user changed after the commit", arrange: async (f) => {
+      await db.execute(sql`insert into "user" (id, name, email, email_verified, created_at, updated_at) values ('e3-user', 'E3', 'e3@example.test', true, now(), now()) on conflict do nothing`);
+      await db.update(issues).set({ responsibleUserId: "e3-user" }).where(eq(issues.id, f.issue.id));
+    } },
+    { name: "E4 the binding was cleared", arrange: async (f) => {
+      await db.update(issues).set({ executionWorkspaceId: null }).where(eq(issues.id, f.issue.id));
+    } },
+    { name: "E5 the row became a plugin provider", arrange: async (f) => {
+      await db.update(executionWorkspaces).set({ providerType: "plugin" }).where(eq(executionWorkspaces.id, f.workspace.id));
+    } },
+    { name: "E5 the row has another strategy", arrange: async (f) => {
+      await db.update(executionWorkspaces).set({ strategyType: "project_primary" }).where(eq(executionWorkspaces.id, f.workspace.id));
+    } },
+    { name: "E7 the generation differs from the intent", arrange: async (f) => ({ workspaceGeneration: f.generation + 5 }) },
+  ];
+  it.each(failClosedCases)("$name: the successor fails closed without calling the reopen service", async ({ arrange }) => {
+    const f = await archivedContinuationTarget();
+    const overrides = (await arrange(f)) ?? {};
+    const successor = await dispatchedContinuationRun(f, overrides);
+    const before = (await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, f.workspace.id)))[0];
+    const svc = executionWorkspaceService(db);
+    const reopen = vi.spyOn(svc, "reopenClosedIsolatedExecutionWorkspaceForIssue");
+    await expect(successorStep(successor, svc)).rejects.toThrow(/^Cross-task continuation could not reopen the target workspace: /);
+    expect(reopen).not.toHaveBeenCalled();
+    expect((await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, f.workspace.id)))[0]).toEqual(before);
+    await expect(access(f.workspace.cwd!)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("E5: a deleted workspace row fails closed", async () => {
+    const f = await archivedContinuationTarget();
+    const successor = await dispatchedContinuationRun(f);
+    await db.update(issues).set({ executionWorkspaceId: null }).where(eq(issues.id, f.issue.id));
+    await db.delete(executionWorkspaces).where(eq(executionWorkspaces.id, f.workspace.id));
+    const svc = executionWorkspaceService(db);
+    const reopen = vi.spyOn(svc, "reopenClosedIsolatedExecutionWorkspaceForIssue");
+    await expect(successorStep(successor, svc)).rejects.toThrow(/^Cross-task continuation could not reopen the target workspace: /);
+    expect(reopen).not.toHaveBeenCalled();
+  });
+
+  it("E6: an already active row makes no service call and leaves ordinary restore to preparation", async () => {
+    const f = await archivedContinuationTarget();
+    const successor = await dispatchedContinuationRun(f);
+    await db.update(executionWorkspaces).set({ status: "active", closedAt: null }).where(eq(executionWorkspaces.id, f.workspace.id));
+    const svc = executionWorkspaceService(db);
+    const reopen = vi.spyOn(svc, "reopenClosedIsolatedExecutionWorkspaceForIssue");
+    await expect(successorStep(successor, svc)).resolves.toEqual({ kind: "already_active", workspaceId: f.workspace.id });
+    expect(reopen).not.toHaveBeenCalled();
+  });
+
+  it("E8: the successor still reopens after the setting is turned off", async () => {
+    const f = await archivedContinuationTarget();
+    const successor = await dispatchedContinuationRun(f);
+    await instanceSettingsService(db).updateExperimental({ enableCrossTaskDeferredContinuation: false });
+    await expect(successorStep(successor)).resolves.toMatchObject({ kind: "reopened", reopened: true });
+  });
+
+  it.each([
+    { name: "an external-provider run", externalProvider: true, hasPersistedNativeExecutionInput: false, freshIsolatedWorkspaceRequested: false },
+    { name: "a same-run native resume", externalProvider: false, hasPersistedNativeExecutionInput: true, freshIsolatedWorkspaceRequested: false },
+    { name: "a fresh isolated workspace request", externalProvider: false, hasPersistedNativeExecutionInput: false, freshIsolatedWorkspaceRequested: true },
+  ])("E9 / E0: $name is not eligible", async (e0) => {
+    const f = await archivedContinuationTarget();
+    const successor = await dispatchedContinuationRun(f);
+    const svc = executionWorkspaceService(db);
+    const reopen = vi.spyOn(svc, "reopenClosedIsolatedExecutionWorkspaceForIssue");
+    await expect(reopenTargetBoundSuccessorWorkspace(db, {
+      run: { id: successor.id, companyId: successor.companyId, agentId: successor.agentId, wakeupRequestId: successor.wakeupRequestId,
+        issueId: successor.issueId, nativeIssueId: successor.nativeIssueId, contextSnapshot: successor.contextSnapshot as Record<string, unknown> },
+      responsibleUserId: null, executionWorkspacesSvc: svc, ...e0,
+    })).resolves.toEqual({ kind: "not_eligible" });
+    expect(reopen).not.toHaveBeenCalled();
   });
 
   it("keeps the admitted recovery workspace when the issue now points elsewhere", async () => {
