@@ -5069,7 +5069,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         // A concurrent sweep already committed this intent's one dispatch
         // receipt; its run committed with it. Recover from that receipt
         // instead of requeueing the intent.
-        if (dispatchKey && isUniqueViolation(error)) {
+        if (dispatchKey && isUniqueViolation(error, "agent_wakeup_requests_cross_task_continuation_dispatch_uq")) {
           const committedDispatch = await findDispatchReceipt();
           if (committedDispatch) {
             await recoverFromDispatchReceipt(committedDispatch);

@@ -7,7 +7,7 @@ import {
   isCrossTaskContinuationDispatchKey,
   isSuccessorReopenableWorkspace,
 } from "../cross-task-continuation.js";
-import { readExecutionWorkspaceLifecycleGeneration, type executionWorkspaceService } from "../execution-workspaces.js";
+import { isClosedExecutionWorkspaceStatus, readExecutionWorkspaceLifecycleGeneration, type executionWorkspaceService } from "../execution-workspaces.js";
 import { runRetainsIssueIdentity } from "../task-repository-acquisition.js";
 
 // A cross-task continuation commits an intent and leaves the target's archived
@@ -58,10 +58,7 @@ type ContinuationPayload = {
 };
 
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
-
-function closedStatus(status: string | null | undefined) {
-  return status === "archived" || status === "cleanup_failed";
-}
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Find the committed intent that this run is the dispatch of (E1). Every value
@@ -81,7 +78,8 @@ async function loadDispatchedIntent(db: Db, run: TargetBoundSuccessorRun) {
     return null;
   }
   const intentId = dispatchKey!.slice(crossTaskContinuationDispatchKey("").length);
-  if (!intentId) return null;
+  // The receipt key is written by the consumer; anything else is not a dispatch.
+  if (!UUID_PATTERN.test(intentId)) return null;
   const [intent] = await db.select({
     id: agentWakeupRequests.id,
     idempotencyKey: agentWakeupRequests.idempotencyKey,
@@ -91,7 +89,7 @@ async function loadDispatchedIntent(db: Db, run: TargetBoundSuccessorRun) {
   }).from(agentWakeupRequests).where(and(
     eq(agentWakeupRequests.id, intentId),
     eq(agentWakeupRequests.companyId, run.companyId),
-  )).catch(() => []);
+  ));
   if (!intent
     || intent.requestedByActorType !== "system"
     || intent.requestedByActorId !== CROSS_TASK_CONTINUATION_COMMITTER_ID) {
@@ -181,7 +179,7 @@ export async function reopenTargetBoundSuccessorWorkspace(
   }
   // E6: status.
   if (row.status === "active") return { kind: "already_active", workspaceId };
-  if (!closedStatus(row.status)) return fail("the workspace is not reopenable");
+  if (!isClosedExecutionWorkspaceStatus(row.status)) return fail("the workspace is not reopenable");
   // E7: generation, checked again by the service under its locks.
   const expectedClosedGeneration = typeof continuation.workspaceGeneration === "number"
     ? continuation.workspaceGeneration : null;

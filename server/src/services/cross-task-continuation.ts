@@ -10,7 +10,7 @@ import {
 import type { IssueCommentContinuationReceipt } from "@paperclipai/shared";
 import { and, desc, eq, inArray, isNotNull, like, or } from "drizzle-orm";
 import { acquireExecutionWorkspaceLifecycleLock } from "./execution-workspace-lifecycle-lock.js";
-import { readExecutionWorkspaceLifecycleGeneration } from "./execution-workspaces.js";
+import { isClosedExecutionWorkspaceStatus, readExecutionWorkspaceLifecycleGeneration } from "./execution-workspaces.js";
 import { isDeadlockDetected, isUniqueViolation } from "../db-errors.js";
 
 // A cross-task explicit resume does not reopen the target's archived workspace in
@@ -99,17 +99,14 @@ export type IssueExecutionWorkspaceBinding =
       generation: number;
       strategyType: string | null;
       providerType: string | null;
+      metadata: Record<string, unknown> | null;
     }
   | { kind: "open_or_shared"; workspaceId: string };
-
-function isClosedWorkspaceStatus(status: string | null | undefined) {
-  return status === "archived" || status === "cleanup_failed";
-}
 
 // Uses the reopen service's status test, so the route and the successor agree on
 // what a closed workspace is.
 function isClosedIsolatedRow(row: { mode: string | null; status: string | null }) {
-  return row.mode === "isolated_workspace" && isClosedWorkspaceStatus(row.status);
+  return row.mode === "isolated_workspace" && isClosedExecutionWorkspaceStatus(row.status);
 }
 
 /**
@@ -157,6 +154,7 @@ export async function classifyIssueExecutionWorkspaceBinding(
       generation: readExecutionWorkspaceLifecycleGeneration(row.metadata as Record<string, unknown> | null),
       strategyType: row.strategyType,
       providerType: row.providerType,
+      metadata: row.metadata as Record<string, unknown> | null,
     };
   }
   return { kind: "open_or_shared", workspaceId };

@@ -18924,8 +18924,10 @@ export function issueRoutes(
         (effectiveResumeRequested === true || effectiveReopenRequested === true)
           ? await classifyIssueExecutionWorkspaceBinding(db, issue)
           : null;
+      // With the setting off nothing below runs, so behavior is exactly today's.
       const crossTaskCandidate =
         (crossTaskBinding?.kind === "missing" || crossTaskBinding?.kind === "closed_isolated") &&
+        (await instanceSettings.getExperimental()).enableCrossTaskDeferredContinuation === true &&
         !(await runBindsIssueForWorkspaceExecution(db, req.actor, issue.companyId, issue.id));
       if (crossTaskCandidate && crossTaskBinding) {
         const binding = crossTaskBinding;
@@ -18933,10 +18935,7 @@ export function issueRoutes(
           res.status(409).json({ error: CROSS_TASK_CONTINUATION_MESSAGES.notReopenable });
           return;
         }
-        if (
-          binding.kind === "closed_isolated" &&
-          (await instanceSettings.getExperimental()).enableCrossTaskDeferredContinuation === true
-        ) {
+        if (binding.kind === "closed_isolated") {
           // Only a row that the target-bound successor can reopen takes the
           // deferred path. Any other closed isolated row is refused here.
           if (!isSuccessorReopenableWorkspace(binding)) {
