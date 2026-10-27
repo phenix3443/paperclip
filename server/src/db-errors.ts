@@ -50,3 +50,17 @@ export function isForeignKeyViolation(error: unknown): boolean {
   }
   return false;
 }
+
+/**
+ * Recognizes a Postgres deadlock (SQLSTATE 40P01). PostgreSQL has already
+ * rolled the transaction back, so the caller can map it to a retryable conflict.
+ */
+export function isDeadlockDetected(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < MAX_CAUSE_DEPTH && current && typeof current === "object"; depth += 1) {
+    const candidate = current as { code?: unknown; cause?: unknown };
+    if (candidate.code === "40P01") return true;
+    current = candidate.cause;
+  }
+  return false;
+}
