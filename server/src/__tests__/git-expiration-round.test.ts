@@ -357,6 +357,26 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
       current: { state: "read" } });
   });
 
+  it("stops partial at the row deadline while a Git child stalls, holding the locks until the child is gone", async () => {
+    const f = await reconstructable();
+    faults.spawn = args => args.includes("ORIG_HEAD") ? ["sh", "-c", "trap '' TERM; sleep 30"] : null;
+    const journal = memoryJournal();
+    const locks: number[] = [];
+    const watcher = setInterval(() => { void advisoryLocks().then(count => locks.push(count)); }, 100);
+    const started = Date.now();
+    let summary;
+    try {
+      summary = await round(journal, { companyId: f.companyId, budgetHooks: { rowMs: 1_000 } });
+    } finally {
+      clearInterval(watcher);
+    }
+    expect(Date.now() - started).toBeLessThan(ROW_DRAIN_BOUND_MS + 5_000);
+    expect(summary).toMatchObject({ status: "partial", stopReason: "resource_limit", resourceLimited: 1, candidates: 0, drainIncomplete: false });
+    expect(journal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "resource_limit", reason: "row_deadline" });
+    expect(locks.filter(count => count === 2).length).toBeGreaterThan(5);
+    await waitFor(async () => await advisoryLocks() === 0 && await roundBackends() === 0);
+  }, 30_000);
+
   it("stops partial when Git output is too large in an ancestry proof", async () => {
     const f = await reconstructable();
     await fs.writeFile(path.join(git(f.cwd, "rev-parse", "--absolute-git-dir"), "ORIG_HEAD"), `${git(f.cwd, "rev-parse", "HEAD")}\n`);

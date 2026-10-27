@@ -14,7 +14,7 @@ import { isRuntimeOwnedGitBranch } from "./execution-workspace-branch-ownership.
 import { recordedIsolatedRemoteSource, verifiedRecordedIsolatedRemoteSource, materializeIsolatedRemoteWorkspaceSource } from "./isolated-remote-workspace-source.js";
 import { findRegenerableWorkspaceDirs } from "./workspace-compaction.js";
 import { PROJECT_REPOSITORIES_DIR } from "@paperclipai/adapter-utils/git-workspace-sync";
-import { GitExpirationBudgetExceeded, runBoundedGit } from "./git-expiration-budget.js";
+import { GitExpirationBudgetExceeded, readBoundedDirectory, runBoundedGit } from "./git-expiration-budget.js";
 
 const execFile = promisify(execFileCallback);
 const shaPattern = /^[a-f0-9]{40}$/;
@@ -160,17 +160,17 @@ async function stockGitFiles() {
 export async function assertReproducibleBaseGitStorage(cwd: string, signal?: AbortSignal) {
   const root = path.join(cwd, ".git");
   const allowed = new Set(["HEAD", "ORIG_HEAD", "FETCH_HEAD", "index", "config", "description", "hooks", "info", "refs", "objects", "logs", "packed-refs", "worktrees", "branches"]);
-  if ((await fs.readdir(root)).some(name => !allowed.has(name))) throw new Error("unknown_base_git_files");
+  if ((await readBoundedDirectory(root, signal)).some(entry => !allowed.has(entry.name))) throw new Error("unknown_base_git_files");
   const branches = path.join(root, "branches");
   const branchesStat = await fs.lstat(branches).catch((error: NodeJS.ErrnoException) => {
     if (error.code === "ENOENT") return null;
     throw error;
   });
   if (branchesStat && (!branchesStat.isDirectory() || branchesStat.isSymbolicLink()
-    || (await fs.readdir(branches)).length > 0)) throw new Error("custom_git_metadata");
+    || (await readBoundedDirectory(branches, signal)).length > 0)) throw new Error("custom_git_metadata");
   const templates = await stockGitFiles();
   for (const directory of ["hooks", "info"]) {
-    for (const name of await fs.readdir(path.join(root, directory))) {
+    for (const { name } of await readBoundedDirectory(path.join(root, directory), signal)) {
       const file = `${directory}/${name}`;
       const entry = await fs.lstat(path.join(root, file));
       if (!entry.isFile()) throw new Error("custom_git_metadata");
@@ -186,7 +186,7 @@ export async function assertReproducibleBaseGitStorage(cwd: string, signal?: Abo
   // merely because Git's object/ref enumeration does not mention it.
   async function walk(relative: string): Promise<void> {
     signal?.throwIfAborted();
-    for (const entry of await fs.readdir(path.join(root, relative), { withFileTypes: true })) {
+    for (const entry of await readBoundedDirectory(path.join(root, relative), signal)) {
       const name = `${relative}/${entry.name}`;
       if (entry.isSymbolicLink() || (!entry.isDirectory() && !entry.isFile())) throw new Error("unsupported_git_storage");
       if (entry.isDirectory()) { await walk(name); continue; }
@@ -345,10 +345,10 @@ export async function assertReproducibleGitFiles(cwd: string, signal?: AbortSign
     .catch(onGitExit(() => { throw new Error("unique_original_head"); }));
   if (gitDir !== common) {
     const allowed = new Set(["HEAD", "ORIG_HEAD", "FETCH_HEAD", "index", "commondir", "gitdir", "logs", "refs", "COMMIT_EDITMSG", "index.lock", "HEAD.lock"]);
-    if ((await fs.readdir(gitDir)).some(name => !allowed.has(name))) throw new Error("unknown_worktree_git_files");
+    if ((await readBoundedDirectory(gitDir, signal)).some(entry => !allowed.has(entry.name))) throw new Error("unknown_worktree_git_files");
     await assertReproducibleFetchHead(cwd, gitDir, signal, options.verifyFetchedCommit);
     async function assertEmptyRefs(root: string): Promise<void> {
-      const entries = await fs.readdir(root, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
+      const entries = await readBoundedDirectory(root, signal).catch((error: NodeJS.ErrnoException) => {
         if (error.code === "ENOENT") return []; throw error;
       });
       for (const entry of entries) {
@@ -361,10 +361,10 @@ export async function assertReproducibleGitFiles(cwd: string, signal?: AbortSign
       if (error.code === "ENOENT") return null; throw error;
     });
     if (message !== null && message.trim() !== (await gitCacheCommand(cwd, ["log", "-1", "--format=%B"], signal)).trim()) throw new Error("uncommitted_git_message");
-    const logs = await fs.readdir(path.join(gitDir, "logs")).catch((error: NodeJS.ErrnoException) => {
+    const logs = await readBoundedDirectory(path.join(gitDir, "logs"), signal).catch((error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT") return []; throw error;
     });
-    if (logs.some(name => name !== "HEAD")) throw new Error("unknown_worktree_git_logs");
+    if (logs.some(entry => entry.name !== "HEAD")) throw new Error("unknown_worktree_git_logs");
   }
   // Packed stashes/replacement refs are just as important as loose refs.
   if ((await gitCacheCommand(cwd, ["for-each-ref", "--format=%(refname)", "refs/stash", "refs/replace"], signal)).trim()) throw new Error("unique_git_refs");

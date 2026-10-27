@@ -1,5 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { execFile, spawn } from "node:child_process";
+import type { Dirent } from "node:fs";
+import fs from "node:fs/promises";
 
 export const GIT_EXPIRATION_BUDGETS = Object.freeze({
   roundSeconds: 600,
@@ -46,21 +48,51 @@ export const probeGitProcessGroup: GitGroupProbe = pgid => {
 export type InspectionBudgetHooks = {
   probeGroup?: GitGroupProbe;
   gitTimeoutMs?: number;
+  rowMs?: number;
 };
 
 export class InspectionBudget {
   readonly signal: AbortSignal;
-  readonly peaks = { childOutputBytes: 0, gitChildren: 0 };
+  readonly peaks = { childOutputBytes: 0, gitChildren: 0, rowEntries: 0, rowMs: 0 };
   readonly probeGroup: GitGroupProbe;
   readonly gitTimeoutCapMs: number;
+  readonly rowMs: number;
   private readonly controller = new AbortController();
   private readonly running = new Set<Promise<unknown>>();
+  private readonly startedAt = Date.now();
+  private readonly rowTimer: NodeJS.Timeout;
   private gitChildren = 0;
+  private entries = 0;
 
   constructor(roundSignal: AbortSignal, hooks: InspectionBudgetHooks = {}) {
     this.signal = AbortSignal.any([roundSignal, this.controller.signal]);
     this.probeGroup = hooks.probeGroup ?? probeGitProcessGroup;
     this.gitTimeoutCapMs = hooks.gitTimeoutMs ?? Number.POSITIVE_INFINITY;
+    this.rowMs = hooks.rowMs ?? GIT_EXPIRATION_BUDGETS.rowMs;
+    this.rowTimer = setTimeout(() => this.expireRow(), this.rowMs);
+    this.rowTimer.unref();
+  }
+
+  rowTimeLeft() {
+    return Math.max(0, this.startedAt + this.rowMs - Date.now());
+  }
+
+  expireRow(): GitExpirationBudgetExceeded {
+    return this.exceeded(new GitExpirationBudgetExceeded("row_deadline", this.rowMs, Date.now() - this.startedAt));
+  }
+
+  countEntry() {
+    this.signal.throwIfAborted();
+    this.entries += 1;
+    this.peaks.rowEntries = this.entries;
+    if (this.entries > GIT_EXPIRATION_BUDGETS.walkerEntries) {
+      throw this.exceeded(new GitExpirationBudgetExceeded("walker_entries", GIT_EXPIRATION_BUDGETS.walkerEntries, this.entries));
+    }
+  }
+
+  close() {
+    clearTimeout(this.rowTimer);
+    this.peaks.rowMs = Date.now() - this.startedAt;
   }
 
   run<T>(work: () => Promise<T>): Promise<T> {
@@ -104,6 +136,21 @@ const budgetStore = new AsyncLocalStorage<InspectionBudget>();
 
 export function currentInspectionBudget(): InspectionBudget | undefined {
   return budgetStore.getStore();
+}
+
+export function isInspectionStop(error: unknown, signal?: AbortSignal) {
+  return error instanceof GitExpirationBudgetExceeded || !!signal?.aborted || !!currentInspectionBudget()?.signal.aborted;
+}
+
+export async function readBoundedDirectory(directory: string, signal?: AbortSignal): Promise<Dirent[]> {
+  const budget = currentInspectionBudget();
+  const entries: Dirent[] = [];
+  for await (const entry of await fs.opendir(directory)) {
+    signal?.throwIfAborted();
+    budget?.countEntry();
+    entries.push(entry);
+  }
+  return entries;
 }
 
 export type BoundedGitOptions = {
@@ -188,10 +235,13 @@ function runInGroup(budget: InspectionBudget, args: string[], options: BoundedGi
     const child = spawn("git", args, { cwd: options.cwd, env: boundedGitEnv(options.env), detached: true,
       stdio: ["pipe", "pipe", "pipe"] });
     const pgid = child.pid;
-    const timeoutMs = Math.min(options.timeout, budget.gitTimeoutCapMs);
+    const commandTimeoutMs = Math.min(options.timeout, budget.gitTimeoutCapMs);
+    const rowLeftMs = budget.rowTimeLeft();
+    const timeoutMs = Math.min(commandTimeoutMs, rowLeftMs);
     const timeout = setTimeout(() => {
       if (stopCause) return;
-      budgetError = budget.exceeded(new GitExpirationBudgetExceeded("git_timeout", timeoutMs));
+      budgetError = rowLeftMs < commandTimeoutMs ? budget.expireRow()
+        : budget.exceeded(new GitExpirationBudgetExceeded("git_timeout", timeoutMs));
       stop("timeout");
     }, timeoutMs);
     const onAbort = () => stop("abort");
@@ -301,5 +351,6 @@ function runInGroup(budget: InspectionBudget, args: string[], options: BoundedGi
 }
 
 function abortError(signal: AbortSignal) {
+  if (signal.reason instanceof GitExpirationBudgetExceeded) return signal.reason;
   return Object.assign(new Error("The operation was aborted"), { name: "AbortError", code: "ABORT_ERR", cause: signal.reason });
 }

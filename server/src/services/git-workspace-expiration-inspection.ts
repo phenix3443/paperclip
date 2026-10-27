@@ -5,6 +5,7 @@ import { executionWorkspaces, issues, heartbeatRuns, nativeRunFinalizations, env
   workspaceRuntimeServices, issueRecoveryActions, projectWorkspaces, type Db } from "@paperclipai/db";
 import { readManagedCheckoutContents, selectRestoredProjectRepositories, type ManagedCheckoutContents } from "./git-workspace-contents.js";
 import { createGitRemoteAuthProvider, type GitRemoteAuthProvider } from "./git-credentials.js";
+import { readBoundedDirectory } from "./git-expiration-budget.js";
 import { managedProjectCheckoutName } from "./managed-project-checkout-name.js";
 import { assertReproducibleManagedCheckout, inspectGitCacheRecipe, readGitCacheRestoration, readGitCacheExpiration,
   GitCacheRestorationFailure, type GitCacheExpiration, type GitCacheRestoration, type ManagedCheckoutProver } from "./git-workspace-restoration.js";
@@ -20,7 +21,9 @@ export async function allocatedBytes(target: string, shouldContinue: () => boole
   const entry = await fs.lstat(target);
   if (!entry.isDirectory() && !entry.isFile() && !entry.isSymbolicLink()) throw new Error("unsupported_filesystem_entry");
   let bytes = entry.blocks * 512;
-  if (entry.isDirectory()) for (const name of await fs.readdir(target)) bytes += await allocatedBytes(path.join(target, name), shouldContinue);
+  if (entry.isDirectory()) {
+    for (const child of await readBoundedDirectory(target)) bytes += await allocatedBytes(path.join(target, child.name), shouldContinue);
+  }
   return bytes;
 }
 
