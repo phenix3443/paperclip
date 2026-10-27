@@ -9587,6 +9587,13 @@ export function issueRoutes(
     validate(resolveIssueRecoveryActionSchema),
     async (req, res) => {
       const id = req.params.id as string;
+      // Admission is delivered in ordered slices. Until the server can enforce
+      // every admission check, a request that carries it is refused before any
+      // read or write, so a caller never mistakes the legacy path for admission.
+      if (req.body?.executionReconciliation?.admission) {
+        res.status(400).json({ error: "Execution reconciliation admission is not supported", code: "capability_unsupported" });
+        return;
+      }
       const existing = await getAccessibleResource(
         req,
         res,

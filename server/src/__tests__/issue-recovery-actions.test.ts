@@ -2080,6 +2080,46 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id)))[0]).toEqual(recorded);
   });
 
+  it("refuses an admission request before any read or write until admission is supported", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const runId = randomUUID();
+    await seedHeartbeatRun({ companyId, agentId: coderId, runId, issueId: sourceIssueId, status: "failed" });
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+    const [action] = await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId, kind: "active_run_watchdog", status: "resolved", outcome: "blocked",
+      ownerType: "board", returnOwnerAgentId: coderId, cause: "uncertain_external_action", fingerprint: runId,
+      nextAction: "Preserve recorded work without replay.",
+      evidence: { runId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } },
+    }).returning();
+    const timestamp = "2026-10-27T12:00:00.000Z";
+    const admission = {
+      schema: "execution_reconciliation_admission_v1", idempotencyKey: "recon:capability-check",
+      expectedDigest: "a".repeat(64),
+      authorization: { documentId: randomUUID(), revisionId: randomUUID(), revisionNumber: 1, bodyDigest: "b".repeat(64), decisionId: randomUUID() },
+      expected: {
+        companyId, projectId: null, issueId: sourceIssueId, runId, actionId: action!.id,
+        run: { status: "failed", finishedAt: timestamp, agentId: coderId, processPid: null, processGroupId: null, runtimeMode: null },
+        unstartedRunIds: [],
+        action: { status: "resolved", cause: "uncertain_external_action", kind: "active_run_watchdog", outcome: "blocked",
+          ownerAgentId: null, returnOwnerAgentId: coderId, updatedAt: timestamp },
+        issue: { status: "blocked", statusVersion: 0, assigneeAgentId: coderId, assigneeUserId: null, responsibleUserId: null,
+          workspaceBindingRevision: 0, executionPolicy: null, executionState: null, unblockDescriptor: null,
+          monitorNextCheckAt: null, monitorAttemptCount: 0, monitorScheduledBy: null, monitorNotes: null },
+      },
+    };
+    const [beforeAction] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id));
+    const [beforeIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    const response = await request(createApp()).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send({
+      actionId: action!.id, outcome: "restored", sourceIssueStatus: "todo",
+      executionReconciliation: { runId, providerStopped: true, actionOutcome: "completed",
+        outcomeEvidence: "The stopped run saved its comment and commit before the hold.", admission },
+    }).expect(400);
+    expect(response.body.code).toBe("capability_unsupported");
+    // The settled no-replay hold is not reopened and the issue is unchanged.
+    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id)))[0]).toEqual(beforeAction);
+    expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0]).toEqual(beforeIssue);
+  });
+
   async function seedReconciledDelivery() {
     const fixture = await seedCompany();
     const { companyId, coderId, sourceIssueId } = fixture;
