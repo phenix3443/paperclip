@@ -173,7 +173,9 @@ import {
   CROSS_TASK_CONTINUATION_SOURCE,
   crossTaskContinuationDeliveryGate,
   crossTaskContinuationDispatchKey,
-  isTrustedContinuationDispatchReceipt,
+  deferredDispatchReceiptIntentId,
+  isTrustedDeferredDispatchReceipt,
+  NATIVE_STATUS_DISPATCH_ACTOR_PREFIX,
 } from "../cross-task-continuation.js";
 import { retryChatControlAdmission } from "../chat-control-admission-retry.js";
 
@@ -2835,9 +2837,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );
 
-          let reusedContinuationReceipt: typeof agentWakeupRequests.$inferSelect | null = null;
-          const continuationReceiptReadmission = Boolean(executionWaitRequestId)
-            && opts.crossTaskContinuationReceiptId === executionWaitRequestId;
+          let reusedDispatchReceipt: typeof agentWakeupRequests.$inferSelect | null = null;
+          const dispatchReceiptReadmission = Boolean(executionWaitRequestId)
+            && opts.dispatchReceiptReadmissionId === executionWaitRequestId;
           if (executionWaitRequestId) {
             const [pending] = await tx.select().from(agentWakeupRequests).where(and(
               eq(agentWakeupRequests.id, executionWaitRequestId), eq(agentWakeupRequests.companyId, agent.companyId),
@@ -2845,7 +2847,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               // A user message can join a queue originally created by a
               // system wake. Admission validates the saved user comment or board click.
               (opts.queuedCommentInterruptId ?? opts.queuedCommentRequestId) === executionWaitRequestId
-                ? undefined : eq(agentWakeupRequests.requestedByActorType, continuationReceiptReadmission ? "system" : "user"),
+                ? undefined : eq(agentWakeupRequests.requestedByActorType, dispatchReceiptReadmission ? "system" : "user"),
               opts.queuedCommentInterruptId === executionWaitRequestId
                 ? sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt'->>'actorId' = ${opts.requestedByActorId ?? ""}`
                 : opts.queuedCommentRequestId === executionWaitRequestId ? undefined
@@ -2854,11 +2856,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             ));
             // The issue lock serializes cleanup callbacks and periodic workers.
             // An adopted, discarded, or edited receipt is no longer authority.
-            if (pending && continuationReceiptReadmission) {
-              if (!(await isTrustedContinuationDispatchReceipt(tx as unknown as Db, pending, {
+            if (pending && dispatchReceiptReadmission) {
+              if (!(await isTrustedDeferredDispatchReceipt(tx as unknown as Db, pending, {
                 companyId: agent.companyId, agentId, issueId,
               }))) return { kind: "deferred" as const };
-              reusedContinuationReceipt = pending;
+              reusedDispatchReceipt = pending;
             } else if (!pending || (!opts.taskRetryRequestId && !(wakeCommentId && queuedCommentIdsFromWakePayload(pending.payload).includes(wakeCommentId)) &&
                 !(opts.queuedCommentInterruptId && await readQueuedInteractionResponse(tx as unknown as Db,
                   agent.companyId, issueId, pending.payload)))) {
@@ -4322,10 +4324,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             enrichedContextSnapshot.explicitUserContinuation = explicitContinuation;
           }
 
-          const wakeupRequest = reusedContinuationReceipt
+          const wakeupRequest = reusedDispatchReceipt
             ? await tx.update(agentWakeupRequests)
               .set({ status: "queued", error: null, updatedAt: new Date() })
-              .where(and(eq(agentWakeupRequests.id, reusedContinuationReceipt.id),
+              .where(and(eq(agentWakeupRequests.id, reusedDispatchReceipt.id),
                 eq(agentWakeupRequests.status, "deferred_issue_execution")))
               .returning()
               .then((rows) => rows[0])
@@ -4367,7 +4369,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // Consume it with its successor even when chat keeps other messages
           // in separate turns, or finalization will deliver it a second time.
           const adoptableWakeIds = [
-            ...(executionWaitRequestId && !reusedContinuationReceipt ? [executionWaitRequestId] : []),
+            ...(executionWaitRequestId && !reusedDispatchReceipt ? [executionWaitRequestId] : []),
             ...(decidedReviewAdmitted?.foldedWakeIds ?? []),
           ];
           const pendingComments =
@@ -5116,42 +5118,50 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       }
     }
 
-    const promoted = await promoteDeferredContinuationReceipts(input);
+    const promoted = await promoteDeferredDispatchReceipts(input);
     return { scanned: candidates.length, dispatched, recovered, deferred, promoted };
   }
 
-  async function promoteDeferredContinuationReceipts(input: { companyId?: string; limit?: number }) {
+  async function promoteDeferredDispatchReceipts(input: { companyId?: string; limit?: number }) {
     const receipts = await db.select().from(agentWakeupRequests).where(and(
       input.companyId ? eq(agentWakeupRequests.companyId, input.companyId) : undefined,
       eq(agentWakeupRequests.status, "deferred_issue_execution"),
       eq(agentWakeupRequests.requestedByActorType, "system"),
-      sql`${agentWakeupRequests.requestedByActorId} = ${agentWakeupRequests.idempotencyKey}`,
-      like(agentWakeupRequests.idempotencyKey, `${crossTaskContinuationDispatchKey("").replace(/[_%]/g, "\\$&")}%`),
+      or(
+        and(sql`${agentWakeupRequests.requestedByActorId} = ${agentWakeupRequests.idempotencyKey}`,
+          like(agentWakeupRequests.idempotencyKey, `${crossTaskContinuationDispatchKey("")}%`)),
+        like(agentWakeupRequests.requestedByActorId, `${NATIVE_STATUS_DISPATCH_ACTOR_PREFIX}%`),
+      ),
       isNull(agentWakeupRequests.runId),
     )).orderBy(asc(agentWakeupRequests.requestedAt))
       .limit(Math.max(1, Math.min(input.limit ?? 100, 500)));
     let promoted = 0;
     for (const receipt of receipts) {
+      const identity = deferredDispatchReceiptIntentId(receipt);
       const payload = parseObject(receipt.payload);
       const issueId = readNonEmptyString(payload.issueId);
-      const intentId = receipt.idempotencyKey!.slice(crossTaskContinuationDispatchKey("").length);
-      if (!issueId) continue;
+      if (!identity || !issueId) continue;
       if (await getExecutionBlocker(db, receipt.companyId, issueId)) continue;
       const [intent] = await db.select().from(agentWakeupRequests).where(and(
-        eq(agentWakeupRequests.id, intentId), eq(agentWakeupRequests.companyId, receipt.companyId),
+        eq(agentWakeupRequests.id, identity.intentId), eq(agentWakeupRequests.companyId, receipt.companyId),
       ));
       const [target] = await db.select({
         status: issues.status, assigneeAgentId: issues.assigneeAgentId,
         responsibleUserId: issues.responsibleUserId, executionWorkspaceId: issues.executionWorkspaceId,
       }).from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, receipt.companyId)));
       if (!intent || !target) continue;
-      const unresolvedBlockerCount = target.status === "blocked"
-        ? ((await issuesSvc.listDependencyReadiness(receipt.companyId, [issueId])).get(issueId)?.unresolvedBlockerCount ?? 0)
-        : 0;
       const intentPayload = parseObject(intent.payload);
-      const gateError = target.status === "done" || target.status === "cancelled"
-        ? `Native status wake target is already ${target.status}`
-        : crossTaskContinuationDeliveryGate(intentPayload, target, unresolvedBlockerCount);
+      let gateError: string | null = null;
+      if (target.status === "done" || target.status === "cancelled") {
+        gateError = `Native status wake target is already ${target.status}`;
+      } else if (identity.kind === "cross_task_continuation") {
+        const unresolvedBlockerCount = target.status === "blocked"
+          ? ((await issuesSvc.listDependencyReadiness(receipt.companyId, [issueId])).get(issueId)?.unresolvedBlockerCount ?? 0)
+          : 0;
+        gateError = crossTaskContinuationDeliveryGate(intentPayload, target, unresolvedBlockerCount);
+      } else if (target.assigneeAgentId !== receipt.agentId) {
+        gateError = "Native status wake target has a different assignee";
+      }
       if (gateError) {
         await db.update(agentWakeupRequests).set({ status: "skipped", error: gateError, finishedAt: new Date(), updatedAt: new Date() })
           .where(and(eq(agentWakeupRequests.id, receipt.id), eq(agentWakeupRequests.status, "deferred_issue_execution")));
@@ -5164,10 +5174,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           triggerDetail: (receipt.triggerDetail ?? "system") as WakeupOptions["triggerDetail"],
           reason: receipt.reason,
           payload: intentPayload,
-          idempotencyKey: receipt.idempotencyKey,
+          idempotencyKey: receipt.idempotencyKey ?? undefined,
           requestedByActorType: "system",
           requestedByActorId: receipt.requestedByActorId ?? undefined,
-          crossTaskContinuationReceiptId: receipt.id,
+          dispatchReceiptReadmissionId: receipt.id,
           contextSnapshot: parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]),
         }, receipt.id);
         if (run) {
@@ -5176,7 +5186,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             .where(and(eq(agentWakeupRequests.id, intent.id), isNull(agentWakeupRequests.runId)));
         }
       } catch (error) {
-        logger.warn({ err: error, wakeupRequestId: receipt.id }, "failed to re-admit a deferred cross-task continuation receipt");
+        logger.warn({ err: error, wakeupRequestId: receipt.id }, "failed to re-admit a deferred dispatch receipt");
       }
     }
     return promoted;

@@ -29,7 +29,9 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { LEGACY_RECOVERY_CAUSE } from "../services/legacy-execution-recovery.js";
-import { readCrossTaskContinuationWork } from "../services/cross-task-continuation-worker.js";
+import { readCrossTaskContinuationWork, registerCrossTaskContinuationWork } from "../services/cross-task-continuation-worker.js";
+import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
+import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { runningProcesses } from "../adapters/index.ts";
 import {
   CROSS_TASK_CONTINUATION_COMMITTER_ID,
@@ -421,6 +423,104 @@ describeEmbeddedPostgres("cross-task continuation intent consumer", () => {
       freshIsolatedWorkspaceRequested: false,
       executionWorkspacesSvc: { reopenClosedIsolatedExecutionWorkspaceForIssue: vi.fn(), clearReopenPendingConsumptionForUnconsumedReopen: vi.fn() } as never,
     })).rejects.toThrow(/workspace binding changed/);
+  });
+
+  async function deferUnderRecoveryHold() {
+    const seeded = await seedTarget();
+    await db.insert(issueRecoveryActions).values({ companyId: seeded.companyId, sourceIssueId: seeded.issueId, kind: "active_run_watchdog",
+      ownerType: "board", returnOwnerAgentId: seeded.agentId, cause: LEGACY_RECOVERY_CAUSE, fingerprint: `k8:${seeded.issueId}:${randomUUID()}`,
+      evidence: {}, nextAction: "Reconcile stopped work" });
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: seeded.companyId });
+    const [receipt] = await dispatchReceipts(seeded.intent.id);
+    expect(receipt).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    const resolve = () => issueRecoveryActionService(db).resolveActiveForIssue({
+      companyId: seeded.companyId, sourceIssueId: seeded.issueId, status: "resolved", outcome: "restored",
+    } as never);
+    const runsFor = () => db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, receipt!.id));
+    return { ...seeded, receipt: receipt!, resolve, runsFor };
+  }
+
+  it("K8 (b) notification path: the real resolution notifies the worker, which promotes the same receipt without a manual sweep", async () => {
+    const f = await deferUnderRecoveryHold();
+    const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: () => {} });
+    try {
+      const worker = registerCrossTaskContinuationWork(db, coordinator, () => heartbeatService(db).dispatchPendingNativeStatusWakeups());
+      await worker.ready;
+      expect(await f.runsFor()).toHaveLength(0);
+      expect(coordinator.nextWakeAt()).toBeNull();
+      await f.resolve();
+      await vi.waitFor(async () => expect(await f.runsFor()).toHaveLength(1), { timeout: 10_000 });
+      expect(await dispatchReceipts(f.intent.id)).toHaveLength(1);
+      await vi.waitFor(() => expect(coordinator.nextWakeAt()).toBeNull(), { timeout: 10_000 });
+    } finally {
+      await coordinator.stop();
+    }
+    await heartbeat.drainActiveRunExecutions();
+  });
+
+  it("K8 (b) a blocker that reappears before re-admission keeps the receipt deferred with no run", async () => {
+    const f = await deferUnderRecoveryHold();
+    await f.resolve();
+    await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId, kind: "active_run_watchdog",
+      ownerType: "board", returnOwnerAgentId: f.agentId, cause: LEGACY_RECOVERY_CAUSE, fingerprint: `k8-again:${f.issueId}`,
+      evidence: {}, nextAction: "Reconcile stopped work" });
+    expect(await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId })).toMatchObject({ promoted: 0 });
+    expect(await dispatchReceipts(f.intent.id)).toMatchObject([{ id: f.receipt.id, status: "deferred_issue_execution", runId: null }]);
+    expect(await f.runsFor()).toHaveLength(0);
+  });
+
+  it("K8 (b) concurrent releases promote the receipt once", async () => {
+    const f = await deferUnderRecoveryHold();
+    await f.resolve();
+    const sweeps = [heartbeatService(db), heartbeatService(db), heartbeatService(db)];
+    await Promise.all(sweeps.map((sweep) => sweep.dispatchPendingNativeStatusWakeups({ companyId: f.companyId })));
+    await Promise.all(sweeps.map((sweep) => sweep.drainActiveRunExecutions()));
+    expect(await dispatchReceipts(f.intent.id)).toHaveLength(1);
+    expect(await f.runsFor()).toHaveLength(1);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(1);
+  });
+
+  it("K8 (b) a receipt whose intent no longer names the same target is not re-admitted and nothing changes", async () => {
+    const f = await deferUnderRecoveryHold();
+    await db.update(agentWakeupRequests).set({ payload: sql`jsonb_set(${agentWakeupRequests.payload}, '{issueId}', to_jsonb(${randomUUID()}::text))` })
+      .where(eq(agentWakeupRequests.id, f.intent.id));
+    await f.resolve();
+    const before = await dispatchReceipts(f.intent.id);
+    expect(await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId })).toMatchObject({ promoted: 0 });
+    expect(await dispatchReceipts(f.intent.id)).toEqual(before);
+    expect(await f.runsFor()).toHaveLength(0);
+  });
+
+  it("status committer, same path: a receipt deferred by a recovery hold is promoted as the same row to one run once the hold is resolved", async () => {
+    const { companyId, agentId, issueId } = await seedTarget();
+    await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+    await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issueId, kind: "active_run_watchdog",
+      ownerType: "board", returnOwnerAgentId: agentId, cause: LEGACY_RECOVERY_CAUSE, fingerprint: `sc:${issueId}`,
+      evidence: {}, nextAction: "Reconcile stopped work" });
+    const [statusIntent] = await db.insert(agentWakeupRequests).values({
+      companyId, agentId, source: "automation", triggerDetail: "system", reason: "issue_blockers_resolved",
+      requestedByActorType: "system", requestedByActorId: "native-status-committer",
+      idempotencyKey: `native-dependency:${issueId}`,
+      payload: { issueId, taskId: issueId, _paperclipWakeContext: { issueId, taskId: issueId } },
+    }).returning();
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
+    const statusReceipts = () => db.select().from(agentWakeupRequests).where(
+      eq(agentWakeupRequests.requestedByActorId, `native-status-wake-dispatch:${statusIntent!.id}`));
+    const [deferred, ...extra] = await statusReceipts();
+    expect(extra).toHaveLength(0);
+    expect(deferred).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    expect(await heartbeat.dispatchPendingNativeStatusWakeups({ companyId })).toMatchObject({ promoted: 0 });
+
+    await issueRecoveryActionService(db).resolveActiveForIssue({ companyId, sourceIssueId: issueId, status: "resolved", outcome: "restored" } as never);
+    expect(await heartbeat.dispatchPendingNativeStatusWakeups({ companyId })).toMatchObject({ promoted: 1 });
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
+    await heartbeat.drainActiveRunExecutions();
+    const receipts = await statusReceipts();
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]!.id).toBe(deferred!.id);
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, deferred!.id));
+    expect(runs).toHaveLength(1);
+    expect(await readIntent(statusIntent!.id)).toMatchObject({ runId: runs[0]!.id });
   });
 
   it("never dispatches a coalesced intent", async () => {
