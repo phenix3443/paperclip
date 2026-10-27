@@ -6,15 +6,20 @@ import {
   issues,
   type Db,
 } from "@paperclipai/db";
-import type { ExpectedReconciliationState } from "@paperclipai/shared";
+import type {
+  ExecutionReconciliationAdmission,
+  ExecutionReconciliationRefusalCode,
+  ExpectedReconciliationState,
+} from "@paperclipai/shared";
 import { canonicalReconciliationDigest } from "@paperclipai/shared/execution-reconciliation-canonical";
-import { conflict } from "../errors.js";
+import { conflict, notFound } from "../errors.js";
 
 // Receipts and expected-state binding for execution reconciliation admission
 // (doc/plans/2026-10-27-native-execution-reconciliation-admission.md, sections 1 and 6).
 
 type DbOrTransaction = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 type Receipt = typeof executionReconciliationReceipts.$inferSelect;
+export type ExecutionReconciliationReceiptRow = Receipt;
 
 export type ReconciliationReceiptLookup =
   | { state: "committed"; receipt: Receipt }
@@ -188,4 +193,118 @@ export function compareExpectedReconciliationState(
     canonicalReconciliationDigest(serverRecord[key] ?? null) !== canonicalReconciliationDigest(clientRecord[key] ?? null));
   if (differingKeys.length === 0) differingKeys.push("expectedDigest");
   return { matches: false, digest, differingKeys };
+}
+
+const REFUSAL_MARK = Symbol("executionReconciliationRefusal");
+
+/** A stable, coded 409 refusal. The admission transaction rolls back on it. */
+export function executionReconciliationRefusal(
+  code: ExecutionReconciliationRefusalCode,
+  message: string,
+  details: Record<string, unknown> = {},
+) {
+  const error = conflict(message, { ...details, code });
+  (error as unknown as Record<symbol, string>)[REFUSAL_MARK] = code;
+  return error;
+}
+
+/**
+ * Maps a failed admission transaction to its refusal. PostgreSQL deadlocks and
+ * serialization failures become `concurrent_change`: nothing was written and
+ * the caller re-reads and retries with the same key.
+ */
+export function toExecutionReconciliationRefusal(error: unknown): { code: string; error: unknown } | null {
+  const marked = error && typeof error === "object" ? (error as Record<symbol, unknown>)[REFUSAL_MARK] : undefined;
+  if (typeof marked === "string") return { code: marked, error };
+  const pgCode = error && typeof error === "object" ? (error as { code?: unknown; cause?: { code?: unknown } }) : null;
+  const sqlState = pgCode?.code ?? pgCode?.cause?.code;
+  if (sqlState === "40P01" || sqlState === "40001") {
+    return {
+      code: "concurrent_change",
+      error: executionReconciliationRefusal("concurrent_change", "A concurrent change rolled back the request. Re-read and retry with the same key."),
+    };
+  }
+  return null;
+}
+
+/** sha256 of the whole parsed request without the idempotency key. */
+export function executionReconciliationRequestDigest(body: unknown): string {
+  const copy = JSON.parse(JSON.stringify(body)) as {
+    executionReconciliation?: { admission?: { idempotencyKey?: string } };
+  };
+  delete copy.executionReconciliation?.admission?.idempotencyKey;
+  return canonicalReconciliationDigest(copy);
+}
+
+/**
+ * Admission checks of slice A1 on rows locked in this order: L0 key (caller),
+ * L4 issue (caller), L6 action, L9 source run. Returns a replay for a matching
+ * committed receipt, or the verified snapshot to admit. Every failure throws a
+ * coded refusal before any write.
+ */
+export async function checkExecutionReconciliationAdmission(
+  tx: DbOrTransaction,
+  input: {
+    issue: typeof issues.$inferSelect;
+    actionId: string;
+    runId: string;
+    admission: ExecutionReconciliationAdmission;
+    requestDigest: string;
+    priorReceipt: Receipt | undefined;
+  },
+): Promise<
+  | { kind: "replay"; receipt: Receipt; action: typeof issueRecoveryActions.$inferSelect }
+  | { kind: "admit"; expected: ExpectedReconciliationState; expectedDigest: string }
+> {
+  const { issue, admission } = input;
+  const prior = input.priorReceipt;
+  if (prior) {
+    if (prior.state === "abandoned") {
+      throw executionReconciliationRefusal("idempotency_key_settled", "This idempotency key was settled without a commit.");
+    }
+    if (prior.issueId !== issue.id || prior.requestDigest !== input.requestDigest) {
+      throw executionReconciliationRefusal("idempotency_conflict", "This idempotency key was used for a different request.");
+    }
+    const [action] = await tx.select().from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, prior.actionId!));
+    if (!action) throw notFound("Recovery action not found");
+    return { kind: "replay", receipt: prior, action };
+  }
+  const [admitted] = await tx.select({ id: executionReconciliationReceipts.id }).from(executionReconciliationReceipts)
+    .where(and(
+      eq(executionReconciliationReceipts.companyId, issue.companyId),
+      eq(executionReconciliationReceipts.actionId, input.actionId),
+      eq(executionReconciliationReceipts.state, "committed"),
+    ));
+  if (admitted) {
+    throw executionReconciliationRefusal("action_already_reconciled", "This recovery action already has an admitted reconciliation.",
+      { receiptId: admitted.id });
+  }
+  if (issue.executionState != null) {
+    throw executionReconciliationRefusal("execution_state_not_supported", "Admission does not support a task with review state.");
+  }
+  const [action] = await tx.select().from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.id, input.actionId),
+    eq(issueRecoveryActions.companyId, issue.companyId),
+    eq(issueRecoveryActions.sourceIssueId, issue.id),
+  )).for("update");
+  if (!action) throw notFound("Recovery action not found");
+  if ((action.evidence as { runId?: unknown }).runId !== input.runId) {
+    throw executionReconciliationRefusal("expected_state_mismatch", "The recovery action belongs to another run.",
+      { differingKeys: ["runId"] });
+  }
+  const [run] = await tx.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.id, input.runId),
+    eq(heartbeatRuns.companyId, issue.companyId),
+  )).for("update");
+  if (!run) throw notFound("Run not found");
+  if (!run.finishedAt) throw executionReconciliationRefusal("run_not_settled", "The source run has not finished.");
+  const unstartedRunIds = await listUnstartedHoldRunIds(tx, issue.companyId, issue.id);
+  const expected = buildExpectedReconciliationState({ issue, run, action, unstartedRunIds });
+  const comparison = compareExpectedReconciliationState(expected, admission);
+  if (!comparison.matches) {
+    throw executionReconciliationRefusal("expected_state_mismatch", "The task, run or action changed since it was verified.",
+      { serverDigest: comparison.digest, differingKeys: comparison.differingKeys });
+  }
+  return { kind: "admit", expected, expectedDigest: comparison.digest };
 }

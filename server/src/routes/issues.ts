@@ -1,9 +1,18 @@
 import { taskInterruptionPresentation, taskInterruptionPresentations } from "../services/task-interruption-presentation.js";
 import { parseObject } from "../adapters/utils.js";
 import { prepareRestrictedWorkspaceRetry } from "../services/restricted-workspace-retry.js";
-import { executionReconciliationIdempotencyKeySchema, issueSummariesQuerySchema, type IssueSummary } from "@paperclipai/shared";
+import { executionReconciliationIdempotencyKeySchema, issueSummariesQuerySchema, type ExecutionReconciliationAdmission, type IssueSummary } from "@paperclipai/shared";
 import { listIssueSummaries } from "../services/issue-summaries.js";
-import { readReconciliationReceipt, settleReconciliationKey } from "../services/execution-reconciliation-receipts.js";
+import {
+  checkExecutionReconciliationAdmission,
+  executionReconciliationRefusal,
+  executionReconciliationRequestDigest,
+  lockReconciliationKey,
+  readReconciliationReceipt,
+  settleReconciliationKey,
+  toExecutionReconciliationRefusal,
+  type ExecutionReconciliationReceiptRow,
+} from "../services/execution-reconciliation-receipts.js";
 import { assertNoCaseHandoffMutation } from "../services/heartbeat/case-handoff-lifecycle.js";
 import { assertLegacyRunTaskOwnership } from "../legacy-run-task-ownership.js";
 import { enqueueFastResponse } from "../services/fast-responses.js";
@@ -70,6 +79,7 @@ import {
   issueComments,
   issueDocuments,
   issueExecutionDecisions,
+  executionReconciliationReceipts,
   issueRelations,
   issueRecoveryActions,
   issueThreadInteractions,
@@ -3374,6 +3384,9 @@ export function issueRoutes(
       options: Parameters<ReturnType<typeof heartbeatService>["wakeup"]>[1],
     ) => ReturnType<ReturnType<typeof heartbeatService>["wakeup"]>;
     issueListDiagnostics?: IssueListDiagnostics;
+    // Admission is delivered in ordered slices (A1-A3). Until the health
+    // capability is published, only tests enable the admission path.
+    executionReconciliationAdmissionForTests?: boolean;
     declineToolActionRequest?: (input: {
       companyId: string;
       issueId?: string;
@@ -9636,7 +9649,8 @@ export function issueRoutes(
       // Admission is delivered in ordered slices. Until the server can enforce
       // every admission check, a request that carries it is refused before any
       // read or write, so a caller never mistakes the legacy path for admission.
-      if (req.body?.executionReconciliation?.admission) {
+      const admission = req.body?.executionReconciliation?.admission as ExecutionReconciliationAdmission | undefined;
+      if (admission && !opts.executionReconciliationAdmissionForTests) {
         res.status(400).json({ error: "Execution reconciliation admission is not supported", code: "capability_unsupported" });
         return;
       }
@@ -9705,7 +9719,18 @@ export function issueRoutes(
       const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
       const postCommitActivityPublications: ActivityPublication[] = [];
       const postCommitIssueActions: IssuePostCommitAction[] = [];
-      const result = await db.transaction(async (tx) => {
+      const admissionRequestDigest = admission ? executionReconciliationRequestDigest(req.body) : null;
+      const runResolveTransaction = () => db.transaction(async (tx) => {
+        // L0 comes before every row lock; it is held until commit or rollback.
+        let priorReceipt: ExecutionReconciliationReceiptRow | undefined;
+        if (admission) {
+          assertBoard(req);
+          await lockReconciliationKey(tx, existing.companyId, admission.idempotencyKey);
+          priorReceipt = await tx.select().from(executionReconciliationReceipts).where(and(
+            eq(executionReconciliationReceipts.companyId, existing.companyId),
+            eq(executionReconciliationReceipts.idempotencyKey, admission.idempotencyKey),
+          )).then((rows) => rows[0]);
+        }
         const lockedIssue = await tx
           .select()
           .from(issueRows)
@@ -9718,6 +9743,16 @@ export function issueRoutes(
           .for("update")
           .then((rows) => rows[0] ?? null);
         if (!lockedIssue) throw notFound("Issue not found");
+        let admissionCheck: Awaited<ReturnType<typeof checkExecutionReconciliationAdmission>> | null = null;
+        if (admission) {
+          admissionCheck = await checkExecutionReconciliationAdmission(tx, {
+            issue: lockedIssue, actionId: actionId!, runId: executionReconciliation!.runId,
+            admission, requestDigest: admissionRequestDigest!, priorReceipt,
+          });
+          if (admissionCheck.kind === "replay") {
+            return { issue: lockedIssue, recoveryAction: admissionCheck.action, replayed: true, receipt: admissionCheck.receipt };
+          }
+        }
         // Reconciling a reviewer run keeps the task in review; no status change is requested.
         const pendingReviewResume =
           outcome === "restored" &&
@@ -9748,6 +9783,8 @@ export function issueRoutes(
           actionId ? eq(issueRecoveryActions.id, actionId) : inArray(issueRecoveryActions.status, ["active", "escalated"]),
         )).limit(1).for("update");
         if (workspaceRepairAction && hasRequiredWorkspaceRecovery(workspaceRepairAction.evidence)) {
+          // A workspace repair records evidence only; it is not a reconciliation hand-back.
+          if (admission) throw executionReconciliationRefusal("gate_closed:workspace", "Workspace repair is not an admission hand-back.");
           assertBoard(req);
           await requireRecoveryActionAuthority(req, lockedIssue, issueRecoveryActionReadModel(workspaceRepairAction),
             { source: "recovery_action_resolution" });
@@ -9819,6 +9856,8 @@ export function issueRoutes(
                 .returning();
               activeRecoveryAction = issueRecoveryActionReadModel(reopened!);
             } else {
+              // Admission replays only from a matching receipt, never from a settled action.
+              if (admission) throw executionReconciliationRefusal("action_already_reconciled", "The recovery action is already settled.");
               return {
                 issue: lockedIssue,
                 recoveryAction: settled,
@@ -10226,8 +10265,57 @@ export function issueRoutes(
         );
         if (!recoveryAction) throw notFound("Active recovery action not found");
 
-        return { issue, recoveryAction, chatRetry };
+        let receipt: ExecutionReconciliationReceiptRow | undefined;
+        if (admission && admissionCheck?.kind === "admit") {
+          // Written last, in the same transaction as the action and issue.
+          [receipt] = await tx.insert(executionReconciliationReceipts).values({
+            companyId: lockedIssue.companyId,
+            issueId: lockedIssue.id,
+            actionId: recoveryAction.id,
+            runId: executionReconciliation!.runId,
+            idempotencyKey: admission.idempotencyKey,
+            state: "committed",
+            requestDigest: admissionRequestDigest,
+            expectedDigest: admissionCheck.expectedDigest,
+            expectedSnapshot: admissionCheck.expected as unknown as Record<string, unknown>,
+            authorizationRevisionId: admission.authorization.revisionId,
+            authorizationDecisionId: admission.authorization.decisionId,
+            authorizationBodySha256: admission.authorization.bodyDigest,
+            result: {
+              issueStatus: issue.status,
+              statusVersion: issue.statusVersion,
+              actionStatus: recoveryAction.status,
+              actionOutcome: recoveryAction.outcome,
+              continuationDelivery: (recoveryAction.evidence as Record<string, unknown>).continuationDelivery ?? null,
+            },
+            actorUserId: actor.actorType === "user" ? actor.actorId : null,
+          }).returning();
+        }
+
+        return { issue, recoveryAction, chatRetry, receipt };
       });
+      const result = admission
+        ? await runResolveTransaction().catch(async (error: unknown) => {
+            const refusal = toExecutionReconciliationRefusal(error);
+            if (refusal) {
+              // Separate short write after rollback: one audit row, nothing else.
+              await logActivity(db, {
+                companyId: existing.companyId, actorType: actor.actorType, actorId: actor.actorId,
+                agentId: actor.agentId, runId: actor.runId,
+                action: "issue.execution_reconciliation_refused", entityType: "issue", entityId: existing.id,
+                issueId: existing.id,
+                details: { code: refusal.code, requestDigest: admissionRequestDigest,
+                  expectedDigest: admission.expectedDigest, idempotencyKey: admission.idempotencyKey },
+              });
+              throw refusal.error;
+            }
+            throw error;
+          })
+        : await runResolveTransaction();
+      if ("receipt" in result && result.replayed && result.receipt) {
+        res.json({ issue: result.issue, recoveryAction: result.recoveryAction, receipt: result.receipt, replayed: true });
+        return;
+      }
       if (result.replayed) {
         res.json({
           issue: "workspaceRepairOnly" in result
@@ -10347,6 +10435,7 @@ export function issueRoutes(
             : null,
         },
         recoveryAction: result.recoveryAction,
+        ...("receipt" in result && result.receipt ? { receipt: result.receipt } : {}),
       });
     },
   );

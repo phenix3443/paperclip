@@ -59,6 +59,8 @@ import { caseHandoffService } from "../services/case-handoffs.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { withNativeWorkspaceFinalizationOwnership } from "../services/native-runtime/native-workspace-finalization-ownership.js";
 import { noticeMetadataReferencesRecoveryAction } from "../services/recovery/successful-run-handoff.js";
+import { buildExpectedReconciliationState, listUnstartedHoldRunIds } from "../services/execution-reconciliation-receipts.js";
+import { canonicalReconciliationDigest } from "@paperclipai/shared/execution-reconciliation-canonical";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -2139,6 +2141,150 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const logged = await db.select().from(activityLog).where(eq(activityLog.action, "issue.execution_reconciliation_key_settled"));
     expect(logged).toHaveLength(1);
     expect(logged[0]!.details).toMatchObject({ idempotencyKey: key, state: "abandoned" });
+  });
+
+  describe("execution reconciliation admission (slice A1)", () => {
+    const refusalCode = (body: any) => body?.code ?? body?.details?.code;
+
+    async function seedAdmission() {
+      const { companyId, coderId, sourceIssueId } = await seedCompany();
+      const runId = randomUUID();
+      await seedHeartbeatRun({ companyId, agentId: coderId, runId, issueId: sourceIssueId, status: "failed" });
+      await db.update(heartbeatRuns).set({ finishedAt: new Date("2026-05-13T18:30:00.000Z") }).where(eq(heartbeatRuns.id, runId));
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+      const [action] = await db.insert(issueRecoveryActions).values({
+        companyId, sourceIssueId, kind: "active_run_watchdog", status: "resolved", outcome: "blocked",
+        ownerType: "board", returnOwnerAgentId: coderId, cause: "uncertain_external_action", fingerprint: runId,
+        nextAction: "Preserve recorded work without replay.",
+        evidence: { runId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } },
+      }).returning();
+      return { companyId, coderId, sourceIssueId, runId, actionId: action!.id };
+    }
+
+    async function admissionBody(fixture: Awaited<ReturnType<typeof seedAdmission>>, key: string, overrides: Record<string, unknown> = {}) {
+      const [issue] = await db.select().from(issues).where(eq(issues.id, fixture.sourceIssueId));
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
+      const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, fixture.actionId));
+      const expected = buildExpectedReconciliationState({ issue: issue!, run: run!, action: action!,
+        unstartedRunIds: await listUnstartedHoldRunIds(db, fixture.companyId, fixture.sourceIssueId) });
+      return {
+        actionId: fixture.actionId, outcome: "restored", sourceIssueStatus: "todo",
+        executionReconciliation: {
+          runId: fixture.runId, providerStopped: true, actionOutcome: "not_performed",
+          outcomeEvidence: "Provider receipts confirm the action was never submitted; the stopped process has no remaining effects.",
+          admission: {
+            schema: "execution_reconciliation_admission_v1", idempotencyKey: key,
+            expected, expectedDigest: canonicalReconciliationDigest(expected),
+            authorization: { documentId: randomUUID(), revisionId: randomUUID(), revisionNumber: 1, bodyDigest: "b".repeat(64), decisionId: randomUUID() },
+          },
+        },
+        ...overrides,
+      };
+    }
+
+    const admissionApp = () => createApp({ type: "board", source: "local_implicit", userId: "board-user" },
+      { executionReconciliationAdmissionForTests: true });
+    const resolvePath = (issueId: string) => `/api/issues/${issueId}/recovery-actions/resolve`;
+    const snapshot = async (fixture: Awaited<ReturnType<typeof seedAdmission>>) => ({
+      issue: (await db.select().from(issues).where(eq(issues.id, fixture.sourceIssueId)))[0],
+      action: (await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, fixture.actionId)))[0],
+      receipts: await db.select().from(executionReconciliationReceipts),
+      wakes: await db.select().from(agentWakeupRequests),
+      runs: await db.select().from(heartbeatRuns),
+    });
+    const refusals = () => db.select().from(activityLog).where(eq(activityLog.action, "issue.execution_reconciliation_refused"));
+
+    it("admits once, commits the receipt with the action, and replays the same request", async () => {
+      const fixture = await seedAdmission();
+      const body = await admissionBody(fixture, "recon:admit-once-0001");
+      const first = await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(200);
+      expect(first.body.issue.status).toBe("todo");
+      expect(first.body.receipt).toMatchObject({ state: "committed", actionId: fixture.actionId, runId: fixture.runId });
+      const receipts = await db.select().from(executionReconciliationReceipts);
+      expect(receipts).toHaveLength(1);
+      expect(receipts[0]!.result).toMatchObject({ issueStatus: "todo", actionStatus: "resolved", continuationDelivery: "pending" });
+      const after = await snapshot(fixture);
+      const replay = await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(200);
+      expect(replay.body).toMatchObject({ replayed: true, receipt: { id: receipts[0]!.id } });
+      expect(await snapshot(fixture)).toEqual(after);
+    });
+
+    it("refuses a reused key with a different payload, a second key for the action, and a settled key", async () => {
+      const fixture = await seedAdmission();
+      const body = await admissionBody(fixture, "recon:first-admitted-1");
+      await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(200);
+      const before = await snapshot(fixture);
+      const changed = structuredClone(body);
+      changed.executionReconciliation.admission.authorization.decisionId = randomUUID();
+      const conflict = await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(changed).expect(409);
+      expect(refusalCode(conflict.body)).toBe("idempotency_conflict");
+      const otherKey = structuredClone(body);
+      otherKey.executionReconciliation.admission.idempotencyKey = "recon:second-key-0001";
+      const again = await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(otherKey).expect(409);
+      expect(refusalCode(again.body)).toBe("action_already_reconciled");
+      expect(await snapshot(fixture)).toEqual(before);
+      expect((await refusals()).map((row) => (row.details as any).code).sort())
+        .toEqual(["action_already_reconciled", "idempotency_conflict"]);
+
+      const settledFixture = await seedAdmission();
+      const settledKey = "recon:settled-before-1";
+      await request(admissionApp()).post(`/api/issues/${settledFixture.sourceIssueId}/recovery-actions/receipts/${settledKey}/settle`).expect(200);
+      const settled = await request(admissionApp()).post(resolvePath(settledFixture.sourceIssueId))
+        .send(await admissionBody(settledFixture, settledKey)).expect(409);
+      expect(refusalCode(settled.body)).toBe("idempotency_key_settled");
+    });
+
+    it("refuses a changed expected state and leaves the settled hold, issue, wakes and runs untouched", async () => {
+      const fixture = await seedAdmission();
+      const body = await admissionBody(fixture, "recon:stale-expected-1");
+      await db.update(issues).set({ monitorAttemptCount: 1 }).where(eq(issues.id, fixture.sourceIssueId));
+      const before = await snapshot(fixture);
+      const response = await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(409);
+      expect(refusalCode(response.body)).toBe("expected_state_mismatch");
+      expect(JSON.stringify(response.body)).toContain("\"issue\"");
+      // The no-replay hold is not reopened: the refusal rolled back every write.
+      expect(await snapshot(fixture)).toEqual(before);
+      const [refused] = await refusals();
+      expect(refused!.details).toMatchObject({ code: "expected_state_mismatch", idempotencyKey: "recon:stale-expected-1" });
+    });
+
+    it("refuses any non-null executionState and an unfinished source run", async () => {
+      const fixture = await seedAdmission();
+      await db.update(issues).set({ executionState: { status: "changes_requested" } as any }).where(eq(issues.id, fixture.sourceIssueId));
+      const response = await request(admissionApp()).post(resolvePath(fixture.sourceIssueId))
+        .send(await admissionBody(fixture, "recon:review-state-01")).expect(409);
+      expect(refusalCode(response.body)).toBe("execution_state_not_supported");
+
+      const unfinished = await seedAdmission();
+      const body = await admissionBody(unfinished, "recon:unfinished-run-1");
+      await db.update(heartbeatRuns).set({ finishedAt: null }).where(eq(heartbeatRuns.id, unfinished.runId));
+      const refused = await request(admissionApp()).post(resolvePath(unfinished.sourceIssueId)).send(body).expect(409);
+      expect(refusalCode(refused.body)).toBe("run_not_settled");
+      expect(await db.select().from(executionReconciliationReceipts)).toHaveLength(0);
+    });
+
+    it("admits exactly once when identical requests race on the same key", async () => {
+      const fixture = await seedAdmission();
+      const body = await admissionBody(fixture, "recon:concurrent-same-1");
+      const app = admissionApp();
+      const responses = await Promise.all([1, 2, 3].map(() => request(app).post(resolvePath(fixture.sourceIssueId)).send(body)));
+      expect(responses.map((response) => response.status)).toEqual([200, 200, 200]);
+      expect(responses.filter((response) => response.body.replayed === true)).toHaveLength(2);
+      expect(await db.select().from(executionReconciliationReceipts)).toHaveLength(1);
+    });
+
+    it("answers a lost response from the receipt: read returns committed and a retry replays it", async () => {
+      const fixture = await seedAdmission();
+      const key = "recon:lost-response-01";
+      const body = await admissionBody(fixture, key);
+      await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(200);
+      const read = await request(admissionApp()).get(`/api/issues/${fixture.sourceIssueId}/recovery-actions/receipts/${key}`).expect(200);
+      expect(read.body.state).toBe("committed");
+      const settle = await request(admissionApp()).post(`/api/issues/${fixture.sourceIssueId}/recovery-actions/receipts/${key}/settle`).expect(200);
+      expect(settle.body.state).toBe("committed");
+      const retry = await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(200);
+      expect(retry.body.replayed).toBe(true);
+    });
   });
 
   async function seedReconciledDelivery() {
