@@ -144,9 +144,11 @@ function createEmptyRelationReadDb() {
     from: vi.fn().mockReturnThis(),
     where: vi.fn(async () => []),
   };
-  return {
+  const db = {
     select: vi.fn().mockReturnValue(query),
+    transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback(db),
   };
+  return db;
 }
 
 async function createApp(db: unknown = createEmptyRelationReadDb()) {

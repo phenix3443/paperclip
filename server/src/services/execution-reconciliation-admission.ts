@@ -234,7 +234,7 @@ export async function admitExecutionReconciliationGates(
   if (budgetBlock) throw gateClosed("budget", "A budget or pause gate blocks the owner agent.");
 }
 
-export async function admitExecutionReconciliationProcesses(
+export async function assertSourceProcessesAndLeasesStopped(
   tx: DbOrTransaction,
   input: { issue: typeof issues.$inferSelect; decision: ExecutionReconciliation },
 ) {

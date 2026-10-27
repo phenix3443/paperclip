@@ -21,7 +21,7 @@ import {
   lockCompanyForAdmission,
   verifyExecutionReconciliationAuthorization,
 } from "../services/issue-document-decisions.js";
-import { admitExecutionReconciliationGates, admitExecutionReconciliationProcesses, admitExecutionReconciliationRuns, lockAdmissionRows } from "../services/execution-reconciliation-admission.js";
+import { admitExecutionReconciliationGates, assertSourceProcessesAndLeasesStopped, admitExecutionReconciliationRuns, lockAdmissionRows } from "../services/execution-reconciliation-admission.js";
 import { lockAdmissionOwnerAndTreeHolds } from "../services/execution-reconciliation-locks.js";
 import { assertNoCaseHandoffMutation } from "../services/heartbeat/case-handoff-lifecycle.js";
 import { assertLegacyRunTaskOwnership } from "../legacy-run-task-ownership.js";
@@ -2029,7 +2029,7 @@ function buildIssueSubtreeDiagnosticsResponse(input: {
   };
 }
 
-function executionPolicyTransitionIssueInputs(issue: {
+function executionPolicyTransitionInputFingerprint(issue: {
   status: string; assigneeAgentId: string | null; assigneeUserId: string | null;
   responsibleUserId?: string | null; createdByUserId?: string | null;
   executionPolicy?: unknown; executionState?: unknown;
@@ -9815,7 +9815,7 @@ export function issueRoutes(
             issue: lockedIssue, actionId: actionId!, locked: lockedAdmissionRows!,
             unstartedRunIds: admissionCheck.expected.unstartedRunIds,
           });
-          await admitExecutionReconciliationProcesses(tx, { issue: lockedIssue, decision: executionReconciliation! });
+          await assertSourceProcessesAndLeasesStopped(tx, { issue: lockedIssue, decision: executionReconciliation! });
           await admitExecutionReconciliationGates(tx, {
             issue: lockedIssue, action: admissionCheck.expected.action, locked: lockedAdmissionRows!,
             expected: admissionCheck.expected,
@@ -14410,13 +14410,17 @@ export function issueRoutes(
         monitorExplicitlyUpdated:
           req.body.executionPolicy !== undefined && monitorChanged,
       });
-      const executionPolicyTransitionInputs = executionPolicyTransitionIssueInputs(existing);
-      const executionPolicyTransitionGuarded =
-        expectedStatusVersion === undefined && (Object.keys(transition.patch).length > 0 || Boolean(transition.decision));
+      const executionPolicyTransitionFingerprint = executionPolicyTransitionInputFingerprint(existing);
+      const governedByExecutionPolicy = (row: { executionPolicy?: unknown; executionState?: unknown }) =>
+        row.executionPolicy != null || row.executionState != null;
+      const executionPolicyTransitionGuarded = expectedStatusVersion === undefined &&
+        (Object.keys(transition.patch).length > 0 || Boolean(transition.decision) || governedByExecutionPolicy(existing));
       const assertLockedExecutionPolicyTransitionUnchanged = async (tx: Parameters<typeof svc.update>[2]) => {
         const lockedExisting = await svc.getByIdForUpdate(id, tx);
         if (!lockedExisting) return;
-        if (executionPolicyTransitionIssueInputs(lockedExisting) !== executionPolicyTransitionInputs) {
+        if (executionPolicyTransitionInputFingerprint(lockedExisting) === executionPolicyTransitionFingerprint) return;
+        if (Object.keys(transition.patch).length > 0 || Boolean(transition.decision) ||
+            governedByExecutionPolicy(existing) || governedByExecutionPolicy(lockedExisting)) {
           throw conflict("The task changed while this update was prepared. Refresh and retry.",
             { code: "execution_policy_transition_stale" });
         }

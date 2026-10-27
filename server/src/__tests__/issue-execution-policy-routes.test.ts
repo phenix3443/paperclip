@@ -819,6 +819,62 @@ describe("issue execution policy routes", () => {
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
+  it("refuses an edit of a policy-governed task whose policy changed under the lock, and lets an ungoverned edit through", async () => {
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [
+        {
+          id: "11111111-1111-4111-8111-111111111111",
+          type: "review",
+          participants: [{ type: "agent", agentId: "44444444-4444-4444-8444-444444444444" }],
+        },
+      ],
+    })!;
+    const otherPolicy = normalizeIssueExecutionPolicy({
+      stages: [
+        {
+          id: "22222222-2222-4222-8222-222222222222",
+          type: "review",
+          participants: [{ type: "agent", agentId: "66666666-6666-4666-8666-666666666666" }],
+        },
+      ],
+    })!;
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1010",
+      title: "Policy changed concurrently",
+      executionPolicy: policy,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.getByIdForUpdate.mockResolvedValue({ ...issue, executionPolicy: otherPolicy });
+    const app = await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+    });
+
+    const stale = await request(app).patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").send({ title: "Renamed" });
+    expect(stale.status).toBe(409);
+    expect(stale.body).toMatchObject({ details: { code: "execution_policy_transition_stale" } });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+
+    const ungoverned = { ...issue, executionPolicy: null };
+    mockIssueService.getById.mockResolvedValue(ungoverned);
+    mockIssueService.getByIdForUpdate.mockResolvedValue({ ...ungoverned, status: "blocked" });
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...ungoverned, ...patch, updatedAt: new Date(),
+    }));
+    const unrelated = await request(app).patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").send({ title: "Renamed" });
+    expect(unrelated.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+  });
+
   it("allows an agent-authored in_review transition with a scheduled monitor", async () => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
