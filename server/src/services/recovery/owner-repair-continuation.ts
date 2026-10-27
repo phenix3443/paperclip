@@ -43,37 +43,16 @@ export type OwnerRepairSettlement = {
   deliveredRunId?: string | null;
   deniedReason?: string | null;
   /** Latest temporary refusal; it never consumes the reserved receipt. */
-  lastWait?: { reason: string; at: string } | null;
-  /** Version moves accepted after a recorded wait resolved; the audit trail of each rebind. */
-  rebinds?: OwnerRepairRebind[];
+  lastWait?: OwnerRepairWait | null;
 };
 
-export type OwnerRepairRebind = {
-  fromStatusVersion: number;
-  toStatusVersion: number;
-  fromStatusDecisionId: string | null;
-  toStatusDecisionId: string | null;
-  waitReason: string;
+export type OwnerRepairWait = {
+  reason: string;
+  message?: string | null;
   at: string;
+  statusVersion?: number;
+  statusDecisionId?: string | null;
 };
-
-/**
- * A reserved continuation may follow the issue to a new version only after a
- * recorded wait: the same owner still holds an open task, and the responsible
- * human, workspace binding and execution stage are unchanged.
- */
-export function ownerRepairRebindAllowed(
-  settlement: OwnerRepairSettlement,
-  issue: { assigneeAgentId: string | null; status: string; statusVersion: number } & Parameters<typeof ownerRepairIssueBinding>[0],
-) {
-  if (!settlement.lastWait || issue.statusVersion === settlement.expectedIssueStatusVersion) return false;
-  if (issue.assigneeAgentId !== settlement.ownerAgentId || !["todo", "in_progress"].includes(issue.status)) return false;
-  const current = ownerRepairIssueBinding(issue);
-  const bound = settlement.issueBinding;
-  return current.responsibleUserId === bound.responsibleUserId
-    && current.workspaceBindingRevision === bound.workspaceBindingRevision
-    && current.executionStageId === bound.executionStageId;
-}
 
 /** Queue admission request for one reserved owner-repair continuation. */
 export type OwnerRepairContinuationRequest = {
