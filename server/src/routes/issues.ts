@@ -194,6 +194,7 @@ import { isUniqueViolation } from "../db-errors.js";
 import {
   CROSS_TASK_CONTINUATION_MESSAGES,
   CrossTaskContinuationRefusal,
+  type CrossTaskContinuationCommitDeps,
   classifyIssueExecutionWorkspaceBinding,
   isSuccessorReopenableWorkspace,
   commitCrossTaskContinuation,
@@ -6881,6 +6882,40 @@ export function issueRoutes(
     return false;
   }
 
+  // Runs the comment route's access decisions again for a cross-task
+  // continuation, against the issue row its transaction has locked. The gates
+  // write their refusal into a capture, so the caller can return exactly what a
+  // fresh request would get. None of these gates writes anything.
+  async function reauthorizeCrossTaskContinuation(
+    req: Request,
+    lockedIssue: Parameters<CrossTaskContinuationCommitDeps["reauthorize"]>[0],
+    resumeRequested: boolean,
+  ): Promise<{ status: number; body: { error?: string; details?: Record<string, unknown> } } | null> {
+    const refusal = { status: 500, body: {} as { error?: string; details?: Record<string, unknown> } };
+    const capture = {
+      status(code: number) { refusal.status = code; return capture; },
+      json(body: { error?: string; details?: Record<string, unknown> }) { refusal.body = body; return capture; },
+    } as unknown as Response;
+    const commentDecision = await assertAgentIssueCommentAllowed(req, capture, lockedIssue);
+    if (!commentDecision) return refusal;
+    const nonAssignee = req.actor.type === "agent"
+      && lockedIssue.assigneeAgentId !== null
+      && lockedIssue.assigneeAgentId !== req.actor.agentId;
+    // The same rule that turns a cross-task resume into a plain comment.
+    if (isClosedIssueStatus(lockedIssue.status) && nonAssignee
+      && (isDirectParentReportDecision(commentDecision) || isIssueMentionGrantDecision(commentDecision))) {
+      return { status: 409, body: { error: "Issue access changed; retry the follow-up" } };
+    }
+    if (isClosedIssueStatus(lockedIssue.status) && nonAssignee
+      && !(await assertAgentIssueMutationAllowed(req, capture, lockedIssue, { allowVisibleIssueWrite: true }))) {
+      return refusal;
+    }
+    if (!(await assertExplicitResumeIntentAllowed(req, capture, lockedIssue, resumeRequested ? { resumeIntent: true } : {}))) {
+      return refusal;
+    }
+    return null;
+  }
+
   async function assertExplicitResumeIntentAllowed(
     req: Request,
     res: Response,
@@ -7922,6 +7957,7 @@ export function issueRoutes(
         getActivePauseHold: (companyId, issueId) => treeControlSvc.getActivePauseHoldGate(companyId, issueId),
         getUnresolvedBlockerCount: async (issueId, tx) =>
           (await svc.getDependencyReadiness(issueId, tx)).unresolvedBlockerCount,
+        reauthorize: (lockedIssue) => reauthorizeCrossTaskContinuation(req, lockedIssue, input.resumeRequested),
         beforeCommit: crossTaskContinuationTestHooks.beforeCommit,
       });
     } catch (error) {
@@ -18771,6 +18807,9 @@ export function issueRoutes(
               attachmentIds: req.body.attachmentIds,
             })
           : null;
+      // A replay returns a stored comment and receipt, so it needs read access to
+      // the task now. The write gates that can change after the commit stay below.
+      if (crossTaskRequestDigest && !(await assertIssueReadAllowed(req, res, issue))) return;
       if (crossTaskRequestDigest && (await respondWithCrossTaskContinuationReplay(
         req, res, issue, crossTaskRequestDigest,
       ))) return;

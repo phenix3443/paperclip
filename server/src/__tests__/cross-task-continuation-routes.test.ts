@@ -539,4 +539,44 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(after.intents).toHaveLength(0);
     expect(after.issue.status).toBe("done");
   });
+
+  // A low-trust boundary that excludes the target's project, so this agent can no longer read it.
+  async function restrictTarget(targetIssueId: string) {
+    const [target] = await db.select({ companyId: issues.companyId }).from(issues).where(eq(issues.id, targetIssueId));
+    await db.update(issues).set({ executionPolicy: { trustPreset: "low_trust_review", authorizationPolicy: { trustBoundary: {
+      mode: "low_trust_review", companyId: target!.companyId, projectIds: [] } } } }).where(eq(issues.id, targetIssueId));
+  }
+
+  it("R0 needs read access now: a replay after the target became unreadable gets the same refusal as a fresh request", async () => {
+    await setFeature(true);
+    const f = await fixture();
+    const request1 = { body: "Continue", resume: true, clientRequestId: randomUUID() };
+    expect((await post(f.app, f.targetIssueId, request1)).status).toBe(201);
+    await restrictTarget(f.targetIssueId);
+    const fresh = await post(f.app, f.targetIssueId, { ...request1, clientRequestId: randomUUID() });
+    const replay = await post(f.app, f.targetIssueId, request1);
+    expect(fresh.status).toBe(404);
+    expect(replay.status).toBe(fresh.status);
+    expect(replay.body).toEqual(fresh.body);
+    expect(replay.body).not.toHaveProperty("replayed");
+  });
+
+  it("D4 re-runs the access decisions on the locked row: a policy committed before the transaction refuses like a fresh request, with no writes", async () => {
+    await setFeature(true);
+    const control = await fixture();
+    await restrictTarget(control.targetIssueId);
+    const freshRefusal = await post(control.app, control.targetIssueId, { body: "Continue", resume: true, clientRequestId: randomUUID() });
+
+    const f = await fixture();
+    const before = await snapshot(f.targetIssueId, f.workspaceId);
+    crossTaskContinuationTestHooks.beforeTransaction = async () => { await restrictTarget(f.targetIssueId); };
+    const res = await post(f.app, f.targetIssueId, { body: "Continue", resume: true, clientRequestId: randomUUID() });
+    expect(res.status, JSON.stringify(res.body)).toBe(freshRefusal.status);
+    expect(res.body).toEqual(freshRefusal.body);
+    const after = await snapshot(f.targetIssueId, f.workspaceId);
+    expect(after.comments).toHaveLength(0);
+    expect(after.intents).toHaveLength(0);
+    expect(after.issue.status).toBe(before.issue.status);
+    expect(after.workspace).toEqual(before.workspace);
+  });
 });

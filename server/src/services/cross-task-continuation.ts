@@ -267,6 +267,15 @@ export type CrossTaskContinuationCommitDeps = {
   logIssueReopened: (tx: Transaction, input: { reopenedFrom: string }) => Promise<void>;
   getActivePauseHold: (companyId: string, issueId: string) => Promise<unknown | null>;
   getUnresolvedBlockerCount: (issueId: string, tx: Transaction) => Promise<number>;
+  /**
+   * D4: the route's own read, comment, mutation and resume-intent decisions,
+   * run again against the locked issue row. Returns the refusal a fresh request
+   * would get, or null. It writes nothing and does not spend the run cap again.
+   */
+  reauthorize: (issue: typeof issues.$inferSelect) => Promise<{
+    status: number;
+    body: { error?: string; details?: Record<string, unknown> };
+  } | null>;
   /** Test seam: runs after the comment insert and before commit. */
   beforeCommit?: (tx: Transaction) => Promise<void>;
 };
@@ -312,6 +321,14 @@ export async function commitCrossTaskContinuation(
 
       // D4: re-check the gates against the locked rows.
       if (!issue) throw new CrossTaskContinuationRefusal(404, "Issue not found");
+      const accessRefusal = await deps.reauthorize(issue);
+      if (accessRefusal) {
+        throw new CrossTaskContinuationRefusal(
+          accessRefusal.status,
+          accessRefusal.body.error ?? "Forbidden",
+          accessRefusal.body.details,
+        );
+      }
       if (issue.assigneeAgentId !== input.admitted.assigneeAgentId) {
         throw new CrossTaskContinuationRefusal(409, CROSS_TASK_CONTINUATION_MESSAGES.assigneeChanged);
       }
