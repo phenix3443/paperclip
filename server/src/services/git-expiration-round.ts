@@ -36,7 +36,7 @@ export type GitExpirationRoundRow = {
 };
 
 export type GitExpirationRoundStatus = "complete" | "partial";
-export type GitExpirationRoundStopReason = "lock_busy" | "aborted" | "deadline" | "row_budget" | null;
+export type GitExpirationRoundStopReason = "lock_busy" | "aborted" | "deadline" | "row_budget" | "evidence_lost" | null;
 
 export type GitExpirationRoundSummary = {
   roundId: string;
@@ -86,7 +86,8 @@ const ROUND_LIMITS = [
 ];
 
 const LIVE_STATUSES = ["active", "idle", "in_review"];
-const PENDING_EXPIRATION = sql`${executionWorkspaces.metadata}->'gitCacheExpiration'->>'completed' = 'false'`;
+const PENDING_EXPIRATION = sql`(${executionWorkspaces.metadata}->'gitCacheExpiration'->>'schema' = 'paperclip.git-cache-expiration.v1'
+  AND ${executionWorkspaces.metadata}->'gitCacheExpiration'->>'completed' = 'false')`;
 
 /** The rows the recurring sweep hands to Git expiration, as one SQL predicate. */
 export function gitExpirationRoundCandidateFilter() {
@@ -144,15 +145,21 @@ export async function inspectGitExpirationRound(db: Db, options: GitExpirationRo
     return null;
   };
 
+  // A journal that cannot record an event ends the round partial instead of continuing unrecorded.
+  let evidenceLost = false;
+  const record = async (event: GitExpirationRoundEvent) => {
+    try { await options.journal.append(event); return true; } catch { evidenceLost = true; return false; }
+  };
+
   const [clock] = await db.execute<{ upper_bound: string }>(sql`select clock_timestamp()::text as upper_bound`);
   const upperBound = clock!.upper_bound;
   const summary: GitExpirationRoundSummary = { roundId: options.roundId, status: "partial", stopReason: null, upperBound,
     exhausted: false, pages: 0, selected: 0, inspected: 0, candidates: 0, rejected: 0, lockBusy: 0, candidateBytes: 0,
     lastSelectedKey: null, lastCompletedKey: null, limits: ROUND_LIMITS };
-  await options.journal.append({ type: "round_started", roundId: options.roundId, upperBound, mode: options.mode, pageSize,
+  const started = await record({ type: "round_started", roundId: options.roundId, upperBound, mode: options.mode, pageSize,
     companyId: options.companyId ?? null, maxRows: options.maxRows ?? null, deadline: options.deadline?.toISOString() ?? null });
 
-  scan: while (true) {
+  scan: while (started) {
     summary.stopReason = stopReason();
     if (summary.stopReason) break;
     const cursor = summary.lastSelectedKey;
@@ -168,7 +175,7 @@ export async function inspectGitExpirationRound(db: Db, options: GitExpirationRo
       .limit(pageSize);
     const keys = page.map(entry => ({ updatedAt: entry.updatedAtKey, id: entry.workspace.id }));
     summary.pages += 1;
-    await options.journal.append({ type: "page_selected", page: summary.pages, keys });
+    if (!await record({ type: "page_selected", page: summary.pages, keys })) break;
     summary.selected += page.length;
     if (keys.length) summary.lastSelectedKey = keys.at(-1)!;
     // Only an empty or short page proves the bounded set is exhausted.
@@ -185,7 +192,7 @@ export async function inspectGitExpirationRound(db: Db, options: GitExpirationRo
         if (summary.stopReason) break scan;
         throw error;
       }
-      await options.journal.append({ type: "row_inspected", ...row });
+      if (!await record({ type: "row_inspected", ...row })) break scan;
       summary.inspected += 1;
       summary.lastCompletedKey = row.key;
       if (row.outcome === "candidate") { summary.candidates += 1; summary.candidateBytes += row.candidateBytes; }
@@ -199,7 +206,11 @@ export async function inspectGitExpirationRound(db: Db, options: GitExpirationRo
     if (lastPage) { summary.exhausted = true; break; }
   }
 
+  if (evidenceLost) summary.stopReason = "evidence_lost";
   summary.status = summary.exhausted && !summary.stopReason && summary.inspected === summary.selected ? "complete" : "partial";
-  await options.journal.append({ type: "round_finished", ...summary });
+  if (!await record({ type: "round_finished", ...summary }) && summary.status === "complete") {
+    summary.stopReason = "evidence_lost";
+    summary.status = "partial";
+  }
   return summary;
 }

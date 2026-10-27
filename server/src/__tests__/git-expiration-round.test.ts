@@ -137,6 +137,30 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
     });
   });
 
+  it("ends partial on abort or an expired deadline before selecting", async () => {
+    await seed(1);
+    const aborted = new AbortController();
+    aborted.abort();
+    expect(await inspectGitExpirationRound(db, { mode: GIT_EXPIRATION_ROUND_MODE, roundId: "r-abort", journal: memoryJournal(), signal: aborted.signal }))
+      .toMatchObject({ status: "partial", stopReason: "aborted", pages: 0, selected: 0 });
+    expect(await inspectGitExpirationRound(db, { mode: GIT_EXPIRATION_ROUND_MODE, roundId: "r-deadline", journal: memoryJournal(), deadline: new Date(Date.now() - 1000) }))
+      .toMatchObject({ status: "partial", stopReason: "deadline", pages: 0, selected: 0 });
+  });
+
+  it("ends partial when evidence cannot be recorded", async () => {
+    const f = await seed(2);
+    const journal = memoryJournal(async event => { if (event.type === "row_inspected") throw new Error("disk full"); });
+    const summary = await round(journal, { companyId: f.companyId });
+    expect(summary).toMatchObject({ status: "partial", stopReason: "evidence_lost", inspected: 0, lastCompletedKey: null });
+    expect(summary.lastSelectedKey?.id).toBe(f.ids[1]);
+  });
+
+  it("leaves rows updated after the upper bound to a later round", async () => {
+    const f = await seed(1);
+    await db.update(executionWorkspaces).set({ updatedAt: new Date(Date.now() + 3_600_000) }).where(eq(executionWorkspaces.id, f.ids[0]!));
+    expect(await round(memoryJournal(), { companyId: f.companyId })).toMatchObject({ status: "complete", selected: 0 });
+  });
+
   it("ends partial when the row budget is spent", async () => {
     const f = await seed(3);
     const summary = await round(memoryJournal(), { companyId: f.companyId, maxRows: 1 });
