@@ -1,8 +1,26 @@
 import { taskInterruptionPresentation, taskInterruptionPresentations } from "../services/task-interruption-presentation.js";
 import { parseObject } from "../adapters/utils.js";
 import { prepareRestrictedWorkspaceRetry } from "../services/restricted-workspace-retry.js";
-import { issueSummariesQuerySchema, type IssueSummary } from "@paperclipai/shared";
+import { executionReconciliationIdempotencyKeySchema, issueSummariesQuerySchema, type ExecutionReconciliationAdmission, type IssueSummary } from "@paperclipai/shared";
 import { listIssueSummaries } from "../services/issue-summaries.js";
+import { ReconciliationCanonicalError } from "@paperclipai/shared/execution-reconciliation-canonical";
+import {
+  checkExecutionReconciliationAdmission,
+  executionReconciliationRefusal,
+  executionReconciliationRequestDigest,
+  insertCommittedReconciliationReceipt,
+  lockReconciliationKey,
+  readReconciliationReceipt,
+  selectReconciliationReceipt,
+  settleReconciliationKey,
+  toExecutionReconciliationRefusal,
+  type ExecutionReconciliationReceiptRow,
+} from "../services/execution-reconciliation-receipts.js";
+import {
+  createIssueDocumentDecision,
+  lockCompanyForAdmission,
+  verifyExecutionReconciliationAuthorization,
+} from "../services/issue-document-decisions.js";
 import { assertNoCaseHandoffMutation } from "../services/heartbeat/case-handoff-lifecycle.js";
 import { assertLegacyRunTaskOwnership } from "../legacy-run-task-ownership.js";
 import { enqueueFastResponse } from "../services/fast-responses.js";
@@ -101,6 +119,7 @@ import {
   createIssueSchema,
   resolveCreateIssueStatusDefault,
   resolveIssueRecoveryActionSchema,
+  createIssueDocumentDecisionSchema,
   retryWorkspaceExportSchema,
   recoverWorkspaceSchema,
   taskRetrySchema,
@@ -3387,6 +3406,7 @@ export function issueRoutes(
       options: Parameters<ReturnType<typeof heartbeatService>["wakeup"]>[1],
     ) => ReturnType<ReturnType<typeof heartbeatService>["wakeup"]>;
     issueListDiagnostics?: IssueListDiagnostics;
+    executionReconciliationAdmissionForTests?: boolean;
     declineToolActionRequest?: (input: {
       companyId: string;
       issueId?: string;
@@ -9778,11 +9798,61 @@ export function issueRoutes(
     res.status(202).json(receipt);
   });
 
+  const loadReconciliationReceiptScope = async (req: Request, res: Response) => {
+    assertBoard(req);
+    const parsedKey = executionReconciliationIdempotencyKeySchema.safeParse(req.params.key);
+    if (!parsedKey.success) throw badRequest("Invalid idempotency key");
+    const existing = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+    if (!existing) return null;
+    if (!(await assertIssueReadAllowed(req, res, existing))) return null;
+    return { issue: existing, idempotencyKey: parsedKey.data };
+  };
+
+  router.get("/issues/:id/recovery-actions/receipts/:key", async (req, res) => {
+    const scope = await loadReconciliationReceiptScope(req, res);
+    if (!scope) return;
+    const lookup = await readReconciliationReceipt(db, {
+      companyId: scope.issue.companyId, issueId: scope.issue.id, idempotencyKey: scope.idempotencyKey,
+    });
+    res.json(lookup);
+  });
+
+  router.post("/issues/:id/recovery-actions/receipts/:key/settle", async (req, res) => {
+    const scope = await loadReconciliationReceiptScope(req, res);
+    if (!scope) return;
+    const actor = getActorInfo(req);
+    const publications: ActivityPublication[] = [];
+    const result = await settleReconciliationKey(db, {
+      companyId: scope.issue.companyId, issueId: scope.issue.id, idempotencyKey: scope.idempotencyKey,
+      actorUserId: req.actor.userId ?? null,
+      recordSettlement: (tx) => logActivity(tx as unknown as Db, {
+        companyId: scope.issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.execution_reconciliation_key_settled",
+        entityType: "issue",
+        entityId: scope.issue.id,
+        issueId: scope.issue.id,
+        details: { idempotencyKey: scope.idempotencyKey, state: "abandoned" },
+      }, publications),
+    });
+    for (const publication of publications) publishActivity(publication);
+    const { settledNow: _settledNow, ...lookup } = result;
+    res.json(lookup);
+  });
+
   router.post(
     "/issues/:id/recovery-actions/resolve",
     validate(resolveIssueRecoveryActionSchema),
     async (req, res) => {
       const id = req.params.id as string;
+      const admission = req.body?.executionReconciliation?.admission as ExecutionReconciliationAdmission | undefined;
+      if (admission && !opts.executionReconciliationAdmissionForTests) {
+        res.status(400).json({ error: "Execution reconciliation admission is not supported", code: "capability_unsupported" });
+        return;
+      }
       const existing = await getAccessibleResource(
         req,
         res,
@@ -9848,7 +9918,45 @@ export function issueRoutes(
       const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
       const postCommitActivityPublications: ActivityPublication[] = [];
       const postCommitIssueActions: IssuePostCommitAction[] = [];
-      const result = await db.transaction(async (tx) => {
+      let admissionRequestDigest: string | null = null;
+      const refuseAdmission = async (error: unknown): Promise<never> => {
+        const refusal = toExecutionReconciliationRefusal(error) ??
+          (error instanceof HttpError && error.status >= 400 && error.status < 500
+            ? { code: String((error.details as { code?: unknown } | undefined)?.code ?? `http_${error.status}`), error }
+            : null);
+        if (!refusal || !admission) throw error;
+        await logActivity(db, {
+          companyId: existing.companyId, actorType: actor.actorType, actorId: actor.actorId,
+          agentId: actor.agentId, runId: actor.runId,
+          action: "issue.execution_reconciliation_refused", entityType: "issue", entityId: existing.id,
+          issueId: existing.id,
+          details: { code: refusal.code, requestDigest: admissionRequestDigest,
+            expectedDigest: admission.expectedDigest, idempotencyKey: admission.idempotencyKey },
+        }).catch((auditError: unknown) => {
+          logger.warn({ err: auditError, issueId: existing.id }, "failed to record execution reconciliation refusal");
+        });
+        throw refusal.error;
+      };
+      if (admission) {
+        try {
+          admissionRequestDigest = executionReconciliationRequestDigest(req.body, (req as Request & { rawBody?: Buffer }).rawBody);
+        } catch (error) {
+          await refuseAdmission(error instanceof ReconciliationCanonicalError
+            ? badRequest(error.message)
+            : error);
+        }
+      }
+      const runResolveTransaction = () => db.transaction(async (tx) => {
+        let priorReceipt: ExecutionReconciliationReceiptRow | undefined;
+        let admissionCompany: Awaited<ReturnType<typeof lockCompanyForAdmission>> | null = null;
+        let authorizationPayloadDigest: string | null = null;
+        let authorizationEvidence: Record<string, unknown> | null = null;
+        if (admission) {
+          assertBoard(req);
+          await lockReconciliationKey(tx, existing.companyId, admission.idempotencyKey);
+          admissionCompany = await lockCompanyForAdmission(tx, existing.companyId);
+          priorReceipt = await selectReconciliationReceipt(tx, existing.companyId, admission.idempotencyKey);
+        }
         const lockedIssue = await tx
           .select()
           .from(issueRows)
@@ -9861,6 +9969,21 @@ export function issueRoutes(
           .for("update")
           .then((rows) => rows[0] ?? null);
         if (!lockedIssue) throw notFound("Issue not found");
+        let admissionCheck: Awaited<ReturnType<typeof checkExecutionReconciliationAdmission>> | null = null;
+        if (admission) {
+          admissionCheck = await checkExecutionReconciliationAdmission(tx, {
+            issue: lockedIssue, actionId: actionId!, runId: executionReconciliation!.runId,
+            admission, requestDigest: admissionRequestDigest!, priorReceipt,
+          });
+          if (admissionCheck.kind === "replay") {
+            return { issue: lockedIssue, recoveryAction: admissionCheck.action, replayed: true, receipt: admissionCheck.receipt };
+          }
+          ({ payloadDigest: authorizationPayloadDigest, evidence: authorizationEvidence } = await verifyExecutionReconciliationAuthorization(tx, {
+            companyId: lockedIssue.companyId, issueId: lockedIssue.id, actionId: actionId!,
+            runId: executionReconciliation!.runId, authority: admissionCompany!.executionReconciliationAuthority,
+            admission, expectedDigest: admissionCheck.expectedDigest, request: req.body,
+          }));
+        }
         // Reconciling a reviewer run keeps the task in review; no status change is requested.
         const pendingReviewResume =
           outcome === "restored" &&
@@ -9891,6 +10014,7 @@ export function issueRoutes(
           actionId ? eq(issueRecoveryActions.id, actionId) : inArray(issueRecoveryActions.status, ["active", "escalated"]),
         )).limit(1).for("update");
         if (workspaceRepairAction && hasRequiredWorkspaceRecovery(workspaceRepairAction.evidence)) {
+          if (admission) throw executionReconciliationRefusal("gate_closed:workspace", "Workspace repair is not an admission hand-back.");
           assertBoard(req);
           await requireRecoveryActionAuthority(req, lockedIssue, issueRecoveryActionReadModel(workspaceRepairAction),
             { source: "recovery_action_resolution" });
@@ -9962,6 +10086,7 @@ export function issueRoutes(
                 .returning();
               activeRecoveryAction = issueRecoveryActionReadModel(reopened!);
             } else {
+              if (admission) throw executionReconciliationRefusal("action_already_reconciled", "The recovery action is already settled.");
               return {
                 issue: lockedIssue,
                 recoveryAction: settled,
@@ -10191,10 +10316,12 @@ export function issueRoutes(
         if (executionReconciliation) {
           // The authorized chat retry is the sole durable delivery owner.
           // Never also enqueue a generic successor that lacks chat provenance.
+          const reconciliationDecision: typeof executionReconciliation & { authorizationPayloadDigest?: string } =
+            authorizationPayloadDigest ? { ...executionReconciliation, authorizationPayloadDigest } : executionReconciliation;
           await markExecutionReconciliation(
             tx as unknown as Db,
             activeRecoveryAction,
-            executionReconciliation,
+            reconciliationDecision,
             actor.actorId,
             chatRetry
               ? { kind: "chat_failed_run_retry", actionId: chatRetry.actionId }
@@ -10369,8 +10496,42 @@ export function issueRoutes(
         );
         if (!recoveryAction) throw notFound("Active recovery action not found");
 
-        return { issue, recoveryAction, chatRetry };
+        let receipt: ExecutionReconciliationReceiptRow | undefined;
+        if (admission && admissionCheck?.kind === "admit") {
+          receipt = await insertCommittedReconciliationReceipt(tx, {
+            companyId: lockedIssue.companyId,
+            issueId: lockedIssue.id,
+            actionId: recoveryAction.id,
+            runId: executionReconciliation!.runId,
+            idempotencyKey: admission.idempotencyKey,
+            requestDigest: admissionRequestDigest,
+            expectedDigest: admissionCheck.expectedDigest,
+            expectedSnapshot: admissionCheck.expected as unknown as Record<string, unknown>,
+            authorizationRevisionId: admission.authorization.revisionId,
+            authorizationDecisionId: admission.authorization.decisionId,
+            authorizationBodySha256: admission.authorization.bodyDigest,
+            authorizationPayloadDigest,
+            authorizationEvidence,
+            result: {
+              issueStatus: issue.status,
+              statusVersion: issue.statusVersion,
+              actionStatus: recoveryAction.status,
+              actionOutcome: recoveryAction.outcome,
+              continuationDelivery: (recoveryAction.evidence as Record<string, unknown>).continuationDelivery ?? null,
+            },
+            actorUserId: actor.actorType === "user" ? actor.actorId : null,
+          });
+        }
+
+        return { issue, recoveryAction, chatRetry, receipt };
       });
+      const result = admission
+        ? await runResolveTransaction().catch(refuseAdmission)
+        : await runResolveTransaction();
+      if ("receipt" in result && result.replayed && result.receipt) {
+        res.json({ issue: result.issue, recoveryAction: result.recoveryAction, receipt: result.receipt, replayed: true });
+        return;
+      }
       if (result.replayed) {
         res.json({
           issue: "workspaceRepairOnly" in result
@@ -10490,6 +10651,7 @@ export function issueRoutes(
             : null,
         },
         recoveryAction: result.recoveryAction,
+        ...("receipt" in result && result.receipt ? { receipt: result.receipt } : {}),
       });
     },
   );
@@ -11198,6 +11360,61 @@ export function issueRoutes(
 
     res.json(result.document);
   });
+
+  router.post(
+    "/issues/:id/documents/:key/decisions",
+    validate(createIssueDocumentDecisionSchema),
+    async (req, res) => {
+      const issue = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+      if (!issue) return;
+      if (!(await assertIssueReadAllowed(req, res, issue))) return;
+      if (await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)) return;
+      if (req.actor.type === "agent" && !requireAgentRunId(req, res)) return;
+      const keyParsed = issueDocumentKeySchema.safeParse(String(req.params.key ?? "").trim().toLowerCase());
+      if (!keyParsed.success) {
+        res.status(400).json({ error: "Invalid document key", details: keyParsed.error.issues });
+        return;
+      }
+      const actor = getActorInfo(req);
+      const publications: ActivityPublication[] = [];
+      const decision = await createIssueDocumentDecision(db, {
+        companyId: issue.companyId,
+        issueId: issue.id,
+        key: keyParsed.data,
+        request: req.body,
+        actor: {
+          agentId: actor.agentId ?? null,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+          runId: actor.runId ?? null,
+        },
+        recordDecision: (tx, row) => logActivity(tx as unknown as Db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "issue.document_decision_recorded",
+          entityType: "issue",
+          entityId: issue.id,
+          issueId: issue.id,
+          details: {
+            key: keyParsed.data,
+            decisionId: row.id,
+            documentId: row.documentId,
+            revisionId: row.revisionId,
+            revisionNumber: row.revisionNumber,
+            scope: row.scope,
+            outcome: row.outcome,
+            revokesDecisionId: row.revokesDecisionId,
+            expiresAt: row.expiresAt,
+          },
+        }, publications),
+      });
+      for (const publication of publications) publishActivity(publication);
+      res.status(201).json(decision);
+    },
+  );
 
   router.post("/issues/:id/documents/:key/unlock", async (req, res) => {
     const id = req.params.id as string;

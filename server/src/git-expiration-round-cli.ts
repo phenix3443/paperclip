@@ -130,19 +130,26 @@ export async function runGitExpirationRoundCli(argv: string[], env: NodeJS.Proce
   const journal = await openGitExpirationRoundJournal(args.evidenceDir);
   const controller = new AbortController();
   const abort = () => controller.abort();
-  process.once("SIGINT", abort);
-  process.once("SIGTERM", abort);
+  process.on("SIGINT", abort);
+  process.on("SIGTERM", abort);
+  let undrained: Promise<void> | undefined;
   try {
-    const summary = await inspectGitExpirationRound({
-      databaseUrl: args.databaseUrl, mode: GIT_EXPIRATION_ROUND_MODE, roundId: args.roundId, journal, companyId: args.companyId, signal: controller.signal,
-      maxRows: args.maxRows, deadline: args.deadlineSeconds ? new Date(Date.now() + args.deadlineSeconds * 1000) : undefined,
-    });
-    process.stdout.write(`${JSON.stringify(summary)}\n`);
+    let summary;
+    try {
+      summary = await inspectGitExpirationRound({
+        databaseUrl: args.databaseUrl, mode: GIT_EXPIRATION_ROUND_MODE, roundId: args.roundId, journal, companyId: args.companyId, signal: controller.signal,
+        maxRows: args.maxRows, deadline: args.deadlineSeconds ? new Date(Date.now() + args.deadlineSeconds * 1000) : undefined,
+        onUndrainedRow: released => { undrained = released.catch(() => undefined); },
+      });
+      process.stdout.write(`${JSON.stringify(summary)}\n`);
+    } finally {
+      await journal.close();
+    }
     return gitExpirationRoundExitCode(summary);
   } finally {
+    await undrained;
     process.off("SIGINT", abort);
     process.off("SIGTERM", abort);
-    await journal.close();
   }
 }
 

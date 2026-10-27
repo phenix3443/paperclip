@@ -40,6 +40,7 @@ import {
   REQUEST_ITEM_VERDICTS_ITEM_LIMIT,
 } from "../constants.js";
 import { multilineTextSchema } from "./text.js";
+import { executionReconciliationAdmissionSchema } from "./execution-reconciliation-admission.js";
 import {
   lowTrustReviewPresetPolicySchema,
   trustAuthorizationPolicySchema,
@@ -617,6 +618,7 @@ export const resolveIssueRecoveryActionSchema = z
         actionOutcome: z.enum(["completed", "not_performed", "mixed"]),
         outcomeEvidence: z.string().trim().min(20).max(12000),
         workspaceRepairEvidence: z.string().trim().min(20).max(12000).optional(),
+        admission: executionReconciliationAdmissionSchema.optional(),
       })
       .strict()
       .optional(),
@@ -627,6 +629,13 @@ export const resolveIssueRecoveryActionSchema = z
   })
   .strict()
   .superRefine((value, ctx) => {
+    if (value.executionReconciliation?.admission && (value.workspaceBaseRef || !value.actionId)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["executionReconciliation", "admission"],
+        message: "Admission requires the exact actionId and no workspaceBaseRef",
+      });
+    }
     if (value.workspaceBaseRef && (!value.actionId || value.outcome !== "restored" || value.sourceIssueStatus !== "todo" || value.executionReconciliation)) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["workspaceBaseRef"], message: "Branch repair must retry the exact recovery action" });
     }

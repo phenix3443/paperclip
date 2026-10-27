@@ -14,6 +14,7 @@ import { isRuntimeOwnedGitBranch } from "./execution-workspace-branch-ownership.
 import { recordedIsolatedRemoteSource, verifiedRecordedIsolatedRemoteSource, materializeIsolatedRemoteWorkspaceSource } from "./isolated-remote-workspace-source.js";
 import { findRegenerableWorkspaceDirs } from "./workspace-compaction.js";
 import { PROJECT_REPOSITORIES_DIR } from "@paperclipai/adapter-utils/git-workspace-sync";
+import { GitExpirationBudgetExceeded, readBoundedDirectory, runBoundedGit } from "./git-expiration-budget.js";
 
 const execFile = promisify(execFileCallback);
 const shaPattern = /^[a-f0-9]{40}$/;
@@ -110,7 +111,7 @@ export function onGitExit<T>(handle: (error: unknown) => T) {
 }
 
 export async function gitCacheCommand(cwd: string, args: string[], signal?: AbortSignal) {
-  const result = await execFile("git", ["-c", "core.fsmonitor=false", "-C", cwd, ...args], {
+  const result = await runBoundedGit(["-c", "core.fsmonitor=false", "-C", cwd, ...args], {
     timeout: 60_000, signal, maxBuffer: 16 * 1024 * 1024,
     env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0" },
   });
@@ -125,11 +126,14 @@ export async function verifyRemoteGitCommit(repoUrl: string, commit: string, res
     const auth = await resolveGitAuth(repoUrl);
     const env = { ...process.env, ...auth?.env, GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: os.devNull };
     const options = { timeout: 60_000, signal, maxBuffer: 1024 * 1024, env };
-    await execFile("git", ["init", "--bare", temporary], options);
-    await execFile("git", [...auth?.configArgs ?? [], "-C", temporary, "fetch", "--no-tags", "--no-recurse-submodules", "--depth=1", "--", repoUrl, commit], options);
-    const result = await execFile("git", ["-C", temporary, "rev-parse", "FETCH_HEAD^{commit}"], options);
+    await runBoundedGit(["init", "--bare", temporary], options);
+    await runBoundedGit([...auth?.configArgs ?? [], "-C", temporary, "fetch", "--no-tags", "--no-recurse-submodules", "--depth=1", "--", repoUrl, commit], options);
+    const result = await runBoundedGit(["-C", temporary, "rev-parse", "FETCH_HEAD^{commit}"], options);
     if (result.stdout.trim() !== commit) throw new GitCacheRestorationFailure();
-  } catch (error) { throw error instanceof GitCacheRestorationFailure ? error : new GitCacheRestorationFailure(error); }
+  } catch (error) {
+    if (error instanceof GitCacheRestorationFailure || error instanceof GitExpirationBudgetExceeded) throw error;
+    throw new GitCacheRestorationFailure(error);
+  }
   finally { await fs.rm(temporary, { recursive: true, force: true }); }
 }
 
@@ -139,31 +143,34 @@ async function stockGitFiles() {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-template-"));
     const files = new Map<string, Buffer>();
     try {
-      await execFile("git", ["init", "--bare", root], { timeout: 10_000,
+      await runBoundedGit(["init", "--bare", root], { timeout: 10_000, maxBuffer: 1024 * 1024,
         env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: os.devNull } });
       for (const name of ["description", "info/exclude", ...(await fs.readdir(path.join(root, "hooks"))).map(name => `hooks/${name}`)]) {
         files.set(name, await fs.readFile(path.join(root, name)));
       }
       return files;
     } finally { await fs.rm(root, { recursive: true, force: true }); }
-  })();
+  })().catch(error => {
+    templateFiles = undefined;
+    throw error;
+  });
   return templateFiles;
 }
 
 export async function assertReproducibleBaseGitStorage(cwd: string, signal?: AbortSignal) {
   const root = path.join(cwd, ".git");
   const allowed = new Set(["HEAD", "ORIG_HEAD", "FETCH_HEAD", "index", "config", "description", "hooks", "info", "refs", "objects", "logs", "packed-refs", "worktrees", "branches"]);
-  if ((await fs.readdir(root)).some(name => !allowed.has(name))) throw new Error("unknown_base_git_files");
+  if ((await readBoundedDirectory(root, signal)).some(entry => !allowed.has(entry.name))) throw new Error("unknown_base_git_files");
   const branches = path.join(root, "branches");
   const branchesStat = await fs.lstat(branches).catch((error: NodeJS.ErrnoException) => {
     if (error.code === "ENOENT") return null;
     throw error;
   });
   if (branchesStat && (!branchesStat.isDirectory() || branchesStat.isSymbolicLink()
-    || (await fs.readdir(branches)).length > 0)) throw new Error("custom_git_metadata");
+    || (await readBoundedDirectory(branches, signal)).length > 0)) throw new Error("custom_git_metadata");
   const templates = await stockGitFiles();
   for (const directory of ["hooks", "info"]) {
-    for (const name of await fs.readdir(path.join(root, directory))) {
+    for (const { name } of await readBoundedDirectory(path.join(root, directory), signal)) {
       const file = `${directory}/${name}`;
       const entry = await fs.lstat(path.join(root, file));
       if (!entry.isFile()) throw new Error("custom_git_metadata");
@@ -179,7 +186,7 @@ export async function assertReproducibleBaseGitStorage(cwd: string, signal?: Abo
   // merely because Git's object/ref enumeration does not mention it.
   async function walk(relative: string): Promise<void> {
     signal?.throwIfAborted();
-    for (const entry of await fs.readdir(path.join(root, relative), { withFileTypes: true })) {
+    for (const entry of await readBoundedDirectory(path.join(root, relative), signal)) {
       const name = `${relative}/${entry.name}`;
       if (entry.isSymbolicLink() || (!entry.isDirectory() && !entry.isFile())) throw new Error("unsupported_git_storage");
       if (entry.isDirectory()) { await walk(name); continue; }
@@ -234,18 +241,18 @@ async function hasCommitsMissingUpstream(checkout: string, localTips: string[], 
   try {
     const options = { timeout: 120_000, signal, maxBuffer: 16 * 1024 * 1024, cwd: os.tmpdir(),
       env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: os.devNull } };
-    await execFile("git", ["init", "--bare", "--quiet", store], options);
+    await runBoundedGit(["init", "--bare", "--quiet", store], options);
     await fs.writeFile(path.join(store, "objects", "info", "alternates"), `${path.join(await fs.realpath(checkout), ".git", "objects")}\n`);
     try {
       const auth = await resolveGitAuth(repoUrl);
-      await execFile("git", [...auth?.configArgs ?? [], "-C", store, "fetch", "--quiet", "--no-tags", "--no-recurse-submodules",
+      await runBoundedGit([...auth?.configArgs ?? [], "-C", store, "fetch", "--quiet", "--no-tags", "--no-recurse-submodules",
         "--", repoUrl, "+refs/heads/*:refs/upstream/heads/*", "+refs/tags/*:refs/upstream/tags/*"],
         { ...options, env: { ...options.env, ...auth?.env } });
     } catch (error) {
-      if (signal?.aborted) throw error;
+      if (signal?.aborted || error instanceof GitExpirationBudgetExceeded) throw error;
       throw new Error("managed_checkout_upstream_unavailable", { cause: error });
     }
-    const missing = await execFile("git", ["-C", store, "rev-list", "--max-count=1", ...localTips, "--not", "--glob=refs/upstream/*"], options);
+    const missing = await runBoundedGit(["-C", store, "rev-list", "--max-count=1", ...localTips, "--not", "--glob=refs/upstream/*"], options);
     return missing.stdout.trim() !== "";
   } finally {
     await fs.rm(store, { recursive: true, force: true });
@@ -338,10 +345,10 @@ export async function assertReproducibleGitFiles(cwd: string, signal?: AbortSign
     .catch(onGitExit(() => { throw new Error("unique_original_head"); }));
   if (gitDir !== common) {
     const allowed = new Set(["HEAD", "ORIG_HEAD", "FETCH_HEAD", "index", "commondir", "gitdir", "logs", "refs", "COMMIT_EDITMSG", "index.lock", "HEAD.lock"]);
-    if ((await fs.readdir(gitDir)).some(name => !allowed.has(name))) throw new Error("unknown_worktree_git_files");
+    if ((await readBoundedDirectory(gitDir, signal)).some(entry => !allowed.has(entry.name))) throw new Error("unknown_worktree_git_files");
     await assertReproducibleFetchHead(cwd, gitDir, signal, options.verifyFetchedCommit);
     async function assertEmptyRefs(root: string): Promise<void> {
-      const entries = await fs.readdir(root, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
+      const entries = await readBoundedDirectory(root, signal).catch((error: NodeJS.ErrnoException) => {
         if (error.code === "ENOENT") return []; throw error;
       });
       for (const entry of entries) {
@@ -354,10 +361,10 @@ export async function assertReproducibleGitFiles(cwd: string, signal?: AbortSign
       if (error.code === "ENOENT") return null; throw error;
     });
     if (message !== null && message.trim() !== (await gitCacheCommand(cwd, ["log", "-1", "--format=%B"], signal)).trim()) throw new Error("uncommitted_git_message");
-    const logs = await fs.readdir(path.join(gitDir, "logs")).catch((error: NodeJS.ErrnoException) => {
+    const logs = await readBoundedDirectory(path.join(gitDir, "logs"), signal).catch((error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT") return []; throw error;
     });
-    if (logs.some(name => name !== "HEAD")) throw new Error("unknown_worktree_git_logs");
+    if (logs.some(entry => entry.name !== "HEAD")) throw new Error("unknown_worktree_git_logs");
   }
   // Packed stashes/replacement refs are just as important as loose refs.
   if ((await gitCacheCommand(cwd, ["for-each-ref", "--format=%(refname)", "refs/stash", "refs/replace"], signal)).trim()) throw new Error("unique_git_refs");

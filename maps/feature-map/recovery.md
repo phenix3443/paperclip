@@ -321,6 +321,16 @@ only. Separately inspect the underlying execution if it is still stuck.
 - A process disappearance, elapsed timeout, or successful API retry does not
   prove an external tool operation never happened. Unknown outcomes stay unknown
   until corroborated; automatic replay can duplicate a side effect.
+- An execution reconciliation receipt read that says `unsettled` is unknown,
+  not proof that nothing committed. Only the Board settle action turns it into
+  a definite `committed` or a permanent `abandoned` key, and it records one
+  audit row with the tombstone. Admission itself stays off until its health
+  capability is published; see
+  [agent access](../agent-access-map/recovery.md#settle-reconciliation-receipt).
+- A reconciliation approval is a decision on one exact document revision by an
+  agent on the Board-managed company authority list. A comment, a role name or
+  a newer revision is not an approval; see
+  [agent access](../agent-access-map/recovery.md#record-document-decision).
 - Active-run watchdogs, task watchdogs, reviewers, and recovery owners have
   different authority. No recovery card grants board permission by itself.
 - Idle Agent Chat is not stranded work. An intentional operator stop must not

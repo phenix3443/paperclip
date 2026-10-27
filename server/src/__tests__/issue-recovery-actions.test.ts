@@ -21,7 +21,10 @@ import {
   chatEndpoints,
   companies,
   createDb,
+  executionReconciliationReceipts,
   documentRevisions,
+  issueDocumentDecisions,
+  issueDocuments,
   documents,
   environmentLeases,
   environments,
@@ -58,6 +61,14 @@ import { caseHandoffService } from "../services/case-handoffs.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { withNativeWorkspaceFinalizationOwnership } from "../services/native-runtime/native-workspace-finalization-ownership.js";
 import { noticeMetadataReferencesRecoveryAction } from "../services/recovery/successful-run-handoff.js";
+import { buildExpectedReconciliationState, listUnstartedHoldRunIds } from "../services/execution-reconciliation-receipts.js";
+import { lockExecutionReconciliationAuthority } from "../services/execution-reconciliation-authority-lock.js";
+import {
+  canonicalReconciliationDigest,
+  canonicalizeReconciliationJson,
+  sha256HexOfText,
+} from "@paperclipai/shared/execution-reconciliation-canonical";
+import { executionReconciliationRequestIntent } from "@paperclipai/shared";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -170,6 +181,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   }, 30_000);
 
   afterEach(async () => {
+    await db.delete(executionReconciliationReceipts);
+    await db.delete(issueDocumentDecisions);
     await db.delete(caseHandoffs);
     await db.delete(cases);
     await db.delete(documentRevisions);
@@ -273,7 +286,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     opts: Parameters<typeof issueRoutes>[2] = {},
   ) {
     const app = express();
-    app.use(express.json());
+    app.use(express.json({ verify: (req, _res, buf) => { (req as any).rawBody = buf; } }));
     app.use((req, _res, next) => {
       (req as any).actor = actor;
       next();
@@ -2078,6 +2091,579 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(recorded!.evidence).toMatchObject({ executionReconciliation: { runId }, continuationDelivery: "pending" });
     await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
     expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id)))[0]).toEqual(recorded);
+  });
+
+  it("refuses an admission request before any read or write until admission is supported", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const runId = randomUUID();
+    await seedHeartbeatRun({ companyId, agentId: coderId, runId, issueId: sourceIssueId, status: "failed" });
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+    const [action] = await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId, kind: "active_run_watchdog", status: "resolved", outcome: "blocked",
+      ownerType: "board", returnOwnerAgentId: coderId, cause: "uncertain_external_action", fingerprint: runId,
+      nextAction: "Preserve recorded work without replay.",
+      evidence: { runId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } },
+    }).returning();
+    const timestamp = "2026-10-27T12:00:00.000Z";
+    const admission = {
+      schema: "execution_reconciliation_admission_v1", idempotencyKey: "recon:capability-check",
+      expectedDigest: "a".repeat(64),
+      authorization: { documentId: randomUUID(), revisionId: randomUUID(), revisionNumber: 1, bodyDigest: "b".repeat(64), decisionId: randomUUID() },
+      expected: {
+        companyId, projectId: null, issueId: sourceIssueId, runId, actionId: action!.id,
+        run: { status: "failed", finishedAt: timestamp, agentId: coderId, processPid: null, processGroupId: null, runtimeMode: null },
+        unstartedRunIds: [],
+        action: { status: "resolved", cause: "uncertain_external_action", kind: "active_run_watchdog", outcome: "blocked",
+          ownerAgentId: null, returnOwnerAgentId: coderId, updatedAt: timestamp },
+        issue: { status: "blocked", statusVersion: 0, assigneeAgentId: coderId, assigneeUserId: null, responsibleUserId: null,
+          workspaceBindingRevision: 0, executionPolicy: null, executionState: null, unblockDescriptor: null,
+          monitorNextCheckAt: null, monitorAttemptCount: 0, monitorScheduledBy: null, monitorNotes: null },
+      },
+    };
+    const [beforeAction] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id));
+    const [beforeIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+    const response = await request(createApp()).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send({
+      actionId: action!.id, outcome: "restored", sourceIssueStatus: "todo",
+      executionReconciliation: { runId, providerStopped: true, actionOutcome: "completed",
+        outcomeEvidence: "The stopped run saved its comment and commit before the hold.", admission },
+    }).expect(400);
+    expect(response.body.code).toBe("capability_unsupported");
+    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id)))[0]).toEqual(beforeAction);
+    expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0]).toEqual(beforeIssue);
+  });
+
+  it("reads and settles reconciliation keys for Board only and logs the settlement", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const key = "recon:route-settle-key";
+    const agentApp = createApp({ type: "agent", agentId: coderId, companyId, source: "agent_key" });
+    await request(agentApp).get(`/api/issues/${sourceIssueId}/recovery-actions/receipts/${key}`).expect(403);
+    await request(agentApp).post(`/api/issues/${sourceIssueId}/recovery-actions/receipts/${key}/settle`).expect(403);
+    const app = createApp({ type: "board", source: "local_implicit", userId: "board-user" });
+    await request(app).get(`/api/issues/${sourceIssueId}/recovery-actions/receipts/short`).expect(400);
+    expect((await request(app).get(`/api/issues/${sourceIssueId}/recovery-actions/receipts/${key}`).expect(200)).body)
+      .toEqual({ state: "unsettled" });
+    const settled = await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/receipts/${key}/settle`).expect(200);
+    expect(settled.body.state).toBe("abandoned");
+    expect((await request(app).get(`/api/issues/${sourceIssueId}/recovery-actions/receipts/${key}`).expect(200)).body.state)
+      .toBe("abandoned");
+    expect((await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/receipts/${key}/settle`).expect(200)).body)
+      .toEqual({ state: "abandoned", settledAt: settled.body.settledAt });
+    const logged = await db.select().from(activityLog).where(eq(activityLog.action, "issue.execution_reconciliation_key_settled"));
+    expect(logged).toHaveLength(1);
+    expect(logged[0]!.details).toMatchObject({ idempotencyKey: key, state: "abandoned" });
+  });
+
+  it("rolls back a settlement whose audit row fails, and a retry writes the tombstone with its audit", async () => {
+    const { sourceIssueId } = await seedCompany();
+    const key = "recon:settle-audit-fail";
+    const app = createApp({ type: "board", source: "local_implicit", userId: "board-user" });
+    await db.execute(sql`create function fail_settle_audit() returns trigger language plpgsql as $$
+      begin if new.action = 'issue.execution_reconciliation_key_settled' then raise exception 'audit unavailable'; end if; return new; end $$`);
+    await db.execute(sql`create trigger fail_settle_audit before insert on activity_log for each row execute function fail_settle_audit()`);
+    try {
+      await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/receipts/${key}/settle`).expect(500);
+    } finally {
+      await db.execute(sql`drop trigger fail_settle_audit on activity_log`);
+      await db.execute(sql`drop function fail_settle_audit()`);
+    }
+    expect(await db.select().from(executionReconciliationReceipts)).toHaveLength(0);
+    expect((await request(app).get(`/api/issues/${sourceIssueId}/recovery-actions/receipts/${key}`).expect(200)).body)
+      .toEqual({ state: "unsettled" });
+    const retry = await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/receipts/${key}/settle`).expect(200);
+    expect(retry.body.state).toBe("abandoned");
+    const logged = await db.select().from(activityLog).where(eq(activityLog.action, "issue.execution_reconciliation_key_settled"));
+    expect(logged).toHaveLength(1);
+    expect(logged[0]!.details).toMatchObject({ idempotencyKey: key, state: "abandoned" });
+  });
+
+  describe("execution reconciliation admission (slice A1)", () => {
+    const refusalCode = (body: any) => body?.code ?? body?.details?.code;
+
+    async function seedAdmission() {
+      const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+      const runId = randomUUID();
+      await seedHeartbeatRun({ companyId, agentId: coderId, runId, issueId: sourceIssueId, status: "failed" });
+      await db.update(heartbeatRuns).set({ finishedAt: new Date("2026-05-13T18:30:00.000Z") }).where(eq(heartbeatRuns.id, runId));
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+      const [action] = await db.insert(issueRecoveryActions).values({
+        companyId, sourceIssueId, kind: "active_run_watchdog", status: "resolved", outcome: "blocked",
+        ownerType: "board", returnOwnerAgentId: coderId, cause: "uncertain_external_action", fingerprint: runId,
+        nextAction: "Preserve recorded work without replay.",
+        evidence: { runId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } },
+      }).returning();
+      await db.update(companies).set({ executionReconciliationAuthority: { agentIds: [managerId] } })
+        .where(eq(companies.id, companyId));
+      return { companyId, managerId, coderId, sourceIssueId, runId, actionId: action!.id };
+    }
+
+    type AuthorizationOptions = {
+      payload?: (payload: Record<string, any>) => void;
+      body?: (canonical: string) => string;
+      decision?: Record<string, unknown>;
+    };
+
+    async function authorize(
+      fixture: Awaited<ReturnType<typeof seedAdmission>>,
+      request: any,
+      options: AuthorizationOptions = {},
+    ) {
+      const admission = request.executionReconciliation.admission;
+      const payload: Record<string, any> = {
+        schema: "execution_reconciliation_authorization_v1", scope: "execute",
+        companyId: fixture.companyId, issueId: fixture.sourceIssueId, runId: fixture.runId, actionId: fixture.actionId,
+        expectedDigest: admission.expectedDigest,
+        expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+        intent: executionReconciliationRequestIntent(request),
+        evidence: { artifacts: ["comment", "commit"] },
+      };
+      options.payload?.(payload);
+      const canonical = canonicalizeReconciliationJson(payload);
+      const body = options.body ? options.body(canonical) : canonical;
+      const documentId = randomUUID();
+      const revisionId = randomUUID();
+      await db.insert(documents).values({ id: documentId, companyId: fixture.companyId, title: "Reconciliation approval",
+        format: "markdown", latestBody: body, latestRevisionId: revisionId, latestRevisionNumber: 1 });
+      await db.insert(documentRevisions).values({ id: revisionId, companyId: fixture.companyId, documentId,
+        revisionNumber: 1, format: "markdown", body });
+      await db.insert(issueDocuments).values({ companyId: fixture.companyId, issueId: fixture.sourceIssueId, documentId,
+        key: `reconciliation-${documentId.slice(0, 8)}` });
+      const [decision] = await db.insert(issueDocumentDecisions).values({
+        companyId: fixture.companyId, issueId: fixture.sourceIssueId, documentId, revisionId, revisionNumber: 1,
+        bodySha256: sha256HexOfText(body), scope: "execution_reconciliation", outcome: "approved",
+        expiresAt: new Date(Date.now() + 72 * 60 * 60 * 1000 - 60_000), actorAgentId: fixture.managerId,
+        ...options.decision,
+      }).returning();
+      admission.authorization = { documentId, revisionId, revisionNumber: 1, bodyDigest: sha256HexOfText(body), decisionId: decision!.id };
+      return { documentId, revisionId, decisionId: decision!.id, body };
+    }
+
+    async function admissionBody(fixture: Awaited<ReturnType<typeof seedAdmission>>, key: string, overrides: Record<string, unknown> = {},
+      authorization: AuthorizationOptions = {}) {
+      const [issue] = await db.select().from(issues).where(eq(issues.id, fixture.sourceIssueId));
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
+      const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, fixture.actionId));
+      const expected = buildExpectedReconciliationState({ issue: issue!, run: run!, action: action!,
+        unstartedRunIds: await listUnstartedHoldRunIds(db, fixture.companyId, fixture.sourceIssueId) });
+      const request = {
+        actionId: fixture.actionId, outcome: "restored", sourceIssueStatus: "todo",
+        executionReconciliation: {
+          runId: fixture.runId, providerStopped: true, actionOutcome: "not_performed",
+          outcomeEvidence: "Provider receipts confirm the action was never submitted; the stopped process has no remaining effects.",
+          admission: {
+            schema: "execution_reconciliation_admission_v1", idempotencyKey: key,
+            expected, expectedDigest: canonicalReconciliationDigest(expected),
+            authorization: null as any,
+          },
+        },
+        ...overrides,
+      };
+      await authorize(fixture, request, authorization);
+      return request;
+    }
+
+    const admissionApp = () => createApp({ type: "board", source: "local_implicit", userId: "board-user" },
+      { executionReconciliationAdmissionForTests: true });
+    const resolvePath = (issueId: string) => `/api/issues/${issueId}/recovery-actions/resolve`;
+    const snapshot = async (fixture: Awaited<ReturnType<typeof seedAdmission>>) => ({
+      issue: (await db.select().from(issues).where(eq(issues.id, fixture.sourceIssueId)))[0],
+      action: (await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, fixture.actionId)))[0],
+      receipts: await db.select().from(executionReconciliationReceipts),
+      wakes: await db.select().from(agentWakeupRequests),
+      runs: await db.select().from(heartbeatRuns),
+    });
+    const refusals = () => db.select().from(activityLog).where(eq(activityLog.action, "issue.execution_reconciliation_refused"));
+
+    it("admits once, commits the receipt with the action, and replays the same request", async () => {
+      const fixture = await seedAdmission();
+      const body = await admissionBody(fixture, "recon:admit-once-0001");
+      const first = await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(200);
+      expect(first.body.issue.status).toBe("todo");
+      expect(first.body.receipt).toMatchObject({ state: "committed", actionId: fixture.actionId, runId: fixture.runId });
+      const receipts = await db.select().from(executionReconciliationReceipts);
+      expect(receipts).toHaveLength(1);
+      expect(receipts[0]!.result).toMatchObject({ issueStatus: "todo", actionStatus: "resolved", continuationDelivery: "pending" });
+      const after = await snapshot(fixture);
+      const replay = await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(200);
+      expect(replay.body).toMatchObject({ replayed: true, receipt: { id: receipts[0]!.id } });
+      expect(await snapshot(fixture)).toEqual(after);
+    });
+
+    it("refuses a reused key with a different payload, a second key for the action, and a settled key", async () => {
+      const fixture = await seedAdmission();
+      const body = await admissionBody(fixture, "recon:first-admitted-1");
+      await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(200);
+      const before = await snapshot(fixture);
+      const changed = structuredClone(body);
+      changed.executionReconciliation.admission.authorization.decisionId = randomUUID();
+      const conflict = await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(changed).expect(409);
+      expect(refusalCode(conflict.body)).toBe("idempotency_conflict");
+      const otherKey = structuredClone(body);
+      otherKey.executionReconciliation.admission.idempotencyKey = "recon:second-key-0001";
+      const again = await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(otherKey).expect(409);
+      expect(refusalCode(again.body)).toBe("action_already_reconciled");
+      expect(await snapshot(fixture)).toEqual(before);
+      expect((await refusals()).map((row) => (row.details as any).code).sort())
+        .toEqual(["action_already_reconciled", "idempotency_conflict"]);
+
+      const settledFixture = await seedAdmission();
+      const settledKey = "recon:settled-before-1";
+      await request(admissionApp()).post(`/api/issues/${settledFixture.sourceIssueId}/recovery-actions/receipts/${settledKey}/settle`).expect(200);
+      const settled = await request(admissionApp()).post(resolvePath(settledFixture.sourceIssueId))
+        .send(await admissionBody(settledFixture, settledKey)).expect(409);
+      expect(refusalCode(settled.body)).toBe("idempotency_key_settled");
+    });
+
+    it("refuses a changed expected state and leaves the settled hold, issue, wakes and runs untouched", async () => {
+      const fixture = await seedAdmission();
+      const body = await admissionBody(fixture, "recon:stale-expected-1");
+      await db.update(issues).set({ monitorAttemptCount: 1 }).where(eq(issues.id, fixture.sourceIssueId));
+      const before = await snapshot(fixture);
+      const response = await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(409);
+      expect(refusalCode(response.body)).toBe("expected_state_mismatch");
+      expect(JSON.stringify(response.body)).toContain("\"issue\"");
+      expect(await snapshot(fixture)).toEqual(before);
+      const [refused] = await refusals();
+      expect(refused!.details).toMatchObject({ code: "expected_state_mismatch", idempotencyKey: "recon:stale-expected-1" });
+    });
+
+    it("refuses any non-null executionState and an unfinished source run", async () => {
+      const fixture = await seedAdmission();
+      await db.update(issues).set({ executionState: { status: "changes_requested" } as any }).where(eq(issues.id, fixture.sourceIssueId));
+      const response = await request(admissionApp()).post(resolvePath(fixture.sourceIssueId))
+        .send(await admissionBody(fixture, "recon:review-state-01")).expect(409);
+      expect(refusalCode(response.body)).toBe("execution_state_not_supported");
+
+      const unfinished = await seedAdmission();
+      const body = await admissionBody(unfinished, "recon:unfinished-run-1");
+      await db.update(heartbeatRuns).set({ finishedAt: null }).where(eq(heartbeatRuns.id, unfinished.runId));
+      const refused = await request(admissionApp()).post(resolvePath(unfinished.sourceIssueId)).send(body).expect(409);
+      expect(refusalCode(refused.body)).toBe("run_not_settled");
+      expect(await db.select().from(executionReconciliationReceipts)).toHaveLength(0);
+    });
+
+    it("rejects a non-integer number in the request with 400 before hashing and audits the refusal", async () => {
+      const fixture = await seedAdmission();
+      const body = await admissionBody(fixture, "recon:fraction-number-1");
+      (body.executionReconciliation.admission.expected.issue as any).executionPolicy = { weight: 1.5 };
+      const before = await snapshot(fixture);
+      await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(400);
+      expect(await snapshot(fixture)).toEqual(before);
+      const audited = await refusals();
+      expect(audited).toHaveLength(1);
+      expect(audited[0]!.details).toMatchObject({ code: "http_400", requestDigest: null, idempotencyKey: "recon:fraction-number-1" });
+    });
+
+    it.each([
+      ["top-level", (text: string) => text.replace(/^\{/, '{"resolutionNote":"first",'), "resolutionNote"],
+      ["nested", (text: string) => text.replace('"providerStopped":true', '"providerStopped":true,"providerStopped":true'), "providerStopped"],
+    ])("rejects a %s duplicate JSON key with 400 and writes nothing but the refusal audit", async (_name, duplicate, key) => {
+      const fixture = await seedAdmission();
+      const body = await admissionBody(fixture, `recon:duplicate-${key}`.slice(0, 40), { resolutionNote: "last" });
+      const raw = duplicate(JSON.stringify(body));
+      expect(raw).not.toBe(JSON.stringify(body));
+      const before = await snapshot(fixture);
+      const response = await request(admissionApp()).post(resolvePath(fixture.sourceIssueId))
+        .set("content-type", "application/json").send(raw).expect(400);
+      expect(response.body.error).toContain(key);
+      expect(await snapshot(fixture)).toEqual(before);
+      const audited = await refusals();
+      expect(audited).toHaveLength(1);
+      expect(audited[0]!.details).toMatchObject({ code: "http_400", requestDigest: null });
+    });
+
+    it("admits exactly once when identical requests race on the same key", async () => {
+      const fixture = await seedAdmission();
+      const body = await admissionBody(fixture, "recon:concurrent-same-1");
+      const app = admissionApp();
+      const responses = await Promise.all([1, 2, 3].map(() => request(app).post(resolvePath(fixture.sourceIssueId)).send(body)));
+      expect(responses.map((response) => response.status)).toEqual([200, 200, 200]);
+      expect(responses.filter((response) => response.body.replayed === true)).toHaveLength(2);
+      expect(await db.select().from(executionReconciliationReceipts)).toHaveLength(1);
+    });
+
+    it("answers a lost response from the receipt: read returns committed and a retry replays it", async () => {
+      const fixture = await seedAdmission();
+      const key = "recon:lost-response-01";
+      const body = await admissionBody(fixture, key);
+      await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(200);
+      const read = await request(admissionApp()).get(`/api/issues/${fixture.sourceIssueId}/recovery-actions/receipts/${key}`).expect(200);
+      expect(read.body.state).toBe("committed");
+      const settle = await request(admissionApp()).post(`/api/issues/${fixture.sourceIssueId}/recovery-actions/receipts/${key}/settle`).expect(200);
+      expect(settle.body.state).toBe("committed");
+      const retry = await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(200);
+      expect(retry.body.replayed).toBe(true);
+    });
+
+    describe("authorization binding (slice A2)", () => {
+      const refuse = async (fixture: Awaited<ReturnType<typeof seedAdmission>>, body: any) => {
+        const before = await snapshot(fixture);
+        const response = await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(409);
+        expect(await snapshot(fixture)).toEqual(before);
+        const audited = await refusals();
+        expect(audited.at(-1)!.details).toMatchObject({ code: refusalCode(response.body) });
+        return response.body;
+      };
+
+      it("records the payload digest and the exact approval in the receipt and the action evidence", async () => {
+        const fixture = await seedAdmission();
+        const body = await admissionBody(fixture, "recon:a2-admit-000001");
+        const auth = body.executionReconciliation.admission.authorization;
+        await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(200);
+        const [receipt] = await db.select().from(executionReconciliationReceipts);
+        expect(receipt).toMatchObject({ authorizationPayloadDigest: auth.bodyDigest, authorizationRevisionId: auth.revisionId,
+          authorizationDecisionId: auth.decisionId, authorizationBodySha256: auth.bodyDigest,
+          authorizationEvidence: { artifacts: ["comment", "commit"] } });
+        const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, fixture.actionId));
+        expect((action!.evidence as any).executionReconciliation).toMatchObject({
+          authorizationPayloadDigest: auth.bodyDigest, admission: { authorization: auth } });
+      });
+
+      it("refuses an empty authority list and a decision by an actor that is not on the list", async () => {
+        const empty = await seedAdmission();
+        const body = await admissionBody(empty, "recon:a2-no-authority1");
+        await db.update(companies).set({ executionReconciliationAuthority: { agentIds: [] } }).where(eq(companies.id, empty.companyId));
+        expect(refusalCode(await refuse(empty, body))).toBe("authority_not_configured");
+
+        const outsider = await seedAdmission();
+        const outsiderBody = await admissionBody(outsider, "recon:a2-outsider-0001", {}, { decision: { actorAgentId: outsider.coderId } });
+        const refused = await refuse(outsider, outsiderBody);
+        expect(refused).toMatchObject({ details: { code: "authorization_invalid", reason: "actor_not_authorized" } });
+      });
+
+      it("refuses an approval that a newer revision replaced before admission", async () => {
+        const fixture = await seedAdmission();
+        const body = await admissionBody(fixture, "recon:a2-newer-revision");
+        const { documentId } = body.executionReconciliation.admission.authorization;
+        const [r2] = await db.insert(documentRevisions).values({ companyId: fixture.companyId, documentId, revisionNumber: 2,
+          format: "markdown", body: "{}" }).returning();
+        await db.update(documents).set({ latestRevisionId: r2!.id, latestRevisionNumber: 2, latestBody: "{}" })
+          .where(eq(documents.id, documentId));
+        expect(refusalCode(await refuse(fixture, body))).toBe("authorization_stale");
+      });
+
+      it("keeps a committed receipt when a newer revision arrives after admission", async () => {
+        const fixture = await seedAdmission();
+        const body = await admissionBody(fixture, "recon:a2-revision-after");
+        const { documentId } = body.executionReconciliation.admission.authorization;
+        await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(200);
+        const [r2] = await db.insert(documentRevisions).values({ companyId: fixture.companyId, documentId, revisionNumber: 2,
+          format: "markdown", body: "{}" }).returning();
+        await db.update(documents).set({ latestRevisionId: r2!.id, latestRevisionNumber: 2 }).where(eq(documents.id, documentId));
+        const replay = await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(200);
+        expect(replay.body.replayed).toBe(true);
+        expect(await db.select().from(executionReconciliationReceipts)).toHaveLength(1);
+      });
+
+      it.each([
+        ["an expired decision", { decision: { expiresAt: new Date(Date.now() - 60_000) } }, "authorization_expired", undefined],
+        ["an expired payload while the decision is still valid",
+          { payload: (p: any) => { p.expiresAt = new Date(Date.now() - 60_000).toISOString(); } }, "authorization_expired", undefined],
+        ["a payload that outlives its decision",
+          { payload: (p: any) => { p.expiresAt = new Date(Date.now() + 73 * 60 * 60 * 1000).toISOString(); } },
+          "authorization_invalid", "payload_outlives_decision"],
+        ["a body with whitespace", { body: (text: string) => text.replace(/,/, ", ") }, "authorization_invalid", "body_not_canonical"],
+        ["a fenced body", { body: (text: string) => `\`\`\`json\n${text}\n\`\`\`` }, "authorization_invalid", "body_not_canonical"],
+        ["a payload with an extra key", { payload: (p: any) => { p.note = "extra"; } }, "authorization_invalid", "payload_schema"],
+        ["a payload with a missing key", { payload: (p: any) => { delete p.evidence; } }, "authorization_invalid", "payload_schema"],
+      ] as const)("refuses %s", async (_name, options, code, reason) => {
+        const fixture = await seedAdmission();
+        const body = await admissionBody(fixture, `recon:a2-${randomUUID().slice(0, 12)}`, {}, options as AuthorizationOptions);
+        const refused = await refuse(fixture, body);
+        expect(refusalCode(refused)).toBe(code);
+        if (reason) expect(refused.details.reason).toBe(reason);
+      });
+
+      it("refuses a revoked decision and a decision for another revision", async () => {
+        const revoked = await seedAdmission();
+        const body = await admissionBody(revoked, "recon:a2-revoked-00001");
+        const auth = body.executionReconciliation.admission.authorization;
+        await db.insert(issueDocumentDecisions).values({ companyId: revoked.companyId, issueId: revoked.sourceIssueId,
+          documentId: auth.documentId, revisionId: auth.revisionId, revisionNumber: 1, bodySha256: auth.bodyDigest,
+          scope: "execution_reconciliation", outcome: "revoked", revokesDecisionId: auth.decisionId, actorAgentId: revoked.managerId });
+        expect((await refuse(revoked, body)).details.reason).toBe("decision_revoked");
+
+        const unlisted = await seedAdmission();
+        const unlistedBody = await admissionBody(unlisted, "recon:a2-unlisted-revoke");
+        const unlistedAuth = unlistedBody.executionReconciliation.admission.authorization;
+        await db.insert(issueDocumentDecisions).values({ companyId: unlisted.companyId, issueId: unlisted.sourceIssueId,
+          documentId: unlistedAuth.documentId, revisionId: unlistedAuth.revisionId, revisionNumber: 1, bodySha256: unlistedAuth.bodyDigest,
+          scope: "execution_reconciliation", outcome: "revoked", revokesDecisionId: unlistedAuth.decisionId, actorAgentId: unlisted.coderId });
+        await request(admissionApp()).post(resolvePath(unlisted.sourceIssueId)).send(unlistedBody).expect(200);
+
+        const other = await seedAdmission();
+        const otherBody = await admissionBody(other, "recon:a2-other-revision");
+        const otherAuth = otherBody.executionReconciliation.admission.authorization;
+        const [r0] = await db.insert(documentRevisions).values({ companyId: other.companyId, documentId: otherAuth.documentId,
+          revisionNumber: 0, format: "markdown", body: "{}" }).returning();
+        await db.update(issueDocumentDecisions).set({ revisionId: r0!.id }).where(eq(issueDocumentDecisions.id, otherAuth.decisionId));
+        expect((await refuse(other, otherBody)).details.reason).toBe("decision_revision");
+      });
+
+      it("refuses a request whose body digest does not match the revision", async () => {
+        const fixture = await seedAdmission();
+        const body = await admissionBody(fixture, "recon:a2-body-digest-01");
+        body.executionReconciliation.admission.authorization.bodyDigest = "c".repeat(64);
+        expect((await refuse(fixture, body)).details.reason).toBe("body_digest");
+      });
+
+      it.each([
+        ["outcomeEvidence", (p: any) => { p.intent.executionReconciliation.outcomeEvidence = "Another account of the stopped run and its side effects."; }, "intent"],
+        ["workspaceRepairEvidence", (p: any) => { p.intent.executionReconciliation.workspaceRepairEvidence = "The retained workspace was repaired by hand."; }, "intent"],
+        ["resolutionNote", (p: any) => { p.intent.resolutionNote = "approved note"; }, "intent"],
+        ["outcome", (p: any) => { p.intent.outcome = "false_positive"; }, "intent"],
+        ["sourceIssueStatus", (p: any) => { p.intent.sourceIssueStatus = "done"; }, "intent"],
+        ["the source run", (p: any) => { p.runId = randomUUID(); }, "runId"],
+        ["the expected digest", (p: any) => { p.expectedDigest = "d".repeat(64); }, "expectedDigest"],
+      ] as const)("refuses a request that differs from the approved payload in %s", async (_name, change, field) => {
+        const fixture = await seedAdmission();
+        const body = await admissionBody(fixture, `recon:a2-${randomUUID().slice(0, 12)}`, {}, { payload: change });
+        const refused = await refuse(fixture, body);
+        expect(refusalCode(refused)).toBe("authorization_payload_mismatch");
+        expect(refused.details.field).toBe(field);
+      });
+
+      it("treats the same key with another revision as a different request", async () => {
+        const fixture = await seedAdmission();
+        const body = await admissionBody(fixture, "recon:a2-same-key-rev1");
+        await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(200);
+        const changed = structuredClone(body);
+        changed.executionReconciliation.admission.authorization.revisionId = randomUUID();
+        const conflict = await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(changed).expect(409);
+        expect(refusalCode(conflict.body)).toBe("idempotency_conflict");
+      });
+
+      it("checks expiry after the authorization lock, so a decision that expires while admission waits is refused", async () => {
+        const fixture = await seedAdmission();
+        const expiresAt = new Date(Date.now() + 1500);
+        const body = await admissionBody(fixture, "recon:a2-expires-on-wait", {}, {
+          payload: (p: any) => { p.expiresAt = expiresAt.toISOString(); },
+          decision: { expiresAt },
+        });
+        const { documentId } = body.executionReconciliation.admission.authorization;
+        const before = await snapshot(fixture);
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => { release = resolve; });
+        let locked!: () => void;
+        const lockedSignal = new Promise<void>((resolve) => { locked = resolve; });
+        const holder = db.transaction(async (tx) => {
+          await tx.select({ id: documents.id }).from(documents).where(eq(documents.id, documentId)).for("update");
+          locked();
+          await held;
+        });
+        await lockedSignal;
+        const pending = request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).then((response) => response);
+        const waiting = async () => (await db.execute(sql`select count(*)::int as n from pg_stat_activity
+          where wait_event_type = 'Lock' and query ilike '%from "documents"%for share%'`) as unknown as { n: number }[])[0]!.n;
+        for (let attempt = 0; attempt < 50 && await waiting() === 0; attempt += 1) await new Promise((r) => setTimeout(r, 50));
+        expect(await waiting()).toBe(1);
+        await new Promise((r) => setTimeout(r, Math.max(0, expiresAt.getTime() - Date.now()) + 200));
+        release();
+        await holder;
+        const response = await pending;
+        expect(response.status).toBe(409);
+        expect(refusalCode(response.body)).toBe("authorization_expired");
+        expect(await snapshot(fixture)).toEqual(before);
+        const audited = await refusals();
+        expect(audited.at(-1)!.details).toMatchObject({ code: "authorization_expired" });
+      });
+
+      it("waits for an in-flight authority-list change and then applies the new list", async () => {
+        const fixture = await seedAdmission();
+        const body = await admissionBody(fixture, "recon:a2-authority-race");
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => { release = resolve; });
+        let locked!: () => void;
+        const lockedSignal = new Promise<void>((resolve) => { locked = resolve; });
+        const change = db.transaction(async (tx) => {
+          await lockExecutionReconciliationAuthority(tx, fixture.companyId, "exclusive");
+          await tx.update(companies).set({ executionReconciliationAuthority: { agentIds: [] } }).where(eq(companies.id, fixture.companyId));
+          locked();
+          await held;
+        });
+        await lockedSignal;
+        const pending = request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body);
+        const settled = pending.then((response) => response);
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(await db.select().from(executionReconciliationReceipts)).toHaveLength(0);
+        release();
+        await change;
+        const response = await settled;
+        expect(response.status).toBe(409);
+        expect(refusalCode(response.body)).toBe("authority_not_configured");
+      });
+    });
+  });
+
+  describe("issue document decisions", () => {
+    async function seedDocument() {
+      const fixture = await seedCompany();
+      const documentId = randomUUID();
+      const revisionId = randomUUID();
+      const body = '{"schema":"example"}';
+      await db.insert(documents).values({ id: documentId, companyId: fixture.companyId, format: "markdown",
+        latestBody: body, latestRevisionId: revisionId, latestRevisionNumber: 1 });
+      await db.insert(documentRevisions).values({ id: revisionId, companyId: fixture.companyId, documentId,
+        revisionNumber: 1, format: "markdown", body });
+      await db.insert(issueDocuments).values({ companyId: fixture.companyId, issueId: fixture.sourceIssueId, documentId, key: "approval" });
+      return { ...fixture, documentId, revisionId, body };
+    }
+    const decisionsPath = (issueId: string, key = "approval") => `/api/issues/${issueId}/documents/${key}/decisions`;
+    const inHours = (hours: number) => new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
+
+    it("records an approval with a server-computed digest and server-owned actor, and audits it", async () => {
+      const fixture = await seedDocument();
+      const response = await request(createApp({ type: "board", source: "local_implicit", userId: "board-user" }))
+        .post(decisionsPath(fixture.sourceIssueId))
+        .send({ outcome: "approved", revisionId: fixture.revisionId, scope: "execution_reconciliation", expiresAt: inHours(24) })
+        .expect(201);
+      expect(response.body).toMatchObject({ documentId: fixture.documentId, revisionId: fixture.revisionId, revisionNumber: 1,
+        bodySha256: sha256HexOfText(fixture.body), outcome: "approved", actorUserId: "board-user", actorAgentId: null });
+      const logged = await db.select().from(activityLog).where(eq(activityLog.action, "issue.document_decision_recorded"));
+      expect(logged).toHaveLength(1);
+      expect(logged[0]!.details).toMatchObject({ decisionId: response.body.id, outcome: "approved" });
+    });
+
+    it("records an agent decision with the agent and run from authentication and requires a run", async () => {
+      const fixture = await seedDocument();
+      const runId = randomUUID();
+      await seedHeartbeatRun({ companyId: fixture.companyId, agentId: fixture.managerId, runId, issueId: fixture.sourceIssueId, status: "running" });
+      const payload = { outcome: "approved", revisionId: fixture.revisionId, scope: "execution_reconciliation", expiresAt: inHours(1) };
+      const withRun = await request(createApp({ type: "agent", agentId: fixture.managerId, companyId: fixture.companyId, runId, source: "agent_jwt" }))
+        .post(decisionsPath(fixture.sourceIssueId)).set("X-Paperclip-Run-Id", runId).send(payload);
+      expect(withRun.status).toBe(201);
+      expect(withRun.body).toMatchObject({ actorAgentId: fixture.managerId, actorUserId: null, createdByRunId: runId });
+      await request(createApp({ type: "agent", agentId: fixture.managerId, companyId: fixture.companyId, source: "agent_key" }))
+        .post(decisionsPath(fixture.sourceIssueId)).send(payload).expect((res) => expect(res.status).toBeGreaterThanOrEqual(400));
+      await request(createApp({ type: "board", source: "local_implicit" })).post(decisionsPath(fixture.sourceIssueId))
+        .send({ ...payload, actorAgentId: fixture.managerId }).expect(400);
+    });
+
+    it("rejects an expiry in the past or beyond 72 hours, an unknown key and an unknown revision", async () => {
+      const fixture = await seedDocument();
+      const app = createApp({ type: "board", source: "local_implicit", userId: "board-user" });
+      const base = { outcome: "approved", revisionId: fixture.revisionId, scope: "execution_reconciliation" };
+      await request(app).post(decisionsPath(fixture.sourceIssueId)).send({ ...base, expiresAt: inHours(-1) }).expect(422);
+      await request(app).post(decisionsPath(fixture.sourceIssueId)).send({ ...base, expiresAt: inHours(73) }).expect(422);
+      await request(app).post(decisionsPath(fixture.sourceIssueId, "missing")).send({ ...base, expiresAt: inHours(1) }).expect(404);
+      await request(app).post(decisionsPath(fixture.sourceIssueId)).send({ ...base, revisionId: randomUUID(), expiresAt: inHours(1) }).expect(404);
+      expect(await db.select().from(issueDocumentDecisions)).toHaveLength(0);
+    });
+
+    it("revokes only an approval of the same revision", async () => {
+      const fixture = await seedDocument();
+      const app = createApp({ type: "board", source: "local_implicit", userId: "board-user" });
+      const approval = await request(app).post(decisionsPath(fixture.sourceIssueId))
+        .send({ outcome: "approved", revisionId: fixture.revisionId, scope: "execution_reconciliation", expiresAt: inHours(1) }).expect(201);
+      const [r2] = await db.insert(documentRevisions).values({ companyId: fixture.companyId, documentId: fixture.documentId,
+        revisionNumber: 2, format: "markdown", body: "{}" }).returning();
+      await request(app).post(decisionsPath(fixture.sourceIssueId))
+        .send({ outcome: "revoked", revisionId: r2!.id, scope: "execution_reconciliation", revokesDecisionId: approval.body.id }).expect(422);
+      const revoke = await request(app).post(decisionsPath(fixture.sourceIssueId))
+        .send({ outcome: "revoked", revisionId: fixture.revisionId, scope: "execution_reconciliation", revokesDecisionId: approval.body.id }).expect(201);
+      expect(revoke.body).toMatchObject({ outcome: "revoked", revokesDecisionId: approval.body.id, expiresAt: null });
+      await request(app).post(decisionsPath(fixture.sourceIssueId))
+        .send({ outcome: "revoked", revisionId: fixture.revisionId, scope: "execution_reconciliation", revokesDecisionId: revoke.body.id }).expect(422);
+    });
   });
 
   async function seedReconciledDelivery() {

@@ -1,4 +1,4 @@
-import type { InteractionResolverGovernance } from "@paperclipai/shared";
+import type { ExecutionReconciliationAuthority, InteractionResolverGovernance } from "@paperclipai/shared";
 import { numeric, pgTable, uuid, text, integer, timestamp, boolean, jsonb, uniqueIndex } from "drizzle-orm/pg-core";
 
 export const companies = pgTable(
@@ -23,6 +23,10 @@ export const companies = pgTable(
       .$type<InteractionResolverGovernance>()
       .notNull()
       .default({}),
+    executionReconciliationAuthority: jsonb("execution_reconciliation_authority")
+      .$type<ExecutionReconciliationAuthority>()
+      .notNull()
+      .default({ agentIds: [] }),
     feedbackDataSharingEnabled: boolean("feedback_data_sharing_enabled")
       .notNull()
       .default(false),

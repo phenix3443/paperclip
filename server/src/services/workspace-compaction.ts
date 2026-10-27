@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { isInspectionStop, readBoundedDirectory, runBoundedGit } from "./git-expiration-budget.js";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -46,27 +46,11 @@ async function runGitRead(
   args: string[],
   options: { signal?: AbortSignal; input?: string; okExitCodes?: number[] } = {},
 ) {
-  return await new Promise<string>((resolve, reject) => {
-    const child = execFile(
-      "git",
-      ["-C", worktreePath, ...args],
-      { cwd: worktreePath, timeout: GIT_READ_TIMEOUT_MS, signal: options.signal, maxBuffer: 16 * 1024 * 1024 },
-      (error, stdout) => {
-        const exitCode = (error as { code?: unknown } | null)?.code;
-        if (!error || (typeof exitCode === "number" && options.okExitCodes?.includes(exitCode))) {
-          resolve(stdout);
-          return;
-        }
-        reject(error);
-      },
-    );
-    // Git can exit before it reads stdin (or never reads it). A write to the
-    // closed pipe then fails with EPIPE; the exit status above already reports
-    // any real failure, so the stream error is not a second outcome.
-    child.stdin?.on("error", () => {});
-    if (options.input === undefined) child.stdin?.end();
-    else child.stdin?.end(options.input);
+  const result = await runBoundedGit(["-C", worktreePath, ...args], {
+    cwd: worktreePath, timeout: GIT_READ_TIMEOUT_MS, signal: options.signal, maxBuffer: 16 * 1024 * 1024,
+    input: options.input, okExitCodes: options.okExitCodes,
   });
+  return result.stdout;
 }
 
 function splitNul(output: string) {
@@ -135,8 +119,11 @@ export async function findRegenerableWorkspaceDirs(
   async function collect(relativeDir: string, depth: number, candidates: string[]) {
     options.signal?.throwIfAborted();
     if (depth > MAX_WALK_DEPTH) return;
-    const entries = await fs.readdir(path.join(worktreePath, relativeDir), { withFileTypes: true })
-      .catch(() => []);
+    const entries = await readBoundedDirectory(path.join(worktreePath, relativeDir), options.signal)
+      .catch((error: unknown) => {
+        if (isInspectionStop(error, options.signal) || typeof (error as NodeJS.ErrnoException)?.code !== "string") throw error;
+        return [];
+      });
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
       if (PROTECTED_WORKSPACE_DIR_NAMES.has(entry.name)) continue;
