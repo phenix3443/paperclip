@@ -13,6 +13,8 @@ import {
   executionWorkspaces,
   heartbeatRuns,
   issueComments,
+  issueRelations,
+  issueTreeHolds,
   issues,
   projects,
 } from "@paperclipai/db";
@@ -307,5 +309,121 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(after.comments).toEqual(before.comments);
     expect(after.intents).toEqual(before.intents);
     expect(after.issue.status).toBe("done");
+  });
+  // Section 8: refusals with no side effects. Each leaves no comment, no status
+  // change, no intent and no workspace change.
+  async function expectRefusal(
+    f: Awaited<ReturnType<typeof fixture>>,
+    expectedStatus: number,
+    expectedError?: string,
+    app: express.Express = f.app,
+  ) {
+    const before = await snapshot(f.targetIssueId, f.workspaceId);
+    const res = await post(app, f.targetIssueId, { body: "Continue", resume: true, clientRequestId: randomUUID() });
+    expect(res.status, JSON.stringify(res.body)).toBe(expectedStatus);
+    if (expectedError) expect(res.body.error).toBe(expectedError);
+    expect(await snapshot(f.targetIssueId, f.workspaceId)).toEqual(before);
+  }
+
+  it("refuses an active subtree pause hold with 409", async () => {
+    await setFeature(true);
+    const f = await fixture();
+    await db.insert(issueTreeHolds).values({
+      companyId: f.companyId, rootIssueId: f.targetIssueId, mode: "pause", status: "active",
+      createdByActorType: "user", createdByUserId: "responsible-user",
+      releasePolicy: { strategy: "manual", note: "fixture" },
+    });
+    await expectRefusal(f, 409, CROSS_TASK_CONTINUATION_MESSAGES.pauseHold);
+  });
+
+  it("refuses a blocked target with unresolved blockers with 409", async () => {
+    await setFeature(true);
+    const f = await fixture();
+    // Like today's comment gate, blockers refuse a resume of a `blocked` target.
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, f.targetIssueId));
+    const blockerId = randomUUID();
+    await db.insert(issues).values({ id: blockerId, companyId: f.companyId, title: "Blocker", status: "in_progress" });
+    await db.insert(issueRelations).values({ companyId: f.companyId, issueId: blockerId, relatedIssueId: f.targetIssueId, type: "blocks" });
+    await expectRefusal(f, 409, CROSS_TASK_CONTINUATION_MESSAGES.unresolvedBlockers);
+  });
+
+  it("refuses a target whose execution is held by a live run with 409", async () => {
+    await setFeature(true);
+    const f = await fixture();
+    const liveRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: liveRunId, companyId: f.companyId, agentId: f.agentId, status: "queued", invocationSource: "assignment",
+      triggerDetail: "system", contextSnapshot: { issueId: f.targetIssueId },
+    });
+    await db.update(issues).set({ executionRunId: liveRunId }).where(eq(issues.id, f.targetIssueId));
+    const before = await snapshot(f.targetIssueId, f.workspaceId);
+    const res = await post(f.app, f.targetIssueId, { body: "Continue", resume: true, clientRequestId: randomUUID() });
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(await snapshot(f.targetIssueId, f.workspaceId)).toEqual(before);
+  });
+
+  it("refuses a source run the actor does not own with the guard's 403", async () => {
+    await setFeature(true);
+    const f = await fixture();
+    const otherAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: otherAgentId, companyId: f.companyId, name: "Other", role: "engineer", status: "active",
+      adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+    });
+    await db.update(heartbeatRuns).set({ agentId: otherAgentId }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    await expectRefusal(f, 403);
+  });
+
+  it("a commenter that is not the assignee still wakes only the target's assignee", async () => {
+    await setFeature(true);
+    const f = await fixture();
+    // The requester has the ordinary comment access (same company, visible
+    // issue write), so the plan does not refuse it. The intent and the
+    // successor still belong to the target's assignee, never to the requester.
+    const requesterId = randomUUID();
+    const requesterRunId = randomUUID();
+    await db.insert(agents).values({
+      id: requesterId, companyId: f.companyId, name: "Requester", role: "engineer", status: "active",
+      adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: requesterRunId, companyId: f.companyId, agentId: requesterId, status: "running", invocationSource: "assignment",
+      triggerDetail: "system", contextSnapshot: { issueId: f.sourceIssueId, taskId: f.sourceIssueId },
+    });
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = { type: "agent", agentId: requesterId, companyId: f.companyId, runId: requesterRunId, source: "agent_key" } as never;
+      next();
+    });
+    app.use("/api", issueRoutes(db, {} as any));
+    app.use(errorHandler);
+    const res = await post(app, f.targetIssueId, { body: "Continue", resume: true, clientRequestId: randomUUID() });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const after = await snapshot(f.targetIssueId, f.workspaceId);
+    expect(after.intents).toHaveLength(1);
+    expect(after.intents[0]).toMatchObject({ agentId: f.agentId });
+    expect(after.intents[0]!.payload).toMatchObject({ crossTaskContinuation: { requestedByAgentId: requesterId, expectedAssigneeAgentId: f.agentId } });
+    const requesterRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, requesterId));
+    expect(requesterRuns.map((run) => run.id)).toEqual([requesterRunId]);
+  });
+
+  it("refuses a cross-company issue id before any write", async () => {
+    await setFeature(true);
+    const f = await fixture();
+    const other = await fixture();
+    const before = await snapshot(other.targetIssueId, other.workspaceId);
+    const res = await post(f.app, other.targetIssueId, { body: "Continue", resume: true, clientRequestId: randomUUID() });
+    expect([403, 404]).toContain(res.status);
+    expect(await snapshot(other.targetIssueId, other.workspaceId)).toEqual(before);
+  });
+
+  it("G2: a cross-task agent PATCH on the closed target keeps its 403 with no side effects", async () => {
+    await setFeature(true);
+    const f = await fixture();
+    const before = await snapshot(f.targetIssueId, f.workspaceId);
+    const res = await request(f.app).patch(`/api/issues/${f.targetIssueId}`).send({ status: "todo" });
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(await snapshot(f.targetIssueId, f.workspaceId)).toEqual(before);
   });
 });
