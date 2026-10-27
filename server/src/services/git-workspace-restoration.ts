@@ -131,7 +131,6 @@ export async function verifyRemoteGitCommit(repoUrl: string, commit: string, res
     const result = await runBoundedGit(["-C", temporary, "rev-parse", "FETCH_HEAD^{commit}"], options);
     if (result.stdout.trim() !== commit) throw new GitCacheRestorationFailure();
   } catch (error) {
-    // A budget hit (scratch quota, output, group survivor) is not an unverified commit.
     if (error instanceof GitCacheRestorationFailure || error instanceof GitExpirationBudgetExceeded) throw error;
     throw new GitCacheRestorationFailure(error);
   }
@@ -152,7 +151,6 @@ async function stockGitFiles() {
       return files;
     } finally { await fs.rm(root, { recursive: true, force: true }); }
   })().catch(error => {
-    // An aborted or budget-limited first read must not poison the cache for later rows.
     templateFiles = undefined;
     throw error;
   });

@@ -1,7 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { execFile, spawn } from "node:child_process";
 
-/** Approved budgets of the read-only expiration inspection round. No flag or environment variable changes them. */
 export const GIT_EXPIRATION_BUDGETS = Object.freeze({
   roundSeconds: 600,
   stopDrainSeconds: 15,
@@ -21,7 +20,6 @@ export const GIT_CHILD_KILL_GRACE_MS = 2_000;
 export const GIT_GROUP_PROBE_INTERVAL_MS = 50;
 export const ROW_DRAIN_BOUND_MS = 5_000;
 
-/** Git settings that stop a child from starting detached maintenance or an fsmonitor daemon outside its group. */
 const BOUNDED_GIT_CONFIG: ReadonlyArray<readonly [string, string]> = [
   ["gc.auto", "0"], ["maintenance.auto", "false"], ["core.fsmonitor", "false"],
 ];
@@ -34,7 +32,6 @@ export class GitExpirationBudgetExceeded extends Error {
   }
 }
 
-/** True while the process group may still have members. Only `ESRCH` proves it is empty. */
 export type GitGroupProbe = (pgid: number) => boolean;
 
 export const probeGitProcessGroup: GitGroupProbe = pgid => {
@@ -48,14 +45,9 @@ export const probeGitProcessGroup: GitGroupProbe = pgid => {
 
 export type InspectionBudgetHooks = {
   probeGroup?: GitGroupProbe;
-  /** Test seam: an upper bound on every Git child timeout of the row. */
   gitTimeoutMs?: number;
 };
 
-/**
- * Per-row ledger. The round installs one around each row; shared helpers read it
- * through `currentInspectionBudget()` and keep their old behavior without it.
- */
 export class InspectionBudget {
   readonly signal: AbortSignal;
   readonly peaks = { childOutputBytes: 0, gitChildren: 0 };
@@ -75,7 +67,6 @@ export class InspectionBudget {
     return budgetStore.run(this, work);
   }
 
-  /** Records a budget hit, aborts the row and returns the error for the caller to throw. */
   exceeded(error: GitExpirationBudgetExceeded): GitExpirationBudgetExceeded {
     if (!this.controller.signal.aborted) this.controller.abort(error);
     return error;
@@ -93,7 +84,6 @@ export class InspectionBudget {
     this.gitChildren -= 1;
   }
 
-  /** Keeps `work` in the drain set until it settles, whether or not the caller awaits it. */
   track<T>(work: Promise<T>): Promise<T> {
     this.running.add(work);
     const forget = () => { this.running.delete(work); };
@@ -105,7 +95,6 @@ export class InspectionBudget {
     return this.running.size;
   }
 
-  /** Settles only when every tracked runner, including one nobody awaited, has settled. */
   async drain() {
     while (this.running.size) await Promise.allSettled([...this.running]);
   }
@@ -129,7 +118,6 @@ export type BoundedGitOptions = {
 
 export type BoundedGitResult = { stdout: string; stderr: string };
 
-/** The `execFile` path that every caller used before the budget existed. */
 function execGit(args: string[], options: BoundedGitOptions) {
   return new Promise<BoundedGitResult>((resolve, reject) => {
     const child = execFile("git", args, { cwd: options.cwd, env: options.env, timeout: options.timeout,
@@ -141,7 +129,6 @@ function execGit(args: string[], options: BoundedGitOptions) {
       }
       reject(Object.assign(error, { stdout, stderr }));
     });
-    // Git can exit before it reads stdin. The exit status reports any real failure.
     child.stdin?.on("error", () => {});
     if (options.input === undefined) child.stdin?.end();
     else child.stdin?.end(options.input);
@@ -169,12 +156,6 @@ function boundedGitEnv(env: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv {
 
 type StopCause = "timeout" | "abort" | "output" | "max_buffer" | "survivor";
 
-/**
- * Runs one Git child of the inspection. Without a ledger it is the old `execFile`
- * call. With a ledger it owns one process group and settles only after the group is
- * proven empty, so no caller `finally` runs while a member still reads the worktree
- * or writes scratch.
- */
 export function runBoundedGit(args: string[], options: BoundedGitOptions): Promise<BoundedGitResult> {
   const budget = currentInspectionBudget();
   if (!budget) return execGit(args, options);
@@ -198,7 +179,6 @@ function runInGroup(budget: InspectionBudget, args: string[], options: BoundedGi
     let outputBytes = 0;
     let stopCause: StopCause | null = null;
     let maxBufferStream: "stdout" | "stderr" | null = null;
-    // A budget hit aborts the row when it happens, not when the group is later proven empty.
     let budgetError: GitExpirationBudgetExceeded | null = null;
     let leaderExit: { code: number | null; signal: NodeJS.Signals | null } | null = null;
     let spawnError: Error | null = null;
@@ -208,13 +188,18 @@ function runInGroup(budget: InspectionBudget, args: string[], options: BoundedGi
     const child = spawn("git", args, { cwd: options.cwd, env: boundedGitEnv(options.env), detached: true,
       stdio: ["pipe", "pipe", "pipe"] });
     const pgid = child.pid;
-    const timeout = setTimeout(() => stop("timeout"), Math.min(options.timeout, budget.gitTimeoutCapMs));
+    const timeoutMs = Math.min(options.timeout, budget.gitTimeoutCapMs);
+    const timeout = setTimeout(() => {
+      if (stopCause) return;
+      budgetError = budget.exceeded(new GitExpirationBudgetExceeded("git_timeout", timeoutMs));
+      stop("timeout");
+    }, timeoutMs);
     const onAbort = () => stop("abort");
     signal.addEventListener("abort", onAbort, { once: true });
 
     function signalGroup(name: NodeJS.Signals) {
       if (pgid === undefined) return;
-      try { process.kill(-pgid, name); } catch { /* ESRCH: the group is already gone. */ }
+      try { process.kill(-pgid, name); } catch {}
     }
 
     function stop(cause: StopCause) {
@@ -237,7 +222,6 @@ function runInGroup(budget: InspectionBudget, args: string[], options: BoundedGi
           }
           return;
         }
-        // A caller's smaller buffer keeps its old per-stream `execFile` meaning: a per-call error, not a budget hit.
         if (streamBytes > options.maxBuffer) {
           maxBufferStream ??= name;
           stop("max_buffer");
@@ -255,7 +239,6 @@ function runInGroup(budget: InspectionBudget, args: string[], options: BoundedGi
 
     child.once("error", error => {
       spawnError ??= error;
-      // A child that never spawned has no group to wait for.
       if (pgid === undefined) finish();
     });
     child.once("close", (code, closeSignal) => {
@@ -264,7 +247,6 @@ function runInGroup(budget: InspectionBudget, args: string[], options: BoundedGi
         finish();
         return;
       }
-      // Members left after the leader closed make the command result unusable.
       if (!stopCause && budget.probeGroup(pgid)) {
         budgetError = budget.exceeded(new GitExpirationBudgetExceeded("git_group_survivor"));
         stop("survivor");
@@ -299,10 +281,6 @@ function runInGroup(budget: InspectionBudget, args: string[], options: BoundedGi
       if (stopCause === "abort") return reject(abortError(signal));
       if (stopCause === "max_buffer") {
         return reject(Object.assign(new RangeError(`${maxBufferStream ?? "stdout"} maxBuffer length exceeded`), { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
-          stdout: out, stderr: err }));
-      }
-      if (stopCause === "timeout") {
-        return reject(Object.assign(new Error(`git ${args[0] ?? ""} timed out`), { code: null, killed: true, signal: "SIGTERM",
           stdout: out, stderr: err }));
       }
       if (spawnError) {

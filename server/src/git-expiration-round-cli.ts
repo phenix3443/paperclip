@@ -130,8 +130,6 @@ export async function runGitExpirationRoundCli(argv: string[], env: NodeJS.Proce
   const journal = await openGitExpirationRoundJournal(args.evidenceDir);
   const controller = new AbortController();
   const abort = () => controller.abort();
-  // `on`, not `once`: while an undrained row still holds its locks, a second stop
-  // signal must not fall back to the default action and end the process early.
   process.on("SIGINT", abort);
   process.on("SIGTERM", abort);
   let undrained: Promise<void> | undefined;
@@ -147,10 +145,8 @@ export async function runGitExpirationRoundCli(argv: string[], env: NodeJS.Proce
     } finally {
       await journal.close();
     }
-    // A drainIncomplete summary is partial, so this is exit 3 once the row releases.
     return gitExpirationRoundExitCode(summary);
   } finally {
-    // The undrained row keeps both advisory locks; exit only after its chain releases them.
     await undrained;
     process.off("SIGINT", abort);
     process.off("SIGTERM", abort);

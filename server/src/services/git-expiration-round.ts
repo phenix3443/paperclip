@@ -64,7 +64,6 @@ export type GitExpirationRoundSummary = {
   candidateBytes: number;
   lastSelectedKey: GitExpirationRoundKey | null;
   lastCompletedKey: GitExpirationRoundKey | null;
-  /** True when a row's lock chain had not unwound within the drain bound; its locks stay held. */
   drainIncomplete: boolean;
   undrainedRow: GitExpirationRoundKey | null;
   limits: string[];
@@ -91,13 +90,7 @@ export type GitExpirationRoundOptions = {
   maxRows?: number;
   pageSize?: number;
   auth?: GitRemoteAuthProvider;
-  /**
-   * Receives the lock chain of a row that did not drain within the bound. The
-   * caller must keep the process alive until it settles, so the locks are never
-   * released while the row's Git children or walks still run.
-   */
   onUndrainedRow?: (released: Promise<void>) => void;
-  /** Test seam for the per-row ledger. */
   budgetHooks?: InspectionBudgetHooks;
 };
 
@@ -139,9 +132,7 @@ export function readOnlyInspectionGitAuth(env: NodeJS.ProcessEnv = process.env):
 }
 
 type RowInspection = {
-  /** Settles when the row result is known: work returned or threw, or the row signal aborted. */
   outcome: Promise<GitExpirationRoundRow>;
-  /** Settles when the whole lock chain has unwound, after every Git group of the row is gone. */
   released: Promise<void>;
 };
 
@@ -161,8 +152,6 @@ function inspectRow(db: Db, workspace: Workspace, key: GitExpirationRoundKey, au
   };
   const budget = new InspectionBudget(roundSignal, hooks);
   const signal = budget.signal;
-  // Lock order: source, then lifecycle. No finalizer of this chain runs before the
-  // work and the ledger drain have settled.
   const chain = budget.run(() => withIsolatedRepositorySourceLock(db, workspace.companyId, sourceIssueId, () =>
     withDedicatedDbConnection(db, connection => connection.transaction(async tx => {
       const [setting] = await tx.execute<{ idle_timeout_ms: string | null }>(sql`select setting as idle_timeout_ms
@@ -202,13 +191,11 @@ function inspectRow(db: Db, workspace: Workspace, key: GitExpirationRoundKey, au
   });
   const finished = chain.then(value => value, classify);
   const outcome = Promise.race([finished, stopped]);
-  // The loser of the race must not surface as an unhandled rejection.
   finished.catch(() => undefined);
   stopped.catch(() => undefined);
   return { outcome, released: chain.then(() => undefined, () => undefined) };
 }
 
-/** Resolves true when `released` settles within the bound after the outcome, false otherwise. */
 async function awaitRelease(released: Promise<void>) {
   let timer: NodeJS.Timeout | undefined;
   const bound = new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), ROW_DRAIN_BOUND_MS); });
@@ -244,8 +231,6 @@ export async function inspectGitExpirationRound(options: GitExpirationRoundOptio
 
   const db = createDb(options.databaseUrl, { applicationName: GIT_EXPIRATION_ROUND_APPLICATION_NAME, maxConnections: 2,
     sessionParameters: GIT_EXPIRATION_ROUND_SESSION_PARAMETERS });
-  // The pool holds no advisory lock, so an abort may end it at once. Dedicated
-  // clients hold the row locks and end only through their own lock chain.
   const endPool = () => db.$client.end({ timeout: 0 }).catch(() => undefined);
   const cancel = () => { void endPool(); };
   signal.addEventListener("abort", cancel, { once: true });
@@ -299,7 +284,6 @@ export async function inspectGitExpirationRound(options: GitExpirationRoundOptio
           try {
             row = await inspection.outcome;
           } catch {
-            // Classified after the drain wait below.
           }
           if (!await awaitRelease(inspection.released)) {
             summary.drainIncomplete = true;
@@ -325,7 +309,6 @@ export async function inspectGitExpirationRound(options: GitExpirationRoundOptio
     }
   } finally {
     signal.removeEventListener("abort", cancel);
-    // An undrained row keeps its dedicated clients and locks until its chain unwinds.
     if (summary.drainIncomplete) await endPool();
     else await terminateDbConnections(db);
   }

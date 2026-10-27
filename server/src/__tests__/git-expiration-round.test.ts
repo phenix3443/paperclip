@@ -1,7 +1,7 @@
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -20,7 +20,6 @@ import { parseGitExpirationRoundArgs, runGitExpirationRoundCli, GitExpirationRou
   readGitExpirationRoundJournal, gitExpirationRoundExitCode } from "../git-expiration-round-cli.js";
 
 const faults = vi.hoisted(() => ({ git: null as ((args: readonly string[]) => Error | null) | null,
-  // Replaces a bounded Git child of the round with another command in the same process group.
   spawn: null as ((args: readonly string[]) => string[] | null) | null, seamWrite: false, secretServices: 0 }));
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
@@ -361,7 +360,6 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
   it("stops partial when Git output is too large in an ancestry proof", async () => {
     const f = await reconstructable();
     await fs.writeFile(path.join(git(f.cwd, "rev-parse", "--absolute-git-dir"), "ORIG_HEAD"), `${git(f.cwd, "rev-parse", "HEAD")}\n`);
-    // 16 MiB + 1 byte split over stdout and stderr: each stream alone stays below the cap.
     faults.spawn = args => args.includes("merge-base") && args.includes("--is-ancestor")
       ? ["sh", "-c", "head -c 8388608 /dev/zero; head -c 8388609 /dev/zero >&2"] : null;
     const journal = memoryJournal();
@@ -372,8 +370,6 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
 
   it("returns within the drain bound after a budget hit whose Git group is never proven empty, holding both locks", async () => {
     const f = await reconstructable();
-    // While held, the probe never sees ESRCH, as for a group member stuck in uninterruptible sleep:
-    // the first Git child of the row is a survivor (a budget hit) and its group cannot drain.
     let hold = true;
     const undrained: Promise<void>[] = [];
     const journal = memoryJournal();
@@ -387,7 +383,6 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
       expect(journal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "resource_limit", reason: "git_group_survivor" });
       expect(journal.events.at(-1)).toMatchObject({ type: "round_finished", status: "partial", drainIncomplete: true });
       expect(undrained).toHaveLength(1);
-      // The pool is gone, but the row's two dedicated sessions still hold the source and lifecycle locks.
       expect(await advisoryLocks()).toBe(2);
       expect(Number((await db.execute<{ count: string }>(sql`select count(distinct pid)::text as count from pg_locks
         where locktype = 'advisory' and granted`))[0]!.count)).toBe(2);
@@ -632,6 +627,76 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
     });
   });
 
+  it("records git_timeout within the drain bound when the timed-out group is never proven empty, holding both locks", async () => {
+    const f = await reconstructable();
+    let hold = false;
+    faults.spawn = args => args.includes("ORIG_HEAD") ? (hold = true, ["sleep", "30"]) : null;
+    const undrained: Promise<void>[] = [];
+    const journal = memoryJournal();
+    const started = Date.now();
+    try {
+      const summary = await round(journal, { companyId: f.companyId, onUndrainedRow: released => undrained.push(released),
+        budgetHooks: { gitTimeoutMs: 300, probeGroup: pgid => hold || probeGitProcessGroup(pgid) } });
+      expect(Date.now() - started).toBeLessThan(ROW_DRAIN_BOUND_MS + 5_000);
+      expect(summary).toMatchObject({ status: "partial", stopReason: "resource_limit", resourceLimited: 1, drainIncomplete: true,
+        undrainedRow: { id: f.workspaceId } });
+      expect(journal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "resource_limit", reason: "git_timeout" });
+      expect(journal.events.at(-1)).toMatchObject({ type: "round_finished", status: "partial", drainIncomplete: true });
+      expect(undrained).toHaveLength(1);
+      expect(await advisoryLocks()).toBe(2);
+    } finally {
+      hold = false;
+    }
+    await undrained[0];
+    await waitFor(async () => await advisoryLocks() === 0 && await roundBackends() === 0);
+  }, 30_000);
+
+  it("keeps the source and lifecycle sessions alive past a 2 s idle transaction timeout while a row drain is held for 6 s", async () => {
+    const f = await reconstructable();
+    const [{ name }] = await db.execute<{ name: string }>(sql`select current_database() as name`);
+    const ident = `"${name!.replace(/"/g, '""')}"`;
+    await db.execute(sql.raw(`ALTER DATABASE ${ident} SET idle_in_transaction_session_timeout = '2s'`));
+    let hold = false;
+    faults.spawn = args => args.includes("ORIG_HEAD") ? (hold = true, ["sleep", "30"]) : null;
+    const undrained: Promise<void>[] = [];
+    try {
+      const pending = round(memoryJournal(), { companyId: f.companyId, onUndrainedRow: released => undrained.push(released),
+        budgetHooks: { gitTimeoutMs: 300, probeGroup: pgid => hold || probeGitProcessGroup(pgid) } });
+      expect(await pending).toMatchObject({ drainIncomplete: true });
+      await new Promise(resolve => setTimeout(resolve, 6_000));
+      expect(Number((await db.execute<{ count: string }>(sql`select count(*)::text as count from pg_stat_activity
+        where state like 'idle in transaction%' and pid in (select pid from pg_locks where locktype = 'advisory' and granted)`))[0]!.count)).toBe(2);
+    } finally {
+      faults.spawn = null;
+      hold = false;
+      await db.execute(sql.raw(`ALTER DATABASE ${ident} RESET idle_in_transaction_session_timeout`));
+    }
+    await undrained[0];
+    await waitFor(async () => await advisoryLocks() === 0 && await roundBackends() === 0);
+  }, 30_000);
+
+  it("holds both locks while a real group survivor writes scratch, then releases them only after its group is gone", async () => {
+    const f = await reconstructable();
+    const scratch = path.join(root, `survivor-${randomUUID()}`);
+    const pidFile = `${scratch}.pid`;
+    faults.spawn = args => args.includes("ORIG_HEAD")
+      ? ["sh", "-c", `sh -c 'trap "" TERM; echo $$ > "${pidFile}"; while :; do echo x >> "${scratch}"; sleep 0.05; done' </dev/null >/dev/null 2>&1 & while [ ! -s "${pidFile}" ]; do sleep 0.01; done; exit 0`]
+      : null;
+    const journal = memoryJournal();
+    const pending = round(journal, { companyId: f.companyId });
+    await waitFor(async () => (await fs.readFile(pidFile, "utf8").catch(() => "")).trim() !== "");
+    const member = Number((await fs.readFile(pidFile, "utf8")).trim());
+    expect(await advisoryLocks()).toBe(2);
+    const summary = await pending;
+    expect(summary).toMatchObject({ status: "partial", stopReason: "resource_limit", resourceLimited: 1, drainIncomplete: false });
+    expect(journal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "resource_limit", reason: "git_group_survivor" });
+    expect(() => process.kill(member, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
+    const size = (await fs.stat(scratch)).size;
+    await new Promise(resolve => setTimeout(resolve, 300));
+    expect((await fs.stat(scratch)).size).toBe(size);
+    await waitFor(async () => await advisoryLocks() === 0 && await roundBackends() === 0);
+  }, 30_000);
+
   it("keeps the advisory locks of an aborted row until its blocked statement drains", async () => {
     const f = await seed(1);
     const controller = new AbortController();
@@ -649,48 +714,43 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
       expect(journal.events.at(-1)).toMatchObject({ type: "round_finished", status: "partial", drainIncomplete: true });
       expect(journal.events.some(event => event.type === "row_inspected")).toBe(false);
       expect(undrained).toHaveLength(1);
-      // Both row locks stay held while the statement still waits.
       expect(await advisoryLocks()).toBe(2);
     });
     await undrained[0];
     await waitFor(async () => await lockWaiters() === 0 && await advisoryLocks() === 0 && await roundBackends() === 0);
   }, 30_000);
 
-  it("keeps the CLI and its locks alive across stop signals until an undrained row releases, then exits 3", async () => {
+  it("keeps a real CLI process and its locks alive across SIGTERM until SIGKILL ends it", async () => {
     const f = await seed(1);
     const evidenceDir = path.join(root, `cli-undrained-${randomUUID()}`);
-    const written: string[] = [];
-    const write = vi.spyOn(process.stdout, "write").mockImplementation(chunk => { written.push(String(chunk)); return true; });
-    let exitCode: number | undefined;
-    let cli!: Promise<void>;
-    // The test worker has its own SIGTERM handler; deliver the signal only to the ones the CLI installs.
-    const workerHandlers = process.listeners("SIGTERM");
-    const sigterm = () => { for (const handler of process.listeners("SIGTERM")) if (!workerHandlers.includes(handler)) (handler as () => void)(); };
-    try {
-      await holdingTableLock("issues", async () => {
-        cli = runGitExpirationRoundCli(["--round-id", "cli-undrained", "--evidence-dir", evidenceDir, "--company-id", f.companyId],
-          { DATABASE_URL: database.connectionString }).then(code => { exitCode = code; });
-        await waitFor(async () => await lockWaiters() > 0 && await advisoryLocks() > 0);
-        sigterm();
-        await waitFor(async () => written.length > 0);
-        expect(JSON.parse(written[0]!)).toMatchObject({ status: "partial", stopReason: "aborted", drainIncomplete: true, undrainedRow: { id: f.ids[0] } });
+    const loader = path.resolve(here, "../../node_modules/tsx/dist/loader.mjs");
+    const entry = path.resolve(here, "../git-expiration-round-cli.ts");
+    let stdout = "";
+    let exited!: Promise<NodeJS.Signals | number | null>;
+    await holdingTableLock("issues", async () => {
+      const cli = spawn(process.execPath, ["--import", pathToFileURL(loader).href, entry, "--round-id", "cli-undrained", "--evidence-dir", evidenceDir,
+        "--company-id", f.companyId], { env: { ...process.env, DATABASE_URL: database.connectionString }, stdio: ["ignore", "pipe", "inherit"] });
+      exited = new Promise(resolve => cli.once("exit", (code, signal) => resolve(signal ?? code)));
+      cli.stdout.on("data", chunk => { stdout += String(chunk); });
+      try {
+        await waitFor(async () => await lockWaiters() > 0 && await advisoryLocks() === 2);
+        cli.kill("SIGTERM");
+        await waitFor(async () => stdout.includes("\n"));
+        expect(JSON.parse(stdout)).toMatchObject({ status: "partial", stopReason: "aborted", drainIncomplete: true, undrainedRow: { id: f.ids[0] } });
         const events = (await fs.readFile(path.join(evidenceDir, "events.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line) as { type: string });
         expect(events.at(-1)).toMatchObject({ type: "round_finished", status: "partial", drainIncomplete: true });
-        // A second stop signal neither ends the process nor releases the row.
-        expect(process.listenerCount("SIGTERM")).toBe(workerHandlers.length + 1);
-        sigterm();
-        await new Promise(resolve => setTimeout(resolve, 200));
-        expect(exitCode).toBeUndefined();
+        cli.kill("SIGTERM");
+        await new Promise(resolve => setTimeout(resolve, 500));
+        expect(cli.exitCode).toBeNull();
+        expect(cli.signalCode).toBeNull();
         expect(await advisoryLocks()).toBe(2);
-      });
-      await cli;
-    } finally {
-      write.mockRestore();
-    }
-    expect(exitCode).toBe(3);
-    expect(process.listenerCount("SIGTERM")).toBe(workerHandlers.length);
+      } finally {
+        cli.kill("SIGKILL");
+      }
+      expect(await exited).toBe("SIGKILL");
+    });
     await waitFor(async () => await lockWaiters() === 0 && await advisoryLocks() === 0 && await roundBackends() === 0);
-  }, 30_000);
+  }, 60_000);
 
   it("ends partial when evidence cannot be recorded", async () => {
     const f = await seed(2);

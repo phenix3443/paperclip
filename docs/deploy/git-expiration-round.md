@@ -59,7 +59,7 @@ The round uses its own cursor. It does not use or change the cursor of the recur
 
 - All database sessions of the round are read-only (`default_transaction_read_only=on`). A write attempt fails and stops the round.
 - Remote proof uses only the `GITHUB_TOKEN` or `GH_TOKEN` server environment credentials. The round does not read company secrets or managed connections, and it does not refresh OAuth grants.
-- Git commands of the round use `GIT_OPTIONAL_LOCKS=0`, `GIT_TERMINAL_PROMPT=0`, `gc.auto=0`, `maintenance.auto=false` and `core.fsmonitor=false`. Each Git child may write at most 16 MiB to stdout and stderr together, and a row runs at most one Git child at a time. A full scratch disk or quota (`ENOSPC`, `EDQUOT`) stops the round with `resource_limit` instead of rejecting the row. Remote proof fetches into a temporary repository and removes it.
+- Git commands of the round use `GIT_OPTIONAL_LOCKS=0`, `GIT_TERMINAL_PROMPT=0`, `gc.auto=0`, `maintenance.auto=false` and `core.fsmonitor=false`. Each Git child may write at most 16 MiB to stdout and stderr together, and a row runs at most one Git child at a time. A Git timeout, the output cap and a group member left after the leader exits record the row as `resource_limit` at once (`git_timeout`, `git_output`, `git_group_survivor`); the locks stay held until the group is gone, as for a stop signal. A full scratch disk or quota (`ENOSPC`, `EDQUOT`) stops the round with `resource_limit` instead of rejecting the row. Remote proof fetches into a temporary repository and removes it.
 
 ## Evidence
 

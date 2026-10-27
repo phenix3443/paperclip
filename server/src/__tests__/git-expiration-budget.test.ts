@@ -16,14 +16,12 @@ describePosix("bounded Git child runner", () => {
     pidFile = path.join(root, "pids");
   });
   afterAll(async () => {
-    // Leave nothing behind if an assertion failed before the runner reaped its group.
     for (const pid of (await fs.readFile(pidFile, "utf8").catch(() => "")).split("\n").filter(Boolean)) {
-      try { process.kill(Number(pid), "SIGKILL"); } catch { /* already gone */ }
+      try { process.kill(Number(pid), "SIGKILL"); } catch {}
     }
     await fs.rm(root, { recursive: true, force: true });
   });
 
-  /** Puts a fake `git` with the given shell body first on PATH. */
   async function fakeGit(name: string, body: string) {
     const dir = path.join(root, name);
     await fs.mkdir(dir, { recursive: true });
@@ -38,7 +36,6 @@ describePosix("bounded Git child runner", () => {
 
   it("waits for a group member that outlives the leader and ignores SIGTERM, then reports a survivor", async () => {
     await fs.rm(pidFile, { force: true });
-    // The helper keeps the group alive after the leader exits 0, with stdio detached from the runner.
     const env = await fakeGit("survivor", `sh -c 'trap "" TERM; echo $$ >> "$PIDS"; sleep 30' </dev/null >/dev/null 2>&1 &
 echo $$ >> "$PIDS"
 exit 0`);
@@ -79,6 +76,27 @@ sleep 30`);
     await budget.drain();
   }, 15_000);
 
+  it("aborts the row with git_timeout when the timeout fires, while the runner waits for a group that is never proven empty", async () => {
+    const env = await fakeGit("hung", "sleep 30");
+    let hold = true;
+    const budget = new InspectionBudget(new AbortController().signal, { probeGroup: pgid => hold || probeGitProcessGroup(pgid) });
+    let settled = false;
+    const started = Date.now();
+    const pending = run(budget, env, 100).catch((caught: unknown) => caught).finally(() => { settled = true; });
+    await expect.poll(() => budget.signal.aborted).toBe(true);
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(budget.signal.reason).toBeInstanceOf(GitExpirationBudgetExceeded);
+    expect((budget.signal.reason as GitExpirationBudgetExceeded).budget).toBe("git_timeout");
+    await new Promise(resolve => setTimeout(resolve, GIT_CHILD_KILL_GRACE_MS + 500));
+    expect(settled).toBe(false);
+    expect(budget.runningCount).toBe(1);
+    hold = false;
+    const error = await pending;
+    expect((error as GitExpirationBudgetExceeded).budget).toBe("git_timeout");
+    await budget.drain();
+    expect(budget.runningCount).toBe(0);
+  }, 15_000);
+
   it("refuses a second concurrent Git child of the same row", async () => {
     const env = await fakeGit("slow", "sleep 0.3");
     const budget = new InspectionBudget(new AbortController().signal);
@@ -87,7 +105,6 @@ sleep 30`);
     expect(second).toBeInstanceOf(GitExpirationBudgetExceeded);
     expect((second as GitExpirationBudgetExceeded).budget).toBe("git_children");
     expect(budget.peaks.gitChildren).toBe(1);
-    // The budget hit aborts the row, so the first child is stopped and drained too.
     expect(await first).toMatchObject({ name: "AbortError" });
     await budget.drain();
     expect(budget.runningCount).toBe(0);
