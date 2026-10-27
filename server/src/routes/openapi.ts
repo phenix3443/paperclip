@@ -10759,6 +10759,22 @@ registerCurrentRoute({
 });
 
 registerCurrentRoute({
+  method: "get",
+  path: "/api/issues/{id}/recovery-actions/receipts/{key}",
+  tags: ["issues"],
+  summary: "Read the execution reconciliation receipt state for an idempotency key",
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/issues/{id}/recovery-actions/receipts/{key}/settle",
+  tags: ["issues"],
+  summary: "Settle an execution reconciliation idempotency key as committed or permanently abandoned",
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registerCurrentRoute({
   method: "post",
   path: "/api/issues/{id}/scheduled-retry/retry-now",
   tags: ["issues"],
