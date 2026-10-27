@@ -134,6 +134,18 @@ const support = await getEmbeddedPostgresTestSupport();
     await expect(githubGuestBotConnectionForSession(db, { companyId: f.company.id, agentId: f.agent.id, runId: f.run.id, issueId: f.issue.id })).resolves.toBeNull();
   });
 
+  it("follows a chain that leaves the task and comes back, and judges the task's own earlier context", async () => {
+    const f = await delegatedFixture();
+    const [earlier] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: f.agent.id, status: "succeeded", nativeIssueId: f.issue.id, responsibleUserId: "requester" }).returning();
+    const [back] = await db.insert(runIdentityContexts).values({ companyId: f.company.id, runId: earlier.id, revision: 1, responsibleUserId: "requester", cause: "issue_assigned", correlationId: "dispatch" }).returning();
+    await db.update(runIdentityContexts).set({ parentContextId: back.id }).where(eq(runIdentityContexts.id, f.origin.id));
+    expect(await chatRunSourceMessageId(db, f.run, { provider: "github", allowLegacyWakeComment: true, stopAtOtherTask: true })).toBeNull();
+    await expect(githubGuestBotConnectionForSession(db, { companyId: f.company.id, agentId: f.agent.id, runId: f.run.id, issueId: f.issue.id })).resolves.toBeNull();
+    await expect(chatRunSourceMessageId(db, f.run)).rejects.toMatchObject({ status: 403 });
+    await db.update(runIdentityContexts).set({ responsibleUserId: "another-person" }).where(eq(runIdentityContexts.id, back.id));
+    await expect(chatRunSourceMessageId(db, f.run, { provider: "github", allowLegacyWakeComment: true, stopAtOtherTask: true })).rejects.toMatchObject({ status: 403 });
+  });
+
   it.each(["reentry", "missing-run", "foreign-cycle"])("still rejects a delegated chain with a %s", async fault => {
     const f = await delegatedFixture();
     if (fault === "reentry") {
