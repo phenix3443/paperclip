@@ -14,6 +14,7 @@ import {
   agents,
   agentRuntimeState,
   approvals,
+  budgetPolicies,
   authUsers,
   agentWakeupRequests,
   activityLog,
@@ -2382,6 +2383,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         ["a coordinator that names a successor run", null,
           (f) => coordinator(f, { failureDetail: { successorRunId: randomUUID() } }),
           "run_not_settled", "coordinator"],
+        ["an environment lease that was not released", null,
+          (f) => db.insert(environmentLeases).values({ companyId: f.companyId, heartbeatRunId: f.runId, issueId: f.sourceIssueId,
+            status: "active" } as any).then(() => undefined),
+          "run_not_settled", "process_or_lease"],
         ["a source run that succeeded",
           (f) => db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.runId)).then(() => undefined),
           null, "run_not_settled", undefined],
@@ -2510,6 +2515,12 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         }, async (f) => {
           await db.update(projects).set({ pausedAt: new Date() }).where(eq(projects.companyId, f.companyId));
         }],
+        ["budget", null, async (f) => {
+          await db.insert(budgetPolicies).values({ companyId: f.companyId, scopeType: "agent", scopeId: f.coderId,
+            metric: "billed_cents", windowKind: "lifetime", amount: 1, hardStopEnabled: true, notifyEnabled: false } as any);
+          await db.insert(costEvents).values({ companyId: f.companyId, agentId: f.coderId, provider: "test", biller: "test",
+            billingType: "metered_api", model: "budget-fixture", costCents: 500, occurredAt: new Date() } as any);
+        }],
         ["company_pause", null, (f) => db.update(companies).set({ status: "paused" }).where(eq(companies.id, f.companyId))],
         ["agent_pause", null, (f) => db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.coderId))],
         ["monitor", (f) => db.update(issues).set({ monitorNextCheckAt: new Date(Date.now() + 60 * 60 * 1000) })
@@ -2541,6 +2552,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           await db.delete(approvals).where(eq(approvals.companyId, fixture.companyId));
           await db.delete(issueTreeHolds).where(eq(issueTreeHolds.companyId, fixture.companyId));
           await db.delete(projects).where(eq(projects.companyId, fixture.companyId));
+          await db.delete(budgetPolicies).where(eq(budgetPolicies.companyId, fixture.companyId));
         }
       });
     });

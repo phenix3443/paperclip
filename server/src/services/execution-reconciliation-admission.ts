@@ -21,6 +21,9 @@ import { DIRECT_NON_INVOKABLE_STATUSES } from "./agent-invokability.js";
 import { budgetServiceInTransaction } from "./budgets.js";
 import { issueTreeControlService } from "./issue-tree-control.js";
 import { executionReconciliationRefusal } from "./execution-reconciliation-receipts.js";
+import { validateExecutionReconciliation } from "./execution-recovery-resolution.js";
+import { HttpError } from "../errors.js";
+import type { ExecutionReconciliation } from "@paperclipai/shared";
 
 type DbOrTransaction = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 
@@ -229,4 +232,25 @@ export async function admitExecutionReconciliationGates(
   const budgetBlock = await budgetServiceInTransaction(tx as unknown as Db)
     .getInvocationBlock(issue.companyId, ownerAgentId, { issueId: issue.id, projectId: issue.projectId });
   if (budgetBlock) throw gateClosed("budget", "A budget or pause gate blocks the owner agent.");
+}
+
+export async function admitExecutionReconciliationProcesses(
+  tx: DbOrTransaction,
+  input: { issue: typeof issues.$inferSelect; decision: ExecutionReconciliation },
+) {
+  try {
+    await validateExecutionReconciliation({
+      db: tx as unknown as Db,
+      companyId: input.issue.companyId,
+      issueId: input.issue.id,
+      agentId: input.issue.assigneeAgentId,
+      sourceRunId: input.decision.runId,
+      decision: input.decision,
+    });
+  } catch (error) {
+    if (error instanceof HttpError && error.status === 409) {
+      throw executionReconciliationRefusal("run_not_settled", error.message, { reason: "process_or_lease" });
+    }
+    throw error;
+  }
 }

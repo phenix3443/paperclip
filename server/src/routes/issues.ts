@@ -21,7 +21,7 @@ import {
   lockCompanyForAdmission,
   verifyExecutionReconciliationAuthorization,
 } from "../services/issue-document-decisions.js";
-import { admitExecutionReconciliationGates, admitExecutionReconciliationRuns, lockAdmissionRows } from "../services/execution-reconciliation-admission.js";
+import { admitExecutionReconciliationGates, admitExecutionReconciliationProcesses, admitExecutionReconciliationRuns, lockAdmissionRows } from "../services/execution-reconciliation-admission.js";
 import { lockAdmissionOwnerAndTreeHolds } from "../services/execution-reconciliation-locks.js";
 import { assertNoCaseHandoffMutation } from "../services/heartbeat/case-handoff-lifecycle.js";
 import { assertLegacyRunTaskOwnership } from "../legacy-run-task-ownership.js";
@@ -9812,6 +9812,7 @@ export function issueRoutes(
             issue: lockedIssue, actionId: actionId!, locked: lockedAdmissionRows!,
             unstartedRunIds: admissionCheck.expected.unstartedRunIds,
           });
+          await admitExecutionReconciliationProcesses(tx, { issue: lockedIssue, decision: executionReconciliation! });
           await admitExecutionReconciliationGates(tx, {
             issue: lockedIssue, action: admissionCheck.expected.action, locked: lockedAdmissionRows!,
             expected: admissionCheck.expected,
