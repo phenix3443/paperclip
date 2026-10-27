@@ -69,6 +69,7 @@ const support = await getEmbeddedPostgresTestSupport();
   afterAll(async () => { await temporary?.cleanup(); });
   afterEach(async () => {
     crossTaskContinuationTestHooks.beforeCommit = undefined;
+    crossTaskContinuationTestHooks.beforeTransaction = undefined;
     await setFeature(false);
   });
 
@@ -520,5 +521,22 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(after.workspace?.metadata).toMatchObject({ lifecycleGeneration: 7 });
       expect({ ...after.workspace, metadata: null, updatedAt: null }).toEqual({ ...before.workspace, metadata: null, updatedAt: null });
     }
+  });
+
+  it.each(["rebind", "generation"] as const)("L1 reverse (%s): a writer that commits between classification and the locked re-check makes the request 409 with no writes", async (write) => {
+    await setFeature(true);
+    const f = await fixture();
+    crossTaskContinuationTestHooks.beforeTransaction = async () => {
+      if (write === "rebind") await db.update(issues).set({ executionWorkspaceId: null }).where(eq(issues.id, f.targetIssueId));
+      else await db.update(executionWorkspaces).set({ metadata: { lifecycleGeneration: 7 } }).where(eq(executionWorkspaces.id, f.workspaceId));
+    };
+    const between = async () => snapshot(f.targetIssueId, f.workspaceId);
+    const res = await post(f.app, f.targetIssueId, { body: "Continue", resume: true, clientRequestId: randomUUID() });
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body).toMatchObject({ error: CROSS_TASK_CONTINUATION_MESSAGES.notReopenable });
+    const after = await between();
+    expect(after.comments).toHaveLength(0);
+    expect(after.intents).toHaveLength(0);
+    expect(after.issue.status).toBe("done");
   });
 });

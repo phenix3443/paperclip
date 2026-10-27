@@ -3053,6 +3053,9 @@ const issueListActorClientInflight = new Map<string, number>();
 
 /** Test seam for the cross-task continuation transaction (fault injection, barriers). */
 export const crossTaskContinuationTestHooks: {
+  // Runs after the route classified the binding (D1) and before the deferred
+  // transaction starts, so a test can commit a competing write in between.
+  beforeTransaction?: () => Promise<void>;
   beforeCommit?: (tx: Parameters<Parameters<Db["transaction"]>[0]>[0]) => Promise<void>;
 } = {};
 
@@ -7852,6 +7855,7 @@ export function issueRoutes(
     const sourceTrust = await sourceTrustForActorWrite(issue, actor);
     let result: Awaited<ReturnType<typeof commitCrossTaskContinuation>>;
     try {
+      await crossTaskContinuationTestHooks.beforeTransaction?.();
       result = await commitCrossTaskContinuation(db, {
         companyId: issue.companyId,
         issueId: issue.id,
