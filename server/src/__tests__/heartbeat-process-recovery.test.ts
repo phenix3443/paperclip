@@ -32,6 +32,7 @@ import os from "node:os";
 import path from "node:path";
 import { and, eq, or, inArray, sql } from "drizzle-orm";
 import { ownerRepairIssueBinding } from "../services/recovery/owner-repair-continuation.js";
+import { recordRunExecutionReleased } from "../services/heartbeat/case-handoff-lifecycle.js";
 import {
   afterAll,
   afterEach,
@@ -8046,7 +8047,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
-  async function seedCompletedOwnerRepairFixture(opts: { durableSettlement?: boolean } = {}) {
+  async function seedCompletedOwnerRepairFixture(opts: { durableSettlement?: boolean; executionReleased?: boolean } = {}) {
     const { companyId, agentId, runId: repairRunId, issueId } =
       await seedStrandedIssueFixture({
         status: "in_progress",
@@ -8117,6 +8118,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         eventType: "lifecycle",
         payload: { phase: "task.run.measured", outcome: "succeeded", durableSettlement: true },
       });
+    }
+    // The executor's release proof: provider stopped, scratch removed and the
+    // owned process tree is gone.
+    if (opts.durableSettlement !== false && opts.executionReleased !== false) {
+      await recordRunExecutionReleased(db, repairRunId, issueId);
     }
     return { companyId, agentId, repairRunId, issueId, actionId: action.id };
   }
@@ -8399,16 +8405,43 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(after.action).toMatchObject({ status: "resolved", attemptCount: 1 });
   });
 
-  it("settles a completed owner repair from its run completion without waiting for the sweep", async () => {
-    const fixture = await seedCompletedOwnerRepairFixture({ durableSettlement: false });
+  /**
+   * Reports a real host process group to the executor through `onSpawn`, as a
+   * local adapter does. With `linger`, a descendant outlives the group leader,
+   * so the adapter's own exit does not prove the process tree stopped.
+   */
+  async function reportOwnedProcessGroup(input: unknown, opts: { linger: boolean }) {
+    const invocation = input as { onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void> };
+    const startedAt = new Date().toISOString();
+    if (opts.linger) {
+      const orphan = await spawnOrphanedProcessGroup();
+      cleanupPids.add(orphan.descendantPid);
+      await invocation.onSpawn!({ pid: orphan.processPid!, processGroupId: orphan.processGroupId, startedAt });
+      return orphan;
+    }
+    const leader = spawn(process.execPath, ["-e", ""], { detached: true, stdio: "ignore" });
+    await new Promise<void>((resolve, reject) => { leader.once("error", reject); leader.once("exit", () => resolve()); });
+    await invocation.onSpawn!({ pid: leader.pid!, processGroupId: leader.pid!, startedAt });
+    return { processPid: leader.pid!, processGroupId: leader.pid!, descendantPid: null };
+  }
+
+  async function replayOwnerRepairThroughExecutor(fixture: Awaited<ReturnType<typeof seedCompletedOwnerRepairFixture>>) {
     // Replay the scheduled repair through the real executor instead of seeding
-    // its terminal row: completion itself must settle the action.
+    // its terminal row.
     await db.update(heartbeatRuns).set({
       status: "queued", startedAt: null, finishedAt: null, resultJson: null, exitCode: null,
     }).where(eq(heartbeatRuns.id, fixture.repairRunId));
+  }
 
-    // As reported, the repair pushes its fix and leaves the task blocked.
-    mockAdapterExecute.mockImplementationOnce(async () => {
+  it("settles a completed owner repair from its run completion without waiting for the sweep", async () => {
+    const fixture = await seedCompletedOwnerRepairFixture({ durableSettlement: false });
+    // Completion itself must settle the action.
+    await replayOwnerRepairThroughExecutor(fixture);
+
+    // As reported, the repair pushes its fix and leaves the task blocked. Its
+    // whole process group has exited before the adapter returns.
+    mockAdapterExecute.mockImplementationOnce(async (input?: unknown) => {
+      await reportOwnedProcessGroup(input, { linger: false });
       await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, fixture.issueId));
       return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
         summary: "Pushed the fix commit; remaining work continues.", provider: "test", model: "test-model" };
@@ -8436,6 +8469,90 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const otherActions = await db.select().from(issueRecoveryActions)
       .where(and(eq(issueRecoveryActions.sourceIssueId, fixture.issueId), eq(issueRecoveryActions.status, "active")));
     expect(otherActions).toHaveLength(0);
+  });
+
+  it("settles an owner repair only after its process tree is released, then exactly once", async () => {
+    const fixture = await seedCompletedOwnerRepairFixture({ durableSettlement: false });
+    await replayOwnerRepairThroughExecutor(fixture);
+    const reported: { owned: Awaited<ReturnType<typeof reportOwnedProcessGroup>> | null } = { owned: null };
+    // The run succeeds, but a descendant of its process group is still alive.
+    mockAdapterExecute.mockImplementationOnce(async (input?: unknown) => {
+      reported.owned = await reportOwnedProcessGroup(input, { linger: true });
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, fixture.issueId));
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+        summary: "Pushed the fix commit; remaining work continues.", provider: "test", model: "test-model" };
+    });
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, fixture.issueId));
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+        summary: "Finished the remaining work.", provider: "test", model: "test-model" };
+    });
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+
+    const repairRun = await db.select().from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, fixture.repairRunId)).then((rows) => rows[0]!);
+    expect(repairRun.status).toBe("succeeded");
+    expect(repairRun.resultJson ?? {}).not.toHaveProperty("executionReleased");
+    expect(reported.owned).not.toBeNull();
+    const owned = reported.owned!;
+    expect(isPidAlive(owned.descendantPid!)).toBe(true);
+
+    // Neither the completion callback nor the sweep settles while the tree lives.
+    await heartbeat.reconcileStrandedAssignedIssues();
+    await heartbeat.reconcileStrandedAssignedIssues();
+    const held = await observeOwnerRepairContinuation(fixture);
+    expect(held.settlement).toBeNull();
+    expect(held.receipts).toHaveLength(0);
+    expect(held.businessSuccessors).toHaveLength(0);
+    expect(held.repeatedRepairs).toHaveLength(0);
+    expect(held.action).toMatchObject({ status: "active", attemptCount: 1 });
+
+    // Once the whole group stops, the sweep establishes the release proof and
+    // settles exactly once, however often it runs.
+    process.kill(-owned.processGroupId!, "SIGKILL");
+    await expect.poll(() => isPidAlive(owned.descendantPid!)).toBe(false);
+    await heartbeat.reconcileStrandedAssignedIssues();
+    await heartbeat.drainActiveRunExecutions();
+    await heartbeat.reconcileStrandedAssignedIssues();
+    await heartbeat.reconcileStrandedAssignedIssues();
+
+    const after = await observeOwnerRepairContinuation(fixture);
+    const released = await db.select().from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, fixture.repairRunId)).then((rows) => rows[0]!);
+    expect(released.resultJson).toHaveProperty("executionReleased");
+    expect(after.repeatedRepairs).toHaveLength(0);
+    expect(after.businessSuccessors).toHaveLength(1);
+    expect(after.receipts).toHaveLength(1);
+    expect(after.receipts[0]!.runId).toBe(after.businessSuccessors[0]!.id);
+    expect(after.settlement).toMatchObject({ state: "delivered", repairRunId: fixture.repairRunId });
+    expect(after.action).toMatchObject({ status: "resolved", attemptCount: 1 });
+  });
+
+  it("holds the sweep's owner-repair settlement until the run's execution release is proven", async () => {
+    const fixture = await seedCompletedOwnerRepairFixture({ executionReleased: false });
+
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+    const held = await observeOwnerRepairContinuation(fixture);
+    expect(held.settlement).toBeNull();
+    expect(held.receipts).toHaveLength(0);
+    expect(held.businessSuccessors).toHaveLength(0);
+    expect(held.repeatedRepairs).toHaveLength(0);
+    expect(held.issue.status).toBe("blocked");
+    expect(held.action).toMatchObject({ status: "active", attemptCount: 1 });
+
+    await recordRunExecutionReleased(db, fixture.repairRunId, fixture.issueId);
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    const after = await observeOwnerRepairContinuation(fixture);
+    expect(after.repeatedRepairs).toHaveLength(0);
+    expect(after.businessSuccessors).toHaveLength(1);
+    expect(after.receipts).toHaveLength(1);
+    expect(after.settlement).toMatchObject({ state: "delivered", repairRunId: fixture.repairRunId });
+    expect(after.action).toMatchObject({ status: "resolved", attemptCount: 1 });
   });
 
   it.each(["blocked", "in_review"] as const)(
@@ -8614,18 +8731,67 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     return { reservedId, reopened: reopened! };
   }
 
-  it("rebinds a waiting continuation to the version its wait resolution produced, once, with an audit entry", async () => {
-    const fixture = await seedCompletedOwnerRepairFixture();
-    const { reservedId, reopened } = await reserveOwnerRepairContinuation(fixture);
+  /**
+   * Applies one native status decision to the task, as the status committer
+   * does: the decision row and the issue's status, version and last decision
+   * move together. The deciding run belongs to another agent so it is not
+   * mistaken for an owner run.
+   */
+  async function applyNativeStatusDecision(
+    fixture: Awaited<ReturnType<typeof seedCompletedOwnerRepairFixture>>,
+    transition: { fromStatus: string; toStatus: string },
+  ) {
+    const issue = (await selectRecoveryIssueById(fixture.issueId))!;
+    const deciderAgentId = randomUUID();
+    await db.insert(agents).values(recoveryAgentRow(deciderAgentId, fixture.companyId, "StatusDecider", "engineer", "idle"));
+    const contractId = randomUUID(), resultId = randomUUID(), assessmentId = randomUUID(), decisionId = randomUUID();
+    const decisionVersion = issue.statusVersion + 1;
+    await db.insert(completionContracts).values({ id: contractId, companyId: fixture.companyId, issueId: fixture.issueId,
+      revision: decisionVersion, schemaVersion: "paperclip.completion-contract.v1", policyVersion: "test", risk: "low",
+      completionAuthority: "agent_claim_policy", incompleteCriteriaPolicy: "preserve_non_terminal", contractJson: {},
+      canonicalSha256: `fixture-${contractId}`, createdByActorType: "system", createdByActorId: "test" });
+    const [decider] = await db.insert(heartbeatRuns).values({ companyId: fixture.companyId, agentId: deciderAgentId,
+      status: "succeeded", nativeIssueId: fixture.issueId, completionContractId: contractId,
+      startedAt: new Date(), finishedAt: new Date() }).returning();
+    await db.insert(nativeRunResults).values({ id: resultId, companyId: fixture.companyId, issueId: fixture.issueId,
+      runId: decider!.id, completionContractId: contractId, serverFingerprint: `fixture-${resultId}`, schemaStatus: "accepted",
+      resultJson: {}, canonicalSha256: `fixture-${resultId}` });
+    await db.insert(workAssessments).values({ id: assessmentId, companyId: fixture.companyId, issueId: fixture.issueId,
+      runId: decider!.id, contractId, resultId, triggerKind: "turn_finished", triggerActorCompanyId: fixture.companyId,
+      priorIssueStatus: transition.fromStatus, priorStatusVersion: issue.statusVersion, policyVersion: "test",
+      assessmentJson: {}, inputDigest: `fixture-${assessmentId}` });
+    await db.insert(statusDecisions).values({ id: decisionId, companyId: fixture.companyId, issueId: fixture.issueId,
+      runId: decider!.id, assessmentId, decisionVersion, policyVersion: "test", fromStatus: transition.fromStatus,
+      toStatus: transition.toStatus, reasonCode: "test_transition", decisionJson: {}, decisionDigest: `fixture-${decisionId}`,
+      applicationState: "applied", appliedAt: new Date() });
+    await db.update(issues).set({ status: transition.toStatus, statusVersion: decisionVersion, lastStatusDecisionId: decisionId })
+      .where(eq(issues.id, fixture.issueId));
+    return { decisionId, decisionVersion };
+  }
+
+  async function waitOnPausedOwner(fixture: Awaited<ReturnType<typeof seedCompletedOwnerRepairFixture>>) {
     await db.update(agents).set({ status: "paused", pauseReason: "manual", pausedAt: new Date() })
       .where(eq(agents.id, fixture.agentId));
     await heartbeatService(db).reconcileStrandedAssignedIssues();
     const waiting = await observeOwnerRepairContinuation(fixture);
     expect(waiting.settlement).toMatchObject({ state: "pending_dispatch", lastWait: { reason: expect.any(String) } });
+    return waiting;
+  }
 
-    // The wait ends through a status round trip, which moves the issue version.
-    await db.update(issues).set({ status: "todo", statusVersion: reopened.statusVersion + 2 })
-      .where(eq(issues.id, fixture.issueId));
+  it("rebinds a waiting continuation to the version its wait resolution produced, once, with an audit entry", async () => {
+    const fixture = await seedCompletedOwnerRepairFixture();
+    const { reservedId, reopened } = await reserveOwnerRepairContinuation(fixture);
+    const waiting = await waitOnPausedOwner(fixture);
+    expect(waiting.settlement.lastWait).toMatchObject({
+      statusVersion: reopened.statusVersion,
+      statusDecisionId: reopened.lastStatusDecisionId ?? null,
+    });
+    expect(waiting.settlement.lastWait.releasedByDecisionId ?? null).toBeNull();
+
+    // The wait ends through a native status round trip: the task is blocked,
+    // then a decision releases it back to open work.
+    await applyNativeStatusDecision(fixture, { fromStatus: "todo", toStatus: "blocked" });
+    const release = await applyNativeStatusDecision(fixture, { fromStatus: "blocked", toStatus: "todo" });
     await db.update(agents).set({ status: "idle", pauseReason: null, pausedAt: null })
       .where(eq(agents.id, fixture.agentId));
     await heartbeatService(db).reconcileStrandedAssignedIssues();
@@ -8638,10 +8804,48 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(after.receipts[0]!.runId).toBe(after.businessSuccessors[0]!.id);
     expect(after.settlement).toMatchObject({
       state: "delivered",
-      expectedIssueStatusVersion: reopened.statusVersion + 2,
-      rebinds: [expect.objectContaining({ fromStatusVersion: reopened.statusVersion, toStatusVersion: reopened.statusVersion + 2 })],
+      expectedIssueStatusVersion: release.decisionVersion,
+      lastWait: { releasedByDecisionId: release.decisionId },
+      rebinds: [expect.objectContaining({
+        fromStatusVersion: reopened.statusVersion,
+        toStatusVersion: release.decisionVersion,
+        toStatusDecisionId: release.decisionId,
+      })],
     });
     expect(after.action).toMatchObject({ status: "resolved", attemptCount: 1 });
+    const audit = await db.select().from(activityLog).where(and(
+      eq(activityLog.action, "issue.owner_repair_rebound"), eq(activityLog.entityId, fixture.actionId)));
+    expect(audit).toHaveLength(1);
+    expect(audit[0]!.details).toMatchObject({ releasedByDecisionId: release.decisionId, toStatusVersion: release.decisionVersion });
+  });
+
+  it.each([
+    ["an unrelated decision that never left the wait", { fromStatus: "todo", toStatus: "todo" }],
+    ["a direct version bump without a decision", null],
+  ] as const)("admits no successor when a recorded wait sees %s", async (_label, transition) => {
+    const fixture = await seedCompletedOwnerRepairFixture();
+    const { reservedId, reopened } = await reserveOwnerRepairContinuation(fixture);
+    await waitOnPausedOwner(fixture);
+
+    if (transition) await applyNativeStatusDecision(fixture, transition);
+    else await db.update(issues).set({ statusVersion: reopened.statusVersion + 2 }).where(eq(issues.id, fixture.issueId));
+    await db.update(agents).set({ status: "idle", pauseReason: null, pausedAt: null })
+      .where(eq(agents.id, fixture.agentId));
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    const after = await observeOwnerRepairContinuation(fixture);
+    expect(after.repeatedRepairs).toHaveLength(0);
+    expect(after.businessSuccessors.filter((run) => run.contextSnapshot?.wakeReason !== "issue_disposition_repair"))
+      .toHaveLength(0);
+    expect(after.receipts).toHaveLength(1);
+    expect(after.receipts[0]).toMatchObject({ id: reservedId, status: "skipped", runId: null });
+    expect(after.settlement).toMatchObject({ state: "denied", wakeupRequestId: reservedId });
+    expect(after.settlement.rebinds ?? []).toHaveLength(0);
+    expect(after.settlement.lastWait?.releasedByDecisionId ?? null).toBeNull();
+    const audit = await db.select().from(activityLog).where(and(
+      eq(activityLog.action, "issue.owner_repair_rebound"), eq(activityLog.entityId, fixture.actionId)));
+    expect(audit).toHaveLength(0);
   });
 
   it("never re-admits a delivered continuation after its receipt row is compacted away", async () => {
