@@ -2418,6 +2418,68 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       });
     });
 
+    describe("gates on locked rows (slice A3a)", () => {
+      type Fixture = Awaited<ReturnType<typeof seedAdmission>>;
+      type Setup = (fixture: Fixture) => Promise<unknown>;
+      const otherRun = async (f: Fixture) => {
+        const id = randomUUID();
+        await db.insert(heartbeatRuns).values({ id, companyId: f.companyId, agentId: f.managerId, invocationSource: "manual", status: "running" });
+        return id;
+      };
+      const cases: Array<[string, Setup | null, Setup | null]> = [
+        ["dependency", null, async (f) => {
+          const [blocker] = await db.insert(issues).values({ companyId: f.companyId, title: "Blocker", status: "in_progress", priority: "medium" }).returning();
+          await db.insert(issueRelations).values({ companyId: f.companyId, issueId: blocker!.id, relatedIssueId: f.sourceIssueId, type: "blocks" });
+        }],
+        ["interaction", null, (f) => db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.sourceIssueId,
+          kind: "request_confirmation", payload: {} as any })],
+        ["approval", null, async (f) => {
+          const [approval] = await db.insert(approvals).values({ companyId: f.companyId, type: "approve_ceo_strategy", status: "revision_requested", payload: {} }).returning();
+          await db.insert(issueApprovals).values({ companyId: f.companyId, issueId: f.sourceIssueId, approvalId: approval!.id } as any);
+        }],
+        ["subtree_pause", null, (f) => db.insert(issueTreeHolds).values({ companyId: f.companyId, rootIssueId: f.sourceIssueId,
+          mode: "pause", status: "active", releasePolicy: {} })],
+        ["project_pause", async (f) => {
+          const [project] = await db.insert(projects).values({ companyId: f.companyId, name: "Paused project" }).returning();
+          await db.update(issues).set({ projectId: project!.id }).where(eq(issues.id, f.sourceIssueId));
+        }, async (f) => {
+          await db.update(projects).set({ pausedAt: new Date() }).where(eq(projects.companyId, f.companyId));
+        }],
+        ["company_pause", null, (f) => db.update(companies).set({ status: "paused" }).where(eq(companies.id, f.companyId))],
+        ["agent_pause", null, (f) => db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.coderId))],
+        ["monitor", (f) => db.update(issues).set({ monitorNextCheckAt: new Date(Date.now() + 60 * 60 * 1000) })
+          .where(eq(issues.id, f.sourceIssueId)), null],
+        ["workspace", null, (f) => db.update(issues).set({ workspacePendingSelection: { mode: "isolated_workspace" } as any })
+          .where(eq(issues.id, f.sourceIssueId))],
+        ["checkout", null, async (f) => {
+          const runId = await otherRun(f);
+          await db.update(issues).set({ checkoutRunId: runId }).where(eq(issues.id, f.sourceIssueId));
+        }],
+        ["owner", (f) => db.update(issueRecoveryActions).set({ returnOwnerAgentId: f.managerId })
+          .where(eq(issueRecoveryActions.id, f.actionId)), null],
+      ];
+
+      it.each(cases)("refuses gate_closed:%s and writes nothing but the refusal audit", async (gate, beforeBody, afterBody) => {
+        const fixture = await seedAdmission();
+        try {
+          await beforeBody?.(fixture);
+          const body = await admissionBody(fixture, `recon:gate-${gate}`.slice(0, 40).padEnd(16, "0"));
+          await afterBody?.(fixture);
+          const before = await snapshot(fixture);
+          const response = await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(409);
+          expect(refusalCode(response.body)).toBe(`gate_closed:${gate}`);
+          expect(await snapshot(fixture)).toEqual(before);
+          expect((await refusals()).map((row) => (row.details as any).code)).toEqual([`gate_closed:${gate}`]);
+        } finally {
+          await db.update(issues).set({ projectId: null, checkoutRunId: null }).where(eq(issues.companyId, fixture.companyId));
+          await db.delete(issueApprovals).where(eq(issueApprovals.companyId, fixture.companyId));
+          await db.delete(approvals).where(eq(approvals.companyId, fixture.companyId));
+          await db.delete(issueTreeHolds).where(eq(issueTreeHolds.companyId, fixture.companyId));
+          await db.delete(projects).where(eq(projects.companyId, fixture.companyId));
+        }
+      });
+    });
+
     it("rejects a non-integer number in the request with 400 before hashing and audits the refusal", async () => {
       const fixture = await seedAdmission();
       const body = await admissionBody(fixture, "recon:fraction-number-1");

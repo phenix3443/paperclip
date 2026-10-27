@@ -21,7 +21,7 @@ import {
   lockCompanyForAdmission,
   verifyExecutionReconciliationAuthorization,
 } from "../services/issue-document-decisions.js";
-import { admitExecutionReconciliationRuns, lockAdmissionRows } from "../services/execution-reconciliation-admission.js";
+import { admitExecutionReconciliationGates, admitExecutionReconciliationRuns, lockAdmissionRows } from "../services/execution-reconciliation-admission.js";
 import { lockAdmissionOwnerAndTreeHolds } from "../services/execution-reconciliation-locks.js";
 import { assertNoCaseHandoffMutation } from "../services/heartbeat/case-handoff-lifecycle.js";
 import { assertLegacyRunTaskOwnership } from "../legacy-run-task-ownership.js";
@@ -9796,6 +9796,10 @@ export function issueRoutes(
           await admitExecutionReconciliationRuns(tx, {
             issue: lockedIssue, actionId: actionId!, locked: lockedAdmissionRows!,
             unstartedRunIds: admissionCheck.expected.unstartedRunIds,
+          });
+          await admitExecutionReconciliationGates(tx, {
+            issue: lockedIssue, action: admissionCheck.expected.action, locked: lockedAdmissionRows!,
+            expected: admissionCheck.expected,
           });
         }
         // Reconciling a reviewer run keeps the task in review; no status change is requested.

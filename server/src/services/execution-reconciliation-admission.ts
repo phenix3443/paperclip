@@ -1,7 +1,13 @@
 import { and, asc, eq, inArray, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  agents,
   agentWakeupRequests,
+  approvals,
+  companies,
+  issueApprovals,
+  issueThreadInteractions,
+  projects,
   environmentLeases,
   heartbeatRuns,
   issueRecoveryActions,
@@ -9,7 +15,11 @@ import {
   issues,
   nativeRunFinalizations,
 } from "@paperclipai/db";
+import type { ExpectedReconciliationState } from "@paperclipai/shared";
 import { isConversation } from "./agent-conversations.js";
+import { DIRECT_NON_INVOKABLE_STATUSES } from "./agent-invokability.js";
+import { budgetServiceInTransaction } from "./budgets.js";
+import { issueTreeControlService } from "./issue-tree-control.js";
 import { executionReconciliationRefusal } from "./execution-reconciliation-receipts.js";
 
 type DbOrTransaction = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -152,4 +162,71 @@ export async function admitExecutionReconciliationRuns(
   if (blocking.length > 0) {
     throw executionReconciliationRefusal("newer_execution_exists", "A newer run exists for this task.", { reason: "newer_run" });
   }
+}
+
+const gateClosed = (gate: Parameters<typeof gateCode>[0], message: string, details?: Record<string, unknown>) =>
+  executionReconciliationRefusal(gateCode(gate), message, details);
+function gateCode<G extends "dependency" | "interaction" | "approval" | "subtree_pause" | "project_pause" | "company_pause"
+  | "agent_pause" | "budget" | "monitor" | "workspace" | "checkout" | "owner">(gate: G) {
+  return `gate_closed:${gate}` as const;
+}
+
+export async function admitExecutionReconciliationGates(
+  tx: DbOrTransaction,
+  input: {
+    issue: typeof issues.$inferSelect;
+    action: { returnOwnerAgentId: string | null };
+    locked: LockedAdmissionRows;
+    expected: ExpectedReconciliationState;
+  },
+) {
+  const { issue, locked } = input;
+  const run = locked.run!;
+  const ownerAgentId = issue.assigneeAgentId;
+  if (!ownerAgentId || ownerAgentId !== input.action.returnOwnerAgentId || ownerAgentId !== run.agentId) {
+    throw gateClosed("owner", "The assignee, the recorded return owner and the source run agent differ.");
+  }
+  if ([issue.checkoutRunId, issue.executionRunId].some((runId) => runId && runId !== run.id)) {
+    throw gateClosed("checkout", "Another run holds the task checkout or execution lock.");
+  }
+  if (issue.monitorNextCheckAt) {
+    throw gateClosed("monitor", "The task has a scheduled monitor.");
+  }
+  if (issue.workspaceBindingRevision !== input.expected.issue.workspaceBindingRevision || issue.workspacePendingSelection != null) {
+    throw gateClosed("workspace", "The workspace binding changed or a workspace selection is pending.");
+  }
+  const openBlocker = locked.blockers.find((blocker) => !["done", "cancelled"].includes(blocker.status));
+  if (openBlocker) {
+    throw gateClosed("dependency", "A blocking task is not done.", { blockerIssueId: openBlocker.id });
+  }
+  const [interaction] = await tx.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions)
+    .where(and(
+      eq(issueThreadInteractions.companyId, issue.companyId),
+      eq(issueThreadInteractions.issueId, issue.id),
+      eq(issueThreadInteractions.status, "pending"),
+    ))
+    .limit(1);
+  if (interaction) throw gateClosed("interaction", "The task has a pending interaction.");
+  const [approval] = await tx.select({ id: approvals.id }).from(issueApprovals)
+    .innerJoin(approvals, eq(approvals.id, issueApprovals.approvalId))
+    .where(and(eq(issueApprovals.issueId, issue.id), inArray(approvals.status, ["pending", "revision_requested"])))
+    .limit(1);
+  if (approval) throw gateClosed("approval", "The task has a pending approval.");
+  const pauseHold = await issueTreeControlService(tx as unknown as Db).getActivePauseHoldGate(issue.companyId, issue.id);
+  if (pauseHold) throw gateClosed("subtree_pause", "An active subtree pause covers the task.", { holdId: pauseHold.holdId });
+  const [company] = await tx.select({ status: companies.status }).from(companies).where(eq(companies.id, issue.companyId));
+  if (company?.status !== "active") throw gateClosed("company_pause", "The company is not active.");
+  if (issue.projectId) {
+    const [project] = await tx.select({ pausedAt: projects.pausedAt }).from(projects)
+      .where(and(eq(projects.companyId, issue.companyId), eq(projects.id, issue.projectId)));
+    if (project?.pausedAt) throw gateClosed("project_pause", "The project is paused.");
+  }
+  const [agent] = await tx.select({ status: agents.status }).from(agents)
+    .where(and(eq(agents.companyId, issue.companyId), eq(agents.id, ownerAgentId)));
+  if (!agent || DIRECT_NON_INVOKABLE_STATUSES.has(agent.status as never)) {
+    throw gateClosed("agent_pause", "The owner agent cannot be invoked.");
+  }
+  const budgetBlock = await budgetServiceInTransaction(tx as unknown as Db)
+    .getInvocationBlock(issue.companyId, ownerAgentId, { issueId: issue.id, projectId: issue.projectId });
+  if (budgetBlock) throw gateClosed("budget", "A budget or pause gate blocks the owner agent.");
 }
