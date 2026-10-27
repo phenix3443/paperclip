@@ -45,22 +45,43 @@ export const probeGitProcessGroup: GitGroupProbe = pgid => {
   }
 };
 
+export type RowClock = {
+  now(): number;
+  schedule(callback: () => void, ms: number): () => void;
+};
+
+const systemRowClock: RowClock = {
+  now: () => Date.now(),
+  schedule(callback, ms) {
+    const timer = setTimeout(callback, ms);
+    timer.unref();
+    return () => clearTimeout(timer);
+  },
+};
+
+export type InspectionBudgetPeaks = { childOutputBytes: number; gitChildren: number; rowEntries: number; rowMs: number };
+
 export type InspectionBudgetHooks = {
   probeGroup?: GitGroupProbe;
   gitTimeoutMs?: number;
   rowMs?: number;
+  clock?: RowClock;
+  beforeDirectoryRead?: (directory: string) => Promise<void>;
+  onRowClosed?: (peaks: Readonly<InspectionBudgetPeaks>) => void;
 };
 
 export class InspectionBudget {
   readonly signal: AbortSignal;
-  readonly peaks = { childOutputBytes: 0, gitChildren: 0, rowEntries: 0, rowMs: 0 };
+  readonly peaks: InspectionBudgetPeaks = { childOutputBytes: 0, gitChildren: 0, rowEntries: 0, rowMs: 0 };
   readonly probeGroup: GitGroupProbe;
   readonly gitTimeoutCapMs: number;
   readonly rowMs: number;
   private readonly controller = new AbortController();
   private readonly running = new Set<Promise<unknown>>();
-  private readonly startedAt = Date.now();
-  private readonly rowTimer: NodeJS.Timeout;
+  private readonly clock: RowClock;
+  private readonly startedAt: number;
+  private readonly cancelRowTimer: () => void;
+  private readonly hooks: InspectionBudgetHooks;
   private gitChildren = 0;
 
   constructor(roundSignal: AbortSignal, hooks: InspectionBudgetHooks = {}) {
@@ -68,16 +89,22 @@ export class InspectionBudget {
     this.probeGroup = hooks.probeGroup ?? probeGitProcessGroup;
     this.gitTimeoutCapMs = hooks.gitTimeoutMs ?? Number.POSITIVE_INFINITY;
     this.rowMs = hooks.rowMs ?? GIT_EXPIRATION_BUDGETS.rowMs;
-    this.rowTimer = setTimeout(() => this.expireRow(), this.rowMs);
-    this.rowTimer.unref();
+    this.hooks = hooks;
+    this.clock = hooks.clock ?? systemRowClock;
+    this.startedAt = this.clock.now();
+    this.cancelRowTimer = this.clock.schedule(() => this.expireRow(), this.rowMs);
   }
 
   rowTimeLeft() {
-    return Math.max(0, this.startedAt + this.rowMs - Date.now());
+    return Math.max(0, this.startedAt + this.rowMs - this.clock.now());
   }
 
   expireRow(): GitExpirationBudgetExceeded {
-    return this.exceeded(new GitExpirationBudgetExceeded("row_deadline", this.rowMs, Date.now() - this.startedAt));
+    return this.exceeded(new GitExpirationBudgetExceeded("row_deadline", this.rowMs, this.clock.now() - this.startedAt));
+  }
+
+  async beforeDirectoryRead(directory: string) {
+    if (this.hooks.beforeDirectoryRead) await this.track(this.hooks.beforeDirectoryRead(directory));
   }
 
   countEntry() {
@@ -89,8 +116,9 @@ export class InspectionBudget {
   }
 
   close() {
-    clearTimeout(this.rowTimer);
-    this.peaks.rowMs = Date.now() - this.startedAt;
+    this.cancelRowTimer();
+    this.peaks.rowMs = this.clock.now() - this.startedAt;
+    this.hooks.onRowClosed?.(this.peaks);
   }
 
   run<T>(work: () => Promise<T>): Promise<T> {
@@ -143,6 +171,7 @@ export function isInspectionStop(error: unknown, signal?: AbortSignal) {
 export async function readBoundedDirectory(directory: string, signal?: AbortSignal): Promise<Dirent[]> {
   const budget = currentInspectionBudget();
   const entries: Dirent[] = [];
+  await budget?.beforeDirectoryRead(directory);
   for await (const entry of await fs.opendir(directory)) {
     signal?.throwIfAborted();
     budget?.countEntry();

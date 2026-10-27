@@ -68,13 +68,32 @@ describePosix("row walker entry budget and row deadline", () => {
     expect(await findRegenerableWorkspaceDirs(other)).toEqual([]);
   }, 120_000);
 
-  it("stops a walk at the row deadline", async () => {
+  it("expires the row at 60 s and not at 59.9 s while a walk read is pending, and the walk ends once the read returns", async () => {
     const dir = await flat("deadline-walk", 10);
-    const budget = new InspectionBudget(new AbortController().signal, { rowMs: 50 });
-    await expect.poll(() => budget.signal.aborted).toBe(true);
-    const error = await walk(budget, dir).catch((caught: unknown) => caught);
-    expect(error).toMatchObject({ budget: "row_deadline", limit: 50 });
+    let now = 0;
+    let expire: (() => void) | null = null;
+    const clock = { now: () => now, schedule: (callback: () => void) => { expire = callback; return () => { expire = null; }; } };
+    let finishRead!: () => void;
+    const read = new Promise<void>(resolve => { finishRead = resolve; });
+    let reached!: () => void;
+    const pending = new Promise<void>(resolve => { reached = resolve; });
+    const budget = new InspectionBudget(new AbortController().signal, { clock, beforeDirectoryRead: () => { reached(); return read; } });
+    const walking = walk(budget, dir).catch((caught: unknown) => caught);
+    await pending;
+    now = GIT_EXPIRATION_BUDGETS.rowMs - 100;
+    expect(budget.rowTimeLeft()).toBe(100);
+    expect(budget.signal.aborted).toBe(false);
+    now = GIT_EXPIRATION_BUDGETS.rowMs;
+    expire!();
+    expect(budget.signal.reason).toMatchObject({ budget: "row_deadline", limit: GIT_EXPIRATION_BUDGETS.rowMs, observed: GIT_EXPIRATION_BUDGETS.rowMs });
+    expect(budget.runningCount).toBe(1);
+    const drained = budget.drain();
+    finishRead();
+    expect(await walking).toMatchObject({ budget: "row_deadline" });
+    await drained;
+    expect(budget.runningCount).toBe(0);
     budget.close();
+    expect(expire).toBeNull();
   });
 
   it("cuts a Git command whose own timeout is longer than the time left in the row and reports the row deadline", async () => {
