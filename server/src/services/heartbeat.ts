@@ -4,7 +4,7 @@ import { readFreshWorkspaceReadiness } from "./fresh-workspace-continuation.js";
 import { promptInjectionPreventionService } from "./prompt-injection-prevention.js";
 import { createHeartbeatAgentStatus } from "./heartbeat/agent-status.js";
 import { heartbeatExternalProvider, nativeRuntimeHasInstructionFilesystem } from "./heartbeat/external-provider.js";
-import { pendingCaseHandoffForRun, recordCaseHandoffExecutionReleased, recordLegacyCaseHandoffCleanupIntent, recordLegacyCaseHandoffCleanupVerified } from "./heartbeat/case-handoff-lifecycle.js";
+import { pendingCaseHandoffForRun, recordCaseHandoffExecutionReleased, recordLegacyCaseHandoffCleanupIntent, recordLegacyCaseHandoffCleanupVerified, recordRunExecutionReleased } from "./heartbeat/case-handoff-lifecycle.js";
 import { hasStoppedLocalProcessTree, legacyAdapterNeedsLocalProcessSettlement } from "./heartbeat/process-settlement.js";
 import { dotRunnerBroker } from "./dot-runner-broker.js";
 import { withRunExecutionTiming, measureRunPhase, measureWorkspaceSyncPhase, isWorkspaceSyncDetailPhase } from "./execution-preparation-timing.js";
@@ -3654,7 +3654,7 @@ export function heartbeatService(
         });
       }
     } finally {
-      let caseHandoffCleanupSettled = false;
+      let executionCleanupSettled = false;
       await instructionWorkingCopy?.nativeInstructionReservation?.release().catch(error => logger.warn({ runId: run.id, err: error }, "Managed warm session preparation cleanup failed"));
       if (managedAiRuntime) await managedAiRuntime.cleanup().catch(() => logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed"));
       let latestRun = await getRun(run.id).catch(() => null);
@@ -3761,7 +3761,7 @@ export function heartbeatService(
             nativeLifecycleTelemetry: nativeLifecycleTelemetryForRun,
           }));
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
-          caseHandoffCleanupSettled = true;
+          executionCleanupSettled = true;
         }
         if (
           runScratch &&
@@ -3777,12 +3777,12 @@ export function heartbeatService(
               scratch: scratchForCleanup,
               processGroupId: latestRun.processGroupId,
               isProcessGroupAlive,
-              beforeRemove: caseHandoffCleanupSettled && latestRun.runtimeMode === "legacy"
+              beforeRemove: executionCleanupSettled && latestRun.runtimeMode === "legacy"
                 ? () => recordLegacyCaseHandoffCleanupVerified(db, { runId: run.id, controllerBootId: legacyControllerBootId, scratch: scratchForCleanup })
                 : undefined,
             });
           } catch (scratchCleanupError) {
-            caseHandoffCleanupSettled = false;
+            executionCleanupSettled = false;
             logger.warn(
               {
                 err: scratchCleanupError,
@@ -3808,7 +3808,7 @@ export function heartbeatService(
           if (scratchCleanup) {
             // Scratch cleanup verifies the owned process group, including
             // grandchildren. The main adapter's exit is not this proof.
-            if (!scratchCleanup.removed) caseHandoffCleanupSettled = false;
+            if (!scratchCleanup.removed) executionCleanupSettled = false;
             await appendRunEvent(latestRun, {
               eventType: "lifecycle",
               stream: "system",
@@ -3885,17 +3885,21 @@ export function heartbeatService(
       if (latestRun) await reconcileMuseNativeTerminalRun(db, latestRun);
       // Scratch preparation is optional. Its removal cannot be the only proof
       // that a local legacy adapter's closed-stdio descendants stopped.
-      if (caseHandoffCleanupSettled && latestRun?.runtimeMode === "legacy" && legacyLocalAdapterEntered) {
-        caseHandoffCleanupSettled = hasStoppedLocalProcessTree(latestRun);
+      if (executionCleanupSettled && latestRun?.runtimeMode === "legacy" && legacyLocalAdapterEntered) {
+        executionCleanupSettled = hasStoppedLocalProcessTree(latestRun);
       }
-      if (caseHandoffCleanupSettled && latestRun && !nativeSessionResumeScheduled && !nativeWorkspaceFinalizeScheduled &&
-          !nativeOwnershipHeld && isHeartbeatRunTerminalStatus(latestRun.status)) {
+      const executionReleased = executionCleanupSettled && latestRun !== null && !nativeSessionResumeScheduled &&
+        !nativeWorkspaceFinalizeScheduled && !nativeOwnershipHeld && isHeartbeatRunTerminalStatus(latestRun.status);
+      if (executionReleased) {
+        const releasedIssueId = readNonEmptyString(latestRun!.contextSnapshot?.issueId);
+        if (releasedIssueId) await recordRunExecutionReleased(db, run.id, releasedIssueId);
         const handoff = await pendingCaseHandoffForRun(db, run.id);
         if (handoff) await recordCaseHandoffExecutionReleased(db, run.id, handoff.issueId);
       }
-      // A completed owner repair settles as soon as its executor is released.
-      // The recovery sweep repeats the same settlement if this attempt is lost.
-      if (latestRun?.status === "succeeded" && !nativeOwnershipHeld &&
+      // A completed owner repair settles once its executor is released. Recovery
+      // re-checks the same durable release proof, and its sweep repeats this
+      // settlement if the attempt is lost or cleanup is still pending here.
+      if (executionReleased && latestRun?.status === "succeeded" &&
           latestRun.contextSnapshot?.wakeReason === ISSUE_DISPOSITION_REPAIR_RETRY_REASON) {
         await recovery.settleCompletedOwnerRepairRun(latestRun)
           .catch(error => logger.warn({ runId: run.id, error }, "Could not settle completed owner repair; the recovery sweep will retry"));

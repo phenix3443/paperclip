@@ -246,17 +246,40 @@ export async function recordCaseHandoffExecutionReleased(db: Db, runId: string, 
   });
 }
 
-export async function isCaseHandoffSourceReleased(db: Db, input: { runId: string; issueId: string }): Promise<boolean> {
+const RUN_EXECUTION_RELEASE_SCHEMA = "paperclip.run-execution-release.v1";
+const TERMINAL_RUN_STATUSES = ["succeeded", "failed", "cancelled", "interrupted", "timed_out"];
+
+/**
+ * The executor records this only after the provider stopped, scratch cleanup
+ * finished and the owned process tree is gone. A terminal status alone is not
+ * this proof.
+ */
+export async function recordRunExecutionReleased(db: Db, runId: string, issueId: string) {
+  await db.update(heartbeatRuns).set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ||
+    ${JSON.stringify({ executionReleased: { schema: RUN_EXECUTION_RELEASE_SCHEMA, runId, issueId,
+      settledAt: new Date().toISOString() } })}::jsonb` }).where(and(eq(heartbeatRuns.id, runId),
+    inArray(heartbeatRuns.status, TERMINAL_RUN_STATUSES)));
+}
+
+function hasRunExecutionReleaseMarker(run: typeof heartbeatRuns.$inferSelect, issueId: string) {
+  const release = run.resultJson?.executionReleased as Record<string, unknown> | undefined;
+  if (release?.schema === RUN_EXECUTION_RELEASE_SCHEMA && release.runId === run.id && release.issueId === issueId) return true;
+  const handoff = run.resultJson?.caseHandoffExecutionReleased as Record<string, unknown> | undefined;
+  return handoff?.schema === "paperclip.case-handoff-release.v1" && handoff.runId === run.id && handoff.issueId === issueId;
+}
+
+/**
+ * Durable execution-release contract for work that may start only after a run
+ * released its execution: case handoffs and owner-repair settlement. The
+ * executor's marker is the normal proof. After a lost marker or a restart, only
+ * host/provider-owned stop evidence can establish release, never a terminal
+ * status or an expired controller lease. Workspace recovery stays a separate gate.
+ */
+export async function isRunExecutionReleased(db: Db, input: { runId: string; issueId: string }): Promise<boolean> {
   const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.runId)).then(rows => rows[0]);
-  if (!run || !["succeeded", "failed", "cancelled", "interrupted", "timed_out"].includes(run.status) ||
-      isNativeRunnerOwnershipHeld(run)) return false;
-  const marker = run.resultJson?.caseHandoffExecutionReleased as Record<string, unknown> | undefined;
+  if (!run || !TERMINAL_RUN_STATUSES.includes(run.status) || isNativeRunnerOwnershipHeld(run)) return false;
   if (await hasPendingRunCleanup(db, run.companyId, run.id)) return false;
-  if (await getExecutionBlocker(db, run.companyId, input.issueId)) return false;
-  if (marker?.schema === "paperclip.case-handoff-release.v1" && marker.runId === run.id && marker.issueId === input.issueId) return true;
-  // A controller may die after cleanup but before writing its marker. Recover
-  // only from host/provider-owned stop evidence, never a terminal status or an
-  // expired controller lease. Workspace recovery remains an independent gate.
+  if (hasRunExecutionReleaseMarker(run, input.issueId)) return true;
   const recovery = run.resultJson?.executionRecovery as Record<string, unknown> | undefined;
   // setRunStatusFromLive records bootstrap evidence when cancelling an
   // unclaimed queue entry. Its persisted absence of a first start and runtime
@@ -271,6 +294,18 @@ export async function isCaseHandoffSourceReleased(db: Db, input: { runId: string
     (run.runtimeMode === "legacy" && recovery?.providerStopped === true && recovery?.sessionPreserved === true &&
       recovery?.actionOutcomes === "settled" && run.executionStage === "settled");
   if (!stopped) return false;
+  await recordRunExecutionReleased(db, run.id, input.issueId);
+  return true;
+}
+
+export async function isCaseHandoffSourceReleased(db: Db, input: { runId: string; issueId: string }): Promise<boolean> {
+  const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.runId)).then(rows => rows[0]);
+  if (!run || !TERMINAL_RUN_STATUSES.includes(run.status) || isNativeRunnerOwnershipHeld(run)) return false;
+  if (await hasPendingRunCleanup(db, run.companyId, run.id)) return false;
+  if (await getExecutionBlocker(db, run.companyId, input.issueId)) return false;
+  const marker = run.resultJson?.caseHandoffExecutionReleased as Record<string, unknown> | undefined;
+  if (marker?.schema === "paperclip.case-handoff-release.v1" && marker.runId === run.id && marker.issueId === input.issueId) return true;
+  if (!await isRunExecutionReleased(db, input)) return false;
   await recordCaseHandoffExecutionReleased(db, run.id, input.issueId);
   return true;
 }

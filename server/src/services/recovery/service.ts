@@ -3,6 +3,7 @@ import { onboardingFirstTaskAwaitingUserSql } from "./onboarding-first-task-wait
 import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
 import { RESTRICTED_WORKSPACE_SOURCE_REASON } from "../workspace-source-restriction.js";
 import { hasCommittedNativePlanWait } from "../native-runtime/native-plan-wait.js";
+import { isRunExecutionReleased } from "../heartbeat/case-handoff-lifecycle.js";
 import { isNativeWorkspaceExportRepairCause } from "@paperclipai/shared";
 import { settleSlackConversation } from "../slack-conversation-lifecycle.js";
 import { externalConversationStateSql } from "../slack-conversation-state.js";
@@ -167,6 +168,7 @@ import {
   sameOwnerRepairIssueBinding,
   type OwnerRepairContinuationRequest,
   type OwnerRepairSettlement,
+  type OwnerRepairWait,
 } from "./owner-repair-continuation.js";
 import { randomUUID } from "node:crypto";
 import {
@@ -3523,6 +3525,12 @@ export function recoveryService(
       // neither a successor nor another repair may start.
       const settledEvent = await durableRepairSettlementEvent(repairRun!);
       if (!settledEvent) return "pending_settlement";
+      // The measurement event records a terminal outcome, not release. The
+      // provider stop, scratch cleanup and process tree need the same durable
+      // release proof that case handoffs use, on completion and on the sweep.
+      if (!(await isRunExecutionReleased(db, { runId: repairRun!.id, issueId: action.sourceIssueId }))) {
+        return "pending_settlement";
+      }
       // An unknown effect stays with its own recovery; never continue past it.
       const unknownEffect = await db
         .select({ id: issueRecoveryActions.id })
@@ -3733,9 +3741,10 @@ export function recoveryService(
   }
 
   /**
-   * A wait that resolved through the issue's own status flow moves its
-   * version. Rebind the reservation to that version under the issue lock and
-   * record the move; any other mismatch stays stale for the queue to refuse.
+   * A wait released by a native status decision moves the issue's version.
+   * Under the issue lock, rebind the reservation only to the version that this
+   * decision produced, mark the wait released by it, and record the move. Any
+   * other mismatch stays stale for the queue to refuse.
    */
   async function rebindOwnerRepairAfterWait(
     action: typeof issueRecoveryActions.$inferSelect,
@@ -3750,46 +3759,100 @@ export function recoveryService(
         eq(issueRecoveryActions.status, "active"))).for("update");
       const current = readOwnerRepairSettlement(locked?.evidence);
       if (!issue || !current || current.state !== "pending_dispatch" || current.wakeupRequestId !== settlement.wakeupRequestId ||
-          !ownerRepairRebindAllowed(current, issue)) return current ?? settlement;
+          !current.lastWait || !issue.lastStatusDecisionId) return current ?? settlement;
+      const [decision] = await tx.select({
+        id: statusDecisions.id,
+        companyId: statusDecisions.companyId,
+        issueId: statusDecisions.issueId,
+        decisionVersion: statusDecisions.decisionVersion,
+        fromStatus: statusDecisions.fromStatus,
+        toStatus: statusDecisions.toStatus,
+        applicationState: statusDecisions.applicationState,
+        createdAt: statusDecisions.createdAt,
+      }).from(statusDecisions).where(and(
+        eq(statusDecisions.id, issue.lastStatusDecisionId),
+        eq(statusDecisions.companyId, issue.companyId),
+        eq(statusDecisions.issueId, issue.id)));
+      if (!ownerRepairRebindAllowed(current, issue, decision ?? null)) return current;
+      const at = new Date().toISOString();
+      const wait = current.lastWait;
       const next: OwnerRepairSettlement = {
         ...current,
         expectedIssueStatusVersion: issue.statusVersion,
         issueBinding: ownerRepairIssueBinding(issue),
+        lastWait: { ...wait, releasedByDecisionId: decision!.id, releasedAt: at },
         rebinds: [...(current.rebinds ?? []), {
           fromStatusVersion: current.expectedIssueStatusVersion,
           toStatusVersion: issue.statusVersion,
           fromStatusDecisionId: current.issueBinding.lastStatusDecisionId,
-          toStatusDecisionId: issue.lastStatusDecisionId,
-          waitReason: current.lastWait!.reason,
-          at: new Date().toISOString(),
+          toStatusDecisionId: decision!.id,
+          waitReason: wait.reason,
+          waitRecordedAt: wait.at,
+          at,
         }],
       };
       await tx.update(issueRecoveryActions).set({
         evidence: sql`coalesce(${issueRecoveryActions.evidence}, '{}'::jsonb) || ${JSON.stringify({ ownerRepairSettlement: next })}::jsonb`,
         updatedAt: new Date(),
       }).where(eq(issueRecoveryActions.id, action.id));
+      await logActivity(tx as unknown as Db, {
+        companyId: issue.companyId,
+        actorType: "system",
+        actorId: "recovery",
+        agentId: null,
+        runId: current.repairRunId,
+        action: "issue.owner_repair_rebound",
+        entityType: "issue_recovery_action",
+        entityId: action.id,
+        details: {
+          sourceIssueId: issue.id,
+          continuationKey: current.continuationKey,
+          waitReason: wait.reason,
+          releasedByDecisionId: decision!.id,
+          fromStatusVersion: current.expectedIssueStatusVersion,
+          toStatusVersion: issue.statusVersion,
+        },
+      });
       return next;
     });
   }
 
-  /** Saves why a reserved continuation is waiting; unchanged reasons write nothing. */
+  /**
+   * Saves why a reserved continuation is waiting, with the issue version and
+   * decision it was observed at under the issue lock. An unchanged open wait
+   * writes nothing, so a repeated refusal keeps its original observation.
+   */
   async function recordOwnerRepairWait(
     action: typeof issueRecoveryActions.$inferSelect,
     settlement: OwnerRepairSettlement,
     reason: string,
+    message: string | null = null,
   ) {
-    const lastWait = { reason: reason.slice(0, 500), at: new Date().toISOString() };
-    await db.update(issueRecoveryActions).set({
-      evidence: sql`jsonb_set(${issueRecoveryActions.evidence}, '{ownerRepairSettlement,lastWait}', ${JSON.stringify(lastWait)}::jsonb)`,
-      updatedAt: new Date(),
-    }).where(and(
-      eq(issueRecoveryActions.id, action.id),
-      eq(issueRecoveryActions.companyId, action.companyId),
-      eq(issueRecoveryActions.status, "active"),
-      sql`${issueRecoveryActions.evidence} -> 'ownerRepairSettlement' ->> 'wakeupRequestId' = ${settlement.wakeupRequestId}`,
-      sql`${issueRecoveryActions.evidence} -> 'ownerRepairSettlement' ->> 'state' = 'pending_dispatch'`,
-      sql`(${issueRecoveryActions.evidence} -> 'ownerRepairSettlement' -> 'lastWait' ->> 'reason') is distinct from ${lastWait.reason}`,
-    ));
+    await db.transaction(async (tx) => {
+      const [issue] = await tx.select({ statusVersion: issues.statusVersion, lastStatusDecisionId: issues.lastStatusDecisionId })
+        .from(issues).where(and(eq(issues.id, action.sourceIssueId), eq(issues.companyId, action.companyId))).for("update");
+      if (!issue) return;
+      const [locked] = await tx.select({ evidence: issueRecoveryActions.evidence }).from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.id, action.id), eq(issueRecoveryActions.companyId, action.companyId),
+        eq(issueRecoveryActions.status, "active"))).for("update");
+      const current = readOwnerRepairSettlement(locked?.evidence);
+      if (!current || current.state !== "pending_dispatch" || current.wakeupRequestId !== settlement.wakeupRequestId) return;
+      const typedReason = reason.slice(0, 200);
+      const previous = current.lastWait;
+      if (previous && !previous.releasedByDecisionId && previous.reason === typedReason
+        && previous.statusVersion === issue.statusVersion) return;
+      const lastWait: OwnerRepairWait = {
+        reason: typedReason,
+        message: message?.slice(0, 500) ?? null,
+        at: new Date().toISOString(),
+        statusVersion: issue.statusVersion,
+        statusDecisionId: issue.lastStatusDecisionId,
+      };
+      await tx.update(issueRecoveryActions).set({
+        evidence: sql`jsonb_set(${issueRecoveryActions.evidence}, '{ownerRepairSettlement,lastWait}', ${JSON.stringify(lastWait)}::jsonb)`,
+        updatedAt: new Date(),
+      }).where(eq(issueRecoveryActions.id, action.id));
+    });
   }
 
   async function acceptedOwnerRepairReceipt(action: typeof issueRecoveryActions.$inferSelect, settlement: OwnerRepairSettlement) {
@@ -3849,11 +3912,12 @@ export function recoveryService(
       } catch (error) {
         const status = typeof error === "object" && error && "status" in error ? Number(error.status) : null;
         const details = typeof error === "object" && error && "details" in error && error.details && typeof error.details === "object"
-          ? error.details as { code?: unknown } : null;
+          ? error.details as { code?: unknown; reason?: unknown } : null;
         // The queue reports a dispatch-gate wait for every ledger-owned outbox
         // (case handoffs and owner-repair continuations) with this code.
         if (details?.code === "case_handoff_admission_wait") {
-          await recordOwnerRepairWait(action, settlement, error instanceof Error ? error.message : "admission_wait");
+          const gate = typeof details.reason === "string" && details.reason ? details.reason : "admission_wait";
+          await recordOwnerRepairWait(action, settlement, gate, error instanceof Error ? error.message : null);
           return "waiting";
         }
         if (status !== 409 && status !== 404) throw error;
