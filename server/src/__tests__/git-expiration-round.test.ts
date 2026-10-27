@@ -421,7 +421,7 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
       write: async (buffer, offset, length, position) => {
         const line = buffer.toString("utf8");
         current = { line, kind: fault(line) };
-        if (current.kind === "write") throw Object.assign(new Error("no space left on device"), { code: "ENOSPC" });
+        if (current.kind === "write") { current = { line: "", kind: null }; throw Object.assign(new Error("no space left on device"), { code: "ENOSPC" }); }
         return handle.write(buffer, offset, length, position);
       },
       datasync: async () => {
@@ -496,7 +496,25 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
     try {
       expect(await round(late, { companyId: f.companyId, deadline })).toMatchObject({ status: "complete", stopReason: null });
     } finally { vi.useRealTimers(); }
-    expect((await late.persisted()).outcome).toEqual({ status: "complete", stopReason: null });
+    const lateEvidence = await late.persisted();
+    expect(lateEvidence.finished).toEqual(["round_finished:pending_commit", "round_committed:complete"]);
+    expect(lateEvidence.outcome).toEqual({ status: "complete", stopReason: null });
+
+    const synced = new AbortController();
+    const afterSync = await fileJournal(undefined, event => { if (event.type === "round_committed") synced.abort(); });
+    expect(await round(afterSync, { companyId: f.companyId, signal: synced.signal })).toMatchObject({ status: "complete", stopReason: null });
+    expect(synced.signal.aborted).toBe(true);
+    expect((await afterSync.persisted()).outcome).toEqual({ status: "complete", stopReason: null });
+  });
+
+  it("ends partial when the abort arrives while the pending terminal record is synced, before the commit record starts", async () => {
+    const f = await seed(1);
+    const controller = new AbortController();
+    const journal = await fileJournal(undefined, undefined, line => { if (line.includes('"status":"pending_commit"')) controller.abort(); });
+    expect(await round(journal, { companyId: f.companyId, signal: controller.signal })).toMatchObject({ status: "partial", stopReason: "aborted" });
+    const persisted = await journal.persisted();
+    expect(persisted.finished).toEqual(["round_finished:pending_commit", "round_finished:partial"]);
+    expect(persisted.outcome).toEqual({ status: "partial", stopReason: "aborted" });
   });
 
   it("gives exit code 3 with evidence_lost when a commit record that failed its sync cannot be truncated", async () => {
