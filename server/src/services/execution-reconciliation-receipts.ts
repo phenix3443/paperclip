@@ -14,11 +14,10 @@ import type {
 import {
   ReconciliationCanonicalError,
   canonicalReconciliationDigest,
+  findDuplicateJsonKey,
 } from "@paperclipai/shared/execution-reconciliation-canonical";
 import { conflict, notFound } from "../errors.js";
 
-// Receipts and expected-state binding for execution reconciliation admission
-// (doc/plans/2026-10-27-native-execution-reconciliation-admission.md, sections 1 and 6).
 
 type DbOrTransaction = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 type Receipt = typeof executionReconciliationReceipts.$inferSelect;
@@ -29,11 +28,6 @@ export type ReconciliationReceiptLookup =
   | { state: "abandoned"; settledAt: Date }
   | { state: "unsettled" };
 
-/**
- * L0: serializes every resolve and settle that uses the same key. Held until
- * the transaction ends, so a settle waits for an in-flight resolve to commit
- * or roll back before it decides.
- */
 export async function lockReconciliationKey(tx: DbOrTransaction, companyId: string, idempotencyKey: string) {
   await tx.execute(
     sql`select pg_advisory_xact_lock(hashtextextended(${`exec-recon-key:${companyId}:${idempotencyKey}`}, 0))`,
@@ -42,8 +36,6 @@ export async function lockReconciliationKey(tx: DbOrTransaction, companyId: stri
 
 function lookupFromRow(issueId: string, row: Receipt | undefined): ReconciliationReceiptLookup {
   if (!row) return { state: "unsettled" };
-  // A key is unique per company. A key used for another issue is never this
-  // issue's receipt, and reporting it as unsettled would invite a retry.
   if (row.issueId !== issueId) {
     throw conflict("Idempotency key belongs to another issue", { code: "idempotency_conflict" });
   }
@@ -63,7 +55,6 @@ export async function selectReconciliationReceipt(db: DbOrTransaction, companyId
     .then((rows) => rows[0]);
 }
 
-/** Read-only. `unsettled` means unknown: a resolve may still be in flight. */
 export async function readReconciliationReceipt(
   db: Db,
   input: { companyId: string; issueId: string; idempotencyKey: string },
@@ -71,13 +62,15 @@ export async function readReconciliationReceipt(
   return lookupFromRow(input.issueId, await selectReconciliationReceipt(db, input.companyId, input.idempotencyKey));
 }
 
-/**
- * Waits on L0 for any in-flight resolve with this key, then returns the
- * committed receipt or writes an `abandoned` tombstone that blocks the key.
- */
 export async function settleReconciliationKey(
   db: Db,
-  input: { companyId: string; issueId: string; idempotencyKey: string; actorUserId: string | null },
+  input: {
+    companyId: string;
+    issueId: string;
+    idempotencyKey: string;
+    actorUserId: string | null;
+    recordSettlement: (tx: DbOrTransaction) => Promise<unknown>;
+  },
 ): Promise<Exclude<ReconciliationReceiptLookup, { state: "unsettled" }> & { settledNow: boolean }> {
   return db.transaction(async (tx) => {
     await lockReconciliationKey(tx, input.companyId, input.idempotencyKey);
@@ -93,11 +86,11 @@ export async function settleReconciliationKey(
         actorUserId: input.actorUserId,
       })
       .returning();
+    await input.recordSettlement(tx);
     return { state: "abandoned", settledAt: row!.createdAt, settledNow: true };
   });
 }
 
-/** Runs that the hold itself cancelled before they started (no process, no session). */
 export async function listUnstartedHoldRunIds(tx: DbOrTransaction, companyId: string, issueId: string) {
   const rows = await tx
     .select({ id: heartbeatRuns.id })
@@ -118,11 +111,6 @@ export async function listUnstartedHoldRunIds(tx: DbOrTransaction, companyId: st
 
 const iso = (value: Date | null) => (value ? value.toISOString() : null);
 
-/**
- * Builds the expected snapshot from rows the caller has already locked. Every
- * key is present; a null column is null. `finishedAt` must be set: the route
- * refuses an unsettled run before it builds the snapshot.
- */
 export function buildExpectedReconciliationState(input: {
   issue: typeof issues.$inferSelect;
   run: typeof heartbeatRuns.$inferSelect;
@@ -177,10 +165,6 @@ export type ExpectedStateComparison =
   | { matches: true; digest: string }
   | { matches: false; digest: string; differingKeys: string[] };
 
-/**
- * Compares the server snapshot with the caller's digest. On mismatch it names
- * only the differing top-level keys, never their values.
- */
 export function compareExpectedReconciliationState(
   server: ExpectedReconciliationState,
   client: { expected: ExpectedReconciliationState; expectedDigest: string },
@@ -200,7 +184,6 @@ export function compareExpectedReconciliationState(
 
 const REFUSAL_MARK = Symbol("executionReconciliationRefusal");
 
-/** A stable, coded 409 refusal. The admission transaction rolls back on it. */
 export function executionReconciliationRefusal(
   code: ExecutionReconciliationRefusalCode,
   message: string,
@@ -211,11 +194,6 @@ export function executionReconciliationRefusal(
   return error;
 }
 
-/**
- * Maps a failed admission transaction to its refusal. PostgreSQL deadlocks and
- * serialization failures become `concurrent_change`: nothing was written and
- * the caller re-reads and retries with the same key.
- */
 export function toExecutionReconciliationRefusal(
   error: unknown,
 ): { code: ExecutionReconciliationRefusalCode; error: unknown } | null {
@@ -232,8 +210,10 @@ export function toExecutionReconciliationRefusal(
   return null;
 }
 
-/** sha256 of the whole parsed request without the idempotency key. */
-export function executionReconciliationRequestDigest(body: unknown): string {
+export function executionReconciliationRequestDigest(body: unknown, rawBody: Buffer | undefined): string {
+  if (!rawBody) throw new ReconciliationCanonicalError("", "the original request body is unavailable");
+  const duplicate = findDuplicateJsonKey(rawBody.toString("utf8").replace(/^\uFEFF/, ""));
+  if (duplicate) throw new ReconciliationCanonicalError(duplicate, "duplicate JSON key");
   const copy = JSON.parse(JSON.stringify(body)) as {
     executionReconciliation?: { admission?: { idempotencyKey?: string } };
   };
@@ -241,12 +221,6 @@ export function executionReconciliationRequestDigest(body: unknown): string {
   return canonicalReconciliationDigest(copy);
 }
 
-/**
- * Admission checks of slice A1 on rows locked in this order: L0 key (caller),
- * L4 issue (caller), L6 action, L9 source run. Returns a replay for a matching
- * committed receipt, or the verified snapshot to admit. Every failure throws a
- * coded refusal before any write.
- */
 export async function checkExecutionReconciliationAdmission(
   tx: DbOrTransaction,
   input: {
@@ -313,8 +287,6 @@ export async function checkExecutionReconciliationAdmission(
   try {
     comparison = compareExpectedReconciliationState(expected, admission);
   } catch (error) {
-    // Stored JSON outside the canonical rules (for example a fraction in a
-    // policy) cannot be bound to a digest, so it can never be admitted.
     if (error instanceof ReconciliationCanonicalError) {
       throw executionReconciliationRefusal("expected_state_mismatch", "The stored task state cannot be canonicalized.",
         { reason: "server_state_not_canonical" });
@@ -328,7 +300,6 @@ export async function checkExecutionReconciliationAdmission(
   return { kind: "admit", expected, expectedDigest: comparison.digest };
 }
 
-/** The committed receipt, written last in the admission transaction. */
 export async function insertCommittedReconciliationReceipt(
   tx: DbOrTransaction,
   values: Omit<typeof executionReconciliationReceipts.$inferInsert, "state" | "id" | "createdAt">,

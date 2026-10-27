@@ -1,10 +1,5 @@
 import { createHash } from "node:crypto";
 
-// Canonical JSON for execution reconciliation admission. The server, the
-// tests and the operator must produce the same bytes, so the rules are exact:
-// UTF-8, object keys sorted by Unicode code point, no whitespace, null kept,
-// safe integers only. Fixed digests live in the sibling vectors file.
-
 export class ReconciliationCanonicalError extends Error {
   constructor(public readonly path: string, reason: string) {
     super(`Cannot canonicalize ${path || "<root>"}: ${reason}`);
@@ -63,11 +58,6 @@ export function canonicalReconciliationDigest(value: unknown): string {
   return sha256HexOfText(canonicalizeReconciliationJson(value));
 }
 
-/**
- * True when `body` is exactly the canonical form of one JSON value. Duplicate
- * keys, whitespace, fences, trailing bytes and fractions all fail, because the
- * re-canonicalized bytes differ from the body.
- */
 export function isCanonicalReconciliationBody(body: string): boolean {
   let parsed: unknown;
   try {
@@ -80,4 +70,56 @@ export function isCanonicalReconciliationBody(body: string): boolean {
   } catch {
     return false;
   }
+}
+
+export function findDuplicateJsonKey(text: string): string | null {
+  JSON.parse(text);
+  let index = 0;
+  const skipWhitespace = () => {
+    while (index < text.length && " \t\n\r".includes(text[index]!)) index += 1;
+  };
+  const readString = () => {
+    const start = index;
+    index += 1;
+    while (text[index] !== "\"") index += text[index] === "\\" ? 2 : 1;
+    index += 1;
+    return JSON.parse(text.slice(start, index)) as string;
+  };
+  const readValue = (path: string): string | null => {
+    skipWhitespace();
+    const opener = text[index];
+    if (opener === "{" || opener === "[") {
+      const closer = opener === "{" ? "}" : "]";
+      const seen = new Set<string>();
+      index += 1;
+      skipWhitespace();
+      if (text[index] === closer) {
+        index += 1;
+        return null;
+      }
+      for (let position = 0; ; position += 1) {
+        let entryPath = `${path}[${position}]`;
+        if (opener === "{") {
+          skipWhitespace();
+          const key = readString();
+          entryPath = `${path}.${key}`;
+          if (seen.has(key)) return entryPath;
+          seen.add(key);
+          skipWhitespace();
+          index += 1;
+        }
+        const duplicate = readValue(entryPath);
+        if (duplicate) return duplicate;
+        skipWhitespace();
+        if (text[index++] === closer) return null;
+      }
+    }
+    if (opener === "\"") {
+      readString();
+      return null;
+    }
+    while (index < text.length && !",]} \t\n\r".includes(text[index]!)) index += 1;
+    return null;
+  };
+  return readValue("");
 }

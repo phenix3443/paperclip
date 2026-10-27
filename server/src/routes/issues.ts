@@ -3386,8 +3386,6 @@ export function issueRoutes(
       options: Parameters<ReturnType<typeof heartbeatService>["wakeup"]>[1],
     ) => ReturnType<ReturnType<typeof heartbeatService>["wakeup"]>;
     issueListDiagnostics?: IssueListDiagnostics;
-    // Admission is delivered in ordered slices (A1-A3). Until the health
-    // capability is published, only tests enable the admission path.
     executionReconciliationAdmissionForTests?: boolean;
     declineToolActionRequest?: (input: {
       companyId: string;
@@ -9598,9 +9596,6 @@ export function issueRoutes(
     res.status(202).json(receipt);
   });
 
-  // Board-only receipt read and key settlement for execution reconciliation.
-  // `unsettled` is unknown; only settle turns an unclear response into a
-  // definite `committed` or `abandoned` answer.
   const loadReconciliationReceiptScope = async (req: Request, res: Response) => {
     assertBoard(req);
     const parsedKey = executionReconciliationIdempotencyKeySchema.safeParse(req.params.key);
@@ -9623,23 +9618,25 @@ export function issueRoutes(
   router.post("/issues/:id/recovery-actions/receipts/:key/settle", async (req, res) => {
     const scope = await loadReconciliationReceiptScope(req, res);
     if (!scope) return;
+    const actor = getActorInfo(req);
+    const publications: ActivityPublication[] = [];
     const result = await settleReconciliationKey(db, {
       companyId: scope.issue.companyId, issueId: scope.issue.id, idempotencyKey: scope.idempotencyKey,
       actorUserId: req.actor.userId ?? null,
+      recordSettlement: (tx) => logActivity(tx as unknown as Db, {
+        companyId: scope.issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.execution_reconciliation_key_settled",
+        entityType: "issue",
+        entityId: scope.issue.id,
+        issueId: scope.issue.id,
+        details: { idempotencyKey: scope.idempotencyKey, state: "abandoned" },
+      }, publications),
     });
-    const actor = getActorInfo(req);
-    if (result.settledNow) await logActivity(db, {
-      companyId: scope.issue.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "issue.execution_reconciliation_key_settled",
-      entityType: "issue",
-      entityId: scope.issue.id,
-      issueId: scope.issue.id,
-      details: { idempotencyKey: scope.idempotencyKey, state: result.state },
-    });
+    for (const publication of publications) publishActivity(publication);
     const { settledNow: _settledNow, ...lookup } = result;
     res.json(lookup);
   });
@@ -9649,9 +9646,6 @@ export function issueRoutes(
     validate(resolveIssueRecoveryActionSchema),
     async (req, res) => {
       const id = req.params.id as string;
-      // Admission is delivered in ordered slices. Until the server can enforce
-      // every admission check, a request that carries it is refused before any
-      // read or write, so a caller never mistakes the legacy path for admission.
       const admission = req.body?.executionReconciliation?.admission as ExecutionReconciliationAdmission | undefined;
       if (admission && !opts.executionReconciliationAdmissionForTests) {
         res.status(400).json({ error: "Execution reconciliation admission is not supported", code: "capability_unsupported" });
@@ -9723,16 +9717,34 @@ export function issueRoutes(
       const postCommitActivityPublications: ActivityPublication[] = [];
       const postCommitIssueActions: IssuePostCommitAction[] = [];
       let admissionRequestDigest: string | null = null;
+      const refuseAdmission = async (error: unknown): Promise<never> => {
+        const refusal = toExecutionReconciliationRefusal(error) ??
+          (error instanceof HttpError && error.status >= 400 && error.status < 500
+            ? { code: String((error.details as { code?: unknown } | undefined)?.code ?? `http_${error.status}`), error }
+            : null);
+        if (!refusal || !admission) throw error;
+        await logActivity(db, {
+          companyId: existing.companyId, actorType: actor.actorType, actorId: actor.actorId,
+          agentId: actor.agentId, runId: actor.runId,
+          action: "issue.execution_reconciliation_refused", entityType: "issue", entityId: existing.id,
+          issueId: existing.id,
+          details: { code: refusal.code, requestDigest: admissionRequestDigest,
+            expectedDigest: admission.expectedDigest, idempotencyKey: admission.idempotencyKey },
+        }).catch((auditError: unknown) => {
+          logger.warn({ err: auditError, issueId: existing.id }, "failed to record execution reconciliation refusal");
+        });
+        throw refusal.error;
+      };
       if (admission) {
         try {
-          admissionRequestDigest = executionReconciliationRequestDigest(req.body);
+          admissionRequestDigest = executionReconciliationRequestDigest(req.body, (req as Request & { rawBody?: Buffer }).rawBody);
         } catch (error) {
-          if (error instanceof ReconciliationCanonicalError) throw badRequest(error.message);
-          throw error;
+          await refuseAdmission(error instanceof ReconciliationCanonicalError
+            ? badRequest(error.message)
+            : error);
         }
       }
       const runResolveTransaction = () => db.transaction(async (tx) => {
-        // L0 comes before every row lock; it is held until commit or rollback.
         let priorReceipt: ExecutionReconciliationReceiptRow | undefined;
         if (admission) {
           assertBoard(req);
@@ -9791,7 +9803,6 @@ export function issueRoutes(
           actionId ? eq(issueRecoveryActions.id, actionId) : inArray(issueRecoveryActions.status, ["active", "escalated"]),
         )).limit(1).for("update");
         if (workspaceRepairAction && hasRequiredWorkspaceRecovery(workspaceRepairAction.evidence)) {
-          // A workspace repair records evidence only; it is not a reconciliation hand-back.
           if (admission) throw executionReconciliationRefusal("gate_closed:workspace", "Workspace repair is not an admission hand-back.");
           assertBoard(req);
           await requireRecoveryActionAuthority(req, lockedIssue, issueRecoveryActionReadModel(workspaceRepairAction),
@@ -9864,7 +9875,6 @@ export function issueRoutes(
                 .returning();
               activeRecoveryAction = issueRecoveryActionReadModel(reopened!);
             } else {
-              // Admission replays only from a matching receipt, never from a settled action.
               if (admission) throw executionReconciliationRefusal("action_already_reconciled", "The recovery action is already settled.");
               return {
                 issue: lockedIssue,
@@ -10275,7 +10285,6 @@ export function issueRoutes(
 
         let receipt: ExecutionReconciliationReceiptRow | undefined;
         if (admission && admissionCheck?.kind === "admit") {
-          // Written last, in the same transaction as the action and issue.
           receipt = await insertCommittedReconciliationReceipt(tx, {
             companyId: lockedIssue.companyId,
             issueId: lockedIssue.id,
@@ -10302,30 +10311,7 @@ export function issueRoutes(
         return { issue, recoveryAction, chatRetry, receipt };
       });
       const result = admission
-        ? await runResolveTransaction().catch(async (error: unknown) => {
-            // Every refusal on the admission path is audited, including plain
-            // 4xx errors from the shared validation, with their own code if any.
-            const refusal = toExecutionReconciliationRefusal(error) ??
-              (error instanceof HttpError && error.status >= 400 && error.status < 500
-                ? { code: String((error.details as { code?: unknown } | undefined)?.code ?? `http_${error.status}`), error }
-                : null);
-            if (refusal) {
-              // Separate short write after rollback: one audit row, nothing else.
-              await logActivity(db, {
-                companyId: existing.companyId, actorType: actor.actorType, actorId: actor.actorId,
-                agentId: actor.agentId, runId: actor.runId,
-                action: "issue.execution_reconciliation_refused", entityType: "issue", entityId: existing.id,
-                issueId: existing.id,
-                details: { code: refusal.code, requestDigest: admissionRequestDigest,
-                  expectedDigest: admission.expectedDigest, idempotencyKey: admission.idempotencyKey },
-              }).catch((auditError: unknown) => {
-                // The coded refusal is the answer; a lost audit row must not replace it.
-                logger.warn({ err: auditError, issueId: existing.id }, "failed to record execution reconciliation refusal");
-              });
-              throw refusal.error;
-            }
-            throw error;
-          })
+        ? await runResolveTransaction().catch(refuseAdmission)
         : await runResolveTransaction();
       if ("receipt" in result && result.replayed && result.receipt) {
         res.json({ issue: result.issue, recoveryAction: result.recoveryAction, receipt: result.receipt, replayed: true });

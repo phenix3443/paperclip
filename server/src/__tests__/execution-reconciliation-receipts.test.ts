@@ -28,6 +28,8 @@ import {
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
+const recordSettlement = async () => undefined;
+
 describeEmbeddedPostgres("execution reconciliation receipts", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let db: ReturnType<typeof createDb>;
@@ -92,19 +94,33 @@ describeEmbeddedPostgres("execution reconciliation receipts", () => {
     const fixture = await seed();
     const input = { companyId: fixture.companyId, issueId: fixture.issueId, idempotencyKey: "recon:unknown-key-01" };
     expect(await readReconciliationReceipt(db, input)).toEqual({ state: "unsettled" });
-    const settled = await settleReconciliationKey(db, { ...input, actorUserId: "board-user" });
+    const settled = await settleReconciliationKey(db, { ...input, actorUserId: "board-user", recordSettlement });
     expect(settled.state).toBe("abandoned");
     expect((await readReconciliationReceipt(db, input)).state).toBe("abandoned");
-    // Settling again is idempotent and writes nothing new.
-    expect((await settleReconciliationKey(db, { ...input, actorUserId: "board-user" })).state).toBe("abandoned");
+    expect((await settleReconciliationKey(db, { ...input, actorUserId: "board-user", recordSettlement })).state).toBe("abandoned");
     expect(await db.select().from(executionReconciliationReceipts)).toHaveLength(1);
+  });
+
+  it("keeps the key unsettled when the settlement audit fails, so a retry writes both", async () => {
+    const fixture = await seed();
+    const input = { companyId: fixture.companyId, issueId: fixture.issueId, idempotencyKey: "recon:audit-failure-1" };
+    await expect(settleReconciliationKey(db, { ...input, actorUserId: "board-user", recordSettlement: async () => {
+      throw new Error("audit unavailable");
+    } })).rejects.toThrow("audit unavailable");
+    expect(await readReconciliationReceipt(db, input)).toEqual({ state: "unsettled" });
+    let recorded = 0;
+    const retry = await settleReconciliationKey(db, { ...input, actorUserId: "board-user", recordSettlement: async () => {
+      recorded += 1;
+    } });
+    expect(retry).toMatchObject({ state: "abandoned", settledNow: true });
+    expect(recorded).toBe(1);
   });
 
   it("returns a committed receipt instead of abandoning the key", async () => {
     const fixture = await seed();
     await commitReceipt(fixture, "recon:committed-key-1");
     const result = await settleReconciliationKey(db, {
-      companyId: fixture.companyId, issueId: fixture.issueId, idempotencyKey: "recon:committed-key-1", actorUserId: null,
+      companyId: fixture.companyId, issueId: fixture.issueId, idempotencyKey: "recon:committed-key-1", actorUserId: null, recordSettlement,
     });
     expect(result.state).toBe("committed");
   });
@@ -146,10 +162,9 @@ describeEmbeddedPostgres("execution reconciliation receipts", () => {
     });
     await locked.gate;
     const input = { companyId: fixture.companyId, issueId: fixture.issueId, idempotencyKey: key };
-    // Not visible yet: unsettled is unknown, not proof of "not committed".
     expect(await readReconciliationReceipt(db, input)).toEqual({ state: "unsettled" });
     let settleDone = false;
-    const settle = settleReconciliationKey(db, { ...input, actorUserId: "board-user" }).then((value) => {
+    const settle = settleReconciliationKey(db, { ...input, actorUserId: "board-user", recordSettlement }).then((value) => {
       settleDone = true;
       return value;
     });
@@ -174,11 +189,10 @@ describeEmbeddedPostgres("execution reconciliation receipts", () => {
     }).catch((error: Error) => error);
     await locked.gate;
     const input = { companyId: fixture.companyId, issueId: fixture.issueId, idempotencyKey: key };
-    const settle = settleReconciliationKey(db, { ...input, actorUserId: "board-user" });
+    const settle = settleReconciliationKey(db, { ...input, actorUserId: "board-user", recordSettlement });
     held.release();
     expect(await inFlight).toBeInstanceOf(Error);
     expect((await settle).state).toBe("abandoned");
-    // The unique key index is the second guard against a late insert.
     await expect(commitReceipt(fixture, key)).rejects.toThrow();
   });
 
@@ -194,7 +208,6 @@ describeEmbeddedPostgres("execution reconciliation receipts", () => {
     const unstartedRunIds = await listUnstartedHoldRunIds(db, fixture.companyId, fixture.issueId);
     expect(unstartedRunIds).toHaveLength(1);
     const server = buildExpectedReconciliationState({ issue: issue!, run: run!, action: action!, unstartedRunIds });
-    // The server snapshot satisfies the strict request schema, so a caller can echo it.
     expect(expectedReconciliationStateSchema.safeParse(server).success).toBe(true);
     const digest = canonicalReconciliationDigest(server);
     expect(compareExpectedReconciliationState(server, { expected: server, expectedDigest: digest })).toEqual({ matches: true, digest });
@@ -203,7 +216,6 @@ describeEmbeddedPostgres("execution reconciliation receipts", () => {
     stale.issue.monitorAttemptCount += 1;
     const mismatch = compareExpectedReconciliationState(server, { expected: stale, expectedDigest: canonicalReconciliationDigest(stale) });
     expect(mismatch).toEqual({ matches: false, digest, differingKeys: ["issue"] });
-    // A client digest that does not match its own snapshot is also refused.
     expect(compareExpectedReconciliationState(server, { expected: server, expectedDigest: "0".repeat(64) }))
       .toEqual({ matches: false, digest, differingKeys: ["expectedDigest"] });
   });

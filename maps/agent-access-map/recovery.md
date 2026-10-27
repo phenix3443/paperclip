@@ -342,6 +342,20 @@ Verification: `not-run` — Inspect external provider first; wrong source/flag w
 
 Gaps: Unknown stays unknown until corroborated. Evidence text alone can't override independent fences.
 
+### `settle-reconciliation-receipt`
+
+API: `present` — GET /api/issues/{id}/recovery-actions/receipts/{key}; POST /api/issues/{id}/recovery-actions/receipts/{key}/settle. The resolve `executionReconciliation.admission` body stays refused with 400 `capability_unsupported` until the health capability is published.
+
+Agent access: `restricted` — Board only for both routes; agents and the operator have no receipt read or settle authority.
+
+Policy: Same-company task read authorization. GET is read-only: `unsettled` means unknown because a resolve may still be in flight. Settle takes the per-key lock, waits for any in-flight resolve, and returns the committed receipt or writes a permanent `abandoned` tombstone that blocks the key. The tombstone and its `issue.execution_reconciliation_key_settled` activity row commit in one transaction; a repeated settle writes nothing. A key used for another task is an `idempotency_conflict`. Admission requests with duplicate JSON keys or non-canonical numbers get 400 before hashing, and every admission refusal writes one `issue.execution_reconciliation_refused` row after rollback.
+
+Evidence: `source-only` — [recovery routes](../../server/src/routes/issues.ts), [reconciliation receipts](../../server/src/services/execution-reconciliation-receipts.ts); added after the page source revision and reviewed in the PR that adds them. No live provider proof.
+
+Verification: `not-run` — Agent read/settle denied. Unknown key reads unsettled, settles to abandoned once with one audit row; failed audit leaves the key unsettled. Committed key settles to committed and a same-key retry replays without new writes.
+
+Gaps: Embedded PostgreSQL route tests only; the public admission capability, authorization binding and delivery checks arrive in later slices. No UI client calls these routes yet.
+
 ### `resolve-chat-publication`
 
 API: `present` — POST /api/chat-endpoints/{endpointId}/publications/{publicationId}/resolve action mark_delivered/retry_anyway/cancel, optional fileTransfer phase/version.

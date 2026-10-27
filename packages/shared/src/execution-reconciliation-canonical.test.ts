@@ -4,6 +4,7 @@ import {
   ReconciliationCanonicalError,
   canonicalReconciliationDigest,
   canonicalizeReconciliationJson,
+  findDuplicateJsonKey,
   isCanonicalReconciliationBody,
 } from "./execution-reconciliation-canonical.js";
 
@@ -14,7 +15,6 @@ describe("execution reconciliation canonical JSON", () => {
   });
 
   it("sorts keys by Unicode code point, not UTF-16 unit or locale", () => {
-    // U+FF61 sorts before U+1F600 by UTF-16 unit, after it by code point.
     expect(canonicalizeReconciliationJson({ "\u{ff61}": 1, "\u{1f600}": 2, B: 3, a: 4 })).toBe(
       '{"B":3,"a":4,"\u{ff61}":1,"\u{1f600}":2}',
     );
@@ -42,5 +42,15 @@ describe("execution reconciliation canonical JSON", () => {
     expect(isCanonicalReconciliationBody('{"a":1}{"b":2}')).toBe(false);
     expect(isCanonicalReconciliationBody('{"a":1.5}')).toBe(false);
     expect(isCanonicalReconciliationBody('{"a":1}\n')).toBe(false);
+  });
+
+  it.each([
+    ["no duplicates", '{"a": {"b": [1, {"c": "}\\"{"}]}, "d": null}', null],
+    ["a top-level duplicate", '{"note": "x", "a": 1, "note": "y"}', ".note"],
+    ["a nested duplicate", '{"a": {"b": 1, "b": 2}}', ".a.b"],
+    ["a duplicate inside an array", '{"list": [{"k": 1}, {"k": 1, "k": 2}]}', ".list[1].k"],
+    ["an escaped duplicate", '{"a": 1, "\\u0061": 2}', ".a"],
+  ])("finds duplicate keys in raw JSON: %s", (_name, text, expected) => {
+    expect(findDuplicateJsonKey(text)).toBe(expected);
   });
 });

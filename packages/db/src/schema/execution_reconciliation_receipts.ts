@@ -5,9 +5,6 @@ import { issues } from "./issues.js";
 import { issueRecoveryActions } from "./issue_recovery_actions.js";
 import { heartbeatRuns } from "./heartbeat_runs.js";
 
-// One row per execution reconciliation idempotency key. `committed` is an
-// admitted reconciliation, written in the same transaction as the action.
-// `abandoned` is a key settled after it never committed; it can never be reused.
 export const executionReconciliationReceipts = pgTable(
   "execution_reconciliation_receipts",
   {

@@ -1,8 +1,5 @@
 import { z } from "zod";
 
-// Request binding for `executionReconciliation.admission` on the recovery
-// resolve route. See doc/plans/2026-10-27-native-execution-reconciliation-admission.md.
-// Every listed key is required; a null column is sent as null, never omitted.
 
 export const EXECUTION_RECONCILIATION_ADMISSION_SCHEMA = "execution_reconciliation_admission_v1" as const;
 
@@ -53,7 +50,6 @@ const isoTimestampSchema = z
   }, "Expected an ISO 8601 UTC timestamp with milliseconds");
 const nullableString = z.string().nullable();
 const nullableInteger = z.number().int().nullable();
-// A JSON value that must be present (null allowed). z.unknown() would also accept a missing key.
 const requiredJsonValue = z.custom<unknown>((value) => value !== undefined, "Required");
 
 export const expectedReconciliationStateSchema = z

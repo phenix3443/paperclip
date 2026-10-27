@@ -277,7 +277,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     opts: Parameters<typeof issueRoutes>[2] = {},
   ) {
     const app = express();
-    app.use(express.json());
+    app.use(express.json({ verify: (req, _res, buf) => { (req as any).rawBody = buf; } }));
     app.use((req, _res, next) => {
       (req as any).actor = actor;
       next();
@@ -2119,7 +2119,6 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         outcomeEvidence: "The stopped run saved its comment and commit before the hold.", admission },
     }).expect(400);
     expect(response.body.code).toBe("capability_unsupported");
-    // The settled no-replay hold is not reopened and the issue is unchanged.
     expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id)))[0]).toEqual(beforeAction);
     expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0]).toEqual(beforeIssue);
   });
@@ -2138,9 +2137,31 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(settled.body.state).toBe("abandoned");
     expect((await request(app).get(`/api/issues/${sourceIssueId}/recovery-actions/receipts/${key}`).expect(200)).body.state)
       .toBe("abandoned");
-    // A repeated settle changes nothing and is not logged again.
     expect((await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/receipts/${key}/settle`).expect(200)).body)
       .toEqual({ state: "abandoned", settledAt: settled.body.settledAt });
+    const logged = await db.select().from(activityLog).where(eq(activityLog.action, "issue.execution_reconciliation_key_settled"));
+    expect(logged).toHaveLength(1);
+    expect(logged[0]!.details).toMatchObject({ idempotencyKey: key, state: "abandoned" });
+  });
+
+  it("rolls back a settlement whose audit row fails, and a retry writes the tombstone with its audit", async () => {
+    const { sourceIssueId } = await seedCompany();
+    const key = "recon:settle-audit-fail";
+    const app = createApp({ type: "board", source: "local_implicit", userId: "board-user" });
+    await db.execute(sql`create function fail_settle_audit() returns trigger language plpgsql as $$
+      begin if new.action = 'issue.execution_reconciliation_key_settled' then raise exception 'audit unavailable'; end if; return new; end $$`);
+    await db.execute(sql`create trigger fail_settle_audit before insert on activity_log for each row execute function fail_settle_audit()`);
+    try {
+      await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/receipts/${key}/settle`).expect(500);
+    } finally {
+      await db.execute(sql`drop trigger fail_settle_audit on activity_log`);
+      await db.execute(sql`drop function fail_settle_audit()`);
+    }
+    expect(await db.select().from(executionReconciliationReceipts)).toHaveLength(0);
+    expect((await request(app).get(`/api/issues/${sourceIssueId}/recovery-actions/receipts/${key}`).expect(200)).body)
+      .toEqual({ state: "unsettled" });
+    const retry = await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/receipts/${key}/settle`).expect(200);
+    expect(retry.body.state).toBe("abandoned");
     const logged = await db.select().from(activityLog).where(eq(activityLog.action, "issue.execution_reconciliation_key_settled"));
     expect(logged).toHaveLength(1);
     expect(logged[0]!.details).toMatchObject({ idempotencyKey: key, state: "abandoned" });
@@ -2245,7 +2266,6 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       const response = await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(409);
       expect(refusalCode(response.body)).toBe("expected_state_mismatch");
       expect(JSON.stringify(response.body)).toContain("\"issue\"");
-      // The no-replay hold is not reopened: the refusal rolled back every write.
       expect(await snapshot(fixture)).toEqual(before);
       const [refused] = await refusals();
       expect(refused!.details).toMatchObject({ code: "expected_state_mismatch", idempotencyKey: "recon:stale-expected-1" });
@@ -2266,12 +2286,34 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(await db.select().from(executionReconciliationReceipts)).toHaveLength(0);
     });
 
-    it("rejects a non-integer number in the request with 400 before hashing", async () => {
+    it("rejects a non-integer number in the request with 400 before hashing and audits the refusal", async () => {
       const fixture = await seedAdmission();
       const body = await admissionBody(fixture, "recon:fraction-number-1");
       (body.executionReconciliation.admission.expected.issue as any).executionPolicy = { weight: 1.5 };
+      const before = await snapshot(fixture);
       await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(400);
-      expect(await db.select().from(executionReconciliationReceipts)).toHaveLength(0);
+      expect(await snapshot(fixture)).toEqual(before);
+      const audited = await refusals();
+      expect(audited).toHaveLength(1);
+      expect(audited[0]!.details).toMatchObject({ code: "http_400", requestDigest: null, idempotencyKey: "recon:fraction-number-1" });
+    });
+
+    it.each([
+      ["top-level", (text: string) => text.replace(/^\{/, '{"resolutionNote":"first",'), "resolutionNote"],
+      ["nested", (text: string) => text.replace('"providerStopped":true', '"providerStopped":true,"providerStopped":true'), "providerStopped"],
+    ])("rejects a %s duplicate JSON key with 400 and writes nothing but the refusal audit", async (_name, duplicate, key) => {
+      const fixture = await seedAdmission();
+      const body = await admissionBody(fixture, `recon:duplicate-${key}`.slice(0, 40), { resolutionNote: "last" });
+      const raw = duplicate(JSON.stringify(body));
+      expect(raw).not.toBe(JSON.stringify(body));
+      const before = await snapshot(fixture);
+      const response = await request(admissionApp()).post(resolvePath(fixture.sourceIssueId))
+        .set("content-type", "application/json").send(raw).expect(400);
+      expect(response.body.error).toContain(key);
+      expect(await snapshot(fixture)).toEqual(before);
+      const audited = await refusals();
+      expect(audited).toHaveLength(1);
+      expect(audited[0]!.details).toMatchObject({ code: "http_400", requestDigest: null });
     });
 
     it("admits exactly once when identical requests race on the same key", async () => {
