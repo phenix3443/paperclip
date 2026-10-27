@@ -9754,6 +9754,7 @@ export function issueRoutes(
         let priorReceipt: ExecutionReconciliationReceiptRow | undefined;
         let admissionCompany: Awaited<ReturnType<typeof lockCompanyForAdmission>> | null = null;
         let authorizationPayloadDigest: string | null = null;
+        let authorizationEvidence: Record<string, unknown> | null = null;
         if (admission) {
           assertBoard(req);
           await lockReconciliationKey(tx, existing.companyId, admission.idempotencyKey);
@@ -9781,7 +9782,7 @@ export function issueRoutes(
           if (admissionCheck.kind === "replay") {
             return { issue: lockedIssue, recoveryAction: admissionCheck.action, replayed: true, receipt: admissionCheck.receipt };
           }
-          ({ payloadDigest: authorizationPayloadDigest } = await verifyExecutionReconciliationAuthorization(tx, {
+          ({ payloadDigest: authorizationPayloadDigest, evidence: authorizationEvidence } = await verifyExecutionReconciliationAuthorization(tx, {
             companyId: lockedIssue.companyId, issueId: lockedIssue.id, actionId: actionId!,
             runId: executionReconciliation!.runId, authority: admissionCompany!.executionReconciliationAuthority,
             admission, expectedDigest: admissionCheck.expectedDigest, request: req.body,
@@ -10314,6 +10315,7 @@ export function issueRoutes(
             authorizationDecisionId: admission.authorization.decisionId,
             authorizationBodySha256: admission.authorization.bodyDigest,
             authorizationPayloadDigest,
+            authorizationEvidence,
             result: {
               issueStatus: issue.status,
               statusVersion: issue.statusVersion,

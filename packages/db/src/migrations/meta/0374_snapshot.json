@@ -1,5 +1,5 @@
 {
-  "id": "e8b0da8f-a021-42e6-942d-9811b8aaf01e",
+  "id": "c5e83539-76b0-4aba-a45f-1977e455e899",
   "prevId": "75c28d4a-3ecb-48c8-a98c-b547788b32f5",
   "version": "7",
   "dialect": "postgresql",
@@ -28118,6 +28118,12 @@
         "authorization_body_sha256": {
           "name": "authorization_body_sha256",
           "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "authorization_evidence": {
+          "name": "authorization_evidence",
+          "type": "jsonb",
           "primaryKey": false,
           "notNull": false
         },

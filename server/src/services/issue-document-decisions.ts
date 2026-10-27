@@ -1,4 +1,4 @@
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   companies,
   documentRevisions,
@@ -15,7 +15,6 @@ import {
   executionReconciliationRequestIntent,
   type CreateIssueDocumentDecision,
   type ExecutionReconciliationAdmission,
-  type ExecutionReconciliationAuthorizationPayload,
 } from "@paperclipai/shared";
 import {
   canonicalizeReconciliationJson,
@@ -28,6 +27,11 @@ import { lockExecutionReconciliationAuthority } from "./execution-reconciliation
 
 type DbOrTransaction = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 export type IssueDocumentDecisionRow = typeof issueDocumentDecisions.$inferSelect;
+
+async function statementTime(tx: DbOrTransaction) {
+  const rows = await tx.execute<{ now: Date }>(sql`select statement_timestamp() as now`) as unknown as { now: Date }[];
+  return new Date(rows[0]!.now).getTime();
+}
 
 export async function createIssueDocumentDecision(
   db: Db,
@@ -61,11 +65,10 @@ export async function createIssueDocumentDecision(
     if (!revision) throw notFound("Document revision not found");
 
     const request = input.request;
+    const nowMs = await statementTime(tx);
     let expiresAt: Date | null = null;
     let revokesDecisionId: string | null = null;
     if (request.outcome === "approved") {
-      const [{ now }] = await tx.execute<{ now: Date }>(sql`select statement_timestamp() as now`) as unknown as [{ now: Date }];
-      const nowMs = new Date(now).getTime();
       expiresAt = new Date(request.expiresAt);
       if (expiresAt.getTime() <= nowMs) throw unprocessable("expiresAt must be in the future");
       if (expiresAt.getTime() > nowMs + EXECUTION_RECONCILIATION_DECISION_MAX_LIFETIME_MS) {
@@ -104,6 +107,7 @@ export async function createIssueDocumentDecision(
         actorAgentId: input.actor.agentId,
         actorUserId: input.actor.userId,
         createdByRunId: input.actor.runId,
+        createdAt: new Date(nowMs),
       })
       .returning();
     await input.recordDecision(tx, decision!);
@@ -137,14 +141,13 @@ export async function verifyExecutionReconciliationAuthorization(
     expectedDigest: string;
     request: Parameters<typeof executionReconciliationRequestIntent>[0];
   },
-): Promise<{ payload: ExecutionReconciliationAuthorizationPayload; payloadDigest: string }> {
+): Promise<{ payloadDigest: string; evidence: Record<string, unknown> }> {
   const authority = executionReconciliationAuthoritySchema.safeParse(input.authority);
   if (!authority.success || authority.data.agentIds.length === 0) {
     throw executionReconciliationRefusal("authority_not_configured", "No execution reconciliation authority is configured.");
   }
   const reference = input.admission.authorization;
-  const [now] = (await tx.execute<{ now: Date }>(sql`select statement_timestamp() as now`) as unknown as { now: Date }[])
-    .map((row) => new Date(row.now).getTime());
+  const now = await statementTime(tx);
 
   const [document] = await tx
     .select({ id: documents.id, latestRevisionId: documents.latestRevisionId })
@@ -185,16 +188,15 @@ export async function verifyExecutionReconciliationAuthorization(
   const bodySha256 = sha256HexOfText(revision!.body);
   if (bodySha256 !== reference.bodyDigest || bodySha256 !== decision!.bodySha256) invalid("body_digest");
 
-  const [revoke] = await tx
-    .select({ id: issueDocumentDecisions.id })
+  const revokes = await tx
+    .select({ actorAgentId: issueDocumentDecisions.actorAgentId })
     .from(issueDocumentDecisions)
     .where(and(
       eq(issueDocumentDecisions.companyId, input.companyId),
       eq(issueDocumentDecisions.revokesDecisionId, decision!.id),
       eq(issueDocumentDecisions.outcome, "revoked"),
-    ))
-    .orderBy(desc(issueDocumentDecisions.createdAt))
-    .limit(1);
+    ));
+  const revoke = revokes.some((row) => row.actorAgentId && authority.data.agentIds.includes(row.actorAgentId));
   if (revoke) invalid("decision_revoked");
   if (!decision!.actorAgentId || !authority.data.agentIds.includes(decision!.actorAgentId)) {
     invalid("actor_not_authorized");
@@ -206,8 +208,8 @@ export async function verifyExecutionReconciliationAuthorization(
   if (!isCanonicalReconciliationBody(revision!.body)) invalid("body_not_canonical");
   const payload = executionReconciliationAuthorizationPayloadSchema.safeParse(JSON.parse(revision!.body));
   if (!payload.success) invalid("payload_schema");
-  const p = payload.data!;
-  const payloadExpiry = new Date(p.expiresAt).getTime();
+  const approved = payload.data!;
+  const payloadExpiry = new Date(approved.expiresAt).getTime();
   if (payloadExpiry > decision!.expiresAt!.getTime()) invalid("payload_outlives_decision");
   if (now >= payloadExpiry) {
     throw executionReconciliationRefusal("authorization_expired", "The authorization payload expired.");
@@ -216,15 +218,15 @@ export async function verifyExecutionReconciliationAuthorization(
     throw executionReconciliationRefusal("authorization_payload_mismatch",
       "The request does not match the approved payload.", { field });
   };
-  if (p.companyId !== input.companyId) mismatch("companyId");
-  if (p.issueId !== input.issueId) mismatch("issueId");
-  if (p.runId !== input.runId) mismatch("runId");
-  if (p.actionId !== input.actionId) mismatch("actionId");
-  if (p.expectedDigest !== input.admission.expectedDigest || p.expectedDigest !== input.expectedDigest) {
+  if (approved.companyId !== input.companyId) mismatch("companyId");
+  if (approved.issueId !== input.issueId) mismatch("issueId");
+  if (approved.runId !== input.runId) mismatch("runId");
+  if (approved.actionId !== input.actionId) mismatch("actionId");
+  if (approved.expectedDigest !== input.admission.expectedDigest || approved.expectedDigest !== input.expectedDigest) {
     mismatch("expectedDigest");
   }
-  if (canonicalizeReconciliationJson(executionReconciliationRequestIntent(input.request)) !== canonicalizeReconciliationJson(p.intent)) {
+  if (canonicalizeReconciliationJson(executionReconciliationRequestIntent(input.request)) !== canonicalizeReconciliationJson(approved.intent)) {
     mismatch("intent");
   }
-  return { payload: p, payloadDigest: bodySha256 };
+  return { payloadDigest: bodySha256, evidence: approved.evidence };
 }

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import {
   activityLog,
   agentConfigRevisions,
@@ -37,6 +37,7 @@ import { startAgentLifecycle } from "../services/agent-lifecycle.js";
 import { createLifecycleDriver } from "../services/agent-lifecycle-driver.js";
 import { reserveRunBudget } from "../services/budget-reservations.js";
 import { companyService } from "../services/companies.js";
+import { lockExecutionReconciliationAuthority } from "../services/execution-reconciliation-authority-lock.js";
 import { deriveIssuePrefixBase } from "../services/issue-prefix.js";
 import { readBuiltInAgentMarker } from "../lib/built-in-agent-metadata.js";
 import { builtInAgentService, reconcileBuiltInAgentsOnStartup } from "../services/built-in-agents.js";
@@ -132,7 +133,7 @@ describeEmbeddedPostgres("companyService", () => {
     let locked!: () => void;
     const lockedSignal = new Promise<void>((resolve) => { locked = resolve; });
     const admission = db.transaction(async (tx) => {
-      await tx.execute(sql`select pg_advisory_xact_lock_shared(hashtextextended(${`exec-recon-authority:${company.id}`}, 0))`);
+      await lockExecutionReconciliationAuthority(tx, company.id, "shared");
       locked();
       await held;
     });

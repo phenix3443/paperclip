@@ -1,3 +1,4 @@
+import type { ExecutionReconciliationAuthority } from "../validators/execution-reconciliation-admission.js";
 import type {
   CompanyStatus,
   IssueThreadInteractionKind,
@@ -28,7 +29,7 @@ export interface Company {
   defaultResponsibleUserId: string | null;
   requireBoardApprovalForNewAgents: boolean;
   interactionResolverGovernance: InteractionResolverGovernance;
-  executionReconciliationAuthority: { agentIds: string[] };
+  executionReconciliationAuthority: ExecutionReconciliationAuthority;
   feedbackDataSharingEnabled: boolean;
   feedbackDataSharingConsentAt: Date | null;
   feedbackDataSharingConsentByUserId: string | null;

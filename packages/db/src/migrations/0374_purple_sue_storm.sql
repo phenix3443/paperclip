@@ -20,6 +20,7 @@ CREATE TABLE "issue_document_decisions" (
 );
 --> statement-breakpoint
 ALTER TABLE "companies" ADD COLUMN "execution_reconciliation_authority" jsonb DEFAULT '{"agentIds":[]}'::jsonb NOT NULL;--> statement-breakpoint
+ALTER TABLE "execution_reconciliation_receipts" ADD COLUMN "authorization_evidence" jsonb;--> statement-breakpoint
 ALTER TABLE "issue_document_decisions" ADD CONSTRAINT "issue_document_decisions_company_id_companies_id_fk" FOREIGN KEY ("company_id") REFERENCES "public"."companies"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "issue_document_decisions" ADD CONSTRAINT "issue_document_decisions_issue_id_issues_id_fk" FOREIGN KEY ("issue_id") REFERENCES "public"."issues"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "issue_document_decisions" ADD CONSTRAINT "issue_document_decisions_document_id_documents_id_fk" FOREIGN KEY ("document_id") REFERENCES "public"."documents"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint

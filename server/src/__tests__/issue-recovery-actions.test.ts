@@ -62,6 +62,7 @@ import { instanceSettingsService } from "../services/instance-settings.js";
 import { withNativeWorkspaceFinalizationOwnership } from "../services/native-runtime/native-workspace-finalization-ownership.js";
 import { noticeMetadataReferencesRecoveryAction } from "../services/recovery/successful-run-handoff.js";
 import { buildExpectedReconciliationState, listUnstartedHoldRunIds } from "../services/execution-reconciliation-receipts.js";
+import { lockExecutionReconciliationAuthority } from "../services/execution-reconciliation-authority-lock.js";
 import {
   canonicalReconciliationDigest,
   canonicalizeReconciliationJson,
@@ -2410,7 +2411,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(200);
         const [receipt] = await db.select().from(executionReconciliationReceipts);
         expect(receipt).toMatchObject({ authorizationPayloadDigest: auth.bodyDigest, authorizationRevisionId: auth.revisionId,
-          authorizationDecisionId: auth.decisionId, authorizationBodySha256: auth.bodyDigest });
+          authorizationDecisionId: auth.decisionId, authorizationBodySha256: auth.bodyDigest,
+          authorizationEvidence: { artifacts: ["comment", "commit"] } });
         const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, fixture.actionId));
         expect((action!.evidence as any).executionReconciliation).toMatchObject({
           authorizationPayloadDigest: auth.bodyDigest, admission: { authorization: auth } });
@@ -2480,6 +2482,14 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           scope: "execution_reconciliation", outcome: "revoked", revokesDecisionId: auth.decisionId, actorAgentId: revoked.managerId });
         expect((await refuse(revoked, body)).details.reason).toBe("decision_revoked");
 
+        const unlisted = await seedAdmission();
+        const unlistedBody = await admissionBody(unlisted, "recon:a2-unlisted-revoke");
+        const unlistedAuth = unlistedBody.executionReconciliation.admission.authorization;
+        await db.insert(issueDocumentDecisions).values({ companyId: unlisted.companyId, issueId: unlisted.sourceIssueId,
+          documentId: unlistedAuth.documentId, revisionId: unlistedAuth.revisionId, revisionNumber: 1, bodySha256: unlistedAuth.bodyDigest,
+          scope: "execution_reconciliation", outcome: "revoked", revokesDecisionId: unlistedAuth.decisionId, actorAgentId: unlisted.coderId });
+        await request(admissionApp()).post(resolvePath(unlisted.sourceIssueId)).send(unlistedBody).expect(200);
+
         const other = await seedAdmission();
         const otherBody = await admissionBody(other, "recon:a2-other-revision");
         const otherAuth = otherBody.executionReconciliation.admission.authorization;
@@ -2522,7 +2532,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         expect(refusalCode(conflict.body)).toBe("idempotency_conflict");
       });
 
-      it("refuses admission while an authority-list change holds the list, then admits after it commits", async () => {
+      it("waits for an in-flight authority-list change and then applies the new list", async () => {
         const fixture = await seedAdmission();
         const body = await admissionBody(fixture, "recon:a2-authority-race");
         let release!: () => void;
@@ -2530,7 +2540,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         let locked!: () => void;
         const lockedSignal = new Promise<void>((resolve) => { locked = resolve; });
         const change = db.transaction(async (tx) => {
-          await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`exec-recon-authority:${fixture.companyId}`}, 0))`);
+          await lockExecutionReconciliationAuthority(tx, fixture.companyId, "exclusive");
           await tx.update(companies).set({ executionReconciliationAuthority: { agentIds: [] } }).where(eq(companies.id, fixture.companyId));
           locked();
           await held;

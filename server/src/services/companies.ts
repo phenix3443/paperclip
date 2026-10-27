@@ -301,11 +301,11 @@ export function companyService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
     ) => {
       const budgetPublications: ActivityPublication[] = [];
       const result = await db.transaction(async (tx) => {
-        if (data.status !== undefined || data.budgetMonthlyCents !== undefined) {
-          await tx.select({ id: companies.id }).from(companies).where(eq(companies.id, id)).for("no key update");
-        }
         if (data.executionReconciliationAuthority !== undefined) {
           await lockExecutionReconciliationAuthority(tx, id, "exclusive");
+        }
+        if (data.status !== undefined || data.budgetMonthlyCents !== undefined) {
+          await tx.select({ id: companies.id }).from(companies).where(eq(companies.id, id)).for("no key update");
         }
         const existing = await getCompanyQuery(tx)
           .where(eq(companies.id, id))
