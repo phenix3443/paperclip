@@ -16,7 +16,7 @@ import { inspectGitExpirationRound, assertGitExpirationRoundMode, GIT_EXPIRATION
 import { GitCacheRestorationFailure } from "../services/git-workspace-restoration.js";
 import { createGitRemoteAuthProvider } from "../services/git-credentials.js";
 import { parseGitExpirationRoundArgs, runGitExpirationRoundCli, GitExpirationRoundUsageError, fileGitExpirationRoundJournal,
-  readGitExpirationRoundJournal } from "../git-expiration-round-cli.js";
+  readGitExpirationRoundJournal, gitExpirationRoundExitCode } from "../git-expiration-round-cli.js";
 
 const faults = vi.hoisted(() => ({ git: null as ((args: readonly string[]) => Error | null) | null, seamWrite: false, secretServices: 0 }));
 vi.mock("node:child_process", async (importOriginal) => {
@@ -409,25 +409,32 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
       .toMatchObject({ status: "partial", stopReason: "aborted", exhausted: true, selected: 0 });
   });
 
-  type JournalFault = "write" | "sync" | null;
-  async function fileJournal(fault: (line: string) => JournalFault = () => null, after?: (event: GitExpirationRoundEvent) => void) {
+  type JournalFault = "write" | "sync" | "sync_and_truncate" | null;
+  async function fileJournal(fault: (line: string) => JournalFault = () => null, after?: (event: GitExpirationRoundEvent) => void,
+    duringSync?: (line: string) => void) {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-round-journal-"));
     journalRoots.push(root);
     const file = path.join(root, "events.jsonl");
     const handle = await fs.open(file, "wx", 0o600);
-    let syncFault = false;
+    let current: { line: string; kind: JournalFault } = { line: "", kind: null };
     const journal = fileGitExpirationRoundJournal({
       write: async (buffer, offset, length, position) => {
-        const kind = fault(buffer.toString("utf8"));
-        if (kind === "write") throw Object.assign(new Error("no space left on device"), { code: "ENOSPC" });
-        syncFault = kind === "sync";
+        const line = buffer.toString("utf8");
+        current = { line, kind: fault(line) };
+        if (current.kind === "write") throw Object.assign(new Error("no space left on device"), { code: "ENOSPC" });
         return handle.write(buffer, offset, length, position);
       },
       datasync: async () => {
-        if (syncFault) { syncFault = false; throw Object.assign(new Error("i/o error"), { code: "EIO" }); }
+        const { line, kind } = current;
+        current = { line: "", kind: kind === "sync_and_truncate" ? "sync_and_truncate" : null };
+        if (line) duringSync?.(line);
         await handle.datasync();
+        if (kind === "sync" || (kind === "sync_and_truncate" && line)) throw Object.assign(new Error("i/o error"), { code: "EIO" });
       },
-      truncate: length => handle.truncate(length),
+      truncate: async length => {
+        if (current.kind === "sync_and_truncate") throw Object.assign(new Error("i/o error"), { code: "EIO" });
+        await handle.truncate(length);
+      },
       close: () => handle.close(),
     });
     return {
@@ -472,6 +479,35 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
     const persisted = await journal.persisted();
     expect(persisted.content).not.toContain("round_committed");
     expect(persisted.outcome).toEqual({ status: "partial", stopReason: "evidence_lost" });
+  });
+
+  it("keeps complete when the abort or deadline arrives while the commit record is written and synced", async () => {
+    const f = await seed(1);
+    const controller = new AbortController();
+    const aborted = await fileJournal(undefined, undefined, line => { if (commitLine(line)) controller.abort(); });
+    expect(await round(aborted, { companyId: f.companyId, signal: controller.signal })).toMatchObject({ status: "complete", stopReason: null });
+    expect(controller.signal.aborted).toBe(true);
+    const abortedEvidence = await aborted.persisted();
+    expect(abortedEvidence.finished).toEqual(["round_finished:pending_commit", "round_committed:complete"]);
+    expect(abortedEvidence.outcome).toEqual({ status: "complete", stopReason: null });
+
+    const deadline = new Date(Date.now() + 10_000);
+    const late = await fileJournal(undefined, undefined, line => { if (commitLine(line)) vi.setSystemTime(deadline.getTime() + 1); });
+    try {
+      expect(await round(late, { companyId: f.companyId, deadline })).toMatchObject({ status: "complete", stopReason: null });
+    } finally { vi.useRealTimers(); }
+    expect((await late.persisted()).outcome).toEqual({ status: "complete", stopReason: null });
+  });
+
+  it("gives exit code 3 with evidence_lost when a commit record that failed its sync cannot be truncated", async () => {
+    const f = await seed(1);
+    const journal = await fileJournal(line => commitLine(line) ? "sync_and_truncate" : null);
+    const summary = await round(journal, { companyId: f.companyId });
+    expect(summary).toMatchObject({ status: "partial", stopReason: "evidence_lost" });
+    expect(gitExpirationRoundExitCode(summary)).toBe(3);
+    const persisted = await journal.persisted();
+    expect(persisted.finished).toEqual(["round_finished:pending_commit", "round_committed:complete"]);
+    expect(persisted.outcome).toEqual({ status: "complete", stopReason: null });
   });
 
   it("does not persist complete when the abort or deadline arrives while the pending terminal record is written", async () => {

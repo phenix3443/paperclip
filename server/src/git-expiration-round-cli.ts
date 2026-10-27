@@ -114,6 +114,10 @@ export function readGitExpirationRoundJournal(content: string): { status: GitExp
   return { status: "partial", stopReason: "evidence_lost" };
 }
 
+export function gitExpirationRoundExitCode(summary: { status: GitExpirationRoundStatus }) {
+  return summary.status === "complete" ? 0 : 3;
+}
+
 export async function runGitExpirationRoundCli(argv: string[], env: NodeJS.ProcessEnv): Promise<number> {
   let args: GitExpirationRoundCliArgs;
   try {
@@ -134,7 +138,7 @@ export async function runGitExpirationRoundCli(argv: string[], env: NodeJS.Proce
       maxRows: args.maxRows, deadline: args.deadlineSeconds ? new Date(Date.now() + args.deadlineSeconds * 1000) : undefined,
     });
     process.stdout.write(`${JSON.stringify(summary)}\n`);
-    return summary.status === "complete" ? 0 : 3;
+    return gitExpirationRoundExitCode(summary);
   } finally {
     process.off("SIGINT", abort);
     process.off("SIGTERM", abort);

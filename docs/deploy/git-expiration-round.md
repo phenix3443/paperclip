@@ -81,7 +81,14 @@ The round writes `events.jsonl` in the evidence directory. Each line is one even
 
 ### Read the result
 
-A complete round ends with two records: a `round_finished` with status `pending_commit`, then a `round_committed`. The round writes `round_committed` only after `pending_commit` is on disk and nothing stopped the round. No other record says `complete`.
+A complete round ends with two records: a `round_finished` with status `pending_commit`, then a `round_committed`. No other record says `complete`.
+
+The commit record alone decides `complete`:
+
+- The round is complete when `round_committed` is written and its sync succeeds.
+- If the write or the sync of `round_committed` fails, the round is partial with `evidence_lost`.
+- An abort or the deadline stops the round only before the round starts to write `round_committed`. One that arrives while the round writes or syncs `round_committed`, or after that, does not change the result. The work of the round is already done at that point.
+- If an abort or the deadline arrives while the round writes `pending_commit`, the round does not write `round_committed`. It writes a `round_finished` with status `partial` and returns `partial`. If that record cannot be written, the journal ends with `pending_commit` and the round returns `partial` with `evidence_lost`.
 
 Read the journal in this way:
 
@@ -92,9 +99,11 @@ Read the journal in this way:
 
 `readGitExpirationRoundJournal` in `server/src/git-expiration-round-cli.ts` applies these rules.
 
-If an abort or the deadline arrives while the round writes `pending_commit`, the round does not write `round_committed`. It writes a `round_finished` with status `partial` and returns `partial`. If that record cannot be written, the journal ends with `pending_commit` and the round returns `partial` with `evidence_lost`.
+### When the exit code is the result
 
-If a record cannot be written or synced, the round truncates the file to the end of the previous record and ends partial with `evidence_lost`. If the truncation also fails, the journal can be wrong. In that case exit code `3` from the command is the result. An abort that arrives after `round_committed` is on disk does not change the result.
+If a record cannot be written or synced, the round truncates the file to the end of the previous record and ends partial with `evidence_lost`. The truncation can also fail. Then the journal on disk can be wrong: for example, a `round_committed` whose sync failed can stay in the file, and the rules above read the journal as complete.
+
+So when the round returns `partial` with `evidence_lost`, the command exits with code `3`, and the journal on disk is not trusted, even if its last record says `complete`. A reader must check the exit code or the run record of the command first, and read the journal only when the exit code is `0`, or to find the rows of a partial round.
 
 Row outcomes:
 
