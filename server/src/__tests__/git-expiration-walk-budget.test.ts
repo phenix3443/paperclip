@@ -72,12 +72,18 @@ describePosix("row walker entry budget and row deadline", () => {
     const dir = await flat("deadline-walk", 10);
     let now = 0;
     let expire: (() => void) | null = null;
-    const clock = { now: () => now, schedule: (callback: () => void) => { expire = callback; return () => { expire = null; }; } };
+    let scheduledMs = 0;
+    const clock = { now: () => now, schedule: (callback: () => void, ms: number) => {
+      expire = callback;
+      scheduledMs = ms;
+      return () => { expire = null; };
+    } };
     let finishRead!: () => void;
     const read = new Promise<void>(resolve => { finishRead = resolve; });
     let reached!: () => void;
     const pending = new Promise<void>(resolve => { reached = resolve; });
     const budget = new InspectionBudget(new AbortController().signal, { clock, beforeDirectoryRead: () => { reached(); return read; } });
+    expect(scheduledMs).toBe(GIT_EXPIRATION_BUDGETS.rowMs);
     const walking = walk(budget, dir).catch((caught: unknown) => caught);
     await pending;
     now = GIT_EXPIRATION_BUDGETS.rowMs - 100;

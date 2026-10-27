@@ -415,12 +415,17 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
     expect(baseline).toMatchObject({ status: "complete", candidates: 1, rejected: 0 });
     const counted = rowEntries[0]!;
     const missing = GIT_EXPIRATION_BUDGETS.walkerEntries - counted;
-    await fill(0, missing);
+    await fill(0, missing - 1);
 
+    const below = await round(memoryJournal(), { companyId: f.companyId, budgetHooks });
+    expect(rowEntries[1]).toBe(GIT_EXPIRATION_BUDGETS.walkerEntries - 1);
+    expect(below).toMatchObject({ status: "complete", candidates: 1, rejected: 0, resourceLimited: 0 });
+
+    await fill(missing - 1, 1);
     directories = [];
     const atJournal = memoryJournal();
     const at = await round(atJournal, { companyId: f.companyId, budgetHooks });
-    expect(rowEntries[1]).toBe(GIT_EXPIRATION_BUDGETS.walkerEntries);
+    expect(rowEntries[2]).toBe(GIT_EXPIRATION_BUDGETS.walkerEntries);
     expect(at).toMatchObject({ status: "complete", candidates: 1, rejected: 0, resourceLimited: 0 });
     expect(atJournal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "candidate" });
 
@@ -428,7 +433,7 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
     directories = [];
     const overJournal = memoryJournal();
     const over = await round(overJournal, { companyId: f.companyId, budgetHooks });
-    expect(rowEntries[2]).toBe(GIT_EXPIRATION_BUDGETS.walkerEntries + 1);
+    expect(rowEntries[3]).toBe(GIT_EXPIRATION_BUDGETS.walkerEntries + 1);
     expect(over).toMatchObject({ status: "partial", stopReason: "resource_limit", resourceLimited: 1, candidates: 0, rejected: 0, drainIncomplete: false });
     expect(overJournal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "resource_limit", reason: "walker_entries" });
     expect(overJournal.events.at(-1)).toMatchObject({ type: "round_finished", status: "partial" });
@@ -457,11 +462,14 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
     };
     const undrained: Promise<void>[] = [];
     const journal = memoryJournal();
+    let returned = false;
     const running = round(journal, { companyId: f.companyId, budgetHooks: { clock, beforeDirectoryRead },
-      onUndrainedRow: released => undrained.push(released) });
+      onUndrainedRow: released => undrained.push(released) }).finally(() => { returned = true; });
     await stalled;
     clock.advance(GIT_EXPIRATION_BUDGETS.rowMs - 100);
-    await new Promise(resolve => setTimeout(resolve, 500));
+    await new Promise(resolve => setTimeout(resolve, ROW_DRAIN_BOUND_MS + 1_000));
+    expect(returned).toBe(false);
+    expect(undrained).toHaveLength(0);
     expect(journal.events.some(event => event.type === "row_inspected")).toBe(false);
     expect(await advisoryLocks()).toBe(2);
 
