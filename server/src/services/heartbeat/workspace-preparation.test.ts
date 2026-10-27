@@ -1,5 +1,7 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile, access, rename, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -8,7 +10,7 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { captureDirectorySnapshot, directorySnapshotSha256, serializeDirectorySnapshot } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
-import { activityLog, agentWakeupRequests, agents, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environmentLeases, executionWorkspaces, executionWorkspaceRepositoryAccess, heartbeatRuns, issues, issueAccessGrants, plugins, projects, projectWorkspaces, type Db } from "@paperclipai/db";
+import { activityLog, agentWakeupRequests, agents, companies, companyMemberships, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environmentLeases, executionWorkspaces, executionWorkspaceRepositoryAccess, heartbeatRuns, issues, issueAccessGrants, plugins, projects, projectWorkspaces, type Db } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -17,6 +19,8 @@ import { environmentService } from "../environments.js";
 import { executionWorkspaceService, readExecutionWorkspaceLifecycleGeneration, toExecutionWorkspace } from "../execution-workspaces.js";
 import { CROSS_TASK_CONTINUATION_COMMITTER_ID, crossTaskContinuationDispatchKey, crossTaskContinuationIntentKey } from "../cross-task-continuation.js";
 import { reopenTargetBoundSuccessorWorkspace } from "./target-bound-successor-reopen.js";
+import { crossTaskContinuationTestHooks, issueRoutes } from "../../routes/issues.js";
+import { errorHandler } from "../../middleware/index.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { workspaceOperationService } from "../workspace-operations.js";
 import { nativeWorkspaceSyncInternals, prepareNativeWorkspaceSync } from "../native-runtime/native-workspace-sync.js";
@@ -699,11 +703,11 @@ describe.skipIf(!support.supported)("heartbeat workspace preparation boundary", 
     return run!;
   }
 
-  function successorStep(run: typeof heartbeatRuns.$inferSelect, executionWorkspacesSvc = executionWorkspaceService(db)) {
+  function successorStep(run: typeof heartbeatRuns.$inferSelect, executionWorkspacesSvc = executionWorkspaceService(db), responsibleUserId: string | null = null) {
     return reopenTargetBoundSuccessorWorkspace(db, {
       run: { id: run.id, companyId: run.companyId, agentId: run.agentId, wakeupRequestId: run.wakeupRequestId,
         issueId: run.issueId, nativeIssueId: run.nativeIssueId, contextSnapshot: run.contextSnapshot as Record<string, unknown> },
-      responsibleUserId: null, externalProvider: false, hasPersistedNativeExecutionInput: false,
+      responsibleUserId, externalProvider: false, hasPersistedNativeExecutionInput: false,
       freshIsolatedWorkspaceRequested: false, executionWorkspacesSvc,
     });
   }
@@ -1192,6 +1196,102 @@ describe.skipIf(!support.supported)("heartbeat workspace preparation boundary", 
     expect(await closedRowFacts(f.workspace.id)).toMatchObject({ status: "active", generation: failedGeneration + 1 });
     if (inodeAfterFailure !== null) expect((await stat(f.workspace.cwd!)).ino).toBe(inodeAfterFailure);
     expect(await branchHead(f.workspace.cwd!)).toEqual({ branch: f.workspace.branchName, head: f.headBeforeArchive });
+  });
+
+  // The real comments route on the archived target, with an agent whose run is
+  // bound to another task. The running source run fills the agent's single slot,
+  // so the dispatched successor stays queued until the test drives it.
+  async function crossTaskRoute(f: Awaited<ReturnType<typeof archivedContinuationTarget>>) {
+    await db.execute(sql`insert into "user" (id, name, email, email_verified, created_at, updated_at) values ('k5-user', 'K5', 'k5@example.test', true, now(), now()) on conflict do nothing`);
+    await db.insert(companyMemberships).values({ companyId: f.issue.companyId, principalType: "user", principalId: "k5-user", status: "active", membershipRole: "member" });
+    await db.update(issues).set({ status: "done", responsibleUserId: "k5-user" }).where(eq(issues.id, f.issue.id));
+    // The committed intent records the target's responsible user.
+    f.workspace = (await executionWorkspaceService(db).getStoredById(f.issue.companyId, f.workspace.id))!;
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } } }).where(eq(agents.id, f.input.agent.id));
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.agentId, f.input.agent.id));
+    const [source] = await db.insert(issues).values({ companyId: f.issue.companyId, title: "Source task", identifier: "WSP-2",
+      projectId: f.issue.projectId, status: "in_progress", assigneeAgentId: f.input.agent.id }).returning();
+    const [sourceRun] = await db.insert(heartbeatRuns).values({ companyId: f.issue.companyId, agentId: f.input.agent.id,
+      status: "running", invocationSource: "assignment", triggerDetail: "system",
+      contextSnapshot: { issueId: source!.id, taskId: source!.id } }).returning();
+    await instanceSettingsService(db).updateExperimental({ enableCrossTaskDeferredContinuation: true });
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = { type: "agent", agentId: f.input.agent.id, companyId: f.issue.companyId, runId: sourceRun!.id, source: "agent_key" } as never;
+      next();
+    });
+    app.use("/api", issueRoutes(db, {} as any));
+    app.use(errorHandler);
+    const post = () => request(app).post(`/api/issues/${f.issue.id}/comments`)
+      .send({ body: "Child finished, please continue", resume: true, clientRequestId: randomUUID() });
+    const successorRun = async () => {
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.input.agent.id));
+      return runs.filter(run => run.id !== sourceRun!.id && run.status === "queued");
+    };
+    return { post, successorRun, sourceRun: sourceRun! };
+  }
+
+  it("K5: the real route and consumer dispatch one target-bound successor whose step reopens the workspace and whose preparation reuses it", async () => {
+    const f = await archivedContinuationTarget();
+    const route = await crossTaskRoute(f);
+    const res = await route.post();
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(await closedRowFacts(f.workspace.id)).toMatchObject({ status: "archived", generation: f.generation });
+    const intents = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.requestedByActorId, CROSS_TASK_CONTINUATION_COMMITTER_ID));
+    expect(intents).toHaveLength(1);
+    expect(intents[0]!.idempotencyKey).toMatch(/^issue_cross_task_continuation:/);
+    const receipts = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey, crossTaskContinuationDispatchKey(intents[0]!.id)));
+    expect(receipts).toHaveLength(1);
+    const [successor, ...others] = await route.successorRun();
+    expect(others).toHaveLength(0);
+    expect(successor).toMatchObject({ wakeupRequestId: receipts[0]!.id, contextSnapshot: { issueId: f.issue.id } });
+    expect(intents[0]).toMatchObject({ status: "coalesced", runId: successor!.id });
+    // The successor's setup: the step, then ordinary preparation.
+    await expect(successorStep(successor!, executionWorkspaceService(db), "k5-user")).resolves.toMatchObject({ kind: "reopened", reopened: true, generation: f.generation + 1 });
+    const active = (await executionWorkspaceService(db).getStoredById(f.issue.companyId, f.workspace.id))!;
+    f.input.run = successor!;
+    f.input.task.responsibleUserId = "k5-user";
+    f.input.task.issueRef = await readIssue(f.issue.id);
+    f.input.reuse.requestedShouldReuseExisting = true;
+    f.input.reuse.existingExecutionWorkspace = active;
+    f.input.reuse.reusableExistingExecutionWorkspace = active;
+    f.input.reuse.workspaceReuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({ issueExecutionWorkspaceId: f.workspace.id,
+      issueExecutionWorkspacePreference: "reuse_existing", existingExecutionWorkspaceStatus: active.status });
+    const prepared = await prepareHeartbeatWorkspace(db, f.input);
+    expect(prepared.persistedExecutionWorkspace!.id).toBe(f.workspace.id);
+    expect(await branchHead(f.workspace.cwd!)).toEqual({ branch: f.workspace.branchName, head: f.headBeforeArchive });
+    expect(await workspaceActivity("execution_workspace.reopened")).toHaveLength(1);
+  });
+
+  it("L2e: an eager reopen waiting behind the deferred route transaction reopens after the commit, and the successor then makes no service call", async () => {
+    const f = await archivedContinuationTarget();
+    const route = await crossTaskRoute(f);
+    const h = await raceHarness(f);
+    let releaseRoute!: () => void;
+    const routeHeld = new Promise<void>(resolve => { releaseRoute = resolve; });
+    let routeReached!: () => void;
+    const routeAtCommit = new Promise<void>(resolve => { routeReached = resolve; });
+    crossTaskContinuationTestHooks.beforeCommit = async () => { routeReached(); await routeHeld; };
+    // The route takes the lifecycle lock first, so it is the harness's first holder; let it through.
+    const responseDone = route.post().then(res => res);
+    await h.holderReached;
+    h.release();
+    await routeAtCommit;
+    const eagerDone = h.eager();
+    await h.settle();
+    releaseRoute();
+    const res = await responseDone;
+    crossTaskContinuationTestHooks.beforeCommit = undefined;
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    await expect(eagerDone).resolves.toMatchObject({ ok: true, reopened: true });
+    expect(h.rebuilds).toEqual({ eager: 1 });
+    const [successor] = await route.successorRun();
+    const svc = executionWorkspaceService(db);
+    const reopen = vi.spyOn(svc, "reopenClosedIsolatedExecutionWorkspaceForIssue");
+    await expect(successorStep(successor!, svc, "k5-user")).resolves.toEqual({ kind: "already_active", workspaceId: f.workspace.id });
+    expect(reopen).not.toHaveBeenCalled();
+    expect(await closedRowFacts(f.workspace.id)).toMatchObject({ status: "active", generation: f.generation + 1 });
   });
 
   it("keeps the admitted recovery workspace when the issue now points elsewhere", async () => {
