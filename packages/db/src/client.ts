@@ -156,6 +156,8 @@ export interface DatabaseClientOptions {
    */
   applicationName?: string;
   sessionParameters?: Record<string, string>;
+  dedicatedApplicationName?: string;
+  beforeDedicatedConnection?: (openDedicated: number) => void;
 }
 
 /**
@@ -261,12 +263,14 @@ export function postgresJsOptions(options: DatabaseClientOptions): Record<string
 const dedicatedDbFactories = new WeakMap<object, () => Db>();
 
 const openDedicatedDbs = new WeakMap<object, Set<Db>>();
+const dedicatedDbGuards = new WeakMap<object, (openDedicated: number) => void>();
 
 export async function withDedicatedDbConnection<T>(db: Db, action: (dedicated: Db) => Promise<T>): Promise<T> {
   const factory = dedicatedDbFactories.get(db);
   if (!factory) throw new Error("dedicated_connection_requires_create_db");
-  const dedicated = factory();
   const open = openDedicatedDbs.get(db) ?? new Set<Db>();
+  dedicatedDbGuards.get(db)?.(open.size);
+  const dedicated = factory();
   openDedicatedDbs.set(db, open);
   open.add(dedicated);
   try { return await action(dedicated); }
@@ -321,11 +325,13 @@ function createDbClient(url: string, resolved: DatabaseClientOptions, owner?: ob
   // message cannot establish that replay is safe. Leave retries to callers
   // that know the complete operation is idempotent.
   const db = installDatabaseWorkSignals(drizzlePg(sql, { schema }), owner);
+  const { dedicatedApplicationName, beforeDedicatedConnection, ...inherited } = resolved;
+  if (beforeDedicatedConnection) dedicatedDbGuards.set(db, beforeDedicatedConnection);
   dedicatedDbFactories.set(db, () => createDbClient(url, {
-    ...resolved, maxConnections: 1, applicationName: "paperclip-workspace-finalization-lock",
+    ...inherited, maxConnections: 1, applicationName: dedicatedApplicationName ?? "paperclip-workspace-finalization-lock",
   }, db));
   livenessDbFactories.set(db, () => createDbClient(url, {
-    ...resolved, maxConnections: LIVENESS_POOL_MAX_CONNECTIONS, applicationName: "paperclip-controller-lease",
+    ...inherited, maxConnections: LIVENESS_POOL_MAX_CONNECTIONS, applicationName: "paperclip-controller-lease",
   }, db));
   return db;
 }

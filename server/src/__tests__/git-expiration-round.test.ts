@@ -284,8 +284,15 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
     const head = git(f.cwd, "rev-parse", "HEAD");
     const before = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, f.workspaceId));
     const journal = memoryJournal();
-    const summary = await round(journal, { companyId: f.companyId });
-    expect(summary).toMatchObject({ status: "complete", candidates: 1, rejected: 0 });
+    const backends: number[] = [];
+    const summary = await round(journal, { companyId: f.companyId, budgetHooks: { beforeDirectoryRead: async () => {
+      if (!backends.length) backends.push(await roundBackends());
+    } } });
+    expect(summary).toMatchObject({ status: "complete", candidates: 1, rejected: 0, budgetHit: null,
+      peaks: { dbClients: GIT_EXPIRATION_BUDGETS.dbConnections, gitChildren: 1 } });
+    expect(summary.peaks.rowEntries).toBeGreaterThan(0);
+    expect(backends[0]).toBeGreaterThanOrEqual(3);
+    expect(backends[0]).toBeLessThanOrEqual(GIT_EXPIRATION_BUDGETS.dbConnections);
     expect(journal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "candidate", candidateBytes: expect.any(Number) });
     expect(await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, f.workspaceId))).toEqual(before);
     expect(git(f.cwd, "rev-parse", "HEAD")).toBe(head);
@@ -550,8 +557,11 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
 
   it("ends partial when the row budget is spent", async () => {
     const f = await seed(3);
-    expect(await round(memoryJournal(), { companyId: f.companyId, maxRows: 1 }))
-      .toMatchObject({ status: "partial", stopReason: "row_budget", inspected: 1, selected: 3 });
+    const events: GitExpirationRoundEvent[] = [];
+    expect(await round(memoryJournal(event => { events.push(event); }), { companyId: f.companyId, maxRows: 1 }))
+      .toMatchObject({ status: "partial", stopReason: "row_budget", inspected: 1, selected: 1, fullPages: 1, exhaustionChecked: true });
+    expect(events.filter(event => event.type === "page_selected").flatMap(event => event.type === "page_selected" ? event.keys : [])).toHaveLength(1);
+    expect(events.filter(event => event.type === "selection_exhaustion_checked")).toEqual([{ type: "selection_exhaustion_checked", more: true }]);
   });
 
   it("ends partial on abort or an expired deadline before selecting", async () => {
