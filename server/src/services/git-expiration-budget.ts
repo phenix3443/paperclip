@@ -62,7 +62,6 @@ export class InspectionBudget {
   private readonly startedAt = Date.now();
   private readonly rowTimer: NodeJS.Timeout;
   private gitChildren = 0;
-  private entries = 0;
 
   constructor(roundSignal: AbortSignal, hooks: InspectionBudgetHooks = {}) {
     this.signal = AbortSignal.any([roundSignal, this.controller.signal]);
@@ -83,10 +82,9 @@ export class InspectionBudget {
 
   countEntry() {
     this.signal.throwIfAborted();
-    this.entries += 1;
-    this.peaks.rowEntries = this.entries;
-    if (this.entries > GIT_EXPIRATION_BUDGETS.walkerEntries) {
-      throw this.exceeded(new GitExpirationBudgetExceeded("walker_entries", GIT_EXPIRATION_BUDGETS.walkerEntries, this.entries));
+    this.peaks.rowEntries += 1;
+    if (this.peaks.rowEntries > GIT_EXPIRATION_BUDGETS.walkerEntries) {
+      throw this.exceeded(new GitExpirationBudgetExceeded("walker_entries", GIT_EXPIRATION_BUDGETS.walkerEntries, this.peaks.rowEntries));
     }
   }
 

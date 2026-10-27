@@ -121,7 +121,7 @@ export async function findRegenerableWorkspaceDirs(
     if (depth > MAX_WALK_DEPTH) return;
     const entries = await readBoundedDirectory(path.join(worktreePath, relativeDir), options.signal)
       .catch((error: unknown) => {
-        if (isInspectionStop(error, options.signal)) throw error;
+        if (isInspectionStop(error, options.signal) || typeof (error as NodeJS.ErrnoException)?.code !== "string") throw error;
         return [];
       });
     for (const entry of entries) {
