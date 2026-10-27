@@ -11,7 +11,10 @@ import type {
   ExecutionReconciliationRefusalCode,
   ExpectedReconciliationState,
 } from "@paperclipai/shared";
-import { canonicalReconciliationDigest } from "@paperclipai/shared/execution-reconciliation-canonical";
+import {
+  ReconciliationCanonicalError,
+  canonicalReconciliationDigest,
+} from "@paperclipai/shared/execution-reconciliation-canonical";
 import { conflict, notFound } from "../errors.js";
 
 // Receipts and expected-state binding for execution reconciliation admission
@@ -49,7 +52,7 @@ function lookupFromRow(issueId: string, row: Receipt | undefined): Reconciliatio
     : { state: "abandoned", settledAt: row.createdAt };
 }
 
-async function selectReceipt(db: DbOrTransaction, companyId: string, idempotencyKey: string) {
+export async function selectReconciliationReceipt(db: DbOrTransaction, companyId: string, idempotencyKey: string) {
   return db
     .select()
     .from(executionReconciliationReceipts)
@@ -65,7 +68,7 @@ export async function readReconciliationReceipt(
   db: Db,
   input: { companyId: string; issueId: string; idempotencyKey: string },
 ): Promise<ReconciliationReceiptLookup> {
-  return lookupFromRow(input.issueId, await selectReceipt(db, input.companyId, input.idempotencyKey));
+  return lookupFromRow(input.issueId, await selectReconciliationReceipt(db, input.companyId, input.idempotencyKey));
 }
 
 /**
@@ -75,11 +78,11 @@ export async function readReconciliationReceipt(
 export async function settleReconciliationKey(
   db: Db,
   input: { companyId: string; issueId: string; idempotencyKey: string; actorUserId: string | null },
-): Promise<Exclude<ReconciliationReceiptLookup, { state: "unsettled" }>> {
+): Promise<Exclude<ReconciliationReceiptLookup, { state: "unsettled" }> & { settledNow: boolean }> {
   return db.transaction(async (tx) => {
     await lockReconciliationKey(tx, input.companyId, input.idempotencyKey);
-    const existing = lookupFromRow(input.issueId, await selectReceipt(tx, input.companyId, input.idempotencyKey));
-    if (existing.state !== "unsettled") return existing;
+    const existing = lookupFromRow(input.issueId, await selectReconciliationReceipt(tx, input.companyId, input.idempotencyKey));
+    if (existing.state !== "unsettled") return { ...existing, settledNow: false };
     const [row] = await tx
       .insert(executionReconciliationReceipts)
       .values({
@@ -90,7 +93,7 @@ export async function settleReconciliationKey(
         actorUserId: input.actorUserId,
       })
       .returning();
-    return { state: "abandoned", settledAt: row!.createdAt };
+    return { state: "abandoned", settledAt: row!.createdAt, settledNow: true };
   });
 }
 
@@ -213,9 +216,11 @@ export function executionReconciliationRefusal(
  * serialization failures become `concurrent_change`: nothing was written and
  * the caller re-reads and retries with the same key.
  */
-export function toExecutionReconciliationRefusal(error: unknown): { code: string; error: unknown } | null {
+export function toExecutionReconciliationRefusal(
+  error: unknown,
+): { code: ExecutionReconciliationRefusalCode; error: unknown } | null {
   const marked = error && typeof error === "object" ? (error as Record<symbol, unknown>)[REFUSAL_MARK] : undefined;
-  if (typeof marked === "string") return { code: marked, error };
+  if (typeof marked === "string") return { code: marked as ExecutionReconciliationRefusalCode, error };
   const pgCode = error && typeof error === "object" ? (error as { code?: unknown; cause?: { code?: unknown } }) : null;
   const sqlState = pgCode?.code ?? pgCode?.cause?.code;
   if (sqlState === "40P01" || sqlState === "40001") {
@@ -265,8 +270,11 @@ export async function checkExecutionReconciliationAdmission(
     if (prior.issueId !== issue.id || prior.requestDigest !== input.requestDigest) {
       throw executionReconciliationRefusal("idempotency_conflict", "This idempotency key was used for a different request.");
     }
-    const [action] = await tx.select().from(issueRecoveryActions)
-      .where(eq(issueRecoveryActions.id, prior.actionId!));
+    const [action] = await tx.select().from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.id, prior.actionId!),
+      eq(issueRecoveryActions.companyId, issue.companyId),
+      eq(issueRecoveryActions.sourceIssueId, issue.id),
+    ));
     if (!action) throw notFound("Recovery action not found");
     return { kind: "replay", receipt: prior, action };
   }
@@ -301,10 +309,30 @@ export async function checkExecutionReconciliationAdmission(
   if (!run.finishedAt) throw executionReconciliationRefusal("run_not_settled", "The source run has not finished.");
   const unstartedRunIds = await listUnstartedHoldRunIds(tx, issue.companyId, issue.id);
   const expected = buildExpectedReconciliationState({ issue, run, action, unstartedRunIds });
-  const comparison = compareExpectedReconciliationState(expected, admission);
+  let comparison: ExpectedStateComparison;
+  try {
+    comparison = compareExpectedReconciliationState(expected, admission);
+  } catch (error) {
+    // Stored JSON outside the canonical rules (for example a fraction in a
+    // policy) cannot be bound to a digest, so it can never be admitted.
+    if (error instanceof ReconciliationCanonicalError) {
+      throw executionReconciliationRefusal("expected_state_mismatch", "The stored task state cannot be canonicalized.",
+        { reason: "server_state_not_canonical" });
+    }
+    throw error;
+  }
   if (!comparison.matches) {
     throw executionReconciliationRefusal("expected_state_mismatch", "The task, run or action changed since it was verified.",
       { serverDigest: comparison.digest, differingKeys: comparison.differingKeys });
   }
   return { kind: "admit", expected, expectedDigest: comparison.digest };
+}
+
+/** The committed receipt, written last in the admission transaction. */
+export async function insertCommittedReconciliationReceipt(
+  tx: DbOrTransaction,
+  values: Omit<typeof executionReconciliationReceipts.$inferInsert, "state" | "id" | "createdAt">,
+) {
+  const [row] = await tx.insert(executionReconciliationReceipts).values({ ...values, state: "committed" }).returning();
+  return row!;
 }

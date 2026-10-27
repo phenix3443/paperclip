@@ -2138,6 +2138,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(settled.body.state).toBe("abandoned");
     expect((await request(app).get(`/api/issues/${sourceIssueId}/recovery-actions/receipts/${key}`).expect(200)).body.state)
       .toBe("abandoned");
+    // A repeated settle changes nothing and is not logged again.
+    expect((await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/receipts/${key}/settle`).expect(200)).body)
+      .toEqual({ state: "abandoned", settledAt: settled.body.settledAt });
     const logged = await db.select().from(activityLog).where(eq(activityLog.action, "issue.execution_reconciliation_key_settled"));
     expect(logged).toHaveLength(1);
     expect(logged[0]!.details).toMatchObject({ idempotencyKey: key, state: "abandoned" });
@@ -2260,6 +2263,14 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       await db.update(heartbeatRuns).set({ finishedAt: null }).where(eq(heartbeatRuns.id, unfinished.runId));
       const refused = await request(admissionApp()).post(resolvePath(unfinished.sourceIssueId)).send(body).expect(409);
       expect(refusalCode(refused.body)).toBe("run_not_settled");
+      expect(await db.select().from(executionReconciliationReceipts)).toHaveLength(0);
+    });
+
+    it("rejects a non-integer number in the request with 400 before hashing", async () => {
+      const fixture = await seedAdmission();
+      const body = await admissionBody(fixture, "recon:fraction-number-1");
+      (body.executionReconciliation.admission.expected.issue as any).executionPolicy = { weight: 1.5 };
+      await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(400);
       expect(await db.select().from(executionReconciliationReceipts)).toHaveLength(0);
     });
 

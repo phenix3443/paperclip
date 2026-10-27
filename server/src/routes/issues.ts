@@ -3,12 +3,15 @@ import { parseObject } from "../adapters/utils.js";
 import { prepareRestrictedWorkspaceRetry } from "../services/restricted-workspace-retry.js";
 import { executionReconciliationIdempotencyKeySchema, issueSummariesQuerySchema, type ExecutionReconciliationAdmission, type IssueSummary } from "@paperclipai/shared";
 import { listIssueSummaries } from "../services/issue-summaries.js";
+import { ReconciliationCanonicalError } from "@paperclipai/shared/execution-reconciliation-canonical";
 import {
   checkExecutionReconciliationAdmission,
   executionReconciliationRefusal,
   executionReconciliationRequestDigest,
+  insertCommittedReconciliationReceipt,
   lockReconciliationKey,
   readReconciliationReceipt,
+  selectReconciliationReceipt,
   settleReconciliationKey,
   toExecutionReconciliationRefusal,
   type ExecutionReconciliationReceiptRow,
@@ -79,7 +82,6 @@ import {
   issueComments,
   issueDocuments,
   issueExecutionDecisions,
-  executionReconciliationReceipts,
   issueRelations,
   issueRecoveryActions,
   issueThreadInteractions,
@@ -9626,7 +9628,7 @@ export function issueRoutes(
       actorUserId: req.actor.userId ?? null,
     });
     const actor = getActorInfo(req);
-    await logActivity(db, {
+    if (result.settledNow) await logActivity(db, {
       companyId: scope.issue.companyId,
       actorType: actor.actorType,
       actorId: actor.actorId,
@@ -9638,7 +9640,8 @@ export function issueRoutes(
       issueId: scope.issue.id,
       details: { idempotencyKey: scope.idempotencyKey, state: result.state },
     });
-    res.json(result);
+    const { settledNow: _settledNow, ...lookup } = result;
+    res.json(lookup);
   });
 
   router.post(
@@ -9719,17 +9722,22 @@ export function issueRoutes(
       const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
       const postCommitActivityPublications: ActivityPublication[] = [];
       const postCommitIssueActions: IssuePostCommitAction[] = [];
-      const admissionRequestDigest = admission ? executionReconciliationRequestDigest(req.body) : null;
+      let admissionRequestDigest: string | null = null;
+      if (admission) {
+        try {
+          admissionRequestDigest = executionReconciliationRequestDigest(req.body);
+        } catch (error) {
+          if (error instanceof ReconciliationCanonicalError) throw badRequest(error.message);
+          throw error;
+        }
+      }
       const runResolveTransaction = () => db.transaction(async (tx) => {
         // L0 comes before every row lock; it is held until commit or rollback.
         let priorReceipt: ExecutionReconciliationReceiptRow | undefined;
         if (admission) {
           assertBoard(req);
           await lockReconciliationKey(tx, existing.companyId, admission.idempotencyKey);
-          priorReceipt = await tx.select().from(executionReconciliationReceipts).where(and(
-            eq(executionReconciliationReceipts.companyId, existing.companyId),
-            eq(executionReconciliationReceipts.idempotencyKey, admission.idempotencyKey),
-          )).then((rows) => rows[0]);
+          priorReceipt = await selectReconciliationReceipt(tx, existing.companyId, admission.idempotencyKey);
         }
         const lockedIssue = await tx
           .select()
@@ -10268,13 +10276,12 @@ export function issueRoutes(
         let receipt: ExecutionReconciliationReceiptRow | undefined;
         if (admission && admissionCheck?.kind === "admit") {
           // Written last, in the same transaction as the action and issue.
-          [receipt] = await tx.insert(executionReconciliationReceipts).values({
+          receipt = await insertCommittedReconciliationReceipt(tx, {
             companyId: lockedIssue.companyId,
             issueId: lockedIssue.id,
             actionId: recoveryAction.id,
             runId: executionReconciliation!.runId,
             idempotencyKey: admission.idempotencyKey,
-            state: "committed",
             requestDigest: admissionRequestDigest,
             expectedDigest: admissionCheck.expectedDigest,
             expectedSnapshot: admissionCheck.expected as unknown as Record<string, unknown>,
@@ -10289,14 +10296,19 @@ export function issueRoutes(
               continuationDelivery: (recoveryAction.evidence as Record<string, unknown>).continuationDelivery ?? null,
             },
             actorUserId: actor.actorType === "user" ? actor.actorId : null,
-          }).returning();
+          });
         }
 
         return { issue, recoveryAction, chatRetry, receipt };
       });
       const result = admission
         ? await runResolveTransaction().catch(async (error: unknown) => {
-            const refusal = toExecutionReconciliationRefusal(error);
+            // Every refusal on the admission path is audited, including plain
+            // 4xx errors from the shared validation, with their own code if any.
+            const refusal = toExecutionReconciliationRefusal(error) ??
+              (error instanceof HttpError && error.status >= 400 && error.status < 500
+                ? { code: String((error.details as { code?: unknown } | undefined)?.code ?? `http_${error.status}`), error }
+                : null);
             if (refusal) {
               // Separate short write after rollback: one audit row, nothing else.
               await logActivity(db, {
@@ -10306,6 +10318,9 @@ export function issueRoutes(
                 issueId: existing.id,
                 details: { code: refusal.code, requestDigest: admissionRequestDigest,
                   expectedDigest: admission.expectedDigest, idempotencyKey: admission.idempotencyKey },
+              }).catch((auditError: unknown) => {
+                // The coded refusal is the answer; a lost audit row must not replace it.
+                logger.warn({ err: auditError, issueId: existing.id }, "failed to record execution reconciliation refusal");
               });
               throw refusal.error;
             }
