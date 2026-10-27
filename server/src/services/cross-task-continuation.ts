@@ -443,7 +443,6 @@ export function crossTaskContinuationDeliveryGate(
   return null;
 }
 
-export const DEFERRED_RECEIPT_READMISSION_DECLINED = "deferred_receipt_readmission_declined";
 export const NATIVE_STATUS_DISPATCH_ACTOR_PREFIX = "native-status-wake-dispatch:";
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -490,7 +489,7 @@ export async function isTrustedDeferredDispatchReceipt(
 
 export async function listPromotableDeferredDispatchReceipts(
   db: Db,
-  input: { companyId?: string; limit: number; after?: { requestedAt: Date; id: string } | null; includeDeclined?: boolean },
+  input: { companyId?: string; limit: number; after?: { requestedAt: Date; id: string } | null },
 ) {
   const rows = await db.select({ receipt: agentWakeupRequests }).from(agentWakeupRequests)
     .innerJoin(issues, and(
@@ -502,8 +501,6 @@ export async function listPromotableDeferredDispatchReceipts(
       eq(agentWakeupRequests.status, "deferred_issue_execution"),
       eq(agentWakeupRequests.requestedByActorType, "system"),
       isNull(agentWakeupRequests.runId),
-      input.includeDeclined ? undefined
-        : sql`${agentWakeupRequests.error} is distinct from ${DEFERRED_RECEIPT_READMISSION_DECLINED}`,
       or(
         and(sql`${agentWakeupRequests.requestedByActorId} = ${agentWakeupRequests.idempotencyKey}`,
           like(agentWakeupRequests.idempotencyKey, `${DISPATCH_KEY_PREFIX}%`)),

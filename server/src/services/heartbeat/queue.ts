@@ -174,7 +174,6 @@ import {
   crossTaskContinuationDeliveryGate,
   crossTaskContinuationDispatchKey,
   deferredDispatchReceiptIntentId,
-  DEFERRED_RECEIPT_READMISSION_DECLINED,
   isTrustedDeferredDispatchReceipt,
   listPromotableDeferredDispatchReceipts,
   NATIVE_STATUS_DISPATCH_ACTOR_PREFIX,
@@ -5133,7 +5132,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     const scope = input.companyId ?? "*";
     let cursor = deferredReceiptPromotionCursors.get(scope) ?? null;
     for (let scanned = 0; scanned < 500;) {
-      const page = await listPromotableDeferredDispatchReceipts(db, { companyId: input.companyId, limit: pageSize, after: cursor, includeDeclined: true });
+      const page = await listPromotableDeferredDispatchReceipts(db, { companyId: input.companyId, limit: pageSize, after: cursor });
       receipts.push(...page.promotable);
       scanned += page.scanned;
       if (page.scanned < pageSize || !page.cursor) {
@@ -5158,12 +5157,15 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const [target] = await db.select({
         status: issues.status, assigneeAgentId: issues.assigneeAgentId,
         responsibleUserId: issues.responsibleUserId, executionWorkspaceId: issues.executionWorkspaceId,
+        conversationAgentId: issues.conversationAgentId, conversationUserId: issues.conversationUserId,
       }).from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, receipt.companyId)));
       if (!intent || !target) continue;
       const intentPayload = parseObject(intent.payload);
       let gateError: string | null = null;
       if (target.status === "done" || target.status === "cancelled") {
         gateError = `Native status wake target is already ${target.status}`;
+      } else if (isConversationExecutionWake(target, receipt.reason)) {
+        gateError = "Conversation tasks do not accept this execution wake";
       } else if (identity.kind === "cross_task_continuation") {
         const unresolvedBlockerCount = target.status === "blocked"
           ? ((await issuesSvc.listDependencyReadiness(receipt.companyId, [issueId])).get(issueId)?.unresolvedBlockerCount ?? 0)
@@ -5194,13 +5196,6 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           promoted += 1;
           await db.update(agentWakeupRequests).set({ runId: run.id, updatedAt: new Date() })
             .where(and(eq(agentWakeupRequests.id, intent.id), isNull(agentWakeupRequests.runId)));
-          await db.update(agentWakeupRequests).set({ error: null, updatedAt: new Date() })
-            .where(and(eq(agentWakeupRequests.id, receipt.id), eq(agentWakeupRequests.error, DEFERRED_RECEIPT_READMISSION_DECLINED)));
-        } else {
-          await db.update(agentWakeupRequests).set({ error: DEFERRED_RECEIPT_READMISSION_DECLINED, updatedAt: new Date() })
-            .where(and(eq(agentWakeupRequests.id, receipt.id), eq(agentWakeupRequests.status, "deferred_issue_execution"),
-              isNull(agentWakeupRequests.runId),
-              sql`${agentWakeupRequests.error} is distinct from ${DEFERRED_RECEIPT_READMISSION_DECLINED}`));
         }
       } catch (error) {
         logger.warn({ err: error, wakeupRequestId: receipt.id }, "failed to re-admit a deferred dispatch receipt");

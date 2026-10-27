@@ -40,7 +40,6 @@ import {
   CROSS_TASK_CONTINUATION_GATE_CHANGED,
   crossTaskContinuationDispatchKey,
   crossTaskContinuationIntentKey,
-  DEFERRED_RECEIPT_READMISSION_DECLINED,
   listPromotableDeferredDispatchReceipts,
 } from "../services/cross-task-continuation.ts";
 
@@ -620,7 +619,7 @@ describeEmbeddedPostgres("cross-task continuation intent consumer", () => {
     }
   });
 
-  it("a native status receipt released by a newer /new boundary is attempted, kept deferred by the conversation wake rule, and leaves the worker quiet", async () => {
+  it("a native status receipt released by a newer /new boundary is settled by the conversation wake rule without a run, and the worker goes quiet", async () => {
     const f = await deferUnderRecoveryHold();
     await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
     await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "automation",
@@ -641,28 +640,35 @@ describeEmbeddedPostgres("cross-task continuation intent consumer", () => {
       expect(await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId })).toMatchObject({ promoted: 0 });
     }
     expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipts[0]!.id)))
-      .toMatchObject([{ status: "deferred_issue_execution", runId: null, error: DEFERRED_RECEIPT_READMISSION_DECLINED }]);
+      .toMatchObject([{ status: "skipped", runId: null, error: "Conversation tasks do not accept this execution wake" }]);
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, receipts[0]!.id))).toHaveLength(0);
     expect((await readCrossTaskContinuationWork(db)).pending).toBe(false);
   });
 
-  it("a receipt marked declined by an earlier attempt is not counted as pending, and the real resolution notification still promotes it", async () => {
+  it("a temporary admission refusal keeps the retry obligation, and the worker promotes the receipt once the refusal clears", async () => {
     const f = await deferUnderRecoveryHold();
-    await db.update(agentWakeupRequests).set({ error: DEFERRED_RECEIPT_READMISSION_DECLINED }).where(eq(agentWakeupRequests.id, f.receipt.id));
+    await f.resolve();
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: false, maxConcurrentRuns: 1 } } })
+      .where(eq(agents.id, f.agentId));
+    expect(await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId })).toMatchObject({ promoted: 0 });
+    expect(await dispatchReceipts(f.intent.id)).toMatchObject([{ id: f.receipt.id, status: "deferred_issue_execution", runId: null }]);
+    expect((await readCrossTaskContinuationWork(db)).pending).toBe(true);
     const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: () => {} });
     try {
-      const worker = registerCrossTaskContinuationWork(db, coordinator, () => heartbeatService(db).dispatchPendingNativeStatusWakeups());
+      const worker = registerCrossTaskContinuationWork(db, coordinator, () => heartbeat.dispatchPendingNativeStatusWakeups());
       await worker.ready;
-      await f.resolve();
-      expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
-      await vi.waitFor(async () => expect(await f.runsFor()).toHaveLength(1), { timeout: 10_000 });
-      expect(await dispatchReceipts(f.intent.id)).toMatchObject([{ id: f.receipt.id, error: null }]);
-      await vi.waitFor(() => expect(coordinator.nextWakeAt()).toBeNull(), { timeout: 10_000 });
+      await vi.waitFor(() => expect(coordinator.nextWakeAt()).not.toBeNull(), { timeout: 10_000 });
+      expect(await f.runsFor()).toHaveLength(0);
+      await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } } })
+        .where(eq(agents.id, f.agentId));
+      await vi.waitFor(async () => expect(await f.runsFor()).toHaveLength(1), { timeout: 20_000 });
+      expect(await dispatchReceipts(f.intent.id)).toMatchObject([{ id: f.receipt.id }]);
+      await vi.waitFor(() => expect(coordinator.nextWakeAt()).toBeNull(), { timeout: 20_000 });
     } finally {
       await coordinator.stop();
     }
     await heartbeat.drainActiveRunExecutions();
-  });
+  }, 60_000);
 
   it("an untrusted deferred receipt is neither a candidate nor pending work, and a sweep leaves it untouched", async () => {
     const f = await deferUnderRecoveryHold();
@@ -689,7 +695,7 @@ describeEmbeddedPostgres("cross-task continuation intent consumer", () => {
     expect(await f.runsFor()).toHaveLength(0);
   });
 
-  it("ready work behind more than one worker page and one promotion pass of ownership-held receipts is found and promoted once", async () => {
+  it("on startup the worker continues past more than one worker page and one promotion pass of ownership-held receipts and promotes the ready one once", async () => {
     const f = await seedTarget();
     await db.update(agentWakeupRequests).set({ status: "coalesced" }).where(eq(agentWakeupRequests.id, f.intent.id));
     const oldest = new Date(Date.now() - 60_000);
@@ -715,11 +721,15 @@ describeEmbeddedPostgres("cross-task continuation intent consumer", () => {
     await ready.resolve();
     expect(await getExecutionBlocker(db, ready.companyId, ready.issueId)).toBeNull();
     expect((await readCrossTaskContinuationWork(db)).pending).toBe(true);
-    let promoted = 0;
-    for (let pass = 0; pass < 3 && (await ready.runsFor()).length === 0; pass += 1) {
-      promoted += (await heartbeat.dispatchPendingNativeStatusWakeups({ limit: 1 })).promoted;
+    const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: () => {} });
+    try {
+      const worker = registerCrossTaskContinuationWork(db, coordinator, () => heartbeat.dispatchPendingNativeStatusWakeups({ limit: 1 }));
+      await worker.ready;
+      await vi.waitFor(async () => expect(await ready.runsFor()).toHaveLength(1), { timeout: 60_000, interval: 500 });
+      await vi.waitFor(() => expect(coordinator.nextWakeAt()).toBeNull(), { timeout: 60_000, interval: 500 });
+    } finally {
+      await coordinator.stop();
     }
-    expect(promoted).toBe(1);
     expect(await ready.runsFor()).toHaveLength(1);
     expect(await dispatchReceipts(ready.intent.id)).toHaveLength(1);
     const heldReceipts = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.requestedAt, oldest));
@@ -728,5 +738,5 @@ describeEmbeddedPostgres("cross-task continuation intent consumer", () => {
     expect((await readCrossTaskContinuationWork(db)).pending).toBe(false);
     expect((await heartbeat.dispatchPendingNativeStatusWakeups({ limit: 1 })).promoted).toBe(0);
     await heartbeat.drainActiveRunExecutions();
-  }, 120_000);
+  }, 180_000);
 });
