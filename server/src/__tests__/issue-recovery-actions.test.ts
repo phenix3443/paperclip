@@ -21,6 +21,7 @@ import {
   chatEndpoints,
   companies,
   createDb,
+  executionReconciliationReceipts,
   documentRevisions,
   documents,
   environmentLeases,
@@ -170,6 +171,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   }, 30_000);
 
   afterEach(async () => {
+    await db.delete(executionReconciliationReceipts);
     await db.delete(caseHandoffs);
     await db.delete(cases);
     await db.delete(documentRevisions);
@@ -2118,6 +2120,25 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     // The settled no-replay hold is not reopened and the issue is unchanged.
     expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id)))[0]).toEqual(beforeAction);
     expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0]).toEqual(beforeIssue);
+  });
+
+  it("reads and settles reconciliation keys for Board only and logs the settlement", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const key = "recon:route-settle-key";
+    const agentApp = createApp({ type: "agent", agentId: coderId, companyId, source: "agent_key" });
+    await request(agentApp).get(`/api/issues/${sourceIssueId}/recovery-actions/receipts/${key}`).expect(403);
+    await request(agentApp).post(`/api/issues/${sourceIssueId}/recovery-actions/receipts/${key}/settle`).expect(403);
+    const app = createApp({ type: "board", source: "local_implicit", userId: "board-user" });
+    await request(app).get(`/api/issues/${sourceIssueId}/recovery-actions/receipts/short`).expect(400);
+    expect((await request(app).get(`/api/issues/${sourceIssueId}/recovery-actions/receipts/${key}`).expect(200)).body)
+      .toEqual({ state: "unsettled" });
+    const settled = await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/receipts/${key}/settle`).expect(200);
+    expect(settled.body.state).toBe("abandoned");
+    expect((await request(app).get(`/api/issues/${sourceIssueId}/recovery-actions/receipts/${key}`).expect(200)).body.state)
+      .toBe("abandoned");
+    const logged = await db.select().from(activityLog).where(eq(activityLog.action, "issue.execution_reconciliation_key_settled"));
+    expect(logged).toHaveLength(1);
+    expect(logged[0]!.details).toMatchObject({ idempotencyKey: key, state: "abandoned" });
   });
 
   async function seedReconciledDelivery() {

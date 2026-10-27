@@ -1,8 +1,9 @@
 import { taskInterruptionPresentation, taskInterruptionPresentations } from "../services/task-interruption-presentation.js";
 import { parseObject } from "../adapters/utils.js";
 import { prepareRestrictedWorkspaceRetry } from "../services/restricted-workspace-retry.js";
-import { issueSummariesQuerySchema, type IssueSummary } from "@paperclipai/shared";
+import { executionReconciliationIdempotencyKeySchema, issueSummariesQuerySchema, type IssueSummary } from "@paperclipai/shared";
 import { listIssueSummaries } from "../services/issue-summaries.js";
+import { readReconciliationReceipt, settleReconciliationKey } from "../services/execution-reconciliation-receipts.js";
 import { assertNoCaseHandoffMutation } from "../services/heartbeat/case-handoff-lifecycle.js";
 import { assertLegacyRunTaskOwnership } from "../legacy-run-task-ownership.js";
 import { enqueueFastResponse } from "../services/fast-responses.js";
@@ -9580,6 +9581,51 @@ export function issueRoutes(
     const receipt = await reconstructNativeWorkspace({ db, companyId: issue.companyId, issueId: issue.id,
       actorId: getActorInfo(req).actorId, request: req.body });
     res.status(202).json(receipt);
+  });
+
+  // Board-only receipt read and key settlement for execution reconciliation.
+  // `unsettled` is unknown; only settle turns an unclear response into a
+  // definite `committed` or `abandoned` answer.
+  const loadReconciliationReceiptScope = async (req: Request, res: Response) => {
+    assertBoard(req);
+    const parsedKey = executionReconciliationIdempotencyKeySchema.safeParse(req.params.key);
+    if (!parsedKey.success) throw badRequest("Invalid idempotency key");
+    const existing = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+    if (!existing) return null;
+    if (!(await assertIssueReadAllowed(req, res, existing))) return null;
+    return { issue: existing, idempotencyKey: parsedKey.data };
+  };
+
+  router.get("/issues/:id/recovery-actions/receipts/:key", async (req, res) => {
+    const scope = await loadReconciliationReceiptScope(req, res);
+    if (!scope) return;
+    const lookup = await readReconciliationReceipt(db, {
+      companyId: scope.issue.companyId, issueId: scope.issue.id, idempotencyKey: scope.idempotencyKey,
+    });
+    res.json(lookup);
+  });
+
+  router.post("/issues/:id/recovery-actions/receipts/:key/settle", async (req, res) => {
+    const scope = await loadReconciliationReceiptScope(req, res);
+    if (!scope) return;
+    const result = await settleReconciliationKey(db, {
+      companyId: scope.issue.companyId, issueId: scope.issue.id, idempotencyKey: scope.idempotencyKey,
+      actorUserId: req.actor.userId ?? null,
+    });
+    const actor = getActorInfo(req);
+    await logActivity(db, {
+      companyId: scope.issue.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "issue.execution_reconciliation_key_settled",
+      entityType: "issue",
+      entityId: scope.issue.id,
+      issueId: scope.issue.id,
+      details: { idempotencyKey: scope.idempotencyKey, state: result.state },
+    });
+    res.json(result);
   });
 
   router.post(
