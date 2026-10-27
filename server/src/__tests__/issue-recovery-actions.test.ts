@@ -2726,6 +2726,33 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(await db.select().from(issueDocumentDecisions)).toHaveLength(0);
     });
 
+    it("waits for an admission that holds the document row before inserting a decision", async () => {
+      const fixture = await seedDocument();
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      let locked!: () => void;
+      const lockedSignal = new Promise<void>((resolve) => { locked = resolve; });
+      const admission = db.transaction(async (tx) => {
+        await tx.select({ id: documents.id }).from(documents).where(eq(documents.id, fixture.documentId)).for("share");
+        locked();
+        await held;
+      });
+      await lockedSignal;
+      const pending = request(createApp({ type: "board", source: "local_implicit", userId: "board-user" }))
+        .post(decisionsPath(fixture.sourceIssueId))
+        .send({ outcome: "approved", revisionId: fixture.revisionId, scope: "execution_reconciliation", expiresAt: inHours(1) })
+        .then((response) => response);
+      const waiting = async () => (await db.execute(sql`select count(*)::int as n from pg_stat_activity
+        where wait_event_type = 'Lock' and query ilike '%from "documents"%for update%'`) as unknown as { n: number }[])[0]!.n;
+      for (let attempt = 0; attempt < 50 && await waiting() === 0; attempt += 1) await new Promise((r) => setTimeout(r, 50));
+      expect(await waiting()).toBe(1);
+      expect(await db.select().from(issueDocumentDecisions)).toHaveLength(0);
+      release();
+      await admission;
+      expect((await pending).status).toBe(201);
+      expect(await db.select().from(issueDocumentDecisions)).toHaveLength(1);
+    });
+
     it("revokes only an approval of the same revision", async () => {
       const fixture = await seedDocument();
       const app = createApp({ type: "board", source: "local_implicit", userId: "board-user" });

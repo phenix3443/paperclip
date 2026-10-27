@@ -54,6 +54,11 @@ export async function createIssueDocumentDecision(
         eq(issueDocuments.key, input.key),
       ));
     if (!link) throw notFound("Document not found");
+    await tx
+      .select({ id: documents.id })
+      .from(documents)
+      .where(and(eq(documents.companyId, input.companyId), eq(documents.id, link.documentId)))
+      .for("update");
     const [revision] = await tx
       .select()
       .from(documentRevisions)
