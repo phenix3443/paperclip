@@ -14,15 +14,6 @@ import { isClosedExecutionWorkspaceStatus, readExecutionWorkspaceLifecycleGenera
 import { isDeadlockDetected, isUniqueViolation } from "../db-errors.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 
-// A cross-task explicit resume does not reopen the target's archived workspace in
-// the request. It commits the comment, the status change and a durable intent in
-// one transaction. The heartbeat queue turns the intent into a run bound to the
-// target, and that run restores the workspace with its own identity. The
-// workspace execution guard does not change.
-//
-// The intent and the dispatch receipt are two different wakeup rows. Each has its
-// own key prefix and its own partial unique index, so neither index matches the
-// other row.
 
 type Transaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
@@ -32,7 +23,6 @@ export const CROSS_TASK_CONTINUATION_REASON = "issue_reopened_via_comment";
 export const CROSS_TASK_CONTINUATION_GATE_CHANGED = "cross_task_continuation_gate_changed";
 const INTENT_KEY_PREFIX = "issue_cross_task_continuation:";
 const DISPATCH_KEY_PREFIX = "cross-task-continuation-dispatch:";
-// `_` is a LIKE wildcard, so the intent prefix is escaped to match the index.
 const INTENT_KEY_LIKE_PREFIX = "issue\\_cross\\_task\\_continuation:";
 
 export const CROSS_TASK_CONTINUATION_MESSAGES = {
@@ -72,7 +62,6 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value ?? null);
 }
 
-/** SHA-256 over the request fields that a replay must match. */
 export function crossTaskContinuationRequestDigest(input: {
   issueId: string;
   body: string;
@@ -104,17 +93,10 @@ export type IssueExecutionWorkspaceBinding =
     }
   | { kind: "open_or_shared"; workspaceId: string };
 
-// Uses the reopen service's status test, so the route and the successor agree on
-// what a closed workspace is.
 function isClosedIsolatedRow(row: { mode: string | null; status: string | null }) {
   return row.mode === "isolated_workspace" && isClosedExecutionWorkspaceStatus(row.status);
 }
 
-/**
- * Whether the target-bound successor can reopen this closed row: a non-plugin
- * `git_worktree` whose provider is not retired. The deferred path admits only
- * these rows.
- */
 export function isSuccessorReopenableWorkspace(row: {
   strategyType: string | null;
   providerType: string | null;
@@ -125,11 +107,6 @@ export function isSuccessorReopenableWorkspace(row: {
     && (row.metadata as Record<string, unknown> | null | undefined)?.workspaceProviderRetired !== true;
 }
 
-/**
- * Classify the persisted workspace binding of an issue. Unlike a lookup that
- * returns null for both "no binding" and "binding to a missing row", this keeps
- * the missing case separate so a cross-task request can refuse it.
- */
 export async function classifyIssueExecutionWorkspaceBinding(
   db: Db | Transaction,
   issue: { companyId: string; executionWorkspaceId?: string | null },
@@ -181,12 +158,6 @@ function receiptFromIntent(intent: typeof agentWakeupRequests.$inferSelect): Cro
   };
 }
 
-/**
- * R0/D3: find a committed cross-task continuation for this agent's
- * clientRequestId. It depends only on the comment and the intent, so a committed
- * request stays replayable after the workspace, the source run, a pause hold or
- * the feature setting changed.
- */
 export async function findCrossTaskContinuationReplay(
   db: Db | Transaction,
   input: { companyId: string; issueId: string; agentId: string; clientRequestId: string; requestDigest: string },
@@ -225,7 +196,6 @@ async function runIsLive(tx: Transaction, companyId: string, runId: string | nul
   return Boolean(run && (LIVE_RUN_STATUSES as readonly string[]).includes(run.status));
 }
 
-/** A pending intent that the queue has not finished delivering. */
 async function findPendingContinuationIntent(
   tx: Transaction,
   input: { companyId: string; issueId: string; agentId: string },
@@ -257,7 +227,6 @@ export type CrossTaskContinuationCommitInput = {
   clientRequestId: string;
   requestDigest: string;
   binding: { workspaceId: string; generation: number };
-  /** The issue as the pre-reopen gates saw it (D0). */
   admitted: { assigneeAgentId: string | null; responsibleUserId: string | null };
   resumeRequested: boolean;
 };
@@ -268,16 +237,10 @@ export type CrossTaskContinuationCommitDeps = {
   logIssueReopened: (tx: Transaction, input: { reopenedFrom: string }) => Promise<void>;
   getActivePauseHold: (companyId: string, issueId: string) => Promise<unknown | null>;
   getUnresolvedBlockerCount: (issueId: string, tx: Transaction) => Promise<number>;
-  /**
-   * D4: the route's own read, comment, mutation and resume-intent decisions,
-   * run again against the locked issue row. Returns the refusal a fresh request
-   * would get, or null. It writes nothing and does not spend the run cap again.
-   */
   reauthorize: (issue: typeof issues.$inferSelect) => Promise<{
     status: number;
     body: { error?: string; details?: Record<string, unknown> };
   } | null>;
-  /** Test seam: runs after the comment insert and before commit. */
   beforeCommit?: (tx: Transaction) => Promise<void>;
 };
 
@@ -291,11 +254,6 @@ export type CrossTaskContinuationCommitResult =
     }
   | { kind: "replay" };
 
-/**
- * D2-D8 in one transaction. Lock order: workspace lifecycle advisory lock, then
- * the issue row, then the workspace row, the same order as every other writer of
- * the workspace lifecycle. Nothing here touches the filesystem.
- */
 export async function commitCrossTaskContinuation(
   db: Db,
   input: CrossTaskContinuationCommitInput,
@@ -311,7 +269,6 @@ export async function commitCrossTaskContinuation(
         eq(executionWorkspaces.id, input.binding.workspaceId), eq(executionWorkspaces.companyId, input.companyId),
       )).for("update");
 
-      // D3: a concurrent duplicate may have committed while this request waited.
       const [duplicate] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
         eq(issueComments.companyId, input.companyId),
         eq(issueComments.issueId, input.issueId),
@@ -320,7 +277,6 @@ export async function commitCrossTaskContinuation(
       ));
       if (duplicate) return { kind: "replay" } as const;
 
-      // D4: re-check the gates against the locked rows.
       if (!issue) throw new CrossTaskContinuationRefusal(404, "Issue not found");
       const accessRefusal = await deps.reauthorize(issue);
       if (accessRefusal) {
@@ -353,8 +309,6 @@ export async function commitCrossTaskContinuation(
             companyId: input.companyId, issueId: input.issueId, agentId: issue.assigneeAgentId,
           })
         : null;
-      // Resume-capable as at D0. An `in_progress` target with no live execution
-      // (checked below) is resumed like a closed one; `todo` only coalesces.
       const reopenable = issue.status === "done" || issue.status === "cancelled"
         || issue.status === "blocked" || issue.status === "in_progress";
       if (!reopenable && !pendingIntent) {
@@ -373,8 +327,6 @@ export async function commitCrossTaskContinuation(
         throw new CrossTaskContinuationRefusal(409, CROSS_TASK_CONTINUATION_MESSAGES.activeExecution);
       }
 
-      // D5: the binding the request classified must still hold. Nothing is
-      // written to the workspace.
       if (
         issue.executionWorkspaceId !== input.binding.workspaceId
         || !workspace
@@ -386,11 +338,8 @@ export async function commitCrossTaskContinuation(
         throw new CrossTaskContinuationRefusal(409, CROSS_TASK_CONTINUATION_MESSAGES.notReopenable);
       }
 
-      // D6: the comment.
       const comment = await deps.addComment(tx);
 
-      // D7: the status change. A request that coalesces into a pending
-      // continuation writes no status change.
       let reopenedFrom: string | null = null;
       let updated: { id: string; status: string } | null = null;
       if (!pendingIntent) {
@@ -400,7 +349,6 @@ export async function commitCrossTaskContinuation(
         await deps.logIssueReopened(tx, { reopenedFrom });
       }
 
-      // D8: the durable intent.
       const payload = {
         issueId: issue.id,
         taskId: issue.id,
@@ -431,8 +379,6 @@ export async function commitCrossTaskContinuation(
         },
         ...(pendingIntent ? { coalescedIntoWakeupRequestId: pendingIntent.id } : {}),
       };
-      // Register the delivery hint before the intent write, in this transaction.
-      // A coalesced intent is never delivered on its own.
       if (!pendingIntent) await notifyDeliveryWork(tx, DELIVERY_QUEUES.crossTaskContinuations, `task:${issue.id}`);
       const now = new Date();
       const [intent] = await tx.insert(agentWakeupRequests).values({
@@ -472,10 +418,6 @@ export async function commitCrossTaskContinuation(
   }
 }
 
-/**
- * Delivery-time revalidation for a continuation intent (6.4). Returns null when
- * the intent may go to the scheduler, or the skip error.
- */
 export function crossTaskContinuationDeliveryGate(
   payload: Record<string, unknown>,
   target: {

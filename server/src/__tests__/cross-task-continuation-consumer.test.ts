@@ -220,7 +220,6 @@ describeEmbeddedPostgres("cross-task continuation intent consumer", () => {
     await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
     await heartbeat.drainActiveRunExecutions();
     const [receipt] = await dispatchReceipts(intent.id);
-    // Simulate the crash between enqueueWakeup and linking the intent.
     await db.update(agentWakeupRequests)
       .set({ status: "claimed", runId: null, claimedAt: new Date(Date.now() - 120_000), finishedAt: null })
       .where(eq(agentWakeupRequests.id, intent.id));
@@ -234,8 +233,6 @@ describeEmbeddedPostgres("cross-task continuation intent consumer", () => {
 
   it("recovers a skipped dispatch receipt (K8) and the dispatch index rejects a second receipt", async () => {
     const { companyId, agentId, issueId, intent } = await seedTarget();
-    // enqueueWakeup wrote a skipped receipt, then the process stopped before
-    // the intent was updated.
     await db.insert(agentWakeupRequests).values({
       companyId,
       agentId,

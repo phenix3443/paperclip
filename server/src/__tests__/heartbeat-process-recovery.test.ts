@@ -2052,13 +2052,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
-  // V3 (#64 plan 6.5.5): the successor step fails closed and the run ends as a
-  // setup failure with no transient retry. Terminal run recovery then blocks the
-  // target at once with the immediate "No live execution path" notice (the plan
-  // expected the later stranded-issue sweep to do it; the sweep finds the target
-  // already blocked and adds nothing). The three rebuild_failed kinds produce the
-  // same step error; the kinds themselves are covered against a real git_worktree
-  // in workspace-preparation.test.ts.
   const v3Kinds = [
     "Execution workspace changed after the continuation request",
     "Failed to rebuild the execution workspace",
@@ -2086,11 +2079,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
       expect(issue.status).toBe("blocked");
       const notices = (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).map(comment => comment.body);
-      // A `todo` target is checked out to `in_progress` when the run starts, so
-      // both lanes end with the in_progress escalation.
       expect(notices.join("\n")).toContain("assigned `in_progress` issue during terminal run recovery, but it still has no live execution path");
       expect(await getExecutionBlocker(db, companyId, issueId)).not.toMatchObject({ workspaceRepairRequired: true });
-      // No transient retry, and later sweeps start nothing and call the step no more.
       const runCount = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).length;
       expect(await runCount()).toBe(1);
       await heartbeat.reconcileStrandedAssignedIssues();

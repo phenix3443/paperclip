@@ -25,9 +25,6 @@ import {
   registerCrossTaskContinuationWork,
 } from "../services/cross-task-continuation-worker.js";
 
-// The delivery worker for committed continuation intents, on real PostgreSQL:
-// commit notifies it, rollback does not, startup reconstructs pending work, a
-// live claim becomes a deadline, and an empty queue schedules nothing.
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("cross-task continuation delivery worker", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -143,20 +140,17 @@ const support = await getEmbeddedPostgresTestSupport();
     const { coordinator, worker } = register(dispatch);
     await worker.ready;
 
-    // Rollback: the coordinator reconciles the settled hint, finds nothing and schedules nothing.
     const rolledBack = await fixture();
     await expect(commit(rolledBack, async () => { throw new Error("injected fault"); })).rejects.toThrow("injected fault");
     await vi.waitFor(() => expect(coordinator.nextWakeAt()).toBeNull(), { timeout: 3_000 });
     expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
 
-    // Commit: the notification wakes the worker; while the intent is undelivered a retry stays scheduled.
     const callsBefore = dispatch.mock.calls.length;
     const committed = await fixture();
     await expect(commit(committed)).resolves.toMatchObject({ kind: "committed" });
     await vi.waitFor(() => expect(dispatch.mock.calls.length).toBeGreaterThan(callsBefore), { timeout: 3_000 });
     await vi.waitFor(() => expect(coordinator.nextWakeAt()).not.toBeNull(), { timeout: 3_000 });
 
-    // Delivery resolves the obligation and the worker goes quiet.
     deliver = true;
     await vi.waitFor(async () => {
       expect((await readCrossTaskContinuationWork(db)).pending).toBe(false);

@@ -3743,10 +3743,6 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       issue: { id: string; companyId: string; projectId: string | null };
       actor: { agentId: string | null; actorType: string };
       authorizationActor: AuthorizationActor;
-      // Set only by the cross-task continuation successor. While the row is
-      // closed, a lifecycle generation other than this one means that another
-      // writer committed to the row after the intent, so the call refuses with
-      // not_reopenable and writes nothing. Eager callers leave it unset.
       expectedClosedGeneration?: number;
     }): Promise<ReopenClosedIsolatedExecutionWorkspaceResult> => {
       const { issue, actor } = input;

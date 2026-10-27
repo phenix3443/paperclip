@@ -50,9 +50,6 @@ export const issueComments = pgTable(
   (table) => ({
     clientRequestUq: unique("issue_comments_client_request_uq").on(table.issueId, table.authorUserId, table.clientRequestId),
     companyIdUq: unique("issue_comments_company_id_uq").on(table.companyId, table.id),
-    // Agent comments have no author user id, so the index above does not
-    // dedupe them. Only the cross-task continuation path writes an agent
-    // clientRequestId, and this index makes its retries replay one comment.
     agentClientRequestUq: uniqueIndex("issue_comments_agent_client_request_uq")
       .on(table.companyId, table.issueId, table.authorAgentId, table.clientRequestId)
       .where(sql`${table.authorAgentId} IS NOT NULL AND ${table.clientRequestId} IS NOT NULL`),

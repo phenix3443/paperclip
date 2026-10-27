@@ -331,8 +331,6 @@ const support = await getEmbeddedPostgresTestSupport();
     });
   }
 
-  // #75 section 5 review conditions for the deferred continuation (#69). The
-  // setting is instance-wide, so each case turns it on and back off.
   async function withDeferredContinuation<T>(body: () => Promise<T>): Promise<T> {
     const settings = instanceSettingsService(db);
     await settings.updateExperimental({ enableCrossTaskDeferredContinuation: true });
@@ -372,7 +370,6 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(commentB?.metadata).toMatchObject({ authorizationReason: "allow_visible_issue_write" });
       const afterA = await snapshot(a);
       expect(afterA.intents).toHaveLength(1);
-      // The intent and its successor belong to the target's assignee, not the requester.
       expect(afterA.intents[0]!.agentId).not.toBe(a.agentId);
     });
   });
@@ -394,7 +391,6 @@ const support = await getEmbeddedPostgresTestSupport();
         expect(after.workspace).toEqual(before.workspace);
         expect(after.runCount).toBe(before.runCount);
       }
-      // The archived-workspace request (M4a) gets the same refusal as M4b.
       expect(responses[0]).toEqual(responses[1]);
     });
   });

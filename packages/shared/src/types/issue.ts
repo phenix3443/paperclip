@@ -1063,25 +1063,13 @@ export interface IssueComment {
   updatedAt: Date;
 }
 
-/**
- * Receipt for a cross-task explicit resume of a task whose isolated workspace is
- * closed. The comment and a durable continuation intent commit together; a run
- * bound to the target restores the workspace when it starts. Read from the
- * intent at response time, so a replay shows its current status and run.
- */
 export interface IssueCommentContinuationReceipt {
   wakeupRequestId: string;
   status: string;
   runId: string | null;
-  /** Set when this request joined a continuation that was already pending. */
   coalescedIntoWakeupRequestId?: string;
 }
 
-/**
- * Comment create response. `replayed` and `continuation` are present only on
- * the cross-task deferred continuation path; a retry with the same agent
- * `clientRequestId` and body returns the original comment with `replayed: true`.
- */
 export type IssueCommentCreateResponse = IssueComment & {
   replayed?: boolean;
   continuation?: IssueCommentContinuationReceipt;

@@ -123,10 +123,6 @@ export interface InstanceExperimentalSettings {
   autoRestartDevServerWhenIdle: boolean;
   enableWorkspaceBranchReconcileForward: boolean;
   enableWorkspaceDirtyQuarantineRepair: boolean;
-  /**
-   * Defer the archived workspace reopen of a cross-task explicit resume to a
-   * durable successor run bound to the target task. Default off.
-   */
   enableCrossTaskDeferredContinuation: boolean;
   /**
    * On cloud-managed instances, grant the stack owner instance-admin access

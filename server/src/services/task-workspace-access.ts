@@ -133,13 +133,6 @@ export async function assertTaskWorkspaceExecutionAccess(
   });
 }
 
-/**
- * Tell whether the actor's run is bound to this task for workspace execution,
- * without asserting it. A route uses this to choose the deferred continuation
- * path before it calls `assertTaskWorkspaceExecutionAccess`, so an unbound run
- * never reaches the guard. A missing run, or a run of another agent, gets the
- * guard's own refusal.
- */
 export async function runBindsIssueForWorkspaceExecution(
   db: Db | DbTransaction,
   actor: AuthorizationActor,

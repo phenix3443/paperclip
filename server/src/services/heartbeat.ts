@@ -2374,9 +2374,6 @@ export function heartbeatService(
           );
         issueContext = { ...issueContext, responsibleUserId };
       }
-      // A run dispatched for a committed cross-task continuation intent reopens
-      // the target's closed workspace with its own identity before anything
-      // below reads the workspace status. Other runs are not affected.
       if (issueId) {
         await reopenTargetBoundSuccessorWorkspace(db, {
           run: {

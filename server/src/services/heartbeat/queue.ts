@@ -4797,10 +4797,6 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     >();
 
     for (const candidate of candidates) {
-      // A cross-task continuation intent has its own dispatch identity: the
-      // receipt key is unique per intent (index
-      // agent_wakeup_requests_cross_task_continuation_dispatch_uq), so the
-      // receipt is looked up by that key instead of by the dispatch actor id.
       const isContinuation =
         candidate.requestedByActorId === CROSS_TASK_CONTINUATION_COMMITTER_ID;
       const dispatchKey = isContinuation
@@ -4886,8 +4882,6 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             candidate.status === "claimed"
               ? eq(agentWakeupRequests.status, "claimed")
               : eq(agentWakeupRequests.status, "queued"),
-            // Fence a stale continuation reclaim on the claim it read, so two
-            // sweeps that read the same stale claim cannot both win it.
             isContinuation && candidate.status === "claimed" && candidate.claimedAt
               ? eq(agentWakeupRequests.claimedAt, candidate.claimedAt)
               : undefined,
@@ -5066,9 +5060,6 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         if (wakeRun) dispatched += 1;
         else deferred += 1;
       } catch (error) {
-        // A concurrent sweep already committed this intent's one dispatch
-        // receipt; its run committed with it. Recover from that receipt
-        // instead of requeueing the intent.
         if (dispatchKey && isUniqueViolation(error, "agent_wakeup_requests_cross_task_continuation_dispatch_uq")) {
           const committedDispatch = await findDispatchReceipt();
           if (committedDispatch) {

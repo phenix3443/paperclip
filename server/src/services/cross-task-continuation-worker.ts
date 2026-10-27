@@ -6,14 +6,8 @@ import { CROSS_TASK_CONTINUATION_COMMITTER_ID } from "./cross-task-continuation.
 
 type Coordinator = Pick<ReturnType<typeof createDeliveryWorkCoordinator>, "register">;
 
-// The consumer's default: a claim older than this is reclaimed.
 export const CROSS_TASK_CONTINUATION_STALE_CLAIM_MS = 60_000;
 
-/**
- * The open delivery obligation of committed continuation intents. A queued
- * intent, or a claim that has gone stale, is work now. A live claim is work at
- * the moment it goes stale, so it becomes a deadline instead of a scan.
- */
 export async function readCrossTaskContinuationWork(db: Db, now = Date.now()) {
   const rows = await db.select({ status: agentWakeupRequests.status, claimedAt: agentWakeupRequests.claimedAt })
     .from(agentWakeupRequests)
@@ -35,11 +29,6 @@ export async function readCrossTaskContinuationWork(db: Db, now = Date.now()) {
   return { pending, nextClaimDeadline };
 }
 
-/**
- * Delivers committed cross-task continuation intents on the shared delivery
- * coordinator. The deferred transaction notifies this queue when it commits an
- * intent; startup reconstructs pending work from the intent rows.
- */
 export function registerCrossTaskContinuationWork(
   db: Db,
   coordinator: Coordinator,

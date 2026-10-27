@@ -109,9 +109,6 @@ describe.skipIf(!support.supported)("target-bound successor workspace reopen", (
   const readRun = (id: string) => db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, id)).then(rows => rows[0]!);
   const leases = (id: string) => db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, id));
 
-  // Archive a real git_worktree with an unmerged commit, as the real cleanup does,
-  // and move the target to `todo` with its binding unchanged, as the deferred
-  // continuation commit does.
   async function archivedContinuationTarget(closedStatus: "archived" | "cleanup_failed" = "archived") {
     const { input, source, issue } = await fixture(true);
     const first = await prepareHeartbeatWorkspace(db, input);
@@ -122,7 +119,6 @@ describe.skipIf(!support.supported)("target-bound successor workspace reopen", (
     const headBeforeArchive = (await execFile("git", ["-C", workspace.cwd!, "rev-parse", "HEAD"])).stdout.trim();
     const cleanup = await cleanupExecutionWorkspaceArtifacts({ workspace,
       projectWorkspace: { cwd: source, cleanupCommand: null }, runCleanupCommands: false });
-    // Archiving keeps the unmerged branch; only the worktree directory is removed.
     expect(cleanup.warnings).toEqual([expect.stringContaining("not fully merged")]);
     await expect(access(workspace.cwd!)).rejects.toMatchObject({ code: "ENOENT" });
     await db.update(executionWorkspaces).set({ status: closedStatus, closedAt: new Date() }).where(eq(executionWorkspaces.id, workspace.id));
@@ -134,8 +130,6 @@ describe.skipIf(!support.supported)("target-bound successor workspace reopen", (
       generation: readExecutionWorkspaceLifecycleGeneration(stored.metadata as Record<string, unknown> | null) };
   }
 
-  // The committed intent and the consumer's dispatch receipt, with the keys and
-  // actor ids that the route and the queue write.
   async function dispatchedContinuationRun(f: Awaited<ReturnType<typeof archivedContinuationTarget>>,
     overrides: { payloadIssueId?: string; workspaceGeneration?: number } = {}) {
     const commentId = randomUUID();
@@ -175,9 +169,7 @@ describe.skipIf(!support.supported)("target-bound successor workspace reopen", (
     const f = await archivedContinuationTarget();
     const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({ issueExecutionWorkspaceId: f.target.executionWorkspaceId,
       issueExecutionWorkspacePreference: f.target.executionWorkspacePreference, existingExecutionWorkspaceStatus: f.workspace.status });
-    // Same inputs as environment-selection.ts: restore is requested, but an archived row is not "available".
     expect(reuseRequest).toEqual({ requestedExecutionWorkspaceId: f.workspace.id, requestedShouldReuseExisting: true, existingExecutionWorkspaceAvailable: false });
-    // The context claims a continuation, but the wakeup row is not a dispatch receipt.
     const [successor] = await db.insert(heartbeatRuns).values({ companyId: f.issue.companyId, agentId: f.input.agent.id, issueId: f.issue.id, scopeKind: "issue", status: "running", runtimeMode: "legacy",
       contextSnapshot: { issueId: f.issue.id, source: "cross_task_continuation" } }).returning();
     const svc = executionWorkspaceService(db);
@@ -214,7 +206,6 @@ describe.skipIf(!support.supported)("target-bound successor workspace reopen", (
     const reopened = await db.select().from(activityLog).where(eq(activityLog.action, "execution_workspace.reopened"));
     expect(reopened).toHaveLength(1);
     expect(reopened[0]!.details).toMatchObject({ issueId: f.issue.id });
-    // Ordinary preparation, with the inputs environment selection builds for an active row (R2-C: no in-place restore of a cleanup_failed row).
     const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({ issueExecutionWorkspaceId: f.workspace.id,
       issueExecutionWorkspacePreference: "reuse_existing", existingExecutionWorkspaceStatus: active.status });
     expect(reuseRequest).toMatchObject({ requestedShouldReuseExisting: true, existingExecutionWorkspaceAvailable: true });
@@ -311,8 +302,6 @@ describe.skipIf(!support.supported)("target-bound successor workspace reopen", (
     expect(reopen).not.toHaveBeenCalled();
   });
 
-  // V3: the step's single service call returns rebuild_failed. The kinds differ
-  // in whether a rebuild call ran and whether the failure bookkeeping committed.
   async function closedRowFacts(workspaceId: string) {
     const [row] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, workspaceId));
     return { status: row!.status, cleanupReason: row!.cleanupReason, cleanupEligibleAt: row!.cleanupEligibleAt,
@@ -369,14 +358,9 @@ describe.skipIf(!support.supported)("target-bound successor workspace reopen", (
     expect({ ...after, metadata: undefined }).toEqual({ ...before, metadata: undefined });
     expect(await workspaceActivity("execution_workspace.reopen_failed")).toHaveLength(0);
     expect(await workspaceActivity("execution_workspace.reopened")).toHaveLength(0);
-    // The rebuilt worktree is not rolled back.
     await expect(access(f.workspace.cwd!)).resolves.toBeUndefined();
   });
 
-  // L2: an eager reopen (the same service call the comment, PATCH and checkout
-  // routes make, without the fence, by a run bound to the target) races the
-  // successor step. A barrier holds the first caller right after it takes the
-  // lifecycle lock; rebuild calls are counted per caller.
   async function raceHarness(f: Awaited<ReturnType<typeof archivedContinuationTarget>>) {
     const caller = new AsyncLocalStorage<string>();
     const rebuilds: Record<string, number> = {};
@@ -391,7 +375,6 @@ describe.skipIf(!support.supported)("target-bound successor workspace reopen", (
     });
     const lifecycle = await import("../execution-workspace-lifecycle-lock.js");
     const realAcquire = lifecycle.acquireExecutionWorkspaceLifecycleLock;
-    // Gates for the first and second lifecycle-lock acquisitions on this row.
     const gates = [0, 1].map(() => {
       let reached!: () => void;
       let release!: () => void;
@@ -418,7 +401,6 @@ describe.skipIf(!support.supported)("target-bound successor workspace reopen", (
     }));
     const step = (run: typeof heartbeatRuns.$inferSelect) => caller.run("step", () => successorStep(run).then(
       outcome => ({ outcome, error: null as Error | null }), (error: Error) => ({ outcome: null, error })));
-    // Give the waiting caller time to reach its lock wait before the holder goes on.
     const settle = () => new Promise(resolve => setTimeout(resolve, 300));
     return { rebuilds, failRebuildFor, holderReached: gates[0]!.reached, release: gates[0]!.release,
       holdSecond: () => { holdSecond = true; }, secondReached: gates[1]!.reached, releaseSecond: gates[1]!.release,
@@ -485,7 +467,6 @@ describe.skipIf(!support.supported)("target-bound successor workspace reopen", (
     expect(await workspaceActivity("execution_workspace.reopened")).toHaveLength(0);
     expect(await closedRowFacts(f.workspace.id)).toMatchObject({ status: "archived", cleanupEligibleAt: null, generation: f.generation + 1 });
     await expect(access(f.workspace.cwd!)).rejects.toMatchObject({ code: "ENOENT" });
-    // A step that starts after the failure committed stops at the unlocked pre-check.
     const svc = executionWorkspaceService(db);
     const reopen = vi.spyOn(svc, "reopenClosedIsolatedExecutionWorkspaceForIssue");
     await expect(successorStep(successor, svc)).rejects.toThrow(/changed after the continuation request/);
@@ -505,8 +486,6 @@ describe.skipIf(!support.supported)("target-bound successor workspace reopen", (
         return realLogActivity(database, entry);
       });
     } else {
-      // Fails the first update that publishes this row as active. A sequence is
-      // not rolled back, so only the eager call's update fails.
       await db.execute(sql.raw(`create sequence if not exists l2g_fault_seq;
         select setval('l2g_fault_seq', 1, false);
         create or replace function l2g_fault() returns trigger language plpgsql as $$
@@ -527,9 +506,7 @@ describe.skipIf(!support.supported)("target-bound successor workspace reopen", (
       await h.settle();
       h.release();
       const eagerResult = await eagerDone;
-      // The step now holds the lifecycle lock and waits at the second gate.
       expect(eagerResult).toMatchObject({ ok: false, code: "rebuild_failed" });
-      // After the eager call: the row is unchanged at g and the rebuilt worktree stays on disk.
       expect(await closedRowFacts(f.workspace.id)).toMatchObject({ status: "archived", generation: f.generation });
       expect(await workspaceActivity("execution_workspace.reopened")).toHaveLength(0);
       expect(await workspaceActivity("execution_workspace.reopen_failed")).toHaveLength(0);
@@ -608,9 +585,6 @@ describe.skipIf(!support.supported)("target-bound successor workspace reopen", (
     expect(await closedRowFacts(f.workspace.id)).toEqual(changed);
   });
 
-  // V3-repair: after the successor's single failed attempt, fixing the cause and
-  // reopening eagerly (a run bound to the target, as the comment route does)
-  // restores the row. No cleanup round runs in between.
   async function eagerReopen(f: Awaited<ReturnType<typeof archivedContinuationTarget>>) {
     const [run] = await db.insert(heartbeatRuns).values({ companyId: f.issue.companyId, agentId: f.input.agent.id,
       issueId: f.issue.id, scopeKind: "issue", status: "running", runtimeMode: "legacy",
@@ -644,7 +618,6 @@ describe.skipIf(!support.supported)("target-bound successor workspace reopen", (
     const failedGeneration = (await closedRowFacts(f.workspace.id)).generation;
     expect(failedGeneration).toBe(kind === "F3" ? f.generation + 1 : f.generation);
     const inodeAfterFailure = kind === "F2" ? (await stat(f.workspace.cwd!)).ino : null;
-    // Fix the cause.
     vi.restoreAllMocks();
     if (kind === "F1") {
       await db.update(executionWorkspaces).set({ metadata: sql`${executionWorkspaces.metadata} - 'gitCacheRestoration'` })
@@ -657,14 +630,10 @@ describe.skipIf(!support.supported)("target-bound successor workspace reopen", (
     expect(await branchHead(f.workspace.cwd!)).toEqual({ branch: f.workspace.branchName, head: f.headBeforeArchive });
   });
 
-  // The real comments route on the archived target, with an agent whose run is
-  // bound to another task. The running source run fills the agent's single slot,
-  // so the dispatched successor stays queued until the test drives it.
   async function crossTaskRoute(f: Awaited<ReturnType<typeof archivedContinuationTarget>>) {
     await db.execute(sql`insert into "user" (id, name, email, email_verified, created_at, updated_at) values ('k5-user', 'K5', 'k5@example.test', true, now(), now()) on conflict do nothing`);
     await db.insert(companyMemberships).values({ companyId: f.issue.companyId, principalType: "user", principalId: "k5-user", status: "active", membershipRole: "member" });
     await db.update(issues).set({ status: "done", responsibleUserId: "k5-user" }).where(eq(issues.id, f.issue.id));
-    // The committed intent records the target's responsible user.
     f.workspace = (await executionWorkspaceService(db).getStoredById(f.issue.companyId, f.workspace.id))!;
     await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } } }).where(eq(agents.id, f.input.agent.id));
     await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.agentId, f.input.agent.id));
@@ -706,7 +675,6 @@ describe.skipIf(!support.supported)("target-bound successor workspace reopen", (
     expect(others).toHaveLength(0);
     expect(successor).toMatchObject({ wakeupRequestId: receipts[0]!.id, contextSnapshot: { issueId: f.issue.id } });
     expect(intents[0]).toMatchObject({ status: "coalesced", runId: successor!.id });
-    // The successor's setup: the step, then ordinary preparation.
     await expect(successorStep(successor!, executionWorkspaceService(db), "k5-user")).resolves.toMatchObject({ kind: "reopened", reopened: true, generation: f.generation + 1 });
     const active = (await executionWorkspaceService(db).getStoredById(f.issue.companyId, f.workspace.id))!;
     f.input.run = successor!;
@@ -732,7 +700,6 @@ describe.skipIf(!support.supported)("target-bound successor workspace reopen", (
     let routeReached!: () => void;
     const routeAtCommit = new Promise<void>(resolve => { routeReached = resolve; });
     crossTaskContinuationTestHooks.beforeCommit = async () => { routeReached(); await routeHeld; };
-    // The route takes the lifecycle lock first, so it is the harness's first holder; let it through.
     const responseDone = route.post().then(res => res);
     await h.holderReached;
     h.release();
@@ -753,19 +720,12 @@ describe.skipIf(!support.supported)("target-bound successor workspace reopen", (
     expect(await closedRowFacts(f.workspace.id)).toMatchObject({ status: "active", generation: f.generation + 1 });
   });
 
-  // L2f: a run bound to the target holds its execution when the consumer
-  // dispatches the intent, so enqueueWakeup writes a deferred receipt under the
-  // dispatch key. Ending the holding run promotes that same receipt to the
-  // intent's only run. A separate running run fills the agent's single slot so
-  // the promoted run stays queued until the test drives it.
   it.each(["L2f-1", "L2f-2"] as const)("%s: while a target-bound run holds execution, the intent still gets exactly one run", async (variant) => {
     const f = await archivedContinuationTarget();
     const route = await crossTaskRoute(f);
     const [holding] = await db.insert(heartbeatRuns).values({ companyId: f.issue.companyId, agentId: f.input.agent.id,
       issueId: f.issue.id, scopeKind: "issue", status: "running", invocationSource: "assignment", triggerDetail: "system",
       responsibleUserId: "k5-user", contextSnapshot: { issueId: f.issue.id, taskId: f.issue.id } }).returning();
-    // The holding run takes the target's execution after the request's gates and
-    // in its transaction, so it holds execution when the route dispatches.
     crossTaskContinuationTestHooks.beforeCommit = async (tx) => {
       await tx.update(issues).set({ executionRunId: holding!.id, executionLockedAt: new Date() }).where(eq(issues.id, f.issue.id));
     };
@@ -778,12 +738,8 @@ describe.skipIf(!support.supported)("target-bound successor workspace reopen", (
     const dispatchKey = crossTaskContinuationDispatchKey(intent!.id);
     const deferred = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey, dispatchKey));
     expect(deferred).toHaveLength(1);
-    // Today the dispatch is not deferred while another run holds the target:
-    // enqueueWakeup writes a queued receipt with a queued run. Either way the
-    // intent has one receipt and, once the holder ends, one run.
     expect(["queued", "deferred_issue_execution"]).toContain(deferred[0]!.status);
     if (variant === "L2f-2") {
-      // While it holds execution, the target-bound run reopens eagerly.
       const eager = await executionWorkspaceService(db).reopenClosedIsolatedExecutionWorkspaceForIssue({
         workspaceId: f.workspace.id, issue: { id: f.issue.id, companyId: f.issue.companyId, projectId: f.issue.projectId },
         actor: { agentId: f.input.agent.id, actorType: "agent" },

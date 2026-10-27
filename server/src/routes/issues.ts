@@ -3052,10 +3052,7 @@ const issueListResponseCache = new Map<string, IssueListCacheEntry>();
 const issueListInflight = new Map<string, IssueListInflightEntry>();
 const issueListActorClientInflight = new Map<string, number>();
 
-/** Test seam for the cross-task continuation transaction (fault injection, barriers). */
 export const crossTaskContinuationTestHooks: {
-  // Runs after the route classified the binding (D1) and before the deferred
-  // transaction starts, so a test can commit a competing write in between.
   beforeTransaction?: () => Promise<void>;
   beforeCommit?: (tx: Parameters<Parameters<Db["transaction"]>[0]>[0]) => Promise<void>;
 } = {};
@@ -6882,10 +6879,6 @@ export function issueRoutes(
     return false;
   }
 
-  // Runs the comment route's access decisions again for a cross-task
-  // continuation, against the issue row its transaction has locked. The gates
-  // write their refusal into a capture, so the caller can return exactly what a
-  // fresh request would get. None of these gates writes anything.
   async function reauthorizeCrossTaskContinuation(
     req: Request,
     lockedIssue: Parameters<CrossTaskContinuationCommitDeps["reauthorize"]>[0],
@@ -6901,7 +6894,6 @@ export function issueRoutes(
     const nonAssignee = req.actor.type === "agent"
       && lockedIssue.assigneeAgentId !== null
       && lockedIssue.assigneeAgentId !== req.actor.agentId;
-    // The same rule that turns a cross-task resume into a plain comment.
     if (isClosedIssueStatus(lockedIssue.status) && nonAssignee
       && (isDirectParentReportDecision(commentDecision) || isIssueMentionGrantDecision(commentDecision))) {
       return { status: 409, body: { error: "Issue access changed; retry the follow-up" } };
@@ -7828,8 +7820,6 @@ export function issueRoutes(
     return null;
   }
 
-  // Answer a retry of a committed cross-task continuation (R0). Returns true when
-  // it sent a response. A fresh request returns false and goes through every gate.
   async function respondWithCrossTaskContinuationReplay(
     req: Request,
     res: Response,
@@ -7861,8 +7851,6 @@ export function issueRoutes(
     return true;
   }
 
-  // The deferred path for a cross-task explicit resume of a task whose isolated
-  // workspace is closed (D2-D9). It never reopens the workspace in the request.
   async function commitDeferredCrossTaskContinuationOrRespond(input: {
     req: Request;
     res: Response;
@@ -8005,8 +7993,6 @@ export function issueRoutes(
         wakeupRequestId: result.continuation.wakeupRequestId,
       },
     });
-    // Notify the queue. The intent is durable, so a failed notify only delays it
-    // until the next sweep.
     await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: issue.companyId }).catch((err) =>
       logger.warn({ err, issueId: issue.id }, "failed to dispatch cross-task continuation intent"));
     res.status(201).json({ ...comment, replayed: false, continuation: result.continuation });
@@ -18793,9 +18779,6 @@ export function issueRoutes(
         );
         return;
       }
-      // R0: replay a committed cross-task continuation before any gate that can
-      // change after the commit (pause holds, blockers, the source run, the
-      // workspace or the feature setting).
       const crossTaskRequestDigest =
         req.actor.type === "agent" && req.actor.agentId && req.body.clientRequestId
           ? crossTaskContinuationRequestDigest({
@@ -18807,8 +18790,6 @@ export function issueRoutes(
               attachmentIds: req.body.attachmentIds,
             })
           : null;
-      // A replay returns a stored comment and receipt, so it needs read access to
-      // the task now. The write gates that can change after the commit stay below.
       if (crossTaskRequestDigest && !(await assertIssueReadAllowed(req, res, issue))) return;
       if (crossTaskRequestDigest && (await respondWithCrossTaskContinuationReplay(
         req, res, issue, crossTaskRequestDigest,
@@ -18952,10 +18933,6 @@ export function issueRoutes(
         ))
       )
         return;
-      // A run bound to another task must not realize this task's workspace. When
-      // the target's isolated workspace is closed, commit the comment, the status
-      // change and a durable continuation together, and let a run bound to the
-      // target restore the workspace when it starts.
       const crossTaskBinding =
         req.actor.type === "agent" &&
         req.actor.agentId &&
@@ -18963,7 +18940,6 @@ export function issueRoutes(
         (effectiveResumeRequested === true || effectiveReopenRequested === true)
           ? await classifyIssueExecutionWorkspaceBinding(db, issue)
           : null;
-      // With the setting off nothing below runs, so behavior is exactly today's.
       const crossTaskCandidate =
         (crossTaskBinding?.kind === "missing" || crossTaskBinding?.kind === "closed_isolated") &&
         (await instanceSettings.getExperimental()).enableCrossTaskDeferredContinuation === true &&
@@ -18975,8 +18951,6 @@ export function issueRoutes(
           return;
         }
         if (binding.kind === "closed_isolated") {
-          // Only a row that the target-bound successor can reopen takes the
-          // deferred path. Any other closed isolated row is refused here.
           if (!isSuccessorReopenableWorkspace(binding)) {
             res.status(409).json({ error: CROSS_TASK_CONTINUATION_MESSAGES.notReopenable });
             return;

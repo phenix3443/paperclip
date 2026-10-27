@@ -52,10 +52,6 @@ vi.mock("../adapters/index.ts", async () => {
   };
 });
 
-// The source run is a bare `running` row with no process. With
-// maxConcurrentRuns = 1 it holds the agent's only slot, so a successor stays
-// queued and the fixture can read the archived workspace row without racing a
-// workspace restore.
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("cross-task deferred continuation route", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -100,9 +96,6 @@ const support = await getEmbeddedPostgresTestSupport();
       responsibleUserId: "responsible-user",
       executionWorkspaceSettings: { mode: "isolated_workspace" },
     });
-    // `executionWorkspaceId` is ON DELETE SET NULL, so a binding to a deleted
-    // row cannot persist. The reachable "missing" binding is one to another
-    // company's workspace, which the company-scoped lookup does not find.
     let workspaceCompanyId = companyId;
     let workspaceProjectId = projectId;
     if (options.workspace === "missing") {
@@ -189,8 +182,6 @@ const support = await getEmbeddedPostgresTestSupport();
     });
     expect(res.body.continuation.wakeupRequestId).toBe(after.intents[0]!.id);
 
-    // K5 (queued half): the notify dispatched one run bound to the target under
-    // the dispatch key. It waits behind the source run's slot.
     const successors = await db.select().from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, f.companyId),
       eq(heartbeatRuns.agentId, f.agentId),
@@ -201,7 +192,6 @@ const support = await getEmbeddedPostgresTestSupport();
     const [linkedIntent] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, after.intents[0]!.id));
     expect(linkedIntent).toMatchObject({ status: "coalesced", runId: successor!.id });
 
-    // The source run is untouched and still owns its own task.
     const [sourceRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
     expect(sourceRun).toMatchObject({ status: "running", contextSnapshot: { issueId: f.sourceIssueId } });
   });
@@ -323,8 +313,6 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(after.intents).toEqual(before.intents);
     expect(after.issue.status).toBe("done");
   });
-  // Section 8: refusals with no side effects. Each leaves no comment, no status
-  // change, no intent and no workspace change.
   async function expectRefusal(
     f: Awaited<ReturnType<typeof fixture>>,
     expectedStatus: number,
@@ -352,7 +340,6 @@ const support = await getEmbeddedPostgresTestSupport();
   it("refuses a blocked target with unresolved blockers with 409", async () => {
     await setFeature(true);
     const f = await fixture();
-    // Like today's comment gate, blockers refuse a resume of a `blocked` target.
     await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, f.targetIssueId));
     const blockerId = randomUUID();
     await db.insert(issues).values({ id: blockerId, companyId: f.companyId, title: "Blocker", status: "in_progress" });
@@ -390,9 +377,6 @@ const support = await getEmbeddedPostgresTestSupport();
   it("a commenter that is not the assignee still wakes only the target's assignee", async () => {
     await setFeature(true);
     const f = await fixture();
-    // The requester has the ordinary comment access (same company, visible
-    // issue write), so the plan does not refuse it. The intent and the
-    // successor still belong to the target's assignee, never to the requester.
     const requesterId = randomUUID();
     const requesterRunId = randomUUID();
     await db.insert(agents).values({
@@ -440,8 +424,6 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await snapshot(f.targetIssueId, f.workspaceId)).toEqual(before);
   });
 
-  // Records every reopen input the routes pass to the workspace service. Must
-  // be installed before the fixture builds the routes.
   function recordReopenInputs() {
     const inputs: Array<Record<string, unknown>> = [];
     const real = executionWorkspacesModule.executionWorkspaceService;
@@ -479,7 +461,6 @@ const support = await getEmbeddedPostgresTestSupport();
     try {
       const f = await fixture({ actor });
       const res = await post(f.app, f.targetIssueId, { body: "Continue", resume: true });
-      // The fixture row has no repository, so the eager rebuild itself fails, as today (#75 M3).
       expect(res.status, JSON.stringify(res.body)).toBe(409);
       expect(res.body).toEqual({ error: "Failed to rebuild the execution workspace" });
       expect(recorder.inputs).toHaveLength(1);
@@ -499,7 +480,6 @@ const support = await getEmbeddedPostgresTestSupport();
     let writer: Promise<unknown> | null = null;
     let writerSettledInsideTransaction = false;
     crossTaskContinuationTestHooks.beforeCommit = async () => {
-      // A separate connection; the deferred transaction holds the issue and workspace rows FOR UPDATE.
       writer = write === "rebind"
         ? db.update(issues).set({ executionWorkspaceId: null }).where(eq(issues.id, f.targetIssueId))
         : db.update(executionWorkspaces).set({ metadata: { lifecycleGeneration: 7 } }).where(eq(executionWorkspaces.id, f.workspaceId));
@@ -514,7 +494,6 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(after.issue.status).toBe("todo");
     expect(after.intents).toHaveLength(1);
     expect(after.comments).toHaveLength(1);
-    // The writer applied after the commit, on top of the committed state.
     if (write === "rebind") {
       expect(after.issue.executionWorkspaceId).toBeNull();
       expect(after.workspace).toEqual(before.workspace);
@@ -541,7 +520,6 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(after.issue.status).toBe("done");
   });
 
-  // A low-trust boundary that excludes the target's project, so this agent can no longer read it.
   async function restrictTarget(targetIssueId: string) {
     const [target] = await db.select({ companyId: issues.companyId }).from(issues).where(eq(issues.id, targetIssueId));
     await db.update(issues).set({ executionPolicy: { trustPreset: "low_trust_review", authorizationPolicy: { trustBoundary: {
@@ -613,15 +591,12 @@ const support = await getEmbeddedPostgresTestSupport();
     const successors = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
       .filter((run) => run.id !== f.sourceRunId);
     expect(successors).toHaveLength(1);
-    // Each request replays its own receipt.
     for (const [res, body] of [[a, "First"], [b, "Second"]] as const) {
       const replay = await post(f.app, f.targetIssueId, { body, resume: true, clientRequestId: res.body.clientRequestId });
       expect(replay.body).toMatchObject({ id: res.body.id, replayed: true, continuation: { wakeupRequestId: res.body.continuation.wakeupRequestId } });
     }
   });
 
-  // I6/I7/I8/K9: a lost response is retried after the state moved on. The retry
-  // replays the committed receipt, with the intent's run, and changes nothing.
   it.each([
     { name: "K9 after dispatch", change: async () => {} },
     { name: "I6 after the successor restored the workspace", change: async (f: Awaited<ReturnType<typeof fixture>>) => {
