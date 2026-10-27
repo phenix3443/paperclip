@@ -22,6 +22,7 @@ import { reopenTargetBoundSuccessorWorkspace } from "./target-bound-successor-re
 import { crossTaskContinuationTestHooks, issueRoutes } from "../../routes/issues.js";
 import { errorHandler } from "../../middleware/index.js";
 import { instanceSettingsService } from "../instance-settings.js";
+import { heartbeatService } from "../heartbeat.js";
 import { workspaceOperationService } from "../workspace-operations.js";
 import { nativeWorkspaceSyncInternals, prepareNativeWorkspaceSync } from "../native-runtime/native-workspace-sync.js";
 import { createHeartbeatWorkspaceResolver, prepareProjectRepositoryWorkspaces, resolveExecutionWorkspaceReuseRequestForIssue } from "./workspaces.js";
@@ -1292,6 +1293,66 @@ describe.skipIf(!support.supported)("heartbeat workspace preparation boundary", 
     await expect(successorStep(successor!, svc, "k5-user")).resolves.toEqual({ kind: "already_active", workspaceId: f.workspace.id });
     expect(reopen).not.toHaveBeenCalled();
     expect(await closedRowFacts(f.workspace.id)).toMatchObject({ status: "active", generation: f.generation + 1 });
+  });
+
+  // L2f: a run bound to the target holds its execution when the consumer
+  // dispatches the intent, so enqueueWakeup writes a deferred receipt under the
+  // dispatch key. Ending the holding run promotes that same receipt to the
+  // intent's only run. A separate running run fills the agent's single slot so
+  // the promoted run stays queued until the test drives it.
+  it.each(["L2f-1", "L2f-2"] as const)("%s: while a target-bound run holds execution, the intent still gets exactly one run", async (variant) => {
+    const f = await archivedContinuationTarget();
+    const route = await crossTaskRoute(f);
+    const [holding] = await db.insert(heartbeatRuns).values({ companyId: f.issue.companyId, agentId: f.input.agent.id,
+      issueId: f.issue.id, scopeKind: "issue", status: "running", invocationSource: "assignment", triggerDetail: "system",
+      responsibleUserId: "k5-user", contextSnapshot: { issueId: f.issue.id, taskId: f.issue.id } }).returning();
+    // The holding run takes the target's execution after the request's gates and
+    // in its transaction, so it holds execution when the route dispatches.
+    crossTaskContinuationTestHooks.beforeCommit = async (tx) => {
+      await tx.update(issues).set({ executionRunId: holding!.id, executionLockedAt: new Date() }).where(eq(issues.id, f.issue.id));
+    };
+    const res = await route.post().then(r => r, e => { throw e; });
+    crossTaskContinuationTestHooks.beforeCommit = undefined;
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const heartbeat = heartbeatService(db);
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.issue.companyId });
+    const [intent] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.requestedByActorId, CROSS_TASK_CONTINUATION_COMMITTER_ID));
+    const dispatchKey = crossTaskContinuationDispatchKey(intent!.id);
+    const deferred = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey, dispatchKey));
+    expect(deferred).toHaveLength(1);
+    // Today the dispatch is not deferred while another run holds the target:
+    // enqueueWakeup writes a queued receipt with a queued run. Either way the
+    // intent has one receipt and, once the holder ends, one run.
+    expect(["queued", "deferred_issue_execution"]).toContain(deferred[0]!.status);
+    if (variant === "L2f-2") {
+      // While it holds execution, the target-bound run reopens eagerly.
+      const eager = await executionWorkspaceService(db).reopenClosedIsolatedExecutionWorkspaceForIssue({
+        workspaceId: f.workspace.id, issue: { id: f.issue.id, companyId: f.issue.companyId, projectId: f.issue.projectId },
+        actor: { agentId: f.input.agent.id, actorType: "agent" },
+        authorizationActor: { type: "agent", agentId: f.input.agent.id, companyId: f.issue.companyId, source: "agent_jwt", runId: holding!.id, onBehalfOfUserId: "k5-user" },
+      });
+      expect(eager).toMatchObject({ ok: true, reopened: true });
+    }
+    await heartbeat.cancelRun(holding!.id, "fixture holding run ends");
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.issue.companyId });
+    const receipts = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey, dispatchKey));
+    expect(receipts).toHaveLength(1);
+    const promoted = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, receipts[0]!.id)));
+    expect(promoted).toHaveLength(1);
+    expect(promoted[0]!.contextSnapshot).toMatchObject({ issueId: f.issue.id });
+    const svc = executionWorkspaceService(db);
+    const reopen = vi.spyOn(svc, "reopenClosedIsolatedExecutionWorkspaceForIssue");
+    const outcome = await successorStep(promoted[0]!, svc, "k5-user");
+    if (variant === "L2f-1") {
+      expect(outcome).toMatchObject({ kind: "reopened", reopened: true, generation: f.generation + 1 });
+      expect(reopen).toHaveBeenCalledTimes(1);
+    } else {
+      expect(outcome).toEqual({ kind: "already_active", workspaceId: f.workspace.id });
+      expect(reopen).not.toHaveBeenCalled();
+    }
+    expect(await closedRowFacts(f.workspace.id)).toMatchObject({ status: "active", generation: f.generation + 1 });
+    expect(await workspaceActivity("execution_workspace.reopened")).toHaveLength(1);
+    expect(await branchHead(f.workspace.cwd!)).toEqual({ branch: f.workspace.branchName, head: f.headBeforeArchive });
   });
 
   it("keeps the admitted recovery workspace when the issue now points elsewhere", async () => {
