@@ -1,4 +1,5 @@
 import { authorizationService } from "../authorization.js";
+import { isAdmittedReconciliation, lockReconciledDeliveryPrefix, recordReconciledDeliveryOutcome, revalidateReconciledDelivery } from "../execution-reconciliation-delivery.js";
 import { assertTaskRetryConversationAllowed, readTaskRetryIntent, retireSupersededTaskRetry } from "../task-retry.js";
 import { insertIssueComment } from "../issue-comment-writes.js";
 import { withExternalAdmissionGuard, assertNoExternalOverlap } from "../../modules/external-agents/index.js";
@@ -2822,6 +2823,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
       const outcome = await db
         .transaction(async (tx) => {
+          if (executionReconciliationWake) await lockReconciledDeliveryPrefix(tx, agent.companyId, agentId);
           await tx.execute(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );
@@ -3281,6 +3283,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           }
 
           let reconciledSourceRunId: string | null = null;
+          let admittedDeliveryActionId: string | null = null;
           let reconciledRestoreRetryCount: number | null = null;
           if (executionReconciliationWake) {
             const actionId = readNonEmptyString(
@@ -3336,7 +3339,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               !readNonEmptyString(decision.outcomeEvidence) ||
               enrichedContextSnapshot.previousRunId !== sourceRunId ||
               enrichedContextSnapshot.retryOfRunId !== sourceRunId ||
-              !["pending", "delivered"].includes(
+              !["pending", "waiting", "delivered"].includes(
                 String(action.evidence.continuationDelivery),
               )
             )
@@ -3383,8 +3386,16 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 return { kind: "deferred" as const };
               return { kind: "replayed" as const, run: existingRun };
             }
-            if (action.evidence.continuationDelivery !== "pending")
+            if (!["pending", "waiting"].includes(String(action.evidence.continuationDelivery)))
               return { kind: "skipped" as const };
+            if (isAdmittedReconciliation(decision)) {
+              const delivery = await revalidateReconciledDelivery(tx, { issue, action });
+              if (delivery.kind !== "deliver") {
+                await recordReconciledDeliveryOutcome(tx, action, delivery);
+                return { kind: "skipped" as const };
+              }
+              admittedDeliveryActionId = action.id;
+            }
             const [reconciledRun] = await tx.select().from(heartbeatRuns).where(and(
               eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, sourceRunId),
             ));
@@ -4431,12 +4442,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             .returning()
             .then((rows) => rows[0]);
 
-          if (ownsReconstructionContinuation) {
+          if (ownsReconstructionContinuation || admittedDeliveryActionId) {
             await tx.update(issueRecoveryActions).set({ evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({
               continuationDelivery: "delivered", continuationRunId: newRun.id,
             })}::jsonb` }).where(and(eq(issueRecoveryActions.companyId, issue.companyId),
               eq(issueRecoveryActions.id, String(enrichedContextSnapshot.recoveryActionId)),
-              sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`));
+              sql`${issueRecoveryActions.evidence}->>'continuationDelivery' in ('pending', 'waiting')`));
           }
 
           await tx

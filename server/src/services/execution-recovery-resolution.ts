@@ -293,7 +293,11 @@ export async function deliverReconciledExecutions(
     .where(
       and(
         eq(issueRecoveryActions.status, "resolved"),
-        sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`,
+        or(
+          sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`,
+          sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'waiting'
+            and (${issueRecoveryActions.evidence}->'continuationWait'->>'recheckAt')::timestamptz <= now()`,
+        ),
       ),
     )
     .limit(25);
@@ -306,7 +310,7 @@ export async function deliverReconciledExecutions(
         eq(issueRecoveryActions.companyId, action.companyId),
         eq(issueRecoveryActions.id, action.id),
         eq(issueRecoveryActions.status, "resolved"),
-        sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`,
+        sql`${issueRecoveryActions.evidence}->>'continuationDelivery' in ('pending', 'waiting')`,
         sql`${issueRecoveryActions.evidence}->'executionReconciliation' = ${JSON.stringify(decision)}::jsonb`,
       );
       const [task] = await db
