@@ -147,7 +147,6 @@ export async function verifyExecutionReconciliationAuthorization(
     throw executionReconciliationRefusal("authority_not_configured", "No execution reconciliation authority is configured.");
   }
   const reference = input.admission.authorization;
-  const now = await statementTime(tx);
 
   const [document] = await tx
     .select({ id: documents.id, latestRevisionId: documents.latestRevisionId })
@@ -161,6 +160,7 @@ export async function verifyExecutionReconciliationAuthorization(
     ))
     .for("share", { of: documents });
   if (!document) invalid("document_not_on_issue");
+  const now = await statementTime(tx);
 
   const [decision] = await tx
     .select()

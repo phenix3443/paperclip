@@ -2532,6 +2532,41 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         expect(refusalCode(conflict.body)).toBe("idempotency_conflict");
       });
 
+      it("checks expiry after the authorization lock, so a decision that expires while admission waits is refused", async () => {
+        const fixture = await seedAdmission();
+        const expiresAt = new Date(Date.now() + 1500);
+        const body = await admissionBody(fixture, "recon:a2-expires-on-wait", {}, {
+          payload: (p: any) => { p.expiresAt = expiresAt.toISOString(); },
+          decision: { expiresAt },
+        });
+        const { documentId } = body.executionReconciliation.admission.authorization;
+        const before = await snapshot(fixture);
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => { release = resolve; });
+        let locked!: () => void;
+        const lockedSignal = new Promise<void>((resolve) => { locked = resolve; });
+        const holder = db.transaction(async (tx) => {
+          await tx.select({ id: documents.id }).from(documents).where(eq(documents.id, documentId)).for("update");
+          locked();
+          await held;
+        });
+        await lockedSignal;
+        const pending = request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).then((response) => response);
+        const waiting = async () => (await db.execute(sql`select count(*)::int as n from pg_stat_activity
+          where wait_event_type = 'Lock' and query ilike '%from "documents"%for share%'`) as unknown as { n: number }[])[0]!.n;
+        for (let attempt = 0; attempt < 50 && await waiting() === 0; attempt += 1) await new Promise((r) => setTimeout(r, 50));
+        expect(await waiting()).toBe(1);
+        await new Promise((r) => setTimeout(r, Math.max(0, expiresAt.getTime() - Date.now()) + 200));
+        release();
+        await holder;
+        const response = await pending;
+        expect(response.status).toBe(409);
+        expect(refusalCode(response.body)).toBe("authorization_expired");
+        expect(await snapshot(fixture)).toEqual(before);
+        const audited = await refusals();
+        expect(audited.at(-1)!.details).toMatchObject({ code: "authorization_expired" });
+      });
+
       it("waits for an in-flight authority-list change and then applies the new list", async () => {
         const fixture = await seedAdmission();
         const body = await admissionBody(fixture, "recon:a2-authority-race");
