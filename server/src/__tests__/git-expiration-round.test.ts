@@ -14,7 +14,7 @@ import { inspectGitExpirationRound, assertGitExpirationRoundMode, GIT_EXPIRATION
   GitExpirationRoundInvariantError, gitExpirationRoundFailure, readOnlyInspectionGitAuth, GIT_EXPIRATION_ROUND_SESSION_PARAMETERS,
   type GitExpirationRoundEvent, type GitExpirationRoundJournal, type GitExpirationRoundOptions } from "../services/git-expiration-round.js";
 import { GitCacheRestorationFailure } from "../services/git-workspace-restoration.js";
-import { probeGitProcessGroup, ROW_DRAIN_BOUND_MS } from "../services/git-expiration-budget.js";
+import { GIT_EXPIRATION_BUDGETS, probeGitProcessGroup, ROW_DRAIN_BOUND_MS } from "../services/git-expiration-budget.js";
 import { createGitRemoteAuthProvider } from "../services/git-credentials.js";
 import { parseGitExpirationRoundArgs, runGitExpirationRoundCli, GitExpirationRoundUsageError, fileGitExpirationRoundJournal,
   readGitExpirationRoundJournal, gitExpirationRoundExitCode } from "../git-expiration-round-cli.js";
@@ -186,12 +186,13 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
     return { companyId, issueId, ids };
   }
 
-  async function reconstructable() {
+  async function reconstructable(files: Record<string, string> = {}) {
     const companyId = randomUUID(), issueId = randomUUID(), workspaceId = randomUUID();
     const location = path.join(root, companyId), source = path.join(location, "author"), remote = path.join(location, "remote.git");
     await fs.mkdir(source, { recursive: true });
     git(source, "init", "--initial-branch=main");
     await fs.writeFile(path.join(source, "marker.txt"), "commit A\n");
+    for (const [name, content] of Object.entries(files)) await fs.writeFile(path.join(source, name), content);
     git(source, "add", "."); git(source, "commit", "-m", "A");
     git(location, "clone", "--bare", source, remote);
     await db.insert(companies).values({ id: companyId, name: "Round fixture", issuePrefix: `GV${companyId.slice(0, 6)}` });
@@ -376,6 +377,21 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
     expect(locks.filter(count => count === 2).length).toBeGreaterThan(5);
     await waitFor(async () => await advisoryLocks() === 0 && await roundBackends() === 0);
   }, 30_000);
+
+  it("stops partial with walker_entries when one row walks more than the entry budget", async () => {
+    const f = await reconstructable({ ".gitignore": "node_modules/\n" });
+    const generated = path.join(f.cwd, "node_modules");
+    await fs.mkdir(generated);
+    for (let start = 0; start <= GIT_EXPIRATION_BUDGETS.walkerEntries; start += 5_000) {
+      await Promise.all(Array.from({ length: Math.min(5_000, GIT_EXPIRATION_BUDGETS.walkerEntries + 1 - start) },
+        (_, offset) => fs.writeFile(path.join(generated, `f${start + offset}`), "")));
+    }
+    const journal = memoryJournal();
+    const summary = await round(journal, { companyId: f.companyId });
+    expect(summary).toMatchObject({ status: "partial", stopReason: "resource_limit", resourceLimited: 1, candidates: 0, rejected: 0, drainIncomplete: false });
+    expect(journal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "resource_limit", reason: "walker_entries" });
+    await waitFor(async () => await advisoryLocks() === 0 && await roundBackends() === 0);
+  }, 60_000);
 
   it("stops partial when Git output is too large in an ancestry proof", async () => {
     const f = await reconstructable();
@@ -715,6 +731,26 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
     await new Promise(resolve => setTimeout(resolve, 300));
     expect((await fs.stat(scratch)).size).toBe(size);
     await waitFor(async () => await advisoryLocks() === 0 && await roundBackends() === 0);
+  }, 30_000);
+
+  it("records row_deadline within the drain bound while a DB statement of the row is blocked, holding both locks", async () => {
+    const f = await seed(1);
+    const undrained: Promise<void>[] = [];
+    const journal = memoryJournal();
+    await holdingTableLock("issues", async () => {
+      const started = Date.now();
+      const summary = await round(journal, { companyId: f.companyId, budgetHooks: { rowMs: 1_000 },
+        onUndrainedRow: released => undrained.push(released) });
+      expect(Date.now() - started).toBeLessThan(1_000 + ROW_DRAIN_BOUND_MS + 2_000);
+      expect(summary).toMatchObject({ status: "partial", stopReason: "resource_limit", resourceLimited: 1,
+        drainIncomplete: true, undrainedRow: { id: f.ids[0] } });
+      expect(journal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "resource_limit", reason: "row_deadline" });
+      expect(journal.events.at(-1)).toMatchObject({ type: "round_finished", status: "partial", drainIncomplete: true });
+      expect(undrained).toHaveLength(1);
+      expect(await advisoryLocks()).toBe(2);
+    });
+    await undrained[0];
+    await waitFor(async () => await lockWaiters() === 0 && await advisoryLocks() === 0 && await roundBackends() === 0);
   }, 30_000);
 
   it("keeps the advisory locks of an aborted row until its blocked statement drains", async () => {
