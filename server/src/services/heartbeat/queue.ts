@@ -166,6 +166,13 @@ import {
 } from "../agent-invokability.js";
 import { isHeartbeatWakeOnDemandEnabled } from "../heartbeat-policy.js";
 import { isUuidLike } from "@paperclipai/shared";
+import { isUniqueViolation } from "../../db-errors.js";
+import {
+  CROSS_TASK_CONTINUATION_COMMITTER_ID,
+  CROSS_TASK_CONTINUATION_SOURCE,
+  crossTaskContinuationDeliveryGate,
+  crossTaskContinuationDispatchKey,
+} from "../cross-task-continuation.js";
 import { retryChatControlAdmission } from "../chat-control-admission-retry.js";
 
 import type { HeartbeatServiceOptions } from "../heartbeat.js";
@@ -4770,7 +4777,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             ? eq(agentWakeupRequests.companyId, input.companyId)
             : undefined,
           eq(agentWakeupRequests.requestedByActorType, "system"),
-          eq(agentWakeupRequests.requestedByActorId, "native-status-committer"),
+          inArray(agentWakeupRequests.requestedByActorId, [
+            "native-status-committer",
+            CROSS_TASK_CONTINUATION_COMMITTER_ID,
+          ]),
           inArray(agentWakeupRequests.status, ["queued", "claimed"]),
           isNull(agentWakeupRequests.runId),
         ),
@@ -4787,22 +4797,39 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     >();
 
     for (const candidate of candidates) {
-      const dispatchActorId = `native-status-wake-dispatch:${candidate.id}`;
-      const existingDispatch = await db
-        .select()
-        .from(agentWakeupRequests)
-        .where(
-          and(
-            eq(agentWakeupRequests.companyId, candidate.companyId),
-            eq(agentWakeupRequests.requestedByActorType, "system"),
-            eq(agentWakeupRequests.requestedByActorId, dispatchActorId),
-          ),
-        )
-        .orderBy(desc(agentWakeupRequests.requestedAt))
-        .limit(1)
-        .then((rows) => rows[0] ?? null);
-
-      if (existingDispatch) {
+      // A cross-task continuation intent has its own dispatch identity: the
+      // receipt key is unique per intent (index
+      // agent_wakeup_requests_cross_task_continuation_dispatch_uq), so the
+      // receipt is looked up by that key instead of by the dispatch actor id.
+      const isContinuation =
+        candidate.requestedByActorId === CROSS_TASK_CONTINUATION_COMMITTER_ID;
+      const dispatchKey = isContinuation
+        ? crossTaskContinuationDispatchKey(candidate.id)
+        : null;
+      const dispatchActorId = dispatchKey ?? `native-status-wake-dispatch:${candidate.id}`;
+      const findDispatchReceipt = () =>
+        db
+          .select()
+          .from(agentWakeupRequests)
+          .where(
+            dispatchKey
+              ? and(
+                  eq(agentWakeupRequests.companyId, candidate.companyId),
+                  eq(agentWakeupRequests.idempotencyKey, dispatchKey),
+                )
+              : and(
+                  eq(agentWakeupRequests.companyId, candidate.companyId),
+                  eq(agentWakeupRequests.requestedByActorType, "system"),
+                  eq(agentWakeupRequests.requestedByActorId, dispatchActorId),
+                ),
+          )
+          .orderBy(desc(agentWakeupRequests.requestedAt))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+      const recoverFromDispatchReceipt = async (
+        existingDispatch: typeof agentWakeupRequests.$inferSelect,
+      ) => {
+        const recoveredAt = new Date();
         const recoveredStatus = existingDispatch.runId
           ? "coalesced"
           : existingDispatch.status === "deferred_issue_execution"
@@ -4815,10 +4842,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             runId: existingDispatch.runId,
             finishedAt:
               (existingDispatch.runId ?? existingDispatch.finishedAt)
-                ? (existingDispatch.finishedAt ?? now)
+                ? (existingDispatch.finishedAt ?? recoveredAt)
                 : null,
             error: existingDispatch.error,
-            updatedAt: now,
+            updatedAt: recoveredAt,
           })
           .where(
             and(
@@ -4826,6 +4853,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               isNull(agentWakeupRequests.runId),
             ),
           );
+      };
+
+      const existingDispatch = await findDispatchReceipt();
+      if (existingDispatch) {
+        await recoverFromDispatchReceipt(existingDispatch);
         recovered += 1;
         continue;
       }
@@ -4854,6 +4886,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             candidate.status === "claimed"
               ? eq(agentWakeupRequests.status, "claimed")
               : eq(agentWakeupRequests.status, "queued"),
+            // Fence a stale continuation reclaim on the claim it read, so two
+            // sweeps that read the same stale claim cannot both win it.
+            isContinuation && candidate.status === "claimed" && candidate.claimedAt
+              ? eq(agentWakeupRequests.claimedAt, candidate.claimedAt)
+              : undefined,
           ),
         )
         .returning({ id: agentWakeupRequests.id });
@@ -4894,6 +4931,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             status: issues.status,
             statusVersion: issues.statusVersion,
             assigneeAgentId: issues.assigneeAgentId,
+            responsibleUserId: issues.responsibleUserId,
+            executionWorkspaceId: issues.executionWorkspaceId,
           })
           .from(issues)
           .where(
@@ -4937,6 +4976,30 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           recovered += 1;
           continue;
         }
+        if (isContinuation) {
+          const unresolvedBlockerCount = targetIssue.status === "blocked"
+            ? ((await issuesSvc.listDependencyReadiness(candidate.companyId, [issueId]))
+                .get(issueId)?.unresolvedBlockerCount ?? 0)
+            : 0;
+          const gateError = crossTaskContinuationDeliveryGate(
+            payload,
+            targetIssue,
+            unresolvedBlockerCount,
+          );
+          if (gateError) {
+            await db
+              .update(agentWakeupRequests)
+              .set({
+                status: "skipped",
+                finishedAt: new Date(),
+                error: gateError,
+                updatedAt: new Date(),
+              })
+              .where(eq(agentWakeupRequests.id, candidate.id));
+            recovered += 1;
+            continue;
+          }
+        }
       }
 
       try {
@@ -4947,33 +5010,29 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             "system") as WakeupOptions["triggerDetail"],
           reason: candidate.reason,
           payload,
-          idempotencyKey: candidate.idempotencyKey,
+          idempotencyKey: dispatchKey ?? candidate.idempotencyKey,
           requestedByActorType: "system",
           requestedByActorId: dispatchActorId,
           ...(completedOnboardingGuard ? { issueStateGuard: completedOnboardingGuard } : {}),
-          contextSnapshot: {
-            ...wakeContext,
-            ...(issueId ? { issueId, taskId: issueId } : {}),
-            wakeReason: candidate.reason,
-            source: "native_status_decision",
-            statusDecisionSource: "native_status_decision",
-            nativeStatusWakeIntentId: candidate.id,
-          },
+          contextSnapshot: isContinuation
+            ? {
+                ...wakeContext,
+                ...(issueId ? { issueId, taskId: issueId } : {}),
+                wakeReason: candidate.reason,
+                source: CROSS_TASK_CONTINUATION_SOURCE,
+                crossTaskContinuationIntentId: candidate.id,
+              }
+            : {
+                ...wakeContext,
+                ...(issueId ? { issueId, taskId: issueId } : {}),
+                wakeReason: candidate.reason,
+                source: "native_status_decision",
+                statusDecisionSource: "native_status_decision",
+                nativeStatusWakeIntentId: candidate.id,
+              },
         });
 
-        const delivered = await db
-          .select()
-          .from(agentWakeupRequests)
-          .where(
-            and(
-              eq(agentWakeupRequests.companyId, candidate.companyId),
-              eq(agentWakeupRequests.requestedByActorType, "system"),
-              eq(agentWakeupRequests.requestedByActorId, dispatchActorId),
-            ),
-          )
-          .orderBy(desc(agentWakeupRequests.requestedAt))
-          .limit(1)
-          .then((rows) => rows[0] ?? null);
+        const delivered = await findDispatchReceipt();
 
         // The committer intent is the durable outbox entry. When admission is
         // blocked, enqueueWakeup creates a separate deferred dispatch receipt;
@@ -5007,6 +5066,17 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         if (wakeRun) dispatched += 1;
         else deferred += 1;
       } catch (error) {
+        // A concurrent sweep already committed this intent's one dispatch
+        // receipt; its run committed with it. Recover from that receipt
+        // instead of requeueing the intent.
+        if (dispatchKey && isUniqueViolation(error)) {
+          const committedDispatch = await findDispatchReceipt();
+          if (committedDispatch) {
+            await recoverFromDispatchReceipt(committedDispatch);
+            recovered += 1;
+            continue;
+          }
+        }
         await db
           .update(agentWakeupRequests)
           .set({
