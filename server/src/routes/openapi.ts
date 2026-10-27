@@ -1390,6 +1390,8 @@ const browserUseOperations = [
 
 const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/issues/{id}/retry",
+  "GET /api/issues/{id}/recovery-actions/receipts/{key}",
+  "POST /api/issues/{id}/recovery-actions/receipts/{key}/settle",
   "GET /api/companies/{companyId}/prompt-injection-prevention",
   "PUT /api/companies/{companyId}/prompt-injection-prevention",
   "GET /api/companies/{companyId}/prompt-injection-prevention/models",

@@ -1058,6 +1058,16 @@ describe("openapi routes", () => {
     expect(replacement.responses["422"]).toBeDefined();
   });
 
+  it("documents board-only execution reconciliation receipt read and settle", () => {
+    const { spec } = loadSpecRoutes();
+    const base = "/api/issues/{id}/recovery-actions/receipts/{key}";
+    for (const operation of [spec.paths[base].get, spec.paths[`${base}/settle`].post]) {
+      expect(operation.security).toEqual([{ BoardSessionAuth: [] }, { BoardApiKeyAuth: [] }]);
+      expect(operation.security).not.toContainEqual({ AgentBearerAuth: [] });
+      expect(operation["x-paperclip-authorization"]).toEqual({ actor: "board" });
+    }
+  });
+
   it("documents the manager-only GitHub wizard and compatible owner-aware registration", () => {
     const { spec } = loadSpecRoutes();
     for (const [suffix, method] of [["draft", "put"], ["setup", "post"], ["identity/start", "post"], ["identity/confirm", "post"]]) {
