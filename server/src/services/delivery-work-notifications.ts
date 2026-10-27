@@ -7,6 +7,7 @@ export const DELIVERY_QUEUES = {
   executionContinuation: "execution-continuation",
   executionStatus: "execution-status",
   executionDisposition: "execution-disposition",
+  crossTaskContinuations: "cross-task-continuations",
   adapterLoginCleanup: "adapter-login-cleanup",
   setupTokenCleanup: "setup-token-cleanup",
   localLoginCleanup: "local-login-cleanup",

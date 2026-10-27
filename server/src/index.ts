@@ -14,6 +14,7 @@ import {
 } from "./services/native-runtime/native-harness-backup-expiration.js";
 import { subscribeAllCompanyLiveEvents } from "./services/live-events.js";
 import { DELIVERY_QUEUES } from "./services/delivery-work-notifications.js";
+import { CROSS_TASK_CONTINUATION_STALE_CLAIM_MS, registerCrossTaskContinuationWork } from "./services/cross-task-continuation-worker.js";
 import { registerBudgetEnforcementWork, registerCostAccountingWork } from "./services/budget-enforcement-worker.js";
 import { caseHandoffDeliveryService } from "./services/case-handoff-delivery.js";
 import { registerScheduledWork } from "./services/scheduled-work.js";
@@ -1365,6 +1366,12 @@ async function startServerWithDatabaseTeardown(
       } },
     ] : []),
   ], () => !heartbeatSchedulerStopped);
+
+  if (heartbeat) {
+    registerCrossTaskContinuationWork(db, deliveryWork, () => heartbeat.dispatchPendingNativeStatusWakeups({
+      staleClaimMs: CROSS_TASK_CONTINUATION_STALE_CLAIM_MS,
+    }));
+  }
 
   const budgetEnforcementWorker = registerBudgetEnforcementWork(db, deliveryWork, {
     cancelWorkForScope: accountingHeartbeat.cancelBudgetScopeWork,

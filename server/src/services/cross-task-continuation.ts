@@ -12,6 +12,7 @@ import { and, desc, eq, inArray, isNotNull, like, or } from "drizzle-orm";
 import { acquireExecutionWorkspaceLifecycleLock } from "./execution-workspace-lifecycle-lock.js";
 import { isClosedExecutionWorkspaceStatus, readExecutionWorkspaceLifecycleGeneration } from "./execution-workspaces.js";
 import { isDeadlockDetected, isUniqueViolation } from "../db-errors.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 
 // A cross-task explicit resume does not reopen the target's archived workspace in
 // the request. It commits the comment, the status change and a durable intent in
@@ -430,6 +431,9 @@ export async function commitCrossTaskContinuation(
         },
         ...(pendingIntent ? { coalescedIntoWakeupRequestId: pendingIntent.id } : {}),
       };
+      // Register the delivery hint before the intent write, in this transaction.
+      // A coalesced intent is never delivered on its own.
+      if (!pendingIntent) await notifyDeliveryWork(tx, DELIVERY_QUEUES.crossTaskContinuations, `task:${issue.id}`);
       const now = new Date();
       const [intent] = await tx.insert(agentWakeupRequests).values({
         companyId: input.companyId,
