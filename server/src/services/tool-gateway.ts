@@ -2579,13 +2579,14 @@ export function createToolGatewayService(
         })
         .returning();
       formalApprovalId = approval.id;
+      const linkedIssueId = input.session.issueId;
       await db.transaction(async (tx) => {
-        await lockIssuesForGateWrite(tx, input.session.companyId, [input.session.issueId]);
+        await lockIssuesForGateWrite(tx, input.session.companyId, [linkedIssueId]);
         await tx
           .insert(issueApprovals)
           .values({
             companyId: input.session.companyId,
-            issueId: input.session.issueId,
+            issueId: linkedIssueId,
             approvalId: approval.id,
             linkedByAgentId: input.session.agentId,
           })

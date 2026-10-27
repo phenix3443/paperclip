@@ -9791,6 +9791,9 @@ export function issueRoutes(
           .for("update")
           .then((rows) => rows[0] ?? null);
         if (!lockedIssue) throw notFound("Issue not found");
+        if (admission && lockedIssue.assigneeAgentId !== existing.assigneeAgentId) {
+          throw executionReconciliationRefusal("concurrent_change", "The task owner changed while the request was prepared. Re-read and retry with the same key.");
+        }
         let admissionCheck: Awaited<ReturnType<typeof checkExecutionReconciliationAdmission>> | null = null;
         if (admission) {
           const lockedAdmissionRows = priorReceipt ? null : await lockAdmissionRows(tx, {
@@ -10092,7 +10095,7 @@ export function issueRoutes(
                 { code: "recovery_review_resume_unverified" },
               );
             }
-            await assertSafeRecoveryHandBackGates({
+            if (!admission) await assertSafeRecoveryHandBackGates({
               req,
               issue: lockedIssue,
               recoveryAction: activeRecoveryAction,
@@ -10193,7 +10196,7 @@ export function issueRoutes(
             lockedIssue.assigneeAgentId ===
               activeRecoveryAction.returnOwnerAgentId;
           if (safeHandBack) {
-            await assertSafeRecoveryHandBackGates({
+            if (!admission) await assertSafeRecoveryHandBackGates({
               req,
               issue: lockedIssue,
               recoveryAction: activeRecoveryAction,

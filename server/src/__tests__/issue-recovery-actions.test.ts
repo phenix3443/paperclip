@@ -2488,6 +2488,61 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       });
     });
 
+    describe("company and owner locks before the task lock (slice A3a)", () => {
+      const holdRow = async (lock: (tx: any) => Promise<unknown>, whileHeld: (tx: any) => Promise<unknown> = async () => {}) => {
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => { release = resolve; });
+        let locked!: () => void;
+        const lockedSignal = new Promise<void>((resolve) => { locked = resolve; });
+        const holder = db.transaction(async (tx) => {
+          await lock(tx);
+          locked();
+          await held;
+          await whileHeld(tx);
+        });
+        await lockedSignal;
+        return { release, holder };
+      };
+      const lockWaiters = async (pattern: string) => (await db.execute(sql`select count(*)::int as n from pg_stat_activity
+        where wait_event_type = 'Lock' and query ilike ${pattern}`) as unknown as { n: number }[])[0]!.n;
+
+      it("waits for a company writer and then reads the company gate it committed", async () => {
+        const fixture = await seedAdmission();
+        const body = await admissionBody(fixture, "recon:a3a-company-wait1");
+        const { release, holder } = await holdRow(
+          (tx) => tx.select({ id: companies.id }).from(companies).where(eq(companies.id, fixture.companyId)).for("update"),
+          (tx) => tx.update(companies).set({ status: "paused" }).where(eq(companies.id, fixture.companyId)),
+        );
+        const pending = request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).then((response) => response);
+        for (let attempt = 0; attempt < 50 && await lockWaiters('%from "companies"%for share%') === 0; attempt += 1) await new Promise((r) => setTimeout(r, 50));
+        expect(await lockWaiters('%from "companies"%for share%')).toBe(1);
+        release();
+        await holder;
+        const response = await pending;
+        expect(response.status).toBe(409);
+        expect(refusalCode(response.body)).toBe("gate_closed:company_pause");
+      });
+
+      it("refuses when the owner changes between the unlocked read and the task lock", async () => {
+        const fixture = await seedAdmission();
+        const body = await admissionBody(fixture, "recon:a3a-owner-race-01");
+        const { release, holder } = await holdRow(
+          (tx) => tx.select({ id: issues.id }).from(issues).where(eq(issues.id, fixture.sourceIssueId)).for("update"),
+          (tx) => tx.update(issues).set({ assigneeAgentId: fixture.managerId }).where(eq(issues.id, fixture.sourceIssueId)),
+        );
+        const pending = request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).then((response) => response);
+        const issueRowSelect = 'select "id", "company_id", "conversation_agent_id"%';
+        for (let attempt = 0; attempt < 50 && await lockWaiters(issueRowSelect) === 0; attempt += 1) await new Promise((r) => setTimeout(r, 50));
+        expect(await lockWaiters(issueRowSelect)).toBe(1);
+        release();
+        await holder;
+        const response = await pending;
+        expect(response.status).toBe(409);
+        expect(refusalCode(response.body)).toBe("concurrent_change");
+        expect(await db.select().from(executionReconciliationReceipts)).toHaveLength(0);
+      });
+    });
+
     describe("gates on locked rows (slice A3a)", () => {
       type Fixture = Awaited<ReturnType<typeof seedAdmission>>;
       type Setup = (fixture: Fixture) => Promise<unknown>;
