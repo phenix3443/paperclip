@@ -1390,6 +1390,8 @@ const browserUseOperations = [
 
 const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/issues/{id}/retry",
+  "GET /api/issues/{id}/recovery-actions/receipts/{key}",
+  "POST /api/issues/{id}/recovery-actions/receipts/{key}/settle",
   "GET /api/companies/{companyId}/prompt-injection-prevention",
   "PUT /api/companies/{companyId}/prompt-injection-prevention",
   "GET /api/companies/{companyId}/prompt-injection-prevention/models",
@@ -10756,6 +10758,22 @@ registerCurrentRoute({
   tags: ["issues"],
   summary: "Resolve an issue recovery action",
   body: resolveIssueRecoveryActionSchema,
+});
+
+registerCurrentRoute({
+  method: "get",
+  path: "/api/issues/{id}/recovery-actions/receipts/{key}",
+  tags: ["issues"],
+  summary: "Read the execution reconciliation receipt state for an idempotency key",
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/issues/{id}/recovery-actions/receipts/{key}/settle",
+  tags: ["issues"],
+  summary: "Settle an execution reconciliation idempotency key as committed or permanently abandoned",
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
 });
 
 registerCurrentRoute({

@@ -312,6 +312,7 @@ export * from "./types/chat-channels.js";
 export * from "./types/chat-github.js";
 export * from "./validators/chat-github.js";
 export * from "./validators/chat-channels.js";
+export * from "./validators/execution-reconciliation-admission.js";
 export {
   humanizeConnectionDisplayName,
   connectionDisplaySecondaryHint,
