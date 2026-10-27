@@ -594,4 +594,61 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(after.intents[0]!.payload).toMatchObject({ reopenedFrom: "in_progress" });
     expect(after.workspace).toEqual(before.workspace);
   });
+
+  it("I3 concurrent: two different clientRequestIds at once give two comments, one intent that dispatches and one coalesced into it, and one successor", async () => {
+    await setFeature(true);
+    const f = await fixture();
+    const [a, b] = await Promise.all([
+      post(f.app, f.targetIssueId, { body: "First", resume: true, clientRequestId: randomUUID() }),
+      post(f.app, f.targetIssueId, { body: "Second", resume: true, clientRequestId: randomUUID() }),
+    ]);
+    expect([a.status, b.status], JSON.stringify([a.body, b.body])).toEqual([201, 201]);
+    const after = await snapshot(f.targetIssueId, f.workspaceId);
+    expect(after.comments).toHaveLength(2);
+    expect(after.intents).toHaveLength(2);
+    const coalesced = after.intents.filter((intent) => (intent.payload as Record<string, unknown>).coalescedIntoWakeupRequestId);
+    expect(coalesced).toHaveLength(1);
+    const primary = after.intents.find((intent) => intent.id !== coalesced[0]!.id)!;
+    expect((coalesced[0]!.payload as Record<string, unknown>).coalescedIntoWakeupRequestId).toBe(primary.id);
+    const successors = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+      .filter((run) => run.id !== f.sourceRunId);
+    expect(successors).toHaveLength(1);
+    // Each request replays its own receipt.
+    for (const [res, body] of [[a, "First"], [b, "Second"]] as const) {
+      const replay = await post(f.app, f.targetIssueId, { body, resume: true, clientRequestId: res.body.clientRequestId });
+      expect(replay.body).toMatchObject({ id: res.body.id, replayed: true, continuation: { wakeupRequestId: res.body.continuation.wakeupRequestId } });
+    }
+  });
+
+  // I6/I7/I8/K9: a lost response is retried after the state moved on. The retry
+  // replays the committed receipt, with the intent's run, and changes nothing.
+  it.each([
+    { name: "K9 after dispatch", change: async () => {} },
+    { name: "I6 after the successor restored the workspace", change: async (f: Awaited<ReturnType<typeof fixture>>) => {
+      await db.update(executionWorkspaces).set({ status: "active", closedAt: null }).where(eq(executionWorkspaces.id, f.workspaceId));
+    } },
+    { name: "I7 after the source run ended", change: async (f: Awaited<ReturnType<typeof fixture>>) => {
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    } },
+    { name: "I8 after a pause hold was added", change: async (f: Awaited<ReturnType<typeof fixture>>) => {
+      await db.insert(issueTreeHolds).values({ companyId: f.companyId, rootIssueId: f.targetIssueId, mode: "pause", status: "active", reason: "fixture pause" });
+    } },
+  ])("$name: the retry replays with the intent's run", async ({ change }) => {
+    await setFeature(true);
+    const f = await fixture();
+    const body = { body: "Continue", resume: true, clientRequestId: randomUUID() };
+    const first = await post(f.app, f.targetIssueId, body);
+    expect(first.status, JSON.stringify(first.body)).toBe(201);
+    const [intent] = (await snapshot(f.targetIssueId, f.workspaceId)).intents;
+    expect(intent!.runId).toBeTruthy();
+    await change(f);
+    const before = await snapshot(f.targetIssueId, f.workspaceId);
+    const retry = await post(f.app, f.targetIssueId, body);
+    expect(retry.status, JSON.stringify(retry.body)).toBe(201);
+    expect(retry.body).toMatchObject({ id: first.body.id, replayed: true,
+      continuation: { wakeupRequestId: intent!.id, runId: intent!.runId } });
+    const after = await snapshot(f.targetIssueId, f.workspaceId);
+    expect(after.comments).toHaveLength(before.comments.length);
+    expect(after.intents).toHaveLength(before.intents.length);
+  });
 });
