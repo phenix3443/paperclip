@@ -53,7 +53,13 @@ Steps 1 to 5 answer with their own error before step 6 runs, and step 6 commits 
 
 `reopenClosedIsolatedExecutionWorkspaceForIssue` calls `assertTaskWorkspaceExecutionAccess(db, req.actor, …)` before any rebuild. That guard loads `req.actor.runId` and throws `forbidden("Task workspace run identity is unavailable")` unless `runRetainsIssueIdentity(run, parent)` holds. A run retains an issue only through `nativeIssueId`, `contextSnapshot.issueId/taskId` or `issueId`.
 
-The Routine run was bound to the capacity task. The cap counted the request as cross-issue, which shows the run's source issue was not the parent. The run identity check is the first check in that guard that depends on the run, so it fails before the later checks (responsible user, `issue:read`, copy identity, trust) can run. The helper itself answers 409 for the failures it handles (`not_reopenable`, rebuild failed). A 403 here can only come from a thrown `forbidden`.
+`runRetainsIssueIdentity` reads more fields than the cap. The cap decides "cross-issue" from the run's `contextSnapshot` only. The guard also accepts the immutable run bindings `nativeIssueId` and `issueId`, so a cross-issue cap result alone does not rule out a pass at the guard. A separate read only check of the incident run closes that gap at field level:
+
+- `nativeIssueId` is null.
+- `issueId` is the capacity task.
+- `contextSnapshot.issueId` and `contextSnapshot.taskId` are the capacity task.
+
+No field names the parent, so `runRetainsIssueIdentity(run, parent)` is false on both of its branches. The run and task IDs stay in the ops records. The run identity check is the first check in that guard that depends on the run, so it fails before the later checks (responsible user, `issue:read`, copy identity, trust) can run. The helper itself answers 409 for the failures it handles (`not_reopenable`, rebuild failed). A 403 here can only come from a thrown `forbidden`.
 
 ### 3.3 Isolated reproduction
 
@@ -87,12 +93,15 @@ All cases are in the characterization test and pass on `develop` `ef2f4565b`.
 | M6 | Agent actor without a run | 403 `Cross-issue writes need a run to attribute them to…` | 0 | none |
 | M7 | Active subtree pause hold on the parent | 409 `Issue follow-up blocked by active subtree pause hold` | 0 | none |
 | M8 | `in_progress` parent with a live run, no closed workspace | 201 | 1 | comment |
-| M9 | `in_review` parent | 409 `Issue is not resumable through comment follow-up intent` | 0 | status and execution state unchanged |
+| M9 | `in_review` parent, no execution policy | 409 `Issue is not resumable through comment follow-up intent` | 0 | none, status unchanged |
+| M9-review | `in_review` parent, archived workspace, policy with review then approval stages, state `pending` on the review stage, one prior `changes_requested` decision, `changesRequestedCount` 1 | 409 `Issue is not resumable through comment follow-up intent` | 0 | none: policy, state, decision rows, assignee, comments, workspace and runs unchanged |
+| M9-approval | As M9-review, but state `pending` on the approval stage with a user participant and the review stage in `completedStageIds` | 409 `Issue is not resumable through comment follow-up intent` | 0 | none, as M9-review |
 
 What the matrix shows:
 
 - M4a and M4b: another agent's ownership is not denied by the guard. Today the guard refuses every cross-task resume on an archived workspace, including ones the access policy would admit. The access policy is the real ownership boundary (M4b). A fix must defer to that same decision and must not widen it. The protected write policy case (403 `Agent cannot request follow-up for another agent's issue`) is not in this fixture. #69 covers the non-assignee requester, and the implementation review should confirm the protected policy case there.
-- M5, M6, M7 and M9 stay denied before the cap gate and before any workspace work. A fix must keep them denied with no effects.
+- M5, M6, M7 and the M9 cases stay denied before the cap gate and before any workspace work. A fix must keep them denied with no effects.
+- M9-review and M9-approval: a resume comment cannot move a parent out of a pending review or approval stage, and it cannot add, remove or change decision history or the round count. The archived workspace is not touched, because the status check runs before the reopen.
 - M3: a run bound to the parent passes the guard. The guard itself does not need to change.
 
 ## 5. Minimal fix
@@ -107,7 +116,7 @@ Draft #69 implements it. This plan adds these review conditions for #69:
 
 1. M1 becomes 201 with exactly one comment and one intent only when the setting is on. With the setting off it stays M1.
 2. M4a with the setting on admits exactly when M4b admits, through the same access decision. A protected write policy that denies M4b also denies M4a.
-3. M5, M6, M7 and M9 keep their current status, body and absence of effects with the setting on.
+3. M5, M6, M7, M9, M9-review and M9-approval keep their current status, body and absence of effects with the setting on.
 4. The PATCH and checkout reopen paths keep their 403 for cross-task agents (#64 section 9, #69 case G2).
 
 Options not chosen:
@@ -125,7 +134,17 @@ A 201 proves the comment row. It does not prove a successor. In M2 the wake is e
 Lost response handling:
 
 - Today, on an archived workspace: a 403 commits only the cap audit row. A retry gets the same 403 and spends one more cap unit (cap 20 per run). It cannot duplicate a comment. Callers must not retry it. They read back once and record the block.
-- Today, on a target without a closed workspace: agent comments have no request idempotency key. The route passes `clientRequestId` to the comment service only for user actors (`routes/issues.ts` comment insert). A retry after a lost 201 can write a second comment and a second wake request. Before retrying, read back comments by author, run and marker. Retry only if the comment is absent.
+- Today, on a target without a closed workspace: agent comments have no request idempotency key. The route passes `clientRequestId` to the comment service only for user actors (`routes/issues.ts` comment insert). A retry after a lost 201 can write a second comment and a second wake request.
+- An empty read-back does not make a retry safe. This order gives two comments:
+  1. The caller sends request A. The response is lost, or the client times out while A is still in the server.
+  2. The caller reads back comments. A has not committed yet, so the read is empty.
+  3. The caller sends retry B.
+  4. A commits its comment, the `todo` move and its wake request.
+  5. B commits a second comment and a second wake request.
+- So without an idempotency key, a caller must not resend after a lost response unless it has proof that A can no longer commit, and a read-back made after that proof shows no comment. Accepted proof:
+  - The caller received a final error response for A, or
+  - The service process that received A has stopped. For example, the service start time is later than the time A was sent. Writes that A had not committed die with that process, so nothing from A can commit later.
+- Without that proof, the outcome of A stays unknown. The caller records it as unknown, does not resend, and reconciles: read back comments by author agent, `createdByRunId` and the marker line, and read the successor evidence above. A later read that finds the comment ends the uncertainty. If the comment is still absent, the caller still does not resend without the proof above. It hands the unknown outcome to CTO on its own task.
 - After #69 with the setting on: the deferred path requires `clientRequestId`. A sequential retry with the same id and body replays (`replayed: true`, same comment and intent). The same id with a different body gets 409. Concurrent identical requests commit one comment and one intent (#69 cases I1, I2, I9, I10). Routines that send cross-task resumes must send a stable `clientRequestId` derived from the request task and parent.
 
 ## 7. Interim continuation without code changes
@@ -169,4 +188,4 @@ pnpm --filter @paperclipai/plugin-sdk build   # once per fresh worktree
 cd server && pnpm exec vitest run src/__tests__/terminal-parent-resume-403-characterization.test.ts
 ```
 
-Result on `ef2f4565b` plus this test: 10 passed. Teardown can log `CONNECTION_ENDED` from background wake work after the database stops. This does not affect the assertions.
+Result on `ef2f4565b` plus this test: 12 passed. Teardown can log `CONNECTION_ENDED` from background wake work after the database stops. This does not affect the assertions.

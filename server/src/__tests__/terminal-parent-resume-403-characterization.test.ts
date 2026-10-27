@@ -13,6 +13,7 @@ import {
   executionWorkspaces,
   heartbeatRuns,
   issueComments,
+  issueExecutionDecisions,
   issueTreeHolds,
   issues,
   projects,
@@ -20,10 +21,6 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-
-// Characterization for phenix3443/paperclip#75. It drives the real comment
-// route, access gates and execution workspace guard against PostgreSQL with
-// synthetic rows only. It records current behavior; it does not change it.
 
 vi.mock("../adapters/index.ts", async () => {
   const actual = await vi.importActual<typeof import("../adapters/index.ts")>("../adapters/index.ts");
@@ -47,6 +44,7 @@ type FixtureOptions = {
   actorRun?: "present" | "absent";
   pauseHold?: boolean;
   activeTargetRun?: boolean;
+  pendingStage?: "review" | "approval";
 };
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -109,6 +107,38 @@ const support = await getEmbeddedPostgresTestSupport();
       });
       await db.update(issues).set({ executionRunId: targetRunId, checkoutRunId: targetRunId }).where(eq(issues.id, targetIssueId));
     }
+    if (options.pendingStage) {
+      const reviewStageId = randomUUID();
+      const approvalStageId = randomUUID();
+      const stageId = options.pendingStage === "review" ? reviewStageId : approvalStageId;
+      const participant = options.pendingStage === "review"
+        ? { type: "agent", agentId: otherAgentId }
+        : { type: "user", userId: "responsible-user" };
+      const [decision] = await db.insert(issueExecutionDecisions).values({
+        companyId, issueId: targetIssueId, stageId: reviewStageId, stageType: "review",
+        actorAgentId: otherAgentId, outcome: "changes_requested", body: "fixture prior review round",
+      }).returning();
+      await db.update(issues).set({
+        executionPolicy: {
+          mode: "normal", commentRequired: true, maxReviewRounds: null,
+          stages: [
+            { id: reviewStageId, type: "review", approvalsNeeded: 1, participants: [{ id: randomUUID(), type: "agent", agentId: otherAgentId }] },
+            { id: approvalStageId, type: "approval", approvalsNeeded: 1, participants: [{ id: randomUUID(), type: "user", userId: "responsible-user" }] },
+          ],
+        },
+        executionState: {
+          status: "pending", currentStageId: stageId,
+          currentStageIndex: options.pendingStage === "review" ? 0 : 1,
+          currentStageType: options.pendingStage,
+          currentParticipant: participant,
+          returnAssignee: { type: "agent", agentId },
+          reviewRequest: null,
+          completedStageIds: options.pendingStage === "review" ? [] : [reviewStageId],
+          lastDecisionId: decision!.id, lastDecisionOutcome: "changes_requested",
+          changesRequestedCount: options.pendingStage === "review" ? 1 : 0,
+        },
+      }).where(eq(issues.id, targetIssueId));
+    }
     if (options.pauseHold) {
       await db.insert(issueTreeHolds).values({ companyId, rootIssueId: targetIssueId, mode: "pause", status: "active", reason: "fixture pause" });
     }
@@ -135,7 +165,8 @@ const support = await getEmbeddedPostgresTestSupport();
       eq(activityLog.companyId, f.companyId), eq(activityLog.action, CROSS_ISSUE_ACTIVITY), eq(activityLog.entityId, f.targetIssueId),
     ));
     const runs = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId));
-    return { issue: issue!, workspace: workspace ?? null, comments, audits, runCount: runs.length };
+    const decisions = await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, f.targetIssueId));
+    return { issue: issue!, workspace: workspace ?? null, comments, audits, runCount: runs.length, decisions };
   }
 
   const resume = (f: Awaited<ReturnType<typeof fixture>>) =>
@@ -148,8 +179,6 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(res.status).toBe(403);
     expect(res.body).toEqual({ error: "Task workspace run identity is unavailable" });
     const after = await snapshot(f);
-    // Same production signature as the incident: the cap audit committed with
-    // allowed=true, and nothing else changed.
     expect(after.audits).toHaveLength(1);
     expect(after.audits[0]!.details).toMatchObject({ kind: "comment", count: 1, allowed: true });
     expect(after.comments).toHaveLength(0);
@@ -167,8 +196,6 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(after.comments).toHaveLength(1);
     expect(after.issue.status).toBe("todo");
     expect(after.audits).toHaveLength(1);
-    // A 201 proves the comment, not a successor. The wake is enqueued after the
-    // response, so successor evidence is a separate read of the run table.
     await vi.waitFor(async () => {
       const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId));
       const successor = runs.find((run) => run.id !== f.sourceRunId);
@@ -179,8 +206,6 @@ const support = await getEmbeddedPostgresTestSupport();
   it("M3: a run bound to the target passes the run identity guard (no cap audit; any refusal is a different branch)", async () => {
     const f = await fixture({ runBoundTo: "target" });
     const res = await resume(f);
-    // The guard admits the target-bound run. The fixture has no repository,
-    // so the rebuild itself fails closed and the row stays archived.
     expect(res.status).toBe(409);
     expect(res.body).toEqual({ error: "Failed to rebuild the execution workspace" });
     const after = await snapshot(f);
@@ -207,9 +232,6 @@ const support = await getEmbeddedPostgresTestSupport();
     const f = await fixture({ targetAssignee: "other", workspace: "none" });
     const res = await resume(f);
     const after = await snapshot(f);
-    // The fixture company uses the default open issue write policy, so a
-    // visible cross-agent resume is admitted. This is not new authority: it is
-    // the existing boundary that the archived workspace case must not widen.
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(res.body.metadata).toMatchObject({ authorizationReason: "allow_visible_issue_write" });
     expect(after.comments).toHaveLength(1);
@@ -274,4 +296,27 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(res.body.error).toBe("Issue is not resumable through comment follow-up intent");
     expect(after.comments).toHaveLength(0);
   });
+
+  for (const stage of ["review", "approval"] as const) {
+    it(`M9-${stage}: an in_review parent with a pending ${stage} stage and prior decision history keeps its stage, history, comments, workspace and runs`, async () => {
+      const f = await fixture({ targetStatus: "in_review", pendingStage: stage });
+      const before = await snapshot(f);
+      expect(before.issue.executionState).toMatchObject({ status: "pending", currentStageType: stage, lastDecisionOutcome: "changes_requested" });
+      expect(before.decisions).toHaveLength(1);
+      expect(before.workspace?.status).toBe("archived");
+      const res = await resume(f);
+      expect(res.status).toBe(409);
+      expect(res.body.error).toBe("Issue is not resumable through comment follow-up intent");
+      const after = await snapshot(f);
+      expect(after.issue.status).toBe("in_review");
+      expect(after.issue.executionPolicy).toEqual(before.issue.executionPolicy);
+      expect(after.issue.executionState).toEqual(before.issue.executionState);
+      expect(after.issue.assigneeAgentId).toBe(before.issue.assigneeAgentId);
+      expect(after.decisions).toEqual(before.decisions);
+      expect(after.comments).toHaveLength(0);
+      expect(after.audits).toHaveLength(0);
+      expect(after.workspace).toEqual(before.workspace);
+      expect(after.runCount).toBe(before.runCount);
+    });
+  }
 });
