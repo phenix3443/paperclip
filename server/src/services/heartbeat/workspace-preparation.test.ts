@@ -847,6 +847,68 @@ describe.skipIf(!support.supported)("heartbeat workspace preparation boundary", 
     expect(reopen).not.toHaveBeenCalled();
   });
 
+  // V3: the step's single service call returns rebuild_failed. The kinds differ
+  // in whether a rebuild call ran and whether the failure bookkeeping committed.
+  async function closedRowFacts(workspaceId: string) {
+    const [row] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, workspaceId));
+    return { status: row!.status, cleanupReason: row!.cleanupReason, cleanupEligibleAt: row!.cleanupEligibleAt,
+      generation: readExecutionWorkspaceLifecycleGeneration(row!.metadata as Record<string, unknown> | null), metadata: row!.metadata };
+  }
+  const workspaceActivity = (action: string) => db.select().from(activityLog).where(eq(activityLog.action, action));
+
+  it("V3-F1: a failure before any rebuild call fails the successor closed and leaves the row byte-identical", async () => {
+    const f = await archivedContinuationTarget();
+    await db.update(executionWorkspaces).set({ cleanupEligibleAt: new Date("2030-01-01T00:00:00Z"),
+      metadata: sql`coalesce(${executionWorkspaces.metadata}, '{}'::jsonb) || '{"gitCacheRestoration":{"schema":"malformed"}}'::jsonb` })
+      .where(eq(executionWorkspaces.id, f.workspace.id));
+    const successor = await dispatchedContinuationRun(f);
+    const before = await closedRowFacts(f.workspace.id);
+    expect(before.generation).toBe(f.generation);
+    const runtime = await import("../workspace-runtime.js");
+    const rebuild = vi.spyOn(runtime, "ensurePersistedExecutionWorkspaceAvailable");
+    await expect(successorStep(successor)).rejects.toThrow(/^Cross-task continuation could not reopen the target workspace: /);
+    expect(rebuild).not.toHaveBeenCalled();
+    expect(await closedRowFacts(f.workspace.id)).toEqual(before);
+    expect(await workspaceActivity("execution_workspace.reopen_failed")).toHaveLength(0);
+    expect(await workspaceActivity("execution_workspace.reopened")).toHaveLength(0);
+  });
+
+  it("V3-F3: a rebuild call that fails commits the failure bookkeeping and fails the successor closed", async () => {
+    const f = await archivedContinuationTarget();
+    const successor = await dispatchedContinuationRun(f);
+    const runtime = await import("../workspace-runtime.js");
+    const rebuild = vi.spyOn(runtime, "ensurePersistedExecutionWorkspaceAvailable").mockRejectedValueOnce(new Error("fixture rebuild failure"));
+    await expect(successorStep(successor)).rejects.toThrow(/^Cross-task continuation could not reopen the target workspace: /);
+    expect(rebuild).toHaveBeenCalledTimes(1);
+    const after = await closedRowFacts(f.workspace.id);
+    expect(after).toMatchObject({ status: "archived", cleanupEligibleAt: null, generation: f.generation + 1 });
+    expect(after.cleanupReason).toBeTruthy();
+    expect(await workspaceActivity("execution_workspace.reopen_failed")).toHaveLength(1);
+    expect(await workspaceActivity("execution_workspace.reopened")).toHaveLength(0);
+  });
+
+  it("V3-F2: a rebuild call that succeeds and then loses its bookkeeping leaves the row closed at the same generation", async () => {
+    const f = await archivedContinuationTarget();
+    const successor = await dispatchedContinuationRun(f);
+    const before = await closedRowFacts(f.workspace.id);
+    const runtime = await import("../workspace-runtime.js");
+    const rebuild = vi.spyOn(runtime, "ensurePersistedExecutionWorkspaceAvailable");
+    const activity = await import("../activity-log.js");
+    const realLogActivity = activity.logActivity;
+    vi.spyOn(activity, "logActivity").mockImplementation(async (database, entry) => {
+      if (entry.action === "execution_workspace.reopened") throw new Error("fixture activity failure");
+      return realLogActivity(database, entry);
+    });
+    await expect(successorStep(successor)).rejects.toThrow(/^Cross-task continuation could not reopen the target workspace: /);
+    expect(rebuild).toHaveBeenCalledTimes(1);
+    const after = await closedRowFacts(f.workspace.id);
+    expect({ ...after, metadata: undefined }).toEqual({ ...before, metadata: undefined });
+    expect(await workspaceActivity("execution_workspace.reopen_failed")).toHaveLength(0);
+    expect(await workspaceActivity("execution_workspace.reopened")).toHaveLength(0);
+    // The rebuilt worktree is not rolled back.
+    await expect(access(f.workspace.cwd!)).resolves.toBeUndefined();
+  });
+
   it("keeps the admitted recovery workspace when the issue now points elsewhere", async () => {
     const { input, issue } = await fixture(true);
     const first = await prepareHeartbeatWorkspace(db, input);
