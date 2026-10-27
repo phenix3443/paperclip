@@ -2,6 +2,9 @@ import { and, asc, eq, sql } from "drizzle-orm";
 import { createDb, executionWorkspaces, terminateDbConnections, withDedicatedDbConnection, type Db } from "@paperclipai/db";
 import { createEnvironmentGitRemoteAuthProvider, type GitRemoteAuthProvider } from "./git-credentials.js";
 import { withIsolatedRepositorySourceLock, IsolatedRepositorySourceBusy } from "./isolated-remote-workspace-source.js";
+import { withWorkspaceLockKeepalive } from "./native-runtime/native-workspace-lock-keepalive.js";
+import { GitExpirationBudgetExceeded, InspectionBudget, isScratchQuotaError, ROW_DRAIN_BOUND_MS,
+  type InspectionBudgetHooks } from "./git-expiration-budget.js";
 import { inspectLockedGitExpirationCandidate, gitExpirationSkipReason, gitExpirationSelectionFilter, isGitExpirationCandidate,
   LIVE_EXECUTION_WORKSPACE_STATUSES, pathExists, withAnonymousGitFallback, type Workspace } from "./git-workspace-expiration-inspection.js";
 
@@ -61,6 +64,9 @@ export type GitExpirationRoundSummary = {
   candidateBytes: number;
   lastSelectedKey: GitExpirationRoundKey | null;
   lastCompletedKey: GitExpirationRoundKey | null;
+  /** True when a row's lock chain had not unwound within the drain bound; its locks stay held. */
+  drainIncomplete: boolean;
+  undrainedRow: GitExpirationRoundKey | null;
   limits: string[];
 };
 
@@ -85,6 +91,14 @@ export type GitExpirationRoundOptions = {
   maxRows?: number;
   pageSize?: number;
   auth?: GitRemoteAuthProvider;
+  /**
+   * Receives the lock chain of a row that did not drain within the bound. The
+   * caller must keep the process alive until it settles, so the locks are never
+   * released while the row's Git children or walks still run.
+   */
+  onUndrainedRow?: (released: Promise<void>) => void;
+  /** Test seam for the per-row ledger. */
+  budgetHooks?: InspectionBudgetHooks;
 };
 
 const ROUND_LIMITS = [
@@ -104,7 +118,11 @@ function errorChain(error: unknown) {
 }
 
 export function gitExpirationRoundFailure(error: unknown): { kind: "database" | "resource_limit"; reason: string } | null {
-  for (const entry of errorChain(error)) {
+  const chain = errorChain(error);
+  const budget = chain.find((entry): entry is GitExpirationBudgetExceeded => entry instanceof GitExpirationBudgetExceeded);
+  if (budget) return { kind: "resource_limit", reason: budget.budget };
+  if (chain.some(isScratchQuotaError)) return { kind: "resource_limit", reason: "scratch" };
+  for (const entry of chain) {
     const { code, killed, signal } = entry as Error & { code?: unknown; killed?: unknown; signal?: unknown };
     if (entry.name === "PostgresError" || entry.name === "DrizzleQueryError" || (typeof code === "string" && code.startsWith("CONNECTION_"))) {
       return { kind: "database", reason: "database_error" };
@@ -120,30 +138,50 @@ export function readOnlyInspectionGitAuth(env: NodeJS.ProcessEnv = process.env):
   return withAnonymousGitFallback(createEnvironmentGitRemoteAuthProvider(env));
 }
 
-async function inspectRow(db: Db, workspace: Workspace, key: GitExpirationRoundKey, auth: GitRemoteAuthProvider,
-  signal: AbortSignal): Promise<GitExpirationRoundRow> {
+type RowInspection = {
+  /** Settles when the row result is known: work returned or threw, or the row signal aborted. */
+  outcome: Promise<GitExpirationRoundRow>;
+  /** Settles when the whole lock chain has unwound, after every Git group of the row is gone. */
+  released: Promise<void>;
+};
+
+function inspectRow(db: Db, workspace: Workspace, key: GitExpirationRoundKey, auth: GitRemoteAuthProvider,
+  roundSignal: AbortSignal, hooks: InspectionBudgetHooks | undefined): RowInspection {
   let current: GitExpirationRoundCurrentRow = { state: "not_read" };
   const row = (): GitExpirationRoundRow => ({ key, workspaceId: workspace.id, companyId: workspace.companyId, status: workspace.status,
     current, outcome: "rejected", reason: null, pendingExpiration: false, candidateBytes: 0 });
-  if (!isGitExpirationCandidate(workspace)) return { ...row(), outcome: "not_candidate", reason: "not_git_expiration_candidate" };
-  if (!workspace.sourceIssueId) return { ...row(), reason: "missing_source_issue" };
+  const settled = (value: GitExpirationRoundRow): RowInspection => ({ outcome: Promise.resolve(value), released: Promise.resolve() });
+  if (!isGitExpirationCandidate(workspace)) return settled({ ...row(), outcome: "not_candidate", reason: "not_git_expiration_candidate" });
+  if (!workspace.sourceIssueId) return settled({ ...row(), reason: "missing_source_issue" });
+  const sourceIssueId = workspace.sourceIssueId;
   const observeCurrent = (reread: { workspace: Workspace; updatedAtKey: string } | null) => {
     current = reread ? { state: "read", key: { updatedAt: reread.updatedAtKey, id: reread.workspace.id }, status: reread.workspace.status }
       : { state: "missing" };
     if (!reread || reread.updatedAtKey !== key.updatedAt) throw new Error("workspace_changed");
   };
-  try {
-    return await withIsolatedRepositorySourceLock(db, workspace.companyId, workspace.sourceIssueId, () =>
-      withDedicatedDbConnection(db, connection => connection.transaction(async tx => {
-        const inspection = await inspectLockedGitExpirationCandidate(tx, workspace, { now: new Date(), auth, signal, observeCurrent });
-        const live = LIVE_EXECUTION_WORKSPACE_STATUSES.includes(inspection.workspace.status);
-        if (!live && !inspection.state) throw new Error("missing_restoration_recipe");
-        if (inspection.state && (await pathExists(inspection.state.worktreeTrash)
-          || (inspection.state.baseTrash && await pathExists(inspection.state.baseTrash)))) throw new Error("ambiguous_expiration_trash");
-        return { ...row(), outcome: "candidate" as const, pendingExpiration: !!inspection.state, candidateBytes: inspection.candidateBytes };
-      })), true);
-  } catch (error) {
-    signal.throwIfAborted();
+  const budget = new InspectionBudget(roundSignal, hooks);
+  const signal = budget.signal;
+  // Lock order: source, then lifecycle. No finalizer of this chain runs before the
+  // work and the ledger drain have settled.
+  const chain = budget.run(() => withIsolatedRepositorySourceLock(db, workspace.companyId, sourceIssueId, () =>
+    withDedicatedDbConnection(db, connection => connection.transaction(async tx => {
+      const [setting] = await tx.execute<{ idle_timeout_ms: string | null }>(sql`select setting as idle_timeout_ms
+        from pg_settings where name = 'idle_in_transaction_session_timeout'`);
+      return withWorkspaceLockKeepalive(tx, Number(setting?.idle_timeout_ms), async () => {
+        try {
+          const inspection = await inspectLockedGitExpirationCandidate(tx, workspace, { now: new Date(), auth, signal, observeCurrent });
+          const live = LIVE_EXECUTION_WORKSPACE_STATUSES.includes(inspection.workspace.status);
+          if (!live && !inspection.state) throw new Error("missing_restoration_recipe");
+          if (inspection.state && (await pathExists(inspection.state.worktreeTrash)
+            || (inspection.state.baseTrash && await pathExists(inspection.state.baseTrash)))) throw new Error("ambiguous_expiration_trash");
+          return { ...row(), outcome: "candidate" as const, pendingExpiration: !!inspection.state, candidateBytes: inspection.candidateBytes };
+        } finally {
+          await budget.drain();
+        }
+      });
+    })), true));
+  const classify = (error: unknown): GitExpirationRoundRow => {
+    roundSignal.throwIfAborted();
     if (error instanceof IsolatedRepositorySourceBusy || (error instanceof Error && error.message === "lifecycle_busy")) {
       return { ...row(), outcome: "lock_busy", reason: "lock_busy" };
     }
@@ -151,6 +189,33 @@ async function inspectRow(db: Db, workspace: Workspace, key: GitExpirationRoundK
     if (failure?.kind === "database") throw error;
     if (failure) return { ...row(), outcome: "resource_limit", reason: failure.reason };
     return { ...row(), reason: gitExpirationSkipReason(error) };
+  };
+  const stopped = new Promise<GitExpirationRoundRow>((resolve, reject) => {
+    const onAbort = () => {
+      try { resolve(classify(signal.reason)); } catch (error) { reject(error); }
+    };
+    if (signal.aborted) onAbort();
+    else {
+      signal.addEventListener("abort", onAbort, { once: true });
+      chain.then(() => signal.removeEventListener("abort", onAbort), () => signal.removeEventListener("abort", onAbort));
+    }
+  });
+  const finished = chain.then(value => value, classify);
+  const outcome = Promise.race([finished, stopped]);
+  // The loser of the race must not surface as an unhandled rejection.
+  finished.catch(() => undefined);
+  stopped.catch(() => undefined);
+  return { outcome, released: chain.then(() => undefined, () => undefined) };
+}
+
+/** Resolves true when `released` settles within the bound after the outcome, false otherwise. */
+async function awaitRelease(released: Promise<void>) {
+  let timer: NodeJS.Timeout | undefined;
+  const bound = new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), ROW_DRAIN_BOUND_MS); });
+  try {
+    return await Promise.race([released.then(() => true as const), bound]);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -170,7 +235,8 @@ export async function inspectGitExpirationRound(options: GitExpirationRoundOptio
   const auth = options.auth ?? readOnlyInspectionGitAuth();
   const summary: GitExpirationRoundSummary = { roundId: options.roundId, status: "partial", stopReason: null, upperBound: null,
     exhausted: false, pages: 0, selected: 0, inspected: 0, candidates: 0, rejected: 0, notCandidates: 0, lockBusy: 0,
-    resourceLimited: 0, candidateBytes: 0, lastSelectedKey: null, lastCompletedKey: null, limits: ROUND_LIMITS };
+    resourceLimited: 0, candidateBytes: 0, lastSelectedKey: null, lastCompletedKey: null, drainIncomplete: false,
+    undrainedRow: null, limits: ROUND_LIMITS };
   let evidenceLost = false;
   const record = async (event: GitExpirationRoundEvent) => {
     try { await options.journal.append(event); return true; } catch { evidenceLost = true; return false; }
@@ -178,7 +244,10 @@ export async function inspectGitExpirationRound(options: GitExpirationRoundOptio
 
   const db = createDb(options.databaseUrl, { applicationName: GIT_EXPIRATION_ROUND_APPLICATION_NAME, maxConnections: 2,
     sessionParameters: GIT_EXPIRATION_ROUND_SESSION_PARAMETERS });
-  const cancel = () => { void terminateDbConnections(db); };
+  // The pool holds no advisory lock, so an abort may end it at once. Dedicated
+  // clients hold the row locks and end only through their own lock chain.
+  const endPool = () => db.$client.end({ timeout: 0 }).catch(() => undefined);
+  const cancel = () => { void endPool(); };
   signal.addEventListener("abort", cancel, { once: true });
   if (signal.aborted) cancel();
   try {
@@ -225,10 +294,19 @@ export async function inspectGitExpirationRound(options: GitExpirationRoundOptio
           summary.stopReason = stopReason();
           if (!summary.stopReason && options.maxRows !== undefined && summary.inspected >= options.maxRows) summary.stopReason = "row_budget";
           if (summary.stopReason) break scan;
-          let row: GitExpirationRoundRow;
+          const inspection = inspectRow(db, entry.workspace, keys[index]!, auth, signal, options.budgetHooks);
+          let row: GitExpirationRoundRow | null = null;
           try {
-            row = await inspectRow(db, entry.workspace, keys[index]!, auth, signal);
+            row = await inspection.outcome;
           } catch {
+            // Classified after the drain wait below.
+          }
+          if (!await awaitRelease(inspection.released)) {
+            summary.drainIncomplete = true;
+            summary.undrainedRow = keys[index]!;
+            options.onUndrainedRow?.(inspection.released);
+          }
+          if (!row) {
             summary.stopReason = stopReason() ?? "database_error";
             break scan;
           }
@@ -240,13 +318,16 @@ export async function inspectGitExpirationRound(options: GitExpirationRoundOptio
           else if (row.outcome === "not_candidate") summary.notCandidates += 1;
           else if (row.outcome === "lock_busy") { summary.lockBusy += 1; summary.stopReason = "lock_busy"; break scan; }
           else { summary.resourceLimited += 1; summary.stopReason = "resource_limit"; break scan; }
+          if (summary.drainIncomplete) { summary.stopReason = "resource_limit"; break scan; }
         }
         if (page.length < pageSize) { summary.exhausted = true; break scan; }
       }
     }
   } finally {
     signal.removeEventListener("abort", cancel);
-    await terminateDbConnections(db);
+    // An undrained row keeps its dedicated clients and locks until its chain unwinds.
+    if (summary.drainIncomplete) await endPool();
+    else await terminateDbConnections(db);
   }
 
   summary.stopReason ??= stopReason() ?? (evidenceLost ? "evidence_lost" : null);
