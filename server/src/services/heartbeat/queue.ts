@@ -174,6 +174,7 @@ import {
   crossTaskContinuationDeliveryGate,
   crossTaskContinuationDispatchKey,
   deferredDispatchReceiptIntentId,
+  DEFERRED_RECEIPT_READMISSION_DECLINED,
   isTrustedDeferredDispatchReceipt,
   listPromotableDeferredDispatchReceipts,
   NATIVE_STATUS_DISPATCH_ACTOR_PREFIX,
@@ -5124,17 +5125,26 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     return { scanned: candidates.length, dispatched, recovered, deferred, promoted };
   }
 
+  const deferredReceiptPromotionCursors = new Map<string, { requestedAt: Date; id: string }>();
+
   async function promoteDeferredDispatchReceipts(input: { companyId?: string; limit?: number }) {
     const pageSize = Math.max(1, Math.min(input.limit ?? 100, 500));
     const receipts: (typeof agentWakeupRequests.$inferSelect)[] = [];
-    let cursor: { requestedAt: Date; id: string } | null = null;
+    const scope = input.companyId ?? "*";
+    let cursor = deferredReceiptPromotionCursors.get(scope) ?? null;
     for (let scanned = 0; scanned < 500;) {
-      const page = await listPromotableDeferredDispatchReceipts(db, { companyId: input.companyId, limit: pageSize, after: cursor });
+      const page = await listPromotableDeferredDispatchReceipts(db, { companyId: input.companyId, limit: pageSize, after: cursor, includeDeclined: true });
       receipts.push(...page.promotable);
       scanned += page.scanned;
-      if (page.scanned < pageSize || !page.cursor || receipts.length >= pageSize) break;
+      if (page.scanned < pageSize || !page.cursor) {
+        cursor = null;
+        break;
+      }
       cursor = page.cursor;
+      if (receipts.length >= pageSize) break;
     }
+    if (cursor) deferredReceiptPromotionCursors.set(scope, cursor);
+    else deferredReceiptPromotionCursors.delete(scope);
     let promoted = 0;
     for (const receipt of receipts) {
       const identity = deferredDispatchReceiptIntentId(receipt);
@@ -5150,6 +5160,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         responsibleUserId: issues.responsibleUserId, executionWorkspaceId: issues.executionWorkspaceId,
       }).from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, receipt.companyId)));
       if (!intent || !target) continue;
+      if (!(await isTrustedDeferredDispatchReceipt(db, receipt, { companyId: receipt.companyId, agentId: receipt.agentId, issueId }))) continue;
       const intentPayload = parseObject(intent.payload);
       let gateError: string | null = null;
       if (target.status === "done" || target.status === "cancelled") {
@@ -5184,6 +5195,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           promoted += 1;
           await db.update(agentWakeupRequests).set({ runId: run.id, updatedAt: new Date() })
             .where(and(eq(agentWakeupRequests.id, intent.id), isNull(agentWakeupRequests.runId)));
+          await db.update(agentWakeupRequests).set({ error: null })
+            .where(and(eq(agentWakeupRequests.id, receipt.id), eq(agentWakeupRequests.error, DEFERRED_RECEIPT_READMISSION_DECLINED)));
+        } else {
+          await db.update(agentWakeupRequests).set({ error: DEFERRED_RECEIPT_READMISSION_DECLINED, updatedAt: new Date() })
+            .where(and(eq(agentWakeupRequests.id, receipt.id), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+              isNull(agentWakeupRequests.runId)));
         }
       } catch (error) {
         logger.warn({ err: error, wakeupRequestId: receipt.id }, "failed to re-admit a deferred dispatch receipt");

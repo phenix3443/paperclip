@@ -28,6 +28,8 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
 import { LEGACY_RECOVERY_CAUSE } from "../services/legacy-execution-recovery.js";
 import { readCrossTaskContinuationWork, registerCrossTaskContinuationWork } from "../services/cross-task-continuation-worker.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
@@ -38,6 +40,8 @@ import {
   CROSS_TASK_CONTINUATION_GATE_CHANGED,
   crossTaskContinuationDispatchKey,
   crossTaskContinuationIntentKey,
+  DEFERRED_RECEIPT_READMISSION_DECLINED,
+  listPromotableDeferredDispatchReceipts,
 } from "../services/cross-task-continuation.ts";
 
 const mockAdapterExecute = vi.hoisted(() =>
@@ -586,4 +590,113 @@ describeEmbeddedPostgres("cross-task continuation intent consumer", () => {
     expect(receipts).toHaveLength(1);
     expect(receipts[0]!.idempotencyKey).toBe(`native-dependency:${issueId}`);
   });
+
+  async function startNewConversation(f: { companyId: string; agentId: string; issueId: string }) {
+    const [boundary] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      authorUserId: "responsible-user", body: "/new", createdAt: new Date(Date.now() + 1000) }).returning();
+    await db.update(issues).set({ conversationState: "active", conversationAgentId: f.agentId,
+      conversationUserId: "responsible-user", conversationBoundaryCommentId: boundary!.id }).where(eq(issues.id, f.issueId));
+  }
+
+  it("a recovery action from before a newer /new boundary no longer holds a deferred continuation receipt, which is promoted to its one run", async () => {
+    const f = await deferUnderRecoveryHold();
+    expect((await readCrossTaskContinuationWork(db)).pending).toBe(false);
+    await instanceSettingsService(db).updateExperimental({ enableAgentChat: true });
+    try {
+      await startNewConversation(f);
+      expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+      expect((await listPromotableDeferredDispatchReceipts(db, { companyId: f.companyId, limit: 100 })).promotable)
+        .toMatchObject([{ id: f.receipt.id }]);
+      expect((await readCrossTaskContinuationWork(db)).pending).toBe(true);
+      expect(await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId })).toMatchObject({ promoted: 1 });
+      const runs = await f.runsFor();
+      expect(runs).toHaveLength(1);
+      expect(await dispatchReceipts(f.intent.id)).toMatchObject([{ id: f.receipt.id, runId: runs[0]!.id }]);
+      expect(await readIntent(f.intent.id)).toMatchObject({ runId: runs[0]!.id });
+      expect((await readCrossTaskContinuationWork(db)).pending).toBe(false);
+      await heartbeat.drainActiveRunExecutions();
+    } finally {
+      await instanceSettingsService(db).updateExperimental({ enableAgentChat: false });
+    }
+  });
+
+  it("a native status receipt released by a newer /new boundary is attempted, kept deferred by the conversation wake rule, and leaves the worker quiet", async () => {
+    const f = await deferUnderRecoveryHold();
+    await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+    await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "automation",
+      triggerDetail: "system", reason: "issue_blockers_resolved", requestedByActorType: "system",
+      requestedByActorId: "native-status-committer", idempotencyKey: `native-dependency:${f.issueId}`,
+      payload: { issueId: f.issueId, taskId: f.issueId, _paperclipWakeContext: { issueId: f.issueId, taskId: f.issueId } } });
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    const receipts = await db.select().from(agentWakeupRequests)
+      .where(sql`${agentWakeupRequests.requestedByActorId} like 'native-status-wake-dispatch:%'`);
+    expect(receipts).toMatchObject([{ status: "deferred_issue_execution", runId: null }]);
+    expect((await readCrossTaskContinuationWork(db)).pending).toBe(false);
+    await startNewConversation(f);
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+    expect((await listPromotableDeferredDispatchReceipts(db, { companyId: f.companyId, limit: 100 })).promotable)
+      .toMatchObject([{ id: receipts[0]!.id }]);
+    expect((await readCrossTaskContinuationWork(db)).pending).toBe(true);
+    for (let pass = 0; pass < 2; pass += 1) {
+      expect(await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId })).toMatchObject({ promoted: 0 });
+    }
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipts[0]!.id)))
+      .toMatchObject([{ status: "deferred_issue_execution", runId: null, error: DEFERRED_RECEIPT_READMISSION_DECLINED }]);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, receipts[0]!.id))).toHaveLength(0);
+    expect((await readCrossTaskContinuationWork(db)).pending).toBe(false);
+  });
+
+  it("a workspace restore hold survives a newer /new boundary and keeps the receipt deferred with no run", async () => {
+    const f = await deferUnderRecoveryHold();
+    await db.update(issueRecoveryActions).set({ evidence: { workspaceRestoreFailure: "restore_unsafe_archive" } })
+      .where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    await startNewConversation(f);
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).not.toBeNull();
+    expect((await listPromotableDeferredDispatchReceipts(db, { companyId: f.companyId, limit: 100 })).promotable).toHaveLength(0);
+    expect((await readCrossTaskContinuationWork(db)).pending).toBe(false);
+    expect(await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId })).toMatchObject({ promoted: 0 });
+    expect(await dispatchReceipts(f.intent.id)).toMatchObject([{ id: f.receipt.id, status: "deferred_issue_execution", runId: null }]);
+    expect(await f.runsFor()).toHaveLength(0);
+  });
+
+  it("ready work behind more than one worker page and one promotion pass of ownership-held receipts is found and promoted once", async () => {
+    const f = await seedTarget();
+    await db.update(agentWakeupRequests).set({ status: "coalesced" }).where(eq(agentWakeupRequests.id, f.intent.id));
+    const oldest = new Date(Date.now() - 60_000);
+    const heldIssues = Array.from({ length: 520 }, () => ({ id: randomUUID(), companyId: f.companyId,
+      title: "Ownership-held", status: "todo" as const, assigneeAgentId: f.agentId, responsibleUserId: "responsible-user" }));
+    await db.insert(issues).values(heldIssues);
+    const heldIntents = heldIssues.map(row => ({ id: randomUUID(), companyId: f.companyId, agentId: f.agentId,
+      source: "automation" as const, triggerDetail: "system" as const, status: "coalesced", requestedByActorType: "system" as const,
+      requestedByActorId: CROSS_TASK_CONTINUATION_COMMITTER_ID,
+      idempotencyKey: crossTaskContinuationIntentKey(row.id, randomUUID()), payload: { issueId: row.id } }));
+    await db.insert(agentWakeupRequests).values(heldIntents);
+    await db.insert(agentWakeupRequests).values(heldIntents.map(intent => ({ companyId: f.companyId, agentId: f.agentId,
+      source: "automation" as const, triggerDetail: "system" as const, status: "deferred_issue_execution", requestedAt: oldest,
+      requestedByActorType: "system" as const, requestedByActorId: crossTaskContinuationDispatchKey(intent.id),
+      idempotencyKey: crossTaskContinuationDispatchKey(intent.id), payload: { issueId: intent.payload.issueId } })));
+    await db.insert(heartbeatRuns).values(heldIssues.map(row => ({ companyId: f.companyId, agentId: f.agentId,
+      invocationSource: "assignment" as const, triggerDetail: "system" as const, status: "failed", runtimeMode: "legacy",
+      processPid: process.pid, contextSnapshot: { issueId: row.id },
+      runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } } })));
+    expect(await getExecutionBlocker(db, f.companyId, heldIssues[0]!.id)).toMatchObject({ cause: "execution_owner_active" });
+    expect((await readCrossTaskContinuationWork(db)).pending).toBe(false);
+    const ready = await deferUnderRecoveryHold();
+    await ready.resolve();
+    expect(await getExecutionBlocker(db, ready.companyId, ready.issueId)).toBeNull();
+    expect((await readCrossTaskContinuationWork(db)).pending).toBe(true);
+    let promoted = 0;
+    for (let pass = 0; pass < 3 && (await ready.runsFor()).length === 0; pass += 1) {
+      promoted += (await heartbeat.dispatchPendingNativeStatusWakeups({ limit: 1 })).promoted;
+    }
+    expect(promoted).toBe(1);
+    expect(await ready.runsFor()).toHaveLength(1);
+    expect(await dispatchReceipts(ready.intent.id)).toHaveLength(1);
+    const heldReceipts = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.requestedAt, oldest));
+    expect(heldReceipts).toHaveLength(520);
+    expect(heldReceipts.every(row => row.status === "deferred_issue_execution" && row.runId === null)).toBe(true);
+    expect((await readCrossTaskContinuationWork(db)).pending).toBe(false);
+    expect((await heartbeat.dispatchPendingNativeStatusWakeups({ limit: 1 })).promoted).toBe(0);
+    await heartbeat.drainActiveRunExecutions();
+  }, 120_000);
 });

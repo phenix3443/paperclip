@@ -1,6 +1,6 @@
 import { isPreDispatchReviewWait } from "./pre-dispatch-review-wait.js";
 import { preDispatchExecutionWaitRecoveryActionPredicate } from "./pre-dispatch-execution-wait.js";
-import { and, desc, eq, gt, inArray, not, or, sql } from "drizzle-orm";
+import { and, desc, eq, exists, gt, inArray, isNotNull, lte, not, or, sql } from "drizzle-orm";
 import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } from "./conversation-continuation.js";
 import { z } from "zod";
 import { agentWakeupRequests, chatConversations, chatEndpoints, environmentLeases, heartbeatRuns, issueComments, issues, issueRecoveryActions, nativeRunFinalizations, toolConnections, type Db } from "@paperclipai/db";
@@ -54,6 +54,32 @@ export function executionBlockerPredicate() {
   );
 }
 
+function restoreHoldRecoveryActionPredicate() {
+  return or(
+    unreconciledNativeExportPredicate(),
+    sql`${issueRecoveryActions.evidence}->>'workspaceRestoreFailure' = 'restore_unsafe_archive'`,
+    sql`${issueRecoveryActions.evidence}->'workspaceRestoreRecovery'->>'schema' = ${LEGACY_WORKSPACE_RECOVERY_SCHEMA}`,
+  );
+}
+
+export function issueHasRecoveryActionExecutionBlocker(db: Db) {
+  return exists(db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.companyId, issues.companyId),
+    eq(issueRecoveryActions.sourceIssueId, issues.id),
+    executionBlockerPredicate(),
+    or(
+      restoreHoldRecoveryActionPredicate(),
+      not(exists(db.select({ id: issueComments.id }).from(issueComments).where(and(
+        isNotNull(issues.conversationAgentId),
+        eq(issueComments.companyId, issues.companyId),
+        eq(issueComments.issueId, issues.id),
+        eq(issueComments.id, issues.conversationBoundaryCommentId),
+        lte(issueRecoveryActions.createdAt, issueComments.createdAt),
+      )))),
+    ),
+  )));
+}
+
 export async function getExecutionBlocker(db: Db, companyId: string, issueId: string, options?: { conversationResetCommentId?: string | null }): Promise<ExecutionBlocker | null> {
   const [conversation] = await db.select({ agentId: issues.conversationAgentId,
     boundaryId: issues.conversationBoundaryCommentId, status: issues.status,
@@ -67,11 +93,7 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     eq(issueRecoveryActions.companyId, companyId),
     eq(issueRecoveryActions.sourceIssueId, issueId),
     executionBlockerPredicate(),
-    or(
-      unreconciledNativeExportPredicate(),
-      sql`${issueRecoveryActions.evidence}->>'workspaceRestoreFailure' = 'restore_unsafe_archive'`,
-      sql`${issueRecoveryActions.evidence}->'workspaceRestoreRecovery'->>'schema' = ${LEGACY_WORKSPACE_RECOVERY_SCHEMA}`,
-    ),
+    restoreHoldRecoveryActionPredicate(),
   )).orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
   // A persisted user /new is an ordered context command, not a retry of uncertain work.
   // The normal issue execution lock still serializes it behind any active turn.

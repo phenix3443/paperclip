@@ -4,7 +4,6 @@ import {
   executionWorkspaces,
   heartbeatRuns,
   issueComments,
-  issueRecoveryActions,
   issues,
   type Db,
 } from "@paperclipai/db";
@@ -14,7 +13,7 @@ import { acquireExecutionWorkspaceLifecycleLock } from "./execution-workspace-li
 import { isClosedExecutionWorkspaceStatus, readExecutionWorkspaceLifecycleGeneration } from "./execution-workspaces.js";
 import { isDeadlockDetected, isUniqueViolation } from "../db-errors.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
-import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
+import { getExecutionBlocker, issueHasRecoveryActionExecutionBlocker } from "./execution-blocker.js";
 
 
 type Transaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -444,6 +443,7 @@ export function crossTaskContinuationDeliveryGate(
   return null;
 }
 
+export const DEFERRED_RECEIPT_READMISSION_DECLINED = "deferred_receipt_readmission_declined";
 export const NATIVE_STATUS_DISPATCH_ACTOR_PREFIX = "native-status-wake-dispatch:";
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -490,7 +490,7 @@ export async function isTrustedDeferredDispatchReceipt(
 
 export async function listPromotableDeferredDispatchReceipts(
   db: Db,
-  input: { companyId?: string; limit: number; after?: { requestedAt: Date; id: string } | null },
+  input: { companyId?: string; limit: number; after?: { requestedAt: Date; id: string } | null; includeDeclined?: boolean },
 ) {
   const rows = await db.select({ receipt: agentWakeupRequests }).from(agentWakeupRequests)
     .innerJoin(issues, and(
@@ -502,6 +502,8 @@ export async function listPromotableDeferredDispatchReceipts(
       eq(agentWakeupRequests.status, "deferred_issue_execution"),
       eq(agentWakeupRequests.requestedByActorType, "system"),
       isNull(agentWakeupRequests.runId),
+      input.includeDeclined ? undefined
+        : sql`${agentWakeupRequests.error} is distinct from ${DEFERRED_RECEIPT_READMISSION_DECLINED}`,
       or(
         and(sql`${agentWakeupRequests.requestedByActorId} = ${agentWakeupRequests.idempotencyKey}`,
           like(agentWakeupRequests.idempotencyKey, `${DISPATCH_KEY_PREFIX}%`)),
@@ -511,11 +513,7 @@ export async function listPromotableDeferredDispatchReceipts(
         eq(heartbeatRuns.id, issues.executionRunId),
         inArray(heartbeatRuns.status, [...LIVE_RUN_STATUSES]),
       ))))),
-      not(exists(db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
-        eq(issueRecoveryActions.companyId, issues.companyId),
-        eq(issueRecoveryActions.sourceIssueId, issues.id),
-        executionBlockerPredicate(),
-      )))),
+      not(issueHasRecoveryActionExecutionBlocker(db)),
       input.after ? or(
         gt(agentWakeupRequests.requestedAt, input.after.requestedAt),
         and(eq(agentWakeupRequests.requestedAt, input.after.requestedAt), gt(agentWakeupRequests.id, input.after.id)),
@@ -533,4 +531,14 @@ export async function listPromotableDeferredDispatchReceipts(
   }
   const last = rows.at(-1)?.receipt;
   return { promotable, scanned: rows.length, cursor: last ? { requestedAt: last.requestedAt, id: last.id } : null };
+}
+
+export async function hasPromotableDeferredDispatchReceipt(db: Db, input: { companyId?: string; pageSize?: number } = {}) {
+  let after: { requestedAt: Date; id: string } | null = null;
+  for (;;) {
+    const page = await listPromotableDeferredDispatchReceipts(db, { companyId: input.companyId, limit: input.pageSize ?? 100, after });
+    if (page.promotable.length > 0) return true;
+    if (!page.cursor || page.scanned < (input.pageSize ?? 100)) return false;
+    after = page.cursor;
+  }
 }

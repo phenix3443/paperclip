@@ -2,7 +2,7 @@ import { and, eq, inArray, isNull } from "drizzle-orm";
 import { agentWakeupRequests, type Db } from "@paperclipai/db";
 import type { createDeliveryWorkCoordinator } from "./delivery-work-coordinator.js";
 import { DELIVERY_QUEUES } from "./delivery-work-notifications.js";
-import { CROSS_TASK_CONTINUATION_COMMITTER_ID, listPromotableDeferredDispatchReceipts } from "./cross-task-continuation.js";
+import { CROSS_TASK_CONTINUATION_COMMITTER_ID, hasPromotableDeferredDispatchReceipt } from "./cross-task-continuation.js";
 
 type Coordinator = Pick<ReturnType<typeof createDeliveryWorkCoordinator>, "register">;
 
@@ -19,7 +19,7 @@ export async function readCrossTaskContinuationWork(db: Db, now = Date.now()) {
     ));
   let pending = false;
   let nextClaimDeadline: number | null = null;
-  if ((await listPromotableDeferredDispatchReceipts(db, { limit: 100 })).promotable.length > 0) pending = true;
+  if (await hasPromotableDeferredDispatchReceipt(db)) pending = true;
   for (const row of rows) {
     const staleAt = row.status === "claimed" && row.claimedAt
       ? row.claimedAt.getTime() + CROSS_TASK_CONTINUATION_STALE_CLAIM_MS
