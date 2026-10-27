@@ -16,10 +16,13 @@ import {
   issueExecutionDecisions,
   issueTreeHolds,
   issues,
+  agentWakeupRequests,
   projects,
 } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
+import { CROSS_TASK_CONTINUATION_COMMITTER_ID } from "../services/cross-task-continuation.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 vi.mock("../adapters/index.ts", async () => {
@@ -45,6 +48,7 @@ type FixtureOptions = {
   pauseHold?: boolean;
   activeTargetRun?: boolean;
   pendingStage?: "review" | "approval";
+  protectedWritePolicy?: boolean;
 };
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -85,6 +89,9 @@ const support = await getEmbeddedPostgresTestSupport();
       assigneeAgentId: options.targetAssignee === "other" ? otherAgentId : agentId,
       responsibleUserId: "responsible-user",
       executionWorkspaceSettings: { mode: "isolated_workspace" },
+      ...(options.protectedWritePolicy
+        ? { executionPolicy: { trustPreset: "low_trust_review", authorizationPolicy: { trustBoundary: { mode: "low_trust_review", companyId, projectIds: [projectId] } } } }
+        : {}),
     });
     if ((options.workspace ?? "archived") === "archived") {
       await db.insert(executionWorkspaces).values({
@@ -166,7 +173,11 @@ const support = await getEmbeddedPostgresTestSupport();
     ));
     const runs = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId));
     const decisions = await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, f.targetIssueId));
-    return { issue: issue!, workspace: workspace ?? null, comments, audits, runCount: runs.length, decisions };
+    const intents = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, f.companyId),
+      eq(agentWakeupRequests.requestedByActorId, CROSS_TASK_CONTINUATION_COMMITTER_ID),
+    ));
+    return { issue: issue!, workspace: workspace ?? null, comments, audits, runCount: runs.length, decisions, intents };
   }
 
   const resume = (f: Awaited<ReturnType<typeof fixture>>) =>
@@ -317,6 +328,105 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(after.audits).toHaveLength(0);
       expect(after.workspace).toEqual(before.workspace);
       expect(after.runCount).toBe(before.runCount);
+    });
+  }
+
+  // #75 section 5 review conditions for the deferred continuation (#69). The
+  // setting is instance-wide, so each case turns it on and back off.
+  async function withDeferredContinuation<T>(body: () => Promise<T>): Promise<T> {
+    const settings = instanceSettingsService(db);
+    await settings.updateExperimental({ enableCrossTaskDeferredContinuation: true });
+    try { return await body(); }
+    finally { await settings.updateExperimental({ enableCrossTaskDeferredContinuation: false }); }
+  }
+  const resumeWithRequestId = (f: Awaited<ReturnType<typeof fixture>>) =>
+    request(f.app).post(`/api/issues/${f.targetIssueId}/comments`)
+      .send({ body: "调度请求: fixture", resume: true, clientRequestId: randomUUID() });
+
+  it("M1 with the setting on: commits exactly one comment and one continuation intent and leaves the archived workspace untouched", async () => {
+    await withDeferredContinuation(async () => {
+      const f = await fixture();
+      const before = await snapshot(f);
+      const res = await resumeWithRequestId(f);
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      const after = await snapshot(f);
+      expect(after.comments).toHaveLength(1);
+      expect(after.intents).toHaveLength(1);
+      expect(after.intents[0]).toMatchObject({ agentId: f.agentId, payload: { issueId: f.targetIssueId } });
+      expect(after.issue.status).toBe("todo");
+      expect(after.workspace).toEqual(before.workspace);
+    });
+  });
+
+  it("M4a with the setting on admits through the same access decision as M4b", async () => {
+    await withDeferredContinuation(async () => {
+      const a = await fixture({ targetAssignee: "other" });
+      const resA = await resumeWithRequestId(a);
+      const b = await fixture({ targetAssignee: "other", workspace: "none" });
+      const resB = await resumeWithRequestId(b);
+      expect(resB.status, JSON.stringify(resB.body)).toBe(201);
+      expect(resA.status, JSON.stringify(resA.body)).toBe(201);
+      const [commentA] = (await snapshot(a)).comments;
+      const [commentB] = (await snapshot(b)).comments;
+      expect(commentA?.metadata).toMatchObject({ authorizationReason: "allow_visible_issue_write" });
+      expect(commentB?.metadata).toMatchObject({ authorizationReason: "allow_visible_issue_write" });
+      const afterA = await snapshot(a);
+      expect(afterA.intents).toHaveLength(1);
+      // The intent and its successor belong to the target's assignee, not the requester.
+      expect(afterA.intents[0]!.agentId).not.toBe(a.agentId);
+    });
+  });
+
+  it("M4a and M4b with the setting on are refused alike by a restrictive write policy, with no effects", async () => {
+    await withDeferredContinuation(async () => {
+      const responses: Array<{ status: number; body: unknown }> = [];
+      for (const workspace of ["archived", "none"] as const) {
+        const f = await fixture({ targetAssignee: "other", workspace, protectedWritePolicy: true });
+        const before = await snapshot(f);
+        const res = await resumeWithRequestId(f);
+        responses.push({ status: res.status, body: res.body });
+        expect(res.status, `${workspace}: ${JSON.stringify(res.body)}`).toBe(403);
+        const after = await snapshot(f);
+        expect(after.comments).toHaveLength(0);
+        expect(after.intents).toHaveLength(0);
+        expect(after.audits).toHaveLength(before.audits.length);
+        expect(after.issue.status).toBe(before.issue.status);
+        expect(after.workspace).toEqual(before.workspace);
+        expect(after.runCount).toBe(before.runCount);
+      }
+      // The archived-workspace request (M4a) gets the same refusal as M4b.
+      expect(responses[0]).toEqual(responses[1]);
+    });
+  });
+
+  const unchangedRefusals: Array<{ name: string; options: FixtureOptions; status: number; error: RegExp }> = [
+    { name: "M5", options: { actorCompany: "other" }, status: 404, error: /^Issue not found$/ },
+    { name: "M6", options: { actorRun: "absent" }, status: 403, error: /^Cross-issue writes need a run to attribute them to/ },
+    { name: "M7", options: { pauseHold: true }, status: 409, error: /^Issue follow-up blocked by active subtree pause hold$/ },
+    { name: "M9", options: { workspace: "none", targetStatus: "in_review" }, status: 409, error: /^Issue is not resumable through comment follow-up intent$/ },
+    { name: "M9-review", options: { targetStatus: "in_review", pendingStage: "review" }, status: 409, error: /^Issue is not resumable through comment follow-up intent$/ },
+    { name: "M9-approval", options: { targetStatus: "in_review", pendingStage: "approval" }, status: 409, error: /^Issue is not resumable through comment follow-up intent$/ },
+  ];
+  for (const refusal of unchangedRefusals) {
+    it(`${refusal.name} with the setting on keeps its refusal and has no effects`, async () => {
+      await withDeferredContinuation(async () => {
+        const f = await fixture(refusal.options);
+        const before = await snapshot(f);
+        const res = await resumeWithRequestId(f);
+        expect(res.status, JSON.stringify(res.body)).toBe(refusal.status);
+        expect(res.body.error).toMatch(refusal.error);
+        const after = await snapshot(f);
+        expect(after.comments).toHaveLength(0);
+        expect(after.intents).toHaveLength(0);
+        expect(after.audits).toHaveLength(before.audits.length);
+        expect(after.issue.status).toBe(before.issue.status);
+        expect(after.issue.executionPolicy).toEqual(before.issue.executionPolicy);
+        expect(after.issue.executionState).toEqual(before.issue.executionState);
+        expect(after.issue.assigneeAgentId).toBe(before.issue.assigneeAgentId);
+        expect(after.decisions).toEqual(before.decisions);
+        expect(after.workspace).toEqual(before.workspace);
+        expect(after.runCount).toBe(before.runCount);
+      });
     });
   }
 });
