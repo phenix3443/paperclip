@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   activityLog,
   agentConfigRevisions,
@@ -121,6 +121,30 @@ describeEmbeddedPostgres("companyService", () => {
       .toEqual(["manual", "company_paused"]);
     await lifecycleWorker.sweep();
     expect((await db.select().from(agents).where(eq(agents.id, agent.id)))[0].lifecycleHolds).toEqual(["manual"]);
+  });
+
+  it("defaults the reconciliation authority list to empty and waits for admission before changing it", async () => {
+    const [company] = await db.insert(companies).values({ name: "Authority", issuePrefix: "AUT" }).returning();
+    expect(company.executionReconciliationAuthority).toEqual({ agentIds: [] });
+    const agentId = randomUUID();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let locked!: () => void;
+    const lockedSignal = new Promise<void>((resolve) => { locked = resolve; });
+    const admission = db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock_shared(hashtextextended(${`exec-recon-authority:${company.id}`}, 0))`);
+      locked();
+      await held;
+    });
+    await lockedSignal;
+    let changed = false;
+    const update = companyService(db).update(company.id, { executionReconciliationAuthority: { agentIds: [agentId] } })
+      .then((result) => { changed = true; return result; });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(changed).toBe(false);
+    release();
+    await admission;
+    expect((await update)?.executionReconciliationAuthority).toEqual({ agentIds: [agentId] });
   });
 
   it("does not auto-provision bundled built-in agents for a freshly created company", async () => {
