@@ -130,19 +130,30 @@ export async function runGitExpirationRoundCli(argv: string[], env: NodeJS.Proce
   const journal = await openGitExpirationRoundJournal(args.evidenceDir);
   const controller = new AbortController();
   const abort = () => controller.abort();
-  process.once("SIGINT", abort);
-  process.once("SIGTERM", abort);
+  // `on`, not `once`: while an undrained row still holds its locks, a second stop
+  // signal must not fall back to the default action and end the process early.
+  process.on("SIGINT", abort);
+  process.on("SIGTERM", abort);
+  let undrained: Promise<void> | undefined;
   try {
-    const summary = await inspectGitExpirationRound({
-      databaseUrl: args.databaseUrl, mode: GIT_EXPIRATION_ROUND_MODE, roundId: args.roundId, journal, companyId: args.companyId, signal: controller.signal,
-      maxRows: args.maxRows, deadline: args.deadlineSeconds ? new Date(Date.now() + args.deadlineSeconds * 1000) : undefined,
-    });
-    process.stdout.write(`${JSON.stringify(summary)}\n`);
+    let summary;
+    try {
+      summary = await inspectGitExpirationRound({
+        databaseUrl: args.databaseUrl, mode: GIT_EXPIRATION_ROUND_MODE, roundId: args.roundId, journal, companyId: args.companyId, signal: controller.signal,
+        maxRows: args.maxRows, deadline: args.deadlineSeconds ? new Date(Date.now() + args.deadlineSeconds * 1000) : undefined,
+        onUndrainedRow: released => { undrained = released.catch(() => undefined); },
+      });
+      process.stdout.write(`${JSON.stringify(summary)}\n`);
+    } finally {
+      await journal.close();
+    }
+    // A drainIncomplete summary is partial, so this is exit 3 once the row releases.
     return gitExpirationRoundExitCode(summary);
   } finally {
+    // The undrained row keeps both advisory locks; exit only after its chain releases them.
+    await undrained;
     process.off("SIGINT", abort);
     process.off("SIGTERM", abort);
-    await journal.close();
   }
 }
 

@@ -14,7 +14,7 @@ import { inspectGitExpirationRound, assertGitExpirationRoundMode, GIT_EXPIRATION
   GitExpirationRoundInvariantError, gitExpirationRoundFailure, readOnlyInspectionGitAuth, GIT_EXPIRATION_ROUND_SESSION_PARAMETERS,
   type GitExpirationRoundEvent, type GitExpirationRoundJournal, type GitExpirationRoundOptions } from "../services/git-expiration-round.js";
 import { GitCacheRestorationFailure } from "../services/git-workspace-restoration.js";
-import { ROW_DRAIN_BOUND_MS } from "../services/git-expiration-budget.js";
+import { probeGitProcessGroup, ROW_DRAIN_BOUND_MS } from "../services/git-expiration-budget.js";
 import { createGitRemoteAuthProvider } from "../services/git-credentials.js";
 import { parseGitExpirationRoundArgs, runGitExpirationRoundCli, GitExpirationRoundUsageError, fileGitExpirationRoundJournal,
   readGitExpirationRoundJournal, gitExpirationRoundExitCode } from "../git-expiration-round-cli.js";
@@ -370,6 +370,34 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
     expect(journal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "resource_limit", reason: "git_output" });
   });
 
+  it("returns within the drain bound after a budget hit whose Git group is never proven empty, holding both locks", async () => {
+    const f = await reconstructable();
+    // While held, the probe never sees ESRCH, as for a group member stuck in uninterruptible sleep:
+    // the first Git child of the row is a survivor (a budget hit) and its group cannot drain.
+    let hold = true;
+    const undrained: Promise<void>[] = [];
+    const journal = memoryJournal();
+    const started = Date.now();
+    try {
+      const summary = await round(journal, { companyId: f.companyId, onUndrainedRow: released => undrained.push(released),
+        budgetHooks: { probeGroup: pgid => hold || probeGitProcessGroup(pgid) } });
+      expect(Date.now() - started).toBeLessThan(ROW_DRAIN_BOUND_MS + 5_000);
+      expect(summary).toMatchObject({ status: "partial", stopReason: "resource_limit", resourceLimited: 1, drainIncomplete: true,
+        undrainedRow: { id: f.workspaceId } });
+      expect(journal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "resource_limit", reason: "git_group_survivor" });
+      expect(journal.events.at(-1)).toMatchObject({ type: "round_finished", status: "partial", drainIncomplete: true });
+      expect(undrained).toHaveLength(1);
+      // The pool is gone, but the row's two dedicated sessions still hold the source and lifecycle locks.
+      expect(await advisoryLocks()).toBe(2);
+      expect(Number((await db.execute<{ count: string }>(sql`select count(distinct pid)::text as count from pg_locks
+        where locktype = 'advisory' and granted`))[0]!.count)).toBe(2);
+    } finally {
+      hold = false;
+    }
+    await undrained[0];
+    await waitFor(async () => await advisoryLocks() === 0 && await roundBackends() === 0);
+  }, 30_000);
+
   it("refuses writes on the round's root and dedicated sessions", async () => {
     const f = await seed(1);
     const readOnly = createDb(database.connectionString, { applicationName: GIT_EXPIRATION_ROUND_APPLICATION_NAME, maxConnections: 2,
@@ -625,6 +653,42 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
       expect(await advisoryLocks()).toBe(2);
     });
     await undrained[0];
+    await waitFor(async () => await lockWaiters() === 0 && await advisoryLocks() === 0 && await roundBackends() === 0);
+  }, 30_000);
+
+  it("keeps the CLI and its locks alive across stop signals until an undrained row releases, then exits 3", async () => {
+    const f = await seed(1);
+    const evidenceDir = path.join(root, `cli-undrained-${randomUUID()}`);
+    const written: string[] = [];
+    const write = vi.spyOn(process.stdout, "write").mockImplementation(chunk => { written.push(String(chunk)); return true; });
+    let exitCode: number | undefined;
+    let cli!: Promise<void>;
+    // The test worker has its own SIGTERM handler; deliver the signal only to the ones the CLI installs.
+    const workerHandlers = process.listeners("SIGTERM");
+    const sigterm = () => { for (const handler of process.listeners("SIGTERM")) if (!workerHandlers.includes(handler)) (handler as () => void)(); };
+    try {
+      await holdingTableLock("issues", async () => {
+        cli = runGitExpirationRoundCli(["--round-id", "cli-undrained", "--evidence-dir", evidenceDir, "--company-id", f.companyId],
+          { DATABASE_URL: database.connectionString }).then(code => { exitCode = code; });
+        await waitFor(async () => await lockWaiters() > 0 && await advisoryLocks() > 0);
+        sigterm();
+        await waitFor(async () => written.length > 0);
+        expect(JSON.parse(written[0]!)).toMatchObject({ status: "partial", stopReason: "aborted", drainIncomplete: true, undrainedRow: { id: f.ids[0] } });
+        const events = (await fs.readFile(path.join(evidenceDir, "events.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line) as { type: string });
+        expect(events.at(-1)).toMatchObject({ type: "round_finished", status: "partial", drainIncomplete: true });
+        // A second stop signal neither ends the process nor releases the row.
+        expect(process.listenerCount("SIGTERM")).toBe(workerHandlers.length + 1);
+        sigterm();
+        await new Promise(resolve => setTimeout(resolve, 200));
+        expect(exitCode).toBeUndefined();
+        expect(await advisoryLocks()).toBe(2);
+      });
+      await cli;
+    } finally {
+      write.mockRestore();
+    }
+    expect(exitCode).toBe(3);
+    expect(process.listenerCount("SIGTERM")).toBe(workerHandlers.length);
     await waitFor(async () => await lockWaiters() === 0 && await advisoryLocks() === 0 && await roundBackends() === 0);
   }, 30_000);
 

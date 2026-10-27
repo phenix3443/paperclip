@@ -178,7 +178,11 @@ type StopCause = "timeout" | "abort" | "output" | "survivor";
 export function runBoundedGit(args: string[], options: BoundedGitOptions): Promise<BoundedGitResult> {
   const budget = currentInspectionBudget();
   if (!budget) return execGit(args, options);
-  budget.takeGitSlot();
+  try {
+    budget.takeGitSlot();
+  } catch (error) {
+    return Promise.reject(error);
+  }
   return budget.track(runInGroup(budget, args, options).finally(() => budget.releaseGitSlot()));
 }
 
@@ -194,6 +198,8 @@ function runInGroup(budget: InspectionBudget, args: string[], options: BoundedGi
     const stderr: Buffer[] = [];
     let outputBytes = 0;
     let stopCause: StopCause | null = null;
+    // A budget hit aborts the row when it happens, not when the group is later proven empty.
+    let budgetError: GitExpirationBudgetExceeded | null = null;
     let leaderExit: { code: number | null; signal: NodeJS.Signals | null } | null = null;
     let spawnError: Error | null = null;
     let killTimer: NodeJS.Timeout | undefined;
@@ -223,7 +229,10 @@ function runInGroup(budget: InspectionBudget, args: string[], options: BoundedGi
         outputBytes += chunk.length;
         budget.peaks.childOutputBytes = Math.max(budget.peaks.childOutputBytes, outputBytes);
         if (outputBytes > outputCap) {
-          stop("output");
+          if (!stopCause) {
+            budgetError = budget.exceeded(new GitExpirationBudgetExceeded("git_output", GIT_EXPIRATION_BUDGETS.childOutputBytes, outputBytes));
+            stop("output");
+          }
           return;
         }
         if (!stopCause) target.push(chunk);
@@ -248,7 +257,10 @@ function runInGroup(budget: InspectionBudget, args: string[], options: BoundedGi
         return;
       }
       // Members left after the leader closed make the command result unusable.
-      if (budget.probeGroup(pgid)) stop("survivor");
+      if (!stopCause && budget.probeGroup(pgid)) {
+        budgetError = budget.exceeded(new GitExpirationBudgetExceeded("git_group_survivor"));
+        stop("survivor");
+      }
       waitForEmptyGroup();
     });
 
@@ -275,11 +287,8 @@ function runInGroup(budget: InspectionBudget, args: string[], options: BoundedGi
     function settle() {
       const out = Buffer.concat(stdout).toString("utf8");
       const err = Buffer.concat(stderr).toString("utf8");
+      if (budgetError) return reject(budgetError);
       if (stopCause === "abort") return reject(abortError(signal));
-      if (stopCause === "output") {
-        return reject(budget.exceeded(new GitExpirationBudgetExceeded("git_output", GIT_EXPIRATION_BUDGETS.childOutputBytes, outputBytes)));
-      }
-      if (stopCause === "survivor") return reject(budget.exceeded(new GitExpirationBudgetExceeded("git_group_survivor")));
       if (stopCause === "timeout") {
         return reject(Object.assign(new Error(`git ${args[0] ?? ""} timed out`), { code: null, killed: true, signal: "SIGTERM",
           stdout: out, stderr: err }));
