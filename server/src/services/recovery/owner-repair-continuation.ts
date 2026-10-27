@@ -42,20 +42,11 @@ export type OwnerRepairSettlement = {
   deliveredAt?: string | null;
   deliveredRunId?: string | null;
   deniedReason?: string | null;
-  /**
-   * Latest temporary refusal; it never consumes the reserved receipt. Every
-   * queue wait is released at the bound version, so a version change after a
-   * wait is never its release and the old request stays stale.
-   */
+  /** Latest temporary refusal; it never consumes the reserved receipt. */
   lastWait?: OwnerRepairWait | null;
 };
 
-/**
- * A typed temporary refusal, recorded under the issue lock together with the
- * issue version and status decision it was observed at.
- */
 export type OwnerRepairWait = {
-  /** Queue gate code (for example `issue_dependencies_blocked`) or `dispatch_deferred`. */
   reason: string;
   message?: string | null;
   at: string;

@@ -3524,9 +3524,6 @@ export function recoveryService(
       // neither a successor nor another repair may start.
       const settledEvent = await durableRepairSettlementEvent(repairRun!);
       if (!settledEvent) return "pending_settlement";
-      // The measurement event records a terminal outcome, not release. The
-      // provider stop, scratch cleanup and process tree need the same durable
-      // release proof that case handoffs use, on completion and on the sweep.
       if (!(await isRunExecutionReleased(db, { runId: repairRun!.id, issueId: action.sourceIssueId }))) {
         return "pending_settlement";
       }
@@ -3739,11 +3736,7 @@ export function recoveryService(
     });
   }
 
-  /**
-   * Saves why a reserved continuation is waiting, with the issue version and
-   * decision it was observed at under the issue lock. An unchanged open wait
-   * writes nothing, so a repeated refusal keeps its original observation.
-   */
+  /** Saves why a reserved continuation is waiting; unchanged reasons write nothing. */
   async function recordOwnerRepairWait(
     action: typeof issueRecoveryActions.$inferSelect,
     settlement: OwnerRepairSettlement,
@@ -3796,8 +3789,6 @@ export function recoveryService(
     // Recover the commit/ack gap first: an accepted receipt is the successor.
     let receipt = await acceptedOwnerRepairReceipt(action, settlement);
     if (!receipt) {
-      // A reservation can predate the release gate. Every new dispatch needs
-      // the repair run's durable execution release, not only a new settlement.
       if (!(await isRunExecutionReleased(db, { runId: settlement.repairRunId, issueId: action.sourceIssueId }))) {
         return "pending_settlement";
       }

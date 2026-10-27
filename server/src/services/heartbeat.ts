@@ -3896,9 +3896,8 @@ export function heartbeatService(
         const handoff = await pendingCaseHandoffForRun(db, run.id);
         if (handoff) await recordCaseHandoffExecutionReleased(db, run.id, handoff.issueId);
       }
-      // A completed owner repair settles once its executor is released. Recovery
-      // re-checks the same durable release proof, and its sweep repeats this
-      // settlement if the attempt is lost or cleanup is still pending here.
+      // A completed owner repair settles as soon as its executor is released.
+      // The recovery sweep repeats the same settlement if this attempt is lost.
       if (executionReleased && latestRun?.status === "succeeded" &&
           latestRun.contextSnapshot?.wakeReason === ISSUE_DISPOSITION_REPAIR_RETRY_REASON) {
         await recovery.settleCompletedOwnerRepairRun(latestRun)

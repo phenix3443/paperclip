@@ -249,11 +249,6 @@ export async function recordCaseHandoffExecutionReleased(db: Db, runId: string, 
 const RUN_EXECUTION_RELEASE_SCHEMA = "paperclip.run-execution-release.v1";
 const TERMINAL_RUN_STATUSES = ["succeeded", "failed", "cancelled", "interrupted", "timed_out"];
 
-/**
- * The executor records this only after the provider stopped, scratch cleanup
- * finished and the owned process tree is gone. A terminal status alone is not
- * this proof.
- */
 export async function recordRunExecutionReleased(db: Db, runId: string, issueId: string) {
   await db.update(heartbeatRuns).set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ||
     ${JSON.stringify({ executionReleased: { schema: RUN_EXECUTION_RELEASE_SCHEMA, runId, issueId,
@@ -268,18 +263,14 @@ function hasRunExecutionReleaseMarker(run: typeof heartbeatRuns.$inferSelect, is
   return handoff?.schema === "paperclip.case-handoff-release.v1" && handoff.runId === run.id && handoff.issueId === issueId;
 }
 
-/**
- * Durable execution-release contract for work that may start only after a run
- * released its execution: case handoffs and owner-repair settlement. The
- * executor's marker is the normal proof. After a lost marker or a restart, only
- * host/provider-owned stop evidence can establish release, never a terminal
- * status or an expired controller lease. Workspace recovery stays a separate gate.
- */
 export async function isRunExecutionReleased(db: Db, input: { runId: string; issueId: string }): Promise<boolean> {
   const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.runId)).then(rows => rows[0]);
   if (!run || !TERMINAL_RUN_STATUSES.includes(run.status) || isNativeRunnerOwnershipHeld(run)) return false;
   if (await hasPendingRunCleanup(db, run.companyId, run.id)) return false;
   if (hasRunExecutionReleaseMarker(run, input.issueId)) return true;
+  // A controller may die after cleanup but before writing its marker. Recover
+  // only from host/provider-owned stop evidence, never a terminal status or an
+  // expired controller lease. Workspace recovery remains an independent gate.
   const recovery = run.resultJson?.executionRecovery as Record<string, unknown> | undefined;
   // setRunStatusFromLive records bootstrap evidence when cancelling an
   // unclaimed queue entry. Its persisted absence of a first start and runtime

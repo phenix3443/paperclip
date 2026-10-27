@@ -8119,8 +8119,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         payload: { phase: "task.run.measured", outcome: "succeeded", durableSettlement: true },
       });
     }
-    // The executor's release proof: provider stopped, scratch removed and the
-    // owned process tree is gone.
     if (opts.durableSettlement !== false && opts.executionReleased !== false) {
       await recordRunExecutionReleased(db, repairRunId, issueId);
     }
@@ -8405,11 +8403,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(after.action).toMatchObject({ status: "resolved", attemptCount: 1 });
   });
 
-  /**
-   * Reports a real host process group to the executor through `onSpawn`, as a
-   * local adapter does. With `linger`, a descendant outlives the group leader,
-   * so the adapter's own exit does not prove the process tree stopped.
-   */
   async function reportOwnedProcessGroup(input: unknown, opts: { linger: boolean }) {
     const invocation = input as { onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void> };
     const startedAt = new Date().toISOString();
@@ -8426,8 +8419,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   }
 
   async function replayOwnerRepairThroughExecutor(fixture: Awaited<ReturnType<typeof seedCompletedOwnerRepairFixture>>) {
-    // Replay the scheduled repair through the real executor instead of seeding
-    // its terminal row.
     await db.update(heartbeatRuns).set({
       status: "queued", startedAt: null, finishedAt: null, resultJson: null, exitCode: null,
     }).where(eq(heartbeatRuns.id, fixture.repairRunId));
@@ -8435,11 +8426,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
   it("settles a completed owner repair from its run completion without waiting for the sweep", async () => {
     const fixture = await seedCompletedOwnerRepairFixture({ durableSettlement: false });
-    // Completion itself must settle the action.
+    // Replay the scheduled repair through the real executor instead of seeding
+    // its terminal row: completion itself must settle the action.
     await replayOwnerRepairThroughExecutor(fixture);
 
-    // As reported, the repair pushes its fix and leaves the task blocked. Its
-    // whole process group has exited before the adapter returns.
+    // As reported, the repair pushes its fix and leaves the task blocked.
     mockAdapterExecute.mockImplementationOnce(async (input?: unknown) => {
       await reportOwnedProcessGroup(input, { linger: false });
       await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, fixture.issueId));
@@ -8475,7 +8466,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const fixture = await seedCompletedOwnerRepairFixture({ durableSettlement: false });
     await replayOwnerRepairThroughExecutor(fixture);
     const reported: { owned: Awaited<ReturnType<typeof reportOwnedProcessGroup>> | null } = { owned: null };
-    // The run succeeds, but a descendant of its process group is still alive.
     mockAdapterExecute.mockImplementationOnce(async (input?: unknown) => {
       reported.owned = await reportOwnedProcessGroup(input, { linger: true });
       await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, fixture.issueId));
@@ -8499,7 +8489,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const owned = reported.owned!;
     expect(isPidAlive(owned.descendantPid!)).toBe(true);
 
-    // Neither the completion callback nor the sweep settles while the tree lives.
     await heartbeat.reconcileStrandedAssignedIssues();
     await heartbeat.reconcileStrandedAssignedIssues();
     const held = await observeOwnerRepairContinuation(fixture);
@@ -8509,8 +8498,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(held.repeatedRepairs).toHaveLength(0);
     expect(held.action).toMatchObject({ status: "active", attemptCount: 1 });
 
-    // Once the whole group stops, the sweep establishes the release proof and
-    // settles exactly once, however often it runs.
     process.kill(-owned.processGroupId!, "SIGKILL");
     await expect.poll(() => isPidAlive(owned.descendantPid!)).toBe(false);
     await heartbeat.reconcileStrandedAssignedIssues();
@@ -8555,7 +8542,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(repairRun.status).toBe("succeeded");
     expect(repairRun.resultJson ?? {}).not.toHaveProperty("executionReleased");
 
-    // An earlier release reserved the continuation without this proof.
     const { reservedId } = await reserveOwnerRepairContinuation(fixture);
     await heartbeat.reconcileStrandedAssignedIssues();
     await heartbeat.reconcileStrandedAssignedIssues();
@@ -8783,12 +8769,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     return { reservedId, reopened: reopened! };
   }
 
-  /**
-   * Applies one native status decision to the task, as the status committer
-   * does: the decision row and the issue's status, version and last decision
-   * move together. The deciding run belongs to another agent so it is not
-   * mistaken for an owner run.
-   */
   async function applyNativeStatusDecision(
     fixture: Awaited<ReturnType<typeof seedCompletedOwnerRepairFixture>>,
     transition: { fromStatus: string; toStatus: string },
