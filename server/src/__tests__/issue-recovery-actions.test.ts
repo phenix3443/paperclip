@@ -7,6 +7,7 @@ import request from "supertest";
 import { and, eq, sql } from "drizzle-orm";
 import { issueApprovalService } from "../services/issue-approvals.js";
 import { approvalService } from "../services/approvals.js";
+import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import {
@@ -2177,6 +2178,83 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const logged = await db.select().from(activityLog).where(eq(activityLog.action, "issue.execution_reconciliation_key_settled"));
     expect(logged).toHaveLength(1);
     expect(logged[0]!.details).toMatchObject({ idempotencyKey: key, state: "abandoned" });
+  });
+
+  describe("PATCH rechecks execution policy transition inputs under the row lock (G3)", () => {
+    const reviewPolicy = (agentId: string) => normalizeIssueExecutionPolicy({
+      stages: [{ id: randomUUID(), type: "review", participants: [{ type: "agent", agentId }] }],
+    })!;
+    const issueRowLockWaiters = async () => (await db.execute(sql`select count(*)::int as n from pg_stat_activity
+      where wait_event_type = 'Lock' and query ilike 'select "id", "company_id", "conversation_agent_id"%'`) as unknown as { n: number }[])[0]!.n;
+
+    it("refuses a PATCH computed before a review policy committed under the lock it waited on", async () => {
+      const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+      await db.update(issues).set({ status: "in_progress", assigneeAgentId: coderId, executionPolicy: null, executionState: null })
+        .where(eq(issues.id, sourceIssueId));
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      let locked!: () => void;
+      const lockedSignal = new Promise<void>((resolve) => { locked = resolve; });
+      const policyWriter = db.transaction(async (tx) => {
+        await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, sourceIssueId)).for("update");
+        locked();
+        await held;
+        await tx.update(issues).set({ executionPolicy: reviewPolicy(managerId) as any }).where(eq(issues.id, sourceIssueId));
+      });
+      await lockedSignal;
+      const pending = request(createApp({ type: "board", source: "local_implicit", userId: "board-user" }))
+        .patch(`/api/issues/${sourceIssueId}`).send({ status: "done" }).then((response) => response);
+      for (let attempt = 0; attempt < 50 && await issueRowLockWaiters() === 0; attempt += 1) await new Promise((r) => setTimeout(r, 50));
+      expect(await issueRowLockWaiters()).toBe(1);
+      release();
+      await policyWriter;
+      const response = await pending;
+      expect(response.status).toBe(409);
+      expect(response.body).toMatchObject({ details: { code: "execution_policy_transition_stale" } });
+      const [after] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(after!.status).toBe("in_progress");
+      expect(after!.executionPolicy).not.toBeNull();
+      expect(companyId).toBeTruthy();
+    });
+
+    it("keeps a PATCH that committed before the policy writer, and the policy written after it", async () => {
+      const { managerId, coderId, sourceIssueId } = await seedCompany();
+      await db.update(issues).set({ status: "in_progress", assigneeAgentId: coderId, executionPolicy: null, executionState: null })
+        .where(eq(issues.id, sourceIssueId));
+      const app = createApp({ type: "board", source: "local_implicit", userId: "board-user" });
+      const done = await request(app).patch(`/api/issues/${sourceIssueId}`).send({ status: "done" });
+      expect(done.status).toBe(200);
+      const policy = await request(app).patch(`/api/issues/${sourceIssueId}`).send({ executionPolicy: reviewPolicy(managerId) });
+      expect(policy.status).toBe(200);
+      const [after] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(after!.status).toBe("done");
+      expect(after!.executionPolicy).not.toBeNull();
+    });
+
+    it("lets an unrelated edit through when the locked row changed but neither row is policy-governed", async () => {
+      const { coderId, sourceIssueId } = await seedCompany();
+      await db.update(issues).set({ status: "in_progress", assigneeAgentId: coderId, executionPolicy: null, executionState: null })
+        .where(eq(issues.id, sourceIssueId));
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      let locked!: () => void;
+      const lockedSignal = new Promise<void>((resolve) => { locked = resolve; });
+      const writer = db.transaction(async (tx) => {
+        await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, sourceIssueId)).for("update");
+        locked();
+        await held;
+        await tx.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+      });
+      await lockedSignal;
+      const pending = request(createApp({ type: "board", source: "local_implicit", userId: "board-user" }))
+        .patch(`/api/issues/${sourceIssueId}`).send({ title: "Renamed while blocked" }).then((response) => response);
+      for (let attempt = 0; attempt < 50 && await issueRowLockWaiters() === 0; attempt += 1) await new Promise((r) => setTimeout(r, 50));
+      release();
+      await writer;
+      expect((await pending).status).toBe(200);
+      const [after] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(after!).toMatchObject({ title: "Renamed while blocked", status: "blocked" });
+    });
   });
 
   describe("execution reconciliation admission (slice A1)", () => {

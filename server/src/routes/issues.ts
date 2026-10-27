@@ -351,6 +351,7 @@ import {
 } from "../services/company-search-rate-limit.js";
 import {
   applyIssueExecutionPolicyTransition,
+  executionPolicyTransitionInputFingerprint,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
@@ -2027,21 +2028,6 @@ function buildIssueSubtreeDiagnosticsResponse(input: {
     truncatedSections,
     caps: input.caps,
   };
-}
-
-function executionPolicyTransitionInputFingerprint(issue: {
-  status: string; assigneeAgentId: string | null; assigneeUserId: string | null;
-  responsibleUserId?: string | null; createdByUserId?: string | null;
-  executionPolicy?: unknown; executionState?: unknown;
-  monitorNextCheckAt?: Date | null; monitorWakeRequestedAt?: Date | null; monitorLastTriggeredAt?: Date | null;
-  monitorAttemptCount?: number | null; monitorNotes?: string | null; monitorScheduledBy?: string | null;
-}) {
-  const iso = (value: Date | null | undefined) => (value ? new Date(value).toISOString() : null);
-  return JSON.stringify([
-    issue.status, issue.assigneeAgentId, issue.assigneeUserId, issue.responsibleUserId ?? null, issue.createdByUserId ?? null,
-    issue.executionPolicy ?? null, issue.executionState ?? null, iso(issue.monitorNextCheckAt), iso(issue.monitorWakeRequestedAt),
-    iso(issue.monitorLastTriggeredAt), issue.monitorAttemptCount ?? null, issue.monitorNotes ?? null, issue.monitorScheduledBy ?? null,
-  ]);
 }
 
 const ACTIVE_REVIEW_APPROVAL_STATUSES = new Set([
@@ -14410,21 +14396,12 @@ export function issueRoutes(
         monitorExplicitlyUpdated:
           req.body.executionPolicy !== undefined && monitorChanged,
       });
-      const executionPolicyTransitionFingerprint = executionPolicyTransitionInputFingerprint(existing);
-      const governedByExecutionPolicy = (row: { executionPolicy?: unknown; executionState?: unknown }) =>
-        row.executionPolicy != null || row.executionState != null;
-      const executionPolicyTransitionGuarded = expectedStatusVersion === undefined &&
-        (Object.keys(transition.patch).length > 0 || Boolean(transition.decision) || governedByExecutionPolicy(existing));
-      const assertLockedExecutionPolicyTransitionUnchanged = async (tx: Parameters<typeof svc.update>[2]) => {
-        const lockedExisting = await svc.getByIdForUpdate(id, tx);
-        if (!lockedExisting) return;
-        if (executionPolicyTransitionInputFingerprint(lockedExisting) === executionPolicyTransitionFingerprint) return;
-        if (Object.keys(transition.patch).length > 0 || Boolean(transition.decision) ||
-            governedByExecutionPolicy(existing) || governedByExecutionPolicy(lockedExisting)) {
-          throw conflict("The task changed while this update was prepared. Refresh and retry.",
-            { code: "execution_policy_transition_stale" });
+      const expectedExecutionPolicyTransition = expectedStatusVersion === undefined
+        ? {
+          inputs: executionPolicyTransitionInputFingerprint(existing),
+          changesTask: Object.keys(transition.patch).length > 0 || Boolean(transition.decision),
         }
-      };
+        : undefined;
       const decisionId = transition.decision ? randomUUID() : null;
       if (decisionId) {
         const nextExecutionState = transition.patch.executionState;
@@ -14781,6 +14758,7 @@ export function issueRoutes(
         workspaceSelectionActor: req.actor,
         expectedExecutionPolicy,
         expectedStatusVersion,
+        expectedExecutionPolicyTransition,
         actorAgentId: actor.agentId ?? null,
         actorRunId: actor.agentId ? actor.runId : null,
         actorRunStopId: actor.agentId && interruptedRunId === actor.runId ? issueMutationStopId : null,
@@ -14936,12 +14914,10 @@ export function issueRoutes(
         Boolean(decision) ||
         shouldRelayStop ||
         persistReviewActivityTransactionally ||
-        reviewPolicySensitiveMutationRequested ||
-        executionPolicyTransitionGuarded;
+        reviewPolicySensitiveMutationRequested;
       try {
         if (shouldUseTransactionalIssueUpdate) {
           issue = await db.transaction(async (tx) => {
-            if (executionPolicyTransitionGuarded) await assertLockedExecutionPolicyTransitionUnchanged(tx);
             if (
               reviewPolicySensitiveMutationRequested &&
               !(await assertLockedReviewPolicyAllowsMutation(tx))

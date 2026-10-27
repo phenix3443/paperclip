@@ -144,11 +144,9 @@ function createEmptyRelationReadDb() {
     from: vi.fn().mockReturnThis(),
     where: vi.fn(async () => []),
   };
-  const db = {
+  return {
     select: vi.fn().mockReturnValue(query),
-    transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback(db),
   };
-  return db;
 }
 
 async function createApp(db: unknown = createEmptyRelationReadDb()) {
@@ -199,6 +197,7 @@ function issueUpdateWithReceipt(issue: ReturnType<typeof makeIssue>, patch: Reco
     actorUserId: _actorUserId,
     workspaceSelectionActor: _workspaceSelectionActor,
     blockedByIssueIds: _blockedByIssueIds,
+    expectedExecutionPolicyTransition: _expectedExecutionPolicyTransition,
     ...issuePatch
   } = patch;
   const updated = {

@@ -161,6 +161,7 @@ import {
 } from "./native-runtime/native-chat-review-presentation.js";
 import {
   applyIssueExecutionPolicyTransition,
+  executionPolicyTransitionInputFingerprint,
   buildInitialIssueMonitorFields,
   normalizeIssueExecutionPolicy,
 } from "./issue-execution-policy.js";
@@ -10831,6 +10832,7 @@ export function issueService(db: Db) {
         workspaceSelectionActor?: AuthorizationActor;
         expectedExecutionPolicy?: typeof issues.$inferInsert.executionPolicy;
         expectedStatusVersion?: number;
+        expectedExecutionPolicyTransition?: { inputs: string; changesTask: boolean };
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
@@ -10882,6 +10884,7 @@ export function issueService(db: Db) {
         workspaceSelectionActor,
         expectedExecutionPolicy,
         expectedStatusVersion,
+        expectedExecutionPolicyTransition,
         ...issueData
       } = data;
       if (expectedStatusVersion !== undefined && (
@@ -11143,6 +11146,14 @@ export function issueService(db: Db) {
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
         if (actorRunId) await assertNoCaseHandoffMutation(tx, actorRunId, id);
+        if (expectedExecutionPolicyTransition &&
+            executionPolicyTransitionInputFingerprint(receiptExisting) !== expectedExecutionPolicyTransition.inputs &&
+            (expectedExecutionPolicyTransition.changesTask || receiptExisting.executionPolicy != null ||
+              receiptExisting.executionState != null)) {
+          throw conflict("The task changed while this update was prepared. Refresh and retry.", {
+            code: "execution_policy_transition_stale",
+          });
+        }
         if (expectedStatusVersion !== undefined && (
           receiptExisting.statusVersion !== expectedStatusVersion || receiptExisting.status !== "backlog"
         )) {
