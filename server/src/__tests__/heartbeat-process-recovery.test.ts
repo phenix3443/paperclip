@@ -8530,6 +8530,58 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(after.action).toMatchObject({ status: "resolved", attemptCount: 1 });
   });
 
+  it("holds a reservation made before the release gate until its repair's process tree is released", async () => {
+    const fixture = await seedCompletedOwnerRepairFixture({ durableSettlement: false });
+    await replayOwnerRepairThroughExecutor(fixture);
+    const reported: { owned: Awaited<ReturnType<typeof reportOwnedProcessGroup>> | null } = { owned: null };
+    mockAdapterExecute.mockImplementationOnce(async (input?: unknown) => {
+      reported.owned = await reportOwnedProcessGroup(input, { linger: true });
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, fixture.issueId));
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+        summary: "Pushed the fix commit; remaining work continues.", provider: "test", model: "test-model" };
+    });
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, fixture.issueId));
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+        summary: "Finished the remaining work.", provider: "test", model: "test-model" };
+    });
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+    const owned = reported.owned!;
+    expect(isPidAlive(owned.descendantPid!)).toBe(true);
+    const repairRun = await db.select().from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, fixture.repairRunId)).then((rows) => rows[0]!);
+    expect(repairRun.status).toBe("succeeded");
+    expect(repairRun.resultJson ?? {}).not.toHaveProperty("executionReleased");
+
+    // An earlier release reserved the continuation without this proof.
+    const { reservedId } = await reserveOwnerRepairContinuation(fixture);
+    await heartbeat.reconcileStrandedAssignedIssues();
+    await heartbeat.reconcileStrandedAssignedIssues();
+    const held = await observeOwnerRepairContinuation(fixture);
+    expect(held.settlement).toMatchObject({ state: "pending_dispatch", wakeupRequestId: reservedId });
+    expect(held.receipts).toHaveLength(0);
+    expect(held.businessSuccessors).toHaveLength(0);
+    expect(held.repeatedRepairs).toHaveLength(0);
+    expect(held.action).toMatchObject({ status: "active", attemptCount: 1 });
+
+    process.kill(-owned.processGroupId!, "SIGKILL");
+    await expect.poll(() => isPidAlive(owned.descendantPid!)).toBe(false);
+    await heartbeat.reconcileStrandedAssignedIssues();
+    await heartbeat.drainActiveRunExecutions();
+    await heartbeat.reconcileStrandedAssignedIssues();
+    await heartbeat.reconcileStrandedAssignedIssues();
+
+    const after = await observeOwnerRepairContinuation(fixture);
+    expect(after.repeatedRepairs).toHaveLength(0);
+    expect(after.businessSuccessors).toHaveLength(1);
+    expect(after.receipts.map((receipt) => receipt.id)).toEqual([reservedId]);
+    expect(after.receipts[0]!.runId).toBe(after.businessSuccessors[0]!.id);
+    expect(after.settlement).toMatchObject({ state: "delivered", wakeupRequestId: reservedId });
+    expect(after.action).toMatchObject({ status: "resolved", attemptCount: 1 });
+  });
+
   it("holds the sweep's owner-repair settlement until the run's execution release is proven", async () => {
     const fixture = await seedCompletedOwnerRepairFixture({ executionReleased: false });
 

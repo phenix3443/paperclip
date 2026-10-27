@@ -3796,6 +3796,11 @@ export function recoveryService(
     // Recover the commit/ack gap first: an accepted receipt is the successor.
     let receipt = await acceptedOwnerRepairReceipt(action, settlement);
     if (!receipt) {
+      // A reservation can predate the release gate. Every new dispatch needs
+      // the repair run's durable execution release, not only a new settlement.
+      if (!(await isRunExecutionReleased(db, { runId: settlement.repairRunId, issueId: action.sourceIssueId }))) {
+        return "pending_settlement";
+      }
       try {
         await deps.enqueueWakeup(settlement.ownerAgentId, {
           source: "automation",
