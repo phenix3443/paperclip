@@ -293,6 +293,14 @@ export function createGitRemoteAuthProvider(
   };
 }
 
+export function createEnvironmentGitRemoteAuthProvider(env: NodeJS.ProcessEnv = process.env): GitRemoteAuthProvider {
+  return async (remoteUrl: string) => {
+    if (!isSupportedGitHubRemoteUrl(remoteUrl)) return null;
+    const token = env.GITHUB_TOKEN?.trim() || env.GH_TOKEN?.trim() || "";
+    return token ? buildGitAuthInvocation({ token, source: "server_env", secretName: null }) : null;
+  };
+}
+
 export async function resolveManagedGitHubIdentitySelection(
   db: Db,
   companyId: string,

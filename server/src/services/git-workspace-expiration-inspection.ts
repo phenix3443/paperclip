@@ -143,10 +143,14 @@ export type GitExpirationInspection = {
 };
 
 export async function inspectLockedGitExpirationCandidate(tx: Tx, snapshot: Workspace,
-  options: { now: Date; auth: GitRemoteAuthProvider; signal?: AbortSignal }): Promise<GitExpirationInspection> {
+  options: { now: Date; auth: GitRemoteAuthProvider; signal?: AbortSignal;
+    observeCurrent?: (current: { workspace: Workspace; updatedAtKey: string } | null) => void }): Promise<GitExpirationInspection> {
   const acquired = await tx.execute<{ locked: boolean }>(sql`select pg_try_advisory_xact_lock(hashtextextended(${`execution_workspace_lifecycle:${snapshot.id}`}, 0)) as locked`);
   if (!acquired[0]?.locked) throw new Error("lifecycle_busy");
-  const workspace = (await tx.select().from(executionWorkspaces).where(and(eq(executionWorkspaces.id, snapshot.id), eq(executionWorkspaces.companyId, snapshot.companyId))))[0];
+  const current = (await tx.select({ workspace: executionWorkspaces, updatedAtKey: sql<string>`${executionWorkspaces.updatedAt}::text` })
+    .from(executionWorkspaces).where(and(eq(executionWorkspaces.id, snapshot.id), eq(executionWorkspaces.companyId, snapshot.companyId))))[0] ?? null;
+  options.observeCurrent?.(current);
+  const workspace = current?.workspace;
   if (!workspace || workspace.updatedAt.getTime() !== snapshot.updatedAt.getTime()) throw new Error("workspace_changed");
   if (!await isGitWorkspaceExpirationEligible(tx, workspace, options.now)) throw new Error("live_or_unresolved_consumer");
   const live = LIVE_EXECUTION_WORKSPACE_STATUSES.includes(workspace.status);

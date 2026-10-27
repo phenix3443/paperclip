@@ -10,7 +10,7 @@ import type { GitRemoteAuthProvider } from "./git-credentials.js";
 import { localRepositoryPath } from "./local-repository-path.js";
 import { managedProjectCheckoutName } from "./managed-project-checkout-name.js";
 import { materializeManagedProjectWorkspace } from "./managed-repository-checkout.js";
-import { ensureSavedGitCommit, gitCacheCommand, GitCacheRestorationFailure } from "./git-workspace-restoration.js";
+import { ensureSavedGitCommit, gitCacheCommand, GitCacheRestorationFailure, onGitExit } from "./git-workspace-restoration.js";
 
 export const CLAUDE_SETTINGS_PATH = ".claude/settings.local.json";
 const SETTINGS_LIMIT = 64 * 1024;
@@ -122,7 +122,7 @@ export function selectRestoredProjectRepositories<T extends { id: string; repoUr
 
 export async function readManagedCheckoutContents(checkout: string, name: string, source: ManagedCheckoutSource, signal?: AbortSignal): Promise<ManagedCheckoutContents> {
   const commit = (await gitCacheCommand(checkout, ["rev-parse", "HEAD"], signal)).trim();
-  const branchName = (await gitCacheCommand(checkout, ["symbolic-ref", "--quiet", "--short", "HEAD"], signal).catch(() => "")).trim() || null;
+  const branchName = (await gitCacheCommand(checkout, ["symbolic-ref", "--quiet", "--short", "HEAD"], signal).catch(onGitExit(() => ""))).trim() || null;
   return { name, source, commit, branchName };
 }
 

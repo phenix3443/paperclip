@@ -67,8 +67,18 @@ The round writes `events.jsonl` in the evidence directory. Each line is one even
 | --- | --- |
 | `round_started` | Round identifier, `upperBound`, mode, page size and limits |
 | `page_selected` | Page number and selected keys |
-| `row_inspected` | Key, workspace, outcome, reason and candidate bytes |
+| `row_inspected` | Selected key, current row, workspace, outcome, reason and candidate bytes |
 | `round_finished` | Summary |
+
+`current` in `row_inspected` is the row that the round read again under the lifecycle lock:
+
+| `current.state` | Meaning |
+| --- | --- |
+| `read` | `current.key` and `current.status` are the values read under the lock. A key that is not the selected key gives `rejected` with `workspace_changed`. |
+| `missing` | The row no longer exists. |
+| `not_read` | The round did not read the row again, for example because the row is not a candidate or a lock is busy. |
+
+If an abort or the deadline arrives while the round writes a `complete` `round_finished`, the round writes a second `round_finished` with status `partial`. The last `round_finished` is the result of the round.
 
 Row outcomes:
 
@@ -78,7 +88,7 @@ Row outcomes:
 | `rejected` | Native expiration would skip the workspace. The reason is the native reason. |
 | `not_candidate` | The sweep selects the row, but the row does not go to Git expiration. |
 | `lock_busy` | Another process holds the source lock or the lifecycle lock. |
-| `resource_limit` | A Git command timeout, a Git output limit or a native helper budget stopped the inspection. |
+| `resource_limit` | A Git command timeout, a Git output limit or a native helper budget stopped the inspection. Only a normal non-zero Git exit can give a rejection. |
 
 ## Complete and partial
 

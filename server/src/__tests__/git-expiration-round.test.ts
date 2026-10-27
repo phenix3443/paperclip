@@ -6,23 +6,52 @@ import { randomUUID } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq, sql } from "drizzle-orm";
-import { companies, issues, executionWorkspaces, createDb } from "@paperclipai/db";
+import { companies, issues, executionWorkspaces, createDb, terminateDbConnections, withDedicatedDbConnection, type Db } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { materializeIsolatedRemoteWorkspaceSource } from "../services/isolated-remote-workspace-source.js";
 import { realizeExecutionWorkspace } from "../services/workspace-runtime.js";
 import { inspectGitExpirationRound, assertGitExpirationRoundMode, GIT_EXPIRATION_ROUND_MODE, GIT_EXPIRATION_ROUND_APPLICATION_NAME,
-  GitExpirationRoundInvariantError, gitExpirationRoundFailure, type GitExpirationRoundEvent, type GitExpirationRoundOptions } from "../services/git-expiration-round.js";
+  GitExpirationRoundInvariantError, gitExpirationRoundFailure, readOnlyInspectionGitAuth, GIT_EXPIRATION_ROUND_SESSION_PARAMETERS,
+  type GitExpirationRoundEvent, type GitExpirationRoundOptions } from "../services/git-expiration-round.js";
 import { GitCacheRestorationFailure } from "../services/git-workspace-restoration.js";
+import { createGitRemoteAuthProvider } from "../services/git-credentials.js";
 import { parseGitExpirationRoundArgs, runGitExpirationRoundCli, GitExpirationRoundUsageError } from "../git-expiration-round-cli.js";
 
-const recipeFailure = vi.hoisted(() => ({ error: null as Error | null }));
-vi.mock("../services/git-workspace-restoration.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../services/git-workspace-restoration.js")>();
-  return { ...actual, inspectGitCacheRecipe: async (...args: Parameters<typeof actual.inspectGitCacheRecipe>) => {
-    if (recipeFailure.error) throw recipeFailure.error;
-    return actual.inspectGitCacheRecipe(...args);
+const faults = vi.hoisted(() => ({ git: null as ((args: readonly string[]) => Error | null) | null, seamWrite: false, secretServices: 0 }));
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  const { promisify: promisifyActual } = await import("node:util");
+  const run = promisifyActual(actual.execFile);
+  const execFile = Object.assign((...args: Parameters<typeof actual.execFile>) => actual.execFile(...args), {
+    [promisifyActual.custom]: (file: string, args: readonly string[] = [], options?: object) => {
+      const fault = file === "git" ? faults.git?.(args) : null;
+      return fault ? Promise.reject(fault) : run(file, args as string[], options as never);
+    },
+  });
+  return { ...actual, execFile };
+});
+vi.mock("../services/secrets.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/secrets.js")>();
+  return { ...actual, secretService: (...args: Parameters<typeof actual.secretService>) => { faults.secretServices += 1; return actual.secretService(...args); } };
+});
+vi.mock("../services/git-workspace-expiration-inspection.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/git-workspace-expiration-inspection.js")>();
+  const { executionWorkspaces: table } = await import("@paperclipai/db");
+  const { eq: equals } = await import("drizzle-orm");
+  return { ...actual, inspectLockedGitExpirationCandidate: async (...args: Parameters<typeof actual.inspectLockedGitExpirationCandidate>) => {
+    if (faults.seamWrite) await args[0].update(table).set({ name: "mutated" }).where(equals(table.id, args[1].id));
+    return actual.inspectLockedGitExpirationCandidate(...args);
   } };
 });
+const gitTimeout = () => Object.assign(new Error("Command failed: git"), { killed: true, signal: "SIGTERM", code: null });
+const gitOutputLimit = () => Object.assign(new Error("stdout maxBuffer length exceeded"), { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" });
+const sqlState = (error: unknown) => {
+  for (let current = error; current instanceof Error; current = current.cause) {
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === "string") return code;
+  }
+  return null;
+};
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const gitEnv = { ...process.env, GIT_AUTHOR_NAME: "Fixture", GIT_AUTHOR_EMAIL: "fixture@example.test",
@@ -65,6 +94,19 @@ describe("one-round Git expiration inspection boundaries", () => {
     expect(gitExpirationRoundFailure(new Error("unproven_workspace_ownership"))).toBeNull();
   });
 
+  it("resolves remote proof credentials from the server environment without a secret or database path", async () => {
+    faults.secretServices = 0;
+    const auth = readOnlyInspectionGitAuth({ GITHUB_TOKEN: " env-token " });
+    for (const url of ["https://github.com/fixture/repo.git", "git@github.com:fixture/repo.git"]) {
+      expect(await auth(url)).toMatchObject({ env: { GITHUB_TOKEN: "env-token", GH_TOKEN: "env-token" } });
+    }
+    expect(await auth("https://gitlab.example.test/fixture/repo.git")).toBeNull();
+    expect(await readOnlyInspectionGitAuth({})("https://github.com/fixture/repo.git")).toBeNull();
+    expect(faults.secretServices).toBe(0);
+    try { createGitRemoteAuthProvider({} as Db, "company"); } catch (error) { expect(error).toBeInstanceOf(Error); }
+    expect(faults.secretServices).toBe(1);
+  });
+
   it("rejects conflicting flags and environment before opening the database", async () => {
     const base = ["--round-id", "r1", "--evidence-dir", "/srv/evidence/r1"];
     const env = { DATABASE_URL: "postgres://127.0.0.1:1/never" };
@@ -102,7 +144,7 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
     process.env.PAPERCLIP_HOME = path.join(root, "home");
     process.env.PAPERCLIP_INSTANCE_ID = "default";
   });
-  afterEach(async () => { recipeFailure.error = null; await db.execute(sql`TRUNCATE TABLE companies CASCADE`); });
+  afterEach(async () => { faults.git = null; faults.seamWrite = false; await db.execute(sql`TRUNCATE TABLE companies CASCADE`); });
   afterAll(async () => {
     if (previousHome === undefined) delete process.env.PAPERCLIP_HOME; else process.env.PAPERCLIP_HOME = previousHome;
     if (previousInstance === undefined) delete process.env.PAPERCLIP_INSTANCE_ID; else process.env.PAPERCLIP_INSTANCE_ID = previousInstance;
@@ -237,16 +279,32 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
     expect(summary).toMatchObject({ status: "complete", selected: 4, notCandidates: 3, rejected: 1 });
   });
 
-  it("reports a row changed after selection as a native rejection", async () => {
+  it("reports a row changed after selection as a native rejection with its selected and current keys", async () => {
     const f = await seed(1);
     const journal = memoryJournal(async event => {
       if (event.type === "page_selected" && event.keys.length) {
-        await db.update(executionWorkspaces).set({ updatedAt: new Date() }).where(eq(executionWorkspaces.id, f.ids[0]!));
+        await db.update(executionWorkspaces).set({ updatedAt: new Date(), status: "idle" }).where(eq(executionWorkspaces.id, f.ids[0]!));
       }
     });
     const summary = await round(journal, { companyId: f.companyId });
-    expect(summary).toMatchObject({ status: "complete", rejected: 1 });
-    expect(journal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "rejected", reason: "workspace_changed" });
+    expect(summary).toMatchObject({ status: "complete", rejected: 1, selected: 1, pages: 1 });
+    const [current] = await db.execute<{ key: string }>(sql`select updated_at::text as key from execution_workspaces where id = ${f.ids[0]}`);
+    const selected = journal.events.find(event => event.type === "page_selected");
+    const row = journal.events.find(event => event.type === "row_inspected");
+    expect(row).toMatchObject({ outcome: "rejected", reason: "workspace_changed", status: "active",
+      key: selected?.type === "page_selected" ? selected.keys[0] : null,
+      current: { state: "read", key: { updatedAt: current!.key, id: f.ids[0] }, status: "idle" } });
+    if (row?.type !== "row_inspected" || row.current.state !== "read") throw new Error("missing current row");
+    expect(row.current.key.updatedAt).not.toBe(row.key.updatedAt);
+  });
+
+  it("records a row deleted after selection as missing", async () => {
+    const f = await seed(1);
+    const journal = memoryJournal(async event => {
+      if (event.type === "page_selected" && event.keys.length) await db.delete(executionWorkspaces).where(eq(executionWorkspaces.id, f.ids[0]!));
+    });
+    expect(await round(journal, { companyId: f.companyId })).toMatchObject({ status: "complete", rejected: 1 });
+    expect(journal.events.find(event => event.type === "row_inspected")).toMatchObject({ reason: "workspace_changed", current: { state: "missing" } });
   });
 
   it("stops partial on a busy source lock without waiting", async () => {
@@ -270,12 +328,45 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
     expect(journal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "resource_limit", reason: "worktree_fetch_head_budget" });
   });
 
-  it("stops partial when a wrapped Git timeout ends an inspection", async () => {
-    const f = await seed(2);
-    recipeFailure.error = new GitCacheRestorationFailure(Object.assign(new Error("Command failed: git fetch"), { killed: true, signal: "SIGTERM" }));
+  it("stops partial when Git times out in a proof step that tolerates a normal Git failure", async () => {
+    const f = await reconstructable();
+    faults.git = args => args.includes("ORIG_HEAD") ? gitTimeout() : null;
     const journal = memoryJournal();
-    expect(await round(journal, { companyId: f.companyId })).toMatchObject({ status: "partial", stopReason: "resource_limit", inspected: 1, selected: 2 });
-    expect(journal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "resource_limit", reason: "git_timeout" });
+    expect(await round(journal, { companyId: f.companyId })).toMatchObject({ status: "partial", stopReason: "resource_limit", resourceLimited: 1, candidates: 0 });
+    expect(journal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "resource_limit", reason: "git_timeout",
+      current: { state: "read" } });
+  });
+
+  it("stops partial when Git output is too large in an ancestry proof", async () => {
+    const f = await reconstructable();
+    await fs.writeFile(path.join(git(f.cwd, "rev-parse", "--absolute-git-dir"), "ORIG_HEAD"), `${git(f.cwd, "rev-parse", "HEAD")}\n`);
+    faults.git = args => args.includes("merge-base") && args.includes("--is-ancestor") ? gitOutputLimit() : null;
+    const journal = memoryJournal();
+    expect(await round(journal, { companyId: f.companyId })).toMatchObject({ status: "partial", stopReason: "resource_limit", candidates: 0 });
+    expect(journal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "resource_limit", reason: "git_output_limit" });
+  });
+
+  it("refuses writes on the round's root and dedicated sessions", async () => {
+    const f = await seed(1);
+    const readOnly = createDb(database.connectionString, { applicationName: GIT_EXPIRATION_ROUND_APPLICATION_NAME, maxConnections: 2,
+      sessionParameters: GIT_EXPIRATION_ROUND_SESSION_PARAMETERS });
+    try {
+      const root = await readOnly.update(companies).set({ name: "mutated" }).where(eq(companies.id, f.companyId)).then(() => null, error => error);
+      expect(sqlState(root)).toBe("25006");
+      const dedicated = await withDedicatedDbConnection(readOnly, connection => connection.transaction(tx =>
+        tx.update(companies).set({ name: "mutated" }).where(eq(companies.id, f.companyId)))).then(() => null, error => error);
+      expect(sqlState(dedicated)).toBe("25006");
+    } finally { await terminateDbConnections(readOnly); }
+    expect((await db.select().from(companies).where(eq(companies.id, f.companyId)))[0]?.name).toBe("Round fixture");
+  });
+
+  it("ends partial with a database error when the inspection writes through the read-only session", async () => {
+    const f = await seed(2);
+    faults.seamWrite = true;
+    const journal = memoryJournal();
+    expect(await round(journal, { companyId: f.companyId })).toMatchObject({ status: "partial", stopReason: "database_error", inspected: 0, selected: 2 });
+    expect(journal.events.some(event => event.type === "row_inspected")).toBe(false);
+    expect((await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.companyId, f.companyId))).map(row => row.name)).not.toContain("mutated");
   });
 
   it("ends partial when the row budget is spent", async () => {
@@ -300,6 +391,28 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
     const emptyPage = new AbortController();
     expect(await round(memoryJournal(event => { if (event.type === "page_selected") emptyPage.abort(); }), { companyId: randomUUID(), signal: emptyPage.signal }))
       .toMatchObject({ status: "partial", stopReason: "aborted", exhausted: true, selected: 0 });
+  });
+
+  it("does not report complete when the abort or deadline arrives while the terminal record is written", async () => {
+    const f = await seed(1);
+    const controller = new AbortController();
+    const aborted = memoryJournal(event => { if (event.type === "round_finished") controller.abort(); });
+    expect(await round(aborted, { companyId: f.companyId, signal: controller.signal })).toMatchObject({ status: "partial", stopReason: "aborted" });
+    const finished = aborted.events.filter(event => event.type === "round_finished");
+    expect(finished.map(event => event.type === "round_finished" && [event.status, event.stopReason])).toEqual([["complete", null], ["partial", "aborted"]]);
+
+    const deadline = new Date(Date.now() + 10_000);
+    const late = memoryJournal(event => { if (event.type === "round_finished") vi.setSystemTime(deadline.getTime() + 1); });
+    try {
+      expect(await round(late, { companyId: f.companyId, deadline })).toMatchObject({ status: "partial", stopReason: "deadline" });
+    } finally { vi.useRealTimers(); }
+    expect(late.events.filter(event => event.type === "round_finished").at(-1)).toMatchObject({ status: "partial", stopReason: "deadline" });
+
+    const lost = new AbortController();
+    const failing = memoryJournal(event => {
+      if (event.type === "round_finished") { lost.abort(); if (event.status === "partial") throw new Error("disk full"); }
+    });
+    expect(await round(failing, { companyId: f.companyId, signal: lost.signal })).toMatchObject({ status: "partial", stopReason: "evidence_lost" });
   });
 
   it("cancels a blocked page query and releases its connections", async () => {

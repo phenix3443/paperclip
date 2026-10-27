@@ -101,6 +101,14 @@ export function readGitCacheRestoration(workspace: Workspace): GitCacheRestorati
   return recipe;
 }
 
+export function onGitExit<T>(handle: (error: unknown) => T) {
+  return (error: unknown): T => {
+    const { code, killed } = error as { code?: unknown; killed?: unknown };
+    if (error instanceof Error && typeof code === "number" && killed !== true) return handle(error);
+    throw error;
+  };
+}
+
 export async function gitCacheCommand(cwd: string, args: string[], signal?: AbortSignal) {
   const result = await execFile("git", ["-c", "core.fsmonitor=false", "-C", cwd, ...args], {
     timeout: 60_000, signal, maxBuffer: 16 * 1024 * 1024,
@@ -208,7 +216,7 @@ export async function assertReproducibleManagedCheckout(checkout: string, input:
   const localTips = new Set([
     ...(await gitCacheCommand(checkout, ["rev-parse", "--verify", "HEAD^{commit}"], signal)).split("\n"),
     ...(await gitCacheCommand(checkout, ["for-each-ref", "--format=%(objectname)"], signal)).split("\n"),
-    ...(await gitCacheCommand(checkout, ["reflog", "show", "--all", "--format=%H"], signal).catch(() => "")).split("\n"),
+    ...(await gitCacheCommand(checkout, ["reflog", "show", "--all", "--format=%H"], signal).catch(onGitExit(() => ""))).split("\n"),
   ].map(line => line.trim()).filter(sha => shaPattern.test(sha)));
   if (localTips.size > MANAGED_CHECKOUT_LOCAL_TIP_LIMIT) throw new Error("managed_checkout_local_tip_budget");
   if (localTips.size && await hasCommitsMissingUpstream(checkout, [...localTips], input.repoUrl, input.resolveGitAuth, signal)) {
@@ -281,9 +289,9 @@ async function assertReproducibleFetchHead(cwd: string, gitDir: string, signal?:
   }
   for (const commit of commits) {
     signal?.throwIfAborted();
-    const objectType = await gitCacheCommand(cwd, ["cat-file", "-t", commit], signal).catch(() => "");
+    const objectType = await gitCacheCommand(cwd, ["cat-file", "-t", commit], signal).catch(onGitExit(() => ""));
     const ancestor = objectType.trim() === "commit" && await gitCacheCommand(cwd, ["merge-base", "--is-ancestor", commit, "HEAD"], signal)
-      .then(() => true, () => false);
+      .then(() => true, onGitExit(() => false));
     signal?.throwIfAborted();
     if (ancestor) continue;
     if (!verifyFetchedCommit) throw new Error("unverified_fetched_commit");
@@ -325,9 +333,9 @@ export async function assertReproducibleGitFiles(cwd: string, signal?: AbortSign
       if (await fs.lstat(path.join(root, name)).then(() => true, (e: NodeJS.ErrnoException) => { if(e.code === "ENOENT") return false; throw e; })) throw new Error("unsupported_local_git_state");
     }
   }
-  const original = await gitCacheCommand(cwd, ["rev-parse", "--verify", "ORIG_HEAD"], signal).catch(() => null);
+  const original = await gitCacheCommand(cwd, ["rev-parse", "--verify", "ORIG_HEAD"], signal).catch(onGitExit(() => null));
   if (original) await gitCacheCommand(cwd, ["merge-base", "--is-ancestor", original.trim(), "HEAD"], signal)
-    .catch(() => { throw new Error("unique_original_head"); });
+    .catch(onGitExit(() => { throw new Error("unique_original_head"); }));
   if (gitDir !== common) {
     const allowed = new Set(["HEAD", "ORIG_HEAD", "FETCH_HEAD", "index", "commondir", "gitdir", "logs", "refs", "COMMIT_EDITMSG", "index.lock", "HEAD.lock"]);
     if ((await fs.readdir(gitDir)).some(name => !allowed.has(name))) throw new Error("unknown_worktree_git_files");
@@ -355,7 +363,7 @@ export async function assertReproducibleGitFiles(cwd: string, signal?: AbortSign
   if ((await gitCacheCommand(cwd, ["for-each-ref", "--format=%(refname)", "refs/stash", "refs/replace"], signal)).trim()) throw new Error("unique_git_refs");
   // Rewrites can leave commits reachable only from this worktree's reflog.
   for (const commit of new Set((await gitCacheCommand(cwd, ["reflog", "show", "--format=%H", "HEAD"], signal)).split("\n").filter(Boolean))) {
-    await gitCacheCommand(cwd, ["merge-base", "--is-ancestor", commit, "HEAD"], signal).catch(() => { throw new Error("unique_reflog_commits"); });
+    await gitCacheCommand(cwd, ["merge-base", "--is-ancestor", commit, "HEAD"], signal).catch(onGitExit(() => { throw new Error("unique_reflog_commits"); }));
   }
   return regenerable;
 }

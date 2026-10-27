@@ -1,6 +1,6 @@
 import { and, asc, eq, sql } from "drizzle-orm";
 import { createDb, executionWorkspaces, terminateDbConnections, withDedicatedDbConnection, type Db } from "@paperclipai/db";
-import { createGitRemoteAuthProvider, type GitRemoteAuthProvider } from "./git-credentials.js";
+import { createEnvironmentGitRemoteAuthProvider, type GitRemoteAuthProvider } from "./git-credentials.js";
 import { withIsolatedRepositorySourceLock, IsolatedRepositorySourceBusy } from "./isolated-remote-workspace-source.js";
 import { inspectLockedGitExpirationCandidate, gitExpirationSkipReason, gitExpirationSelectionFilter, isGitExpirationCandidate,
   LIVE_EXECUTION_WORKSPACE_STATUSES, pathExists, withAnonymousGitFallback, type Workspace } from "./git-workspace-expiration-inspection.js";
@@ -25,11 +25,15 @@ export function assertGitExpirationRoundMode(mode: { enabled?: unknown; dryRun?:
 
 export type GitExpirationRoundKey = { updatedAt: string; id: string };
 
+export type GitExpirationRoundCurrentRow = { state: "read"; key: GitExpirationRoundKey; status: string }
+  | { state: "missing" } | { state: "not_read" };
+
 export type GitExpirationRoundRow = {
   key: GitExpirationRoundKey;
   workspaceId: string;
   companyId: string;
   status: string;
+  current: GitExpirationRoundCurrentRow;
   outcome: "candidate" | "rejected" | "not_candidate" | "lock_busy" | "resource_limit";
   reason: string | null;
   pendingExpiration: boolean;
@@ -112,41 +116,40 @@ export function gitExpirationRoundFailure(error: unknown): { kind: "database" | 
 }
 
 export function readOnlyInspectionGitAuth(env: NodeJS.ProcessEnv = process.env): GitRemoteAuthProvider {
-  return withAnonymousGitFallback(createGitRemoteAuthProvider(null as unknown as Db, "", undefined, {
-    env,
-    secretNames: [],
-    secrets: {
-      getByName: async () => null,
-      resolveSecretValue: async () => { throw new Error("secret_resolution_disabled"); },
-    },
-  }));
+  return withAnonymousGitFallback(createEnvironmentGitRemoteAuthProvider(env));
 }
 
 async function inspectRow(db: Db, workspace: Workspace, key: GitExpirationRoundKey, auth: GitRemoteAuthProvider,
   signal: AbortSignal): Promise<GitExpirationRoundRow> {
-  const row: GitExpirationRoundRow = { key, workspaceId: workspace.id, companyId: workspace.companyId, status: workspace.status,
-    outcome: "rejected", reason: null, pendingExpiration: false, candidateBytes: 0 };
-  if (!isGitExpirationCandidate(workspace)) return { ...row, outcome: "not_candidate", reason: "not_git_expiration_candidate" };
-  if (!workspace.sourceIssueId) return { ...row, reason: "missing_source_issue" };
+  let current: GitExpirationRoundCurrentRow = { state: "not_read" };
+  const row = (): GitExpirationRoundRow => ({ key, workspaceId: workspace.id, companyId: workspace.companyId, status: workspace.status,
+    current, outcome: "rejected", reason: null, pendingExpiration: false, candidateBytes: 0 });
+  if (!isGitExpirationCandidate(workspace)) return { ...row(), outcome: "not_candidate", reason: "not_git_expiration_candidate" };
+  if (!workspace.sourceIssueId) return { ...row(), reason: "missing_source_issue" };
+  const observeCurrent = (reread: { workspace: Workspace; updatedAtKey: string } | null) => {
+    current = reread ? { state: "read", key: { updatedAt: reread.updatedAtKey, id: reread.workspace.id }, status: reread.workspace.status }
+      : { state: "missing" };
+    if (!reread || reread.updatedAtKey !== key.updatedAt) throw new Error("workspace_changed");
+  };
   try {
     return await withIsolatedRepositorySourceLock(db, workspace.companyId, workspace.sourceIssueId, () =>
       withDedicatedDbConnection(db, connection => connection.transaction(async tx => {
-        const inspection = await inspectLockedGitExpirationCandidate(tx, workspace, { now: new Date(), auth, signal });
+        const inspection = await inspectLockedGitExpirationCandidate(tx, workspace, { now: new Date(), auth, signal, observeCurrent });
         const live = LIVE_EXECUTION_WORKSPACE_STATUSES.includes(inspection.workspace.status);
         if (!live && !inspection.state) throw new Error("missing_restoration_recipe");
         if (inspection.state && (await pathExists(inspection.state.worktreeTrash)
           || (inspection.state.baseTrash && await pathExists(inspection.state.baseTrash)))) throw new Error("ambiguous_expiration_trash");
-        return { ...row, outcome: "candidate" as const, pendingExpiration: !!inspection.state, candidateBytes: inspection.candidateBytes };
+        return { ...row(), outcome: "candidate" as const, pendingExpiration: !!inspection.state, candidateBytes: inspection.candidateBytes };
       })), true);
   } catch (error) {
     signal.throwIfAborted();
     if (error instanceof IsolatedRepositorySourceBusy || (error instanceof Error && error.message === "lifecycle_busy")) {
-      return { ...row, outcome: "lock_busy", reason: "lock_busy" };
+      return { ...row(), outcome: "lock_busy", reason: "lock_busy" };
     }
     const failure = gitExpirationRoundFailure(error);
     if (failure?.kind === "database") throw error;
-    if (failure) return { ...row, outcome: "resource_limit", reason: failure.reason };
-    return { ...row, reason: gitExpirationSkipReason(error) };
+    if (failure) return { ...row(), outcome: "resource_limit", reason: failure.reason };
+    return { ...row(), reason: gitExpirationSkipReason(error) };
   }
 }
 
@@ -247,9 +250,11 @@ export async function inspectGitExpirationRound(options: GitExpirationRoundOptio
 
   summary.stopReason ??= stopReason() ?? (evidenceLost ? "evidence_lost" : null);
   summary.status = summary.exhausted && !summary.stopReason && summary.inspected === summary.selected ? "complete" : "partial";
-  if (!await record({ type: "round_finished", ...summary }) && summary.status === "complete") {
-    summary.stopReason = "evidence_lost";
-    summary.status = "partial";
-  }
+  const finished = await record({ type: "round_finished", ...summary });
+  if (summary.status !== "complete") return summary;
+  summary.stopReason = finished ? stopReason() : "evidence_lost";
+  if (!summary.stopReason) return summary;
+  summary.status = "partial";
+  if (finished && !await record({ type: "round_finished", ...summary })) summary.stopReason = "evidence_lost";
   return summary;
 }
