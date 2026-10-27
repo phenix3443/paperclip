@@ -157,7 +157,7 @@ export interface DatabaseClientOptions {
   applicationName?: string;
   sessionParameters?: Record<string, string>;
   dedicatedApplicationName?: string;
-  beforeDedicatedConnection?: (openDedicated: number) => void;
+  beforeDedicatedConnection?: () => () => void;
 }
 
 /**
@@ -263,26 +263,31 @@ export function postgresJsOptions(options: DatabaseClientOptions): Record<string
 const dedicatedDbFactories = new WeakMap<object, () => Db>();
 
 const openDedicatedDbs = new WeakMap<object, Set<Db>>();
-const dedicatedDbGuards = new WeakMap<object, (openDedicated: number) => void>();
+const dedicatedDbGuards = new WeakMap<object, () => () => void>();
 
 export async function withDedicatedDbConnection<T>(db: Db, action: (dedicated: Db) => Promise<T>): Promise<T> {
   const factory = dedicatedDbFactories.get(db);
   if (!factory) throw new Error("dedicated_connection_requires_create_db");
   const open = openDedicatedDbs.get(db) ?? new Set<Db>();
-  dedicatedDbGuards.get(db)?.(open.size);
-  const dedicated = factory();
+  const release = dedicatedDbGuards.get(db)?.();
+  let dedicated: Db;
+  try { dedicated = factory(); }
+  catch (error) { release?.(); throw error; }
   openDedicatedDbs.set(db, open);
   open.add(dedicated);
   try { return await action(dedicated); }
   finally {
     try { await dedicated.$client.end({ timeout: 1 }); }
-    finally { open.delete(dedicated); }
+    finally { open.delete(dedicated); release?.(); }
   }
 }
 
+function openDedicatedDescendants(db: Db): Db[] {
+  return [...(openDedicatedDbs.get(db) ?? [])].flatMap(child => [child, ...openDedicatedDescendants(child)]);
+}
+
 export async function terminateDbConnections(db: Db): Promise<void> {
-  const dedicated = [...(openDedicatedDbs.get(db) ?? [])];
-  await Promise.allSettled([db, ...dedicated].map(client => client.$client.end({ timeout: 0 })));
+  await Promise.allSettled([db, ...openDedicatedDescendants(db)].map(client => client.$client.end({ timeout: 0 })));
 }
 
 // postgres.js pipelines a query onto a busy connection when none is idle, so
@@ -325,13 +330,12 @@ function createDbClient(url: string, resolved: DatabaseClientOptions, owner?: ob
   // message cannot establish that replay is safe. Leave retries to callers
   // that know the complete operation is idempotent.
   const db = installDatabaseWorkSignals(drizzlePg(sql, { schema }), owner);
-  const { dedicatedApplicationName, beforeDedicatedConnection, ...inherited } = resolved;
-  if (beforeDedicatedConnection) dedicatedDbGuards.set(db, beforeDedicatedConnection);
+  if (resolved.beforeDedicatedConnection) dedicatedDbGuards.set(db, resolved.beforeDedicatedConnection);
   dedicatedDbFactories.set(db, () => createDbClient(url, {
-    ...inherited, maxConnections: 1, applicationName: dedicatedApplicationName ?? "paperclip-workspace-finalization-lock",
+    ...resolved, maxConnections: 1, applicationName: resolved.dedicatedApplicationName ?? "paperclip-workspace-finalization-lock",
   }, db));
   livenessDbFactories.set(db, () => createDbClient(url, {
-    ...inherited, maxConnections: LIVENESS_POOL_MAX_CONNECTIONS, applicationName: "paperclip-controller-lease",
+    ...resolved, maxConnections: LIVENESS_POOL_MAX_CONNECTIONS, applicationName: "paperclip-controller-lease",
   }, db));
   return db;
 }

@@ -1,15 +1,33 @@
 import { randomUUID } from "node:crypto";
+import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { sql } from "drizzle-orm";
-import { companies, issues, executionWorkspaces, createDb, withDedicatedDbConnection } from "@paperclipai/db";
+import { companies, issues, executionWorkspaces, createDb, withDedicatedDbConnection, type Db } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { inspectGitExpirationRound, GIT_EXPIRATION_ROUND_MODE, GIT_EXPIRATION_ROUND_APPLICATION_NAME, GitExpirationRoundInvariantError,
   gitExpirationRoundFailure, gitExpirationRoundClients, type GitExpirationRoundEvent, type GitExpirationRoundOptions } from "../services/git-expiration-round.js";
 import { GIT_EXPIRATION_BUDGETS, GitExpirationBudgetExceeded } from "../services/git-expiration-budget.js";
-import { parseGitExpirationRoundArgs, runGitExpirationRoundCli, fileGitExpirationRoundJournal,
+import { parseGitExpirationRoundArgs, runGitExpirationRoundCli, fileGitExpirationRoundJournal, openGitExpirationRoundJournal,
   GIT_EXPIRATION_JOURNAL_TERMINAL_RESERVE_BYTES } from "../git-expiration-round-cli.js";
+
+type Dedicated = <T>(db: Db, action: (dedicated: Db) => Promise<T>) => Promise<T>;
+const faults = vi.hoisted(() => ({ depth: 0, actual: null as unknown,
+  dedicated: null as ((depth: number, dedicated: Db) => Promise<void>) | null }));
+vi.mock("@paperclipai/db", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@paperclipai/db")>();
+  faults.actual = actual.withDedicatedDbConnection;
+  const wrapped: Dedicated = (db, action) => actual.withDedicatedDbConnection(db, async dedicated => {
+    const depth = faults.depth++;
+    try {
+      await faults.dedicated?.(depth, dedicated);
+      return await action(dedicated);
+    } finally { faults.depth -= 1; }
+  });
+  return { ...actual, withDedicatedDbConnection: wrapped };
+});
+const actualDedicated = () => faults.actual as Dedicated;
 
 const memoryJournal = (onAppend?: (event: GitExpirationRoundEvent) => Promise<void> | void) => {
   const events: GitExpirationRoundEvent[] = [];
@@ -223,20 +241,81 @@ describeEmbeddedPostgres("Git expiration selection and DB budgets", () => {
     } finally { await release(); }
   }, 30_000);
 
-  it("refuses a dedicated client over the guard before it connects", async () => {
+  it("guards every dedicated client, including one opened from a dedicated client", async () => {
+    let open = 0;
     const guarded = createDb(database.connectionString, { applicationName: "selection-guard", maxConnections: 1,
-      dedicatedApplicationName: "selection-guard", beforeDedicatedConnection: open => { gitExpirationRoundClients(open + 1); } });
+      dedicatedApplicationName: "selection-guard", beforeDedicatedConnection: () => {
+        if (open >= 1) throw new GitExpirationBudgetExceeded("db_connections", 2, open + 2);
+        open += 1;
+        return () => { open -= 1; };
+      } });
     const backends = async () => Number((await db.execute<{ count: string }>(sql`select count(*)::text as count from pg_stat_activity
       where application_name = 'selection-guard'`))[0]!.count);
     try {
-      await expect(withDedicatedDbConnection(guarded, async outer => {
+      await actualDedicated()(guarded, async outer => {
         await outer.execute(sql`select 1`);
         const before = await backends();
-        await expect(withDedicatedDbConnection(guarded, async () => undefined)).rejects.toMatchObject({ budget: "db_connections" });
+        await expect(actualDedicated()(outer, async () => undefined)).rejects.toMatchObject({ budget: "db_connections" });
+        await expect(actualDedicated()(guarded, async () => undefined)).rejects.toMatchObject({ budget: "db_connections" });
         expect(await backends()).toBe(before);
-        throw new Error("done");
-      })).rejects.toThrow("done");
+      });
+      expect(open).toBe(0);
+      await actualDedicated()(guarded, async inner => { await inner.execute(sql`select 1`); });
     } finally { await guarded.$client.end({ timeout: 1 }); }
+  });
+
+  describe("row DB budgets through the real lock connections", () => {
+    afterEach(() => { faults.dedicated = null; faults.depth = 0; });
+    const roundBackends = async () => Number((await db.execute<{ count: string }>(sql`select count(*)::text as count from pg_stat_activity
+      where application_name = ${GIT_EXPIRATION_ROUND_APPLICATION_NAME}`))[0]!.count);
+
+    it.each([[0, "source"], [1, "lifecycle"]] as const)("records a statement timeout on the %s lock connection (%s) as a row budget hit", async depth => {
+      const { companyId } = await seed(1, { providerType: "local_fs" });
+      faults.dedicated = async (at, dedicated) => { if (at === depth) await dedicated.execute(sql`select pg_sleep(11)`); };
+      const journal = memoryJournal();
+      const started = Date.now();
+      expect(await round(journal, { companyId })).toMatchObject({ status: "partial", stopReason: "resource_limit", resourceLimited: 1,
+        budgetHit: { budget: "statement_timeout", scope: "row", limit: GIT_EXPIRATION_BUDGETS.statementMs } });
+      expect(Date.now() - started).toBeLessThan(10_000 + 3_000);
+      expect(journal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "resource_limit", reason: "statement_timeout" });
+    }, 30_000);
+
+    it("refuses a fifth round connection before it connects and records the row", async () => {
+      const { companyId } = await seed(1, { providerType: "local_fs" });
+      const counts: number[] = [];
+      faults.dedicated = async (at, dedicated) => {
+        if (at !== 1) return;
+        await dedicated.execute(sql`select 1`);
+        counts.push(await roundBackends());
+        await actualDedicated()(dedicated, async () => undefined);
+      };
+      const journal = memoryJournal();
+      const summary = await round(journal, { companyId });
+      expect(summary).toMatchObject({ status: "partial", stopReason: "resource_limit", resourceLimited: 1,
+        budgetHit: { budget: "db_connections", scope: "row", limit: 4, observed: 5 }, peaks: { dbClients: 4 } });
+      expect(journal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "resource_limit", reason: "db_connections" });
+      expect(counts[0]).toBeLessThanOrEqual(GIT_EXPIRATION_BUDGETS.dbConnections);
+      expect(journal.events.at(-1)).toMatchObject({ type: "round_finished", status: "partial", budgetHit: { budget: "db_connections" } });
+    });
+  });
+
+  it.each([["complete", 1], ["partial", 2]] as const)("reports the same journal size in the %s journal file and the stdout summary", async (status, count) => {
+    const { companyId } = await seed(count);
+    const evidenceDir = path.join(os.tmpdir(), `paperclip-selection-journal-${randomUUID()}`);
+    try {
+      const journal = await openGitExpirationRoundJournal(evidenceDir);
+      const summary = await round(journal, { companyId, maxRows: 1 });
+      await journal.close();
+      const stdout = JSON.parse(JSON.stringify(summary)) as typeof summary;
+      expect(stdout.status).toBe(status);
+      const content = await fs.readFile(path.join(evidenceDir, "events.jsonl"), "utf8");
+      const lines = content.split("\n").slice(0, -1);
+      const finishedAt = lines.findIndex(line => (JSON.parse(line) as GitExpirationRoundEvent).type === "round_finished");
+      const before = Buffer.byteLength(lines.slice(0, finishedAt).map(line => `${line}\n`).join(""));
+      const finished = JSON.parse(lines[finishedAt]!) as { peaks: { journalBytes: number } };
+      expect(stdout.peaks.journalBytes).toBe(before);
+      expect(finished.peaks).toEqual(stdout.peaks);
+    } finally { await fs.rm(evidenceDir, { recursive: true, force: true }); }
   });
 
   it("stops the round at the evidence budget and still writes the terminal record", async () => {

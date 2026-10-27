@@ -300,14 +300,22 @@ export async function inspectGitExpirationRound(options: GitExpirationRoundOptio
       } else evidenceLost = true;
       return false;
     } finally {
-      peak("journalBytes", options.journal.bytes?.() ?? 0);
+      if (event.type !== "round_finished" && event.type !== "round_committed") peak("journalBytes", options.journal.bytes?.() ?? 0);
     }
   };
 
+  let openDedicated = 0;
   const db = createDb(options.databaseUrl, { applicationName: GIT_EXPIRATION_ROUND_APPLICATION_NAME,
     maxConnections: GIT_EXPIRATION_ROUND_POOL_CONNECTIONS, connectTimeoutSeconds: GIT_EXPIRATION_ROUND_CONNECT_TIMEOUT_SECONDS,
     sessionParameters: GIT_EXPIRATION_ROUND_SESSION_PARAMETERS, dedicatedApplicationName: GIT_EXPIRATION_ROUND_APPLICATION_NAME,
-    beforeDedicatedConnection: openDedicated => peak("dbClients", gitExpirationRoundClients(openDedicated)) });
+    beforeDedicatedConnection: () => {
+      peak("dbClients", gitExpirationRoundClients(openDedicated));
+      openDedicated += 1;
+      let released = false;
+      return () => {
+        if (!released) { released = true; openDedicated -= 1; }
+      };
+    } });
   peak("dbClients", GIT_EXPIRATION_ROUND_POOL_CONNECTIONS);
   const endPool = () => db.$client.end({ timeout: 0 }).catch(() => undefined);
   const cancel = () => { void endPool(); };
