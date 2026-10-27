@@ -65,7 +65,7 @@ export async function expireReconstructableGitWorkspace(db: Db, snapshot: Worksp
   try {
     return await withIsolatedRepositorySourceLock(db, snapshot.companyId, snapshot.sourceIssueId, () =>
       withDedicatedDbConnection(db, connection => connection.transaction(async tx => {
-        const inspection = await inspectLockedGitExpirationCandidate(db, tx, snapshot, { now: options.now, signal: options.signal });
+        const inspection = await inspectLockedGitExpirationCandidate(tx, snapshot, { now: options.now, signal: options.signal, auth: expirationGitAuth(db, snapshot) });
         let { workspace, state } = inspection as { workspace: Workspace | undefined; state: Expiration | null };
         if (!workspace) throw new Error("workspace_changed");
         const { recipe, present, auth, checkouts, proveManagedCheckout } = inspection;

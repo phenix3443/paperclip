@@ -1,13 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { createDb } from "@paperclipai/db";
 import { inspectGitExpirationRound, GIT_EXPIRATION_ROUND_MODE, type GitExpirationRoundEvent, type GitExpirationRoundJournal } from "./services/git-expiration-round.js";
-
-// Usage: node dist/git-expiration-round-cli.js --round-id <id> --evidence-dir <absolute new dir>
-//   [--company-id <uuid>] [--max-rows <n>] [--deadline-seconds <n>]
-//   [--enabled=true] [--dry-run=true] [--expire-base=false]
-// Reads DATABASE_URL. Exit 0 complete, 3 partial, 2 rejected arguments, 1 failure.
 
 export class GitExpirationRoundUsageError extends Error {}
 
@@ -33,7 +27,6 @@ function positiveInteger(name: string, value: string) {
   return Number(value);
 }
 
-/** Validate everything before any database connection or Git process exists. */
 export function parseGitExpirationRoundArgs(argv: string[], env: NodeJS.ProcessEnv): GitExpirationRoundCliArgs {
   for (const [name, expected] of Object.entries(FIXED_ENV)) {
     if (env[name] !== undefined && env[name] !== expected) throw new GitExpirationRoundUsageError(`${name} conflicts with the fixed mode (${expected})`);
@@ -70,7 +63,6 @@ export function parseGitExpirationRoundArgs(argv: string[], env: NodeJS.ProcessE
   return { roundId, evidenceDir, databaseUrl, companyId, maxRows, deadlineSeconds };
 }
 
-/** An append-only JSON Lines journal in a directory this round creates; each event is synced before returning. */
 export async function openGitExpirationRoundJournal(evidenceDir: string): Promise<GitExpirationRoundJournal & { close(): Promise<void> }> {
   await fs.mkdir(evidenceDir, { mode: 0o700 });
   const handle = await fs.open(path.join(evidenceDir, "events.jsonl"), "wx", 0o600);
@@ -97,10 +89,9 @@ export async function runGitExpirationRoundCli(argv: string[], env: NodeJS.Proce
   const abort = () => controller.abort();
   process.once("SIGINT", abort);
   process.once("SIGTERM", abort);
-  const db = createDb(args.databaseUrl);
   try {
-    const summary = await inspectGitExpirationRound(db, {
-      mode: GIT_EXPIRATION_ROUND_MODE, roundId: args.roundId, journal, companyId: args.companyId, signal: controller.signal,
+    const summary = await inspectGitExpirationRound({
+      databaseUrl: args.databaseUrl, mode: GIT_EXPIRATION_ROUND_MODE, roundId: args.roundId, journal, companyId: args.companyId, signal: controller.signal,
       maxRows: args.maxRows, deadline: args.deadlineSeconds ? new Date(Date.now() + args.deadlineSeconds * 1000) : undefined,
     });
     process.stdout.write(`${JSON.stringify(summary)}\n`);
@@ -108,7 +99,6 @@ export async function runGitExpirationRoundCli(argv: string[], env: NodeJS.Proce
   } finally {
     process.off("SIGINT", abort);
     process.off("SIGTERM", abort);
-    await db.$client.end({ timeout: 5 });
     await journal.close();
   }
 }

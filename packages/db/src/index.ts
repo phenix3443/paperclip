@@ -1,6 +1,7 @@
 export {
   createDb,
   withDedicatedDbConnection,
+  terminateDbConnections,
   livenessDb,
   closeLivenessDb,
   closeRegisteredClients,

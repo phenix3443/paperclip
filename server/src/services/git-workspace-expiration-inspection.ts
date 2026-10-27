@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { executionWorkspaces, issues, heartbeatRuns, nativeRunFinalizations, environmentLeases,
   workspaceRuntimeServices, issueRecoveryActions, projectWorkspaces, type Db } from "@paperclipai/db";
 import { readManagedCheckoutContents, selectRestoredProjectRepositories, type ManagedCheckoutContents } from "./git-workspace-contents.js";
@@ -8,10 +8,6 @@ import { createGitRemoteAuthProvider, type GitRemoteAuthProvider } from "./git-c
 import { managedProjectCheckoutName } from "./managed-project-checkout-name.js";
 import { assertReproducibleManagedCheckout, inspectGitCacheRecipe, readGitCacheRestoration, readGitCacheExpiration,
   GitCacheRestorationFailure, type GitCacheExpiration, type GitCacheRestoration, type ManagedCheckoutProver } from "./git-workspace-restoration.js";
-
-// Read-only half of Git workspace expiration. Nothing here archives, persists
-// metadata, creates or recovers expiration lock files, renames or deletes, so
-// the one-round inspection can reuse native proof without reaching live effects.
 
 export type Workspace = typeof executionWorkspaces.$inferSelect;
 export type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -100,7 +96,27 @@ export function hasPendingGitExpiration(workspace: Workspace) {
   return state?.schema === "paperclip.git-cache-expiration.v1" && !state.completed;
 }
 
-function managedCheckoutProver(db: Db, workspace: Workspace, auth: GitRemoteAuthProvider, checkouts: Map<string, ManagedCheckoutContents>): ManagedCheckoutProver {
+export const LIVE_EXECUTION_WORKSPACE_STATUSES = ["active", "idle", "in_review"];
+
+export function liveExecutionWorkspaceFilter() {
+  return and(inArray(executionWorkspaces.status, LIVE_EXECUTION_WORKSPACE_STATUSES), isNull(executionWorkspaces.closedAt));
+}
+
+export function pendingGitExpirationFilter() {
+  return and(inArray(executionWorkspaces.status, ["archived", "cleanup_failed"]),
+    sql`${executionWorkspaces.metadata}->'gitCacheExpiration'->>'completed' = 'false'`);
+}
+
+export function gitExpirationSelectionFilter() {
+  return and(isNotNull(executionWorkspaces.sourceIssueId), or(liveExecutionWorkspaceFilter(), pendingGitExpirationFilter()));
+}
+
+export function isGitExpirationCandidate(workspace: Workspace) {
+  return workspace.providerType !== "plugin" && (hasPendingGitExpiration(workspace)
+    || (workspace.mode === "isolated_workspace" && workspace.strategyType === "git_worktree"));
+}
+
+function managedCheckoutProver(db: Tx, workspace: Workspace, auth: GitRemoteAuthProvider, checkouts: Map<string, ManagedCheckoutContents>): ManagedCheckoutProver {
   let rows: Promise<Array<{ id: string; repoUrl: string | null; repoRef: string | null; cwd: string | null }>> | undefined;
   return async (checkoutPath, name, signal) => {
     if (!workspace.projectId) throw new Error("unknown_managed_checkout");
@@ -115,11 +131,8 @@ function managedCheckoutProver(db: Db, workspace: Workspace, auth: GitRemoteAuth
   };
 }
 
-const LIVE_STATUSES = ["active", "idle", "in_review"];
-
 export type GitExpirationInspection = {
   workspace: Workspace;
-  /** Pending expiration state, or null when a live workspace starts a new expiration cycle. */
   state: GitCacheExpiration | null;
   recipe: GitCacheRestoration;
   present: boolean;
@@ -129,24 +142,20 @@ export type GitExpirationInspection = {
   proveManagedCheckout: ManagedCheckoutProver;
 };
 
-/**
- * Prove one row is an expiration candidate. The caller holds the source lock and
- * the lifecycle transaction `tx`; a changed row is rejected, never substituted.
- */
-export async function inspectLockedGitExpirationCandidate(db: Db, tx: Tx, snapshot: Workspace,
-  options: { now: Date; signal?: AbortSignal }): Promise<GitExpirationInspection> {
+export async function inspectLockedGitExpirationCandidate(tx: Tx, snapshot: Workspace,
+  options: { now: Date; auth: GitRemoteAuthProvider; signal?: AbortSignal }): Promise<GitExpirationInspection> {
   const acquired = await tx.execute<{ locked: boolean }>(sql`select pg_try_advisory_xact_lock(hashtextextended(${`execution_workspace_lifecycle:${snapshot.id}`}, 0)) as locked`);
   if (!acquired[0]?.locked) throw new Error("lifecycle_busy");
-  const workspace = (await db.select().from(executionWorkspaces).where(and(eq(executionWorkspaces.id, snapshot.id), eq(executionWorkspaces.companyId, snapshot.companyId))))[0];
+  const workspace = (await tx.select().from(executionWorkspaces).where(and(eq(executionWorkspaces.id, snapshot.id), eq(executionWorkspaces.companyId, snapshot.companyId))))[0];
   if (!workspace || workspace.updatedAt.getTime() !== snapshot.updatedAt.getTime()) throw new Error("workspace_changed");
   if (!await isGitWorkspaceExpirationEligible(tx, workspace, options.now)) throw new Error("live_or_unresolved_consumer");
-  const live = LIVE_STATUSES.includes(workspace.status);
+  const live = LIVE_EXECUTION_WORKSPACE_STATUSES.includes(workspace.status);
   // A restored active workspace starts a new expiration cycle and records its new HEAD.
   if (!live && !hasPendingGitExpiration(workspace)) throw new Error("not_expirable");
   const state = live ? null : readGitCacheExpiration(workspace);
-  const auth = expirationGitAuth(db, workspace);
+  const auth = options.auth;
   const checkouts = new Map<string, ManagedCheckoutContents>();
-  const proveManagedCheckout = managedCheckoutProver(db, workspace, auth, checkouts);
+  const proveManagedCheckout = managedCheckoutProver(tx, workspace, auth, checkouts);
   const recipe = state ? readGitCacheRestoration(workspace)! : await inspectGitCacheRecipe(workspace,
     auth, options.signal, { proveManagedCheckout });
   const present = await pathExists(recipe.worktreePath);
