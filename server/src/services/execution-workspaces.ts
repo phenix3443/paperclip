@@ -3743,8 +3743,17 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       issue: { id: string; companyId: string; projectId: string | null };
       actor: { agentId: string | null; actorType: string };
       authorizationActor: AuthorizationActor;
+      // Set only by the cross-task continuation successor. While the row is
+      // closed, a lifecycle generation other than this one means that another
+      // writer committed to the row after the intent, so the call refuses with
+      // not_reopenable and writes nothing. Eager callers leave it unset.
+      expectedClosedGeneration?: number;
     }): Promise<ReopenClosedIsolatedExecutionWorkspaceResult> => {
       const { issue, actor } = input;
+      const closedGenerationChanged = (row: { status: string; metadata: unknown }) =>
+        input.expectedClosedGeneration !== undefined
+        && isClosedExecutionWorkspaceStatus(row.status)
+        && readExecutionWorkspaceLifecycleGeneration(row.metadata as Record<string, unknown> | null) !== input.expectedClosedGeneration;
       const [boundSnapshot] = await db.select({ id: issues.id }).from(issues).where(and(
         eq(issues.id, issue.id), eq(issues.companyId, issue.companyId),
         eq(issues.executionWorkspaceId, input.workspaceId),
@@ -3764,6 +3773,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       )).then(rows => rows[0] ?? null);
       if (!freshSnapshot || freshSnapshot.sourceIssueId !== sourceIssueId) {
         return { ok: false, code: "not_reopenable", message: "Execution workspace source changed during reopen" };
+      }
+      if (closedGenerationChanged(freshSnapshot)) {
+        return { ok: false, code: "not_reopenable", message: "Execution workspace changed after the continuation request" };
       }
       const snapshot = freshSnapshot;
       if (snapshot.providerType === "plugin") {
@@ -3907,6 +3919,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
             workspace: toExecutionWorkspace(row),
             generation: readExecutionWorkspaceLifecycleGeneration(row.metadata as Record<string, unknown> | null),
           };
+        }
+        if (closedGenerationChanged(row)) {
+          return { ok: false, code: "not_reopenable", message: "Execution workspace changed after the continuation request" };
         }
 
         if (copyIdentity && !["projectId", "projectWorkspaceId", "cwd", "providerRef", "repoUrl", "baseRef", "branchName", "strategyType", "mode", "metadata"]

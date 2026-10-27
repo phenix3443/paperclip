@@ -93,15 +93,38 @@ export function crossTaskContinuationRequestDigest(input: {
 export type IssueExecutionWorkspaceBinding =
   | { kind: "none" }
   | { kind: "missing"; workspaceId: string }
-  | { kind: "closed_isolated"; workspaceId: string; generation: number }
+  | {
+      kind: "closed_isolated";
+      workspaceId: string;
+      generation: number;
+      strategyType: string | null;
+      providerType: string | null;
+    }
   | { kind: "open_or_shared"; workspaceId: string };
 
 function isClosedWorkspaceStatus(status: string | null | undefined) {
   return status === "archived" || status === "cleanup_failed";
 }
 
-function isClosedIsolatedRow(row: { mode: string | null; status: string | null; closedAt: Date | null }) {
-  return row.mode === "isolated_workspace" && (row.closedAt != null || isClosedWorkspaceStatus(row.status));
+// Uses the reopen service's status test, so the route and the successor agree on
+// what a closed workspace is.
+function isClosedIsolatedRow(row: { mode: string | null; status: string | null }) {
+  return row.mode === "isolated_workspace" && isClosedWorkspaceStatus(row.status);
+}
+
+/**
+ * Whether the target-bound successor can reopen this closed row: a non-plugin
+ * `git_worktree` whose provider is not retired. The deferred path admits only
+ * these rows.
+ */
+export function isSuccessorReopenableWorkspace(row: {
+  strategyType: string | null;
+  providerType: string | null;
+  metadata?: unknown;
+}) {
+  return row.strategyType === "git_worktree"
+    && row.providerType !== "plugin"
+    && (row.metadata as Record<string, unknown> | null | undefined)?.workspaceProviderRetired !== true;
 }
 
 /**
@@ -119,7 +142,8 @@ export async function classifyIssueExecutionWorkspaceBinding(
     id: executionWorkspaces.id,
     mode: executionWorkspaces.mode,
     status: executionWorkspaces.status,
-    closedAt: executionWorkspaces.closedAt,
+    strategyType: executionWorkspaces.strategyType,
+    providerType: executionWorkspaces.providerType,
     metadata: executionWorkspaces.metadata,
   }).from(executionWorkspaces).where(and(
     eq(executionWorkspaces.id, workspaceId),
@@ -131,6 +155,8 @@ export async function classifyIssueExecutionWorkspaceBinding(
       kind: "closed_isolated",
       workspaceId,
       generation: readExecutionWorkspaceLifecycleGeneration(row.metadata as Record<string, unknown> | null),
+      strategyType: row.strategyType,
+      providerType: row.providerType,
     };
   }
   return { kind: "open_or_shared", workspaceId };
@@ -333,7 +359,7 @@ export async function commitCrossTaskContinuation(
         || !isClosedIsolatedRow(workspace)
         || readExecutionWorkspaceLifecycleGeneration(workspace.metadata as Record<string, unknown> | null)
           !== input.binding.generation
-        || (workspace.metadata as Record<string, unknown> | null)?.workspaceProviderRetired === true
+        || !isSuccessorReopenableWorkspace(workspace)
       ) {
         throw new CrossTaskContinuationRefusal(409, CROSS_TASK_CONTINUATION_MESSAGES.notReopenable);
       }

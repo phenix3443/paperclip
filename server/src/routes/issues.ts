@@ -195,6 +195,7 @@ import {
   CROSS_TASK_CONTINUATION_MESSAGES,
   CrossTaskContinuationRefusal,
   classifyIssueExecutionWorkspaceBinding,
+  isSuccessorReopenableWorkspace,
   commitCrossTaskContinuation,
   crossTaskContinuationRequestDigest,
   findCrossTaskContinuationReplay,
@@ -18932,6 +18933,12 @@ export function issueRoutes(
           binding.kind === "closed_isolated" &&
           (await instanceSettings.getExperimental()).enableCrossTaskDeferredContinuation === true
         ) {
+          // Only a row that the target-bound successor can reopen takes the
+          // deferred path. Any other closed isolated row is refused here.
+          if (!isSuccessorReopenableWorkspace(binding)) {
+            res.status(409).json({ error: CROSS_TASK_CONTINUATION_MESSAGES.notReopenable });
+            return;
+          }
           await commitDeferredCrossTaskContinuationOrRespond({
             req,
             res,
