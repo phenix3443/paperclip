@@ -326,6 +326,57 @@ describeEmbeddedPostgres("cross-task continuation intent consumer", () => {
     }
   });
 
+  it("K6 with a barrier: two sweeps reclaim the same stale claim while delivery is held; one receipt, one run, no orphan run", async () => {
+    const { companyId, issueId, intent } = await seedTarget();
+    await db.update(agentWakeupRequests)
+      .set({ status: "claimed", claimedAt: new Date(Date.now() - 120_000) })
+      .where(eq(agentWakeupRequests.id, intent.id));
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let locked!: () => void;
+    const lockTaken = new Promise<void>((resolve) => { locked = resolve; });
+    const barrier = db.transaction(async (tx) => {
+      await tx.execute(sql`select id from issues where id = ${issueId} for update`);
+      locked();
+      await held;
+    });
+    await lockTaken;
+    const sweeps = [heartbeatService(db), heartbeatService(db)];
+    const results = Promise.all(sweeps.map((sweep) => sweep.dispatchPendingNativeStatusWakeups({ companyId })));
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(0);
+    release();
+    await barrier;
+    await results;
+    await Promise.all(sweeps.map((sweep) => sweep.drainActiveRunExecutions()));
+    const receipts = await dispatchReceipts(intent.id);
+    expect(receipts).toHaveLength(1);
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+    expect(runs).toHaveLength(1);
+    expect(runs[0]!.wakeupRequestId).toBe(receipts[0]!.id);
+    expect(await readIntent(intent.id)).toMatchObject({ status: "coalesced", runId: runs[0]!.id });
+  });
+
+  it("K6 without the claim fence: two concurrent deliveries under the same dispatch key commit one receipt and one run", async () => {
+    const { companyId, agentId, issueId, intent } = await seedTarget();
+    const dispatchKey = crossTaskContinuationDispatchKey(intent.id);
+    const deliver = () => heartbeatService(db).wakeup(agentId, {
+      allowRunCoalescing: false,
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_reopened_via_comment",
+      payload: { issueId, taskId: issueId },
+      idempotencyKey: dispatchKey,
+      requestedByActorType: "system",
+      requestedByActorId: dispatchKey,
+      contextSnapshot: { issueId, taskId: issueId, source: "cross_task_continuation", crossTaskContinuationIntentId: intent.id },
+    }).then((run) => ({ run, error: null as unknown }), (error: unknown) => ({ run: null, error }));
+    await Promise.all([deliver(), deliver()]);
+    await heartbeat.drainActiveRunExecutions();
+    expect(await dispatchReceipts(intent.id)).toHaveLength(1);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(1);
+  });
+
   it("never dispatches a coalesced intent", async () => {
     const { companyId, intent } = await seedTarget();
     await db.update(agentWakeupRequests).set({ status: "coalesced" }).where(eq(agentWakeupRequests.id, intent.id));
