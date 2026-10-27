@@ -46,7 +46,11 @@ export const probeGitProcessGroup: GitGroupProbe = pgid => {
   }
 };
 
-export type InspectionBudgetHooks = { probeGroup?: GitGroupProbe };
+export type InspectionBudgetHooks = {
+  probeGroup?: GitGroupProbe;
+  /** Test seam: an upper bound on every Git child timeout of the row. */
+  gitTimeoutMs?: number;
+};
 
 /**
  * Per-row ledger. The round installs one around each row; shared helpers read it
@@ -56,6 +60,7 @@ export class InspectionBudget {
   readonly signal: AbortSignal;
   readonly peaks = { childOutputBytes: 0, gitChildren: 0 };
   readonly probeGroup: GitGroupProbe;
+  readonly gitTimeoutCapMs: number;
   private readonly controller = new AbortController();
   private readonly running = new Set<Promise<unknown>>();
   private gitChildren = 0;
@@ -63,6 +68,7 @@ export class InspectionBudget {
   constructor(roundSignal: AbortSignal, hooks: InspectionBudgetHooks = {}) {
     this.signal = AbortSignal.any([roundSignal, this.controller.signal]);
     this.probeGroup = hooks.probeGroup ?? probeGitProcessGroup;
+    this.gitTimeoutCapMs = hooks.gitTimeoutMs ?? Number.POSITIVE_INFINITY;
   }
 
   run<T>(work: () => Promise<T>): Promise<T> {
@@ -196,7 +202,7 @@ function runInGroup(budget: InspectionBudget, args: string[], options: BoundedGi
     const child = spawn("git", args, { cwd: options.cwd, env: boundedGitEnv(options.env), detached: true,
       stdio: ["pipe", "pipe", "pipe"] });
     const pgid = child.pid;
-    const timeout = setTimeout(() => stop("timeout"), options.timeout);
+    const timeout = setTimeout(() => stop("timeout"), Math.min(options.timeout, budget.gitTimeoutCapMs));
     const onAbort = () => stop("abort");
     signal.addEventListener("abort", onAbort, { once: true });
 

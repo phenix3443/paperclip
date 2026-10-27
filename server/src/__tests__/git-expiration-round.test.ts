@@ -14,11 +14,14 @@ import { inspectGitExpirationRound, assertGitExpirationRoundMode, GIT_EXPIRATION
   GitExpirationRoundInvariantError, gitExpirationRoundFailure, readOnlyInspectionGitAuth, GIT_EXPIRATION_ROUND_SESSION_PARAMETERS,
   type GitExpirationRoundEvent, type GitExpirationRoundJournal, type GitExpirationRoundOptions } from "../services/git-expiration-round.js";
 import { GitCacheRestorationFailure } from "../services/git-workspace-restoration.js";
+import { ROW_DRAIN_BOUND_MS } from "../services/git-expiration-budget.js";
 import { createGitRemoteAuthProvider } from "../services/git-credentials.js";
 import { parseGitExpirationRoundArgs, runGitExpirationRoundCli, GitExpirationRoundUsageError, fileGitExpirationRoundJournal,
   readGitExpirationRoundJournal, gitExpirationRoundExitCode } from "../git-expiration-round-cli.js";
 
-const faults = vi.hoisted(() => ({ git: null as ((args: readonly string[]) => Error | null) | null, seamWrite: false, secretServices: 0 }));
+const faults = vi.hoisted(() => ({ git: null as ((args: readonly string[]) => Error | null) | null,
+  // Replaces a bounded Git child of the round with another command in the same process group.
+  spawn: null as ((args: readonly string[]) => string[] | null) | null, seamWrite: false, secretServices: 0 }));
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
   const { promisify: promisifyActual } = await import("node:util");
@@ -29,7 +32,11 @@ vi.mock("node:child_process", async (importOriginal) => {
       return fault ? Promise.reject(fault) : run(file, args as string[], options as never);
     },
   });
-  return { ...actual, execFile };
+  const spawn = ((file: string, args: readonly string[] = [], options?: object) => {
+    const replacement = file === "git" ? faults.spawn?.(args) : null;
+    return replacement ? actual.spawn(replacement[0]!, replacement.slice(1), options as never) : actual.spawn(file, args as string[], options as never);
+  }) as typeof actual.spawn;
+  return { ...actual, execFile, spawn };
 });
 vi.mock("../services/secrets.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../services/secrets.js")>();
@@ -44,8 +51,6 @@ vi.mock("../services/git-workspace-expiration-inspection.js", async (importOrigi
     return actual.inspectLockedGitExpirationCandidate(...args);
   } };
 });
-const gitTimeout = () => Object.assign(new Error("Command failed: git"), { killed: true, signal: "SIGTERM", code: null });
-const gitOutputLimit = () => Object.assign(new Error("stdout maxBuffer length exceeded"), { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" });
 const sqlState = (error: unknown) => {
   for (let current = error; current instanceof Error; current = current.cause) {
     const code = (current as { code?: unknown }).code;
@@ -160,7 +165,7 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
     process.env.PAPERCLIP_HOME = path.join(root, "home");
     process.env.PAPERCLIP_INSTANCE_ID = "default";
   });
-  afterEach(async () => { faults.git = null; faults.seamWrite = false; await db.execute(sql`TRUNCATE TABLE companies CASCADE`); });
+  afterEach(async () => { faults.git = null; faults.spawn = null; faults.seamWrite = false; await db.execute(sql`TRUNCATE TABLE companies CASCADE`); });
   afterAll(async () => {
     if (previousHome === undefined) delete process.env.PAPERCLIP_HOME; else process.env.PAPERCLIP_HOME = previousHome;
     if (previousInstance === undefined) delete process.env.PAPERCLIP_INSTANCE_ID; else process.env.PAPERCLIP_INSTANCE_ID = previousInstance;
@@ -346,9 +351,9 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
 
   it("stops partial when Git times out in a proof step that tolerates a normal Git failure", async () => {
     const f = await reconstructable();
-    faults.git = args => args.includes("ORIG_HEAD") ? gitTimeout() : null;
+    faults.spawn = args => args.includes("ORIG_HEAD") ? ["sleep", "30"] : null;
     const journal = memoryJournal();
-    expect(await round(journal, { companyId: f.companyId })).toMatchObject({ status: "partial", stopReason: "resource_limit", resourceLimited: 1, candidates: 0 });
+    expect(await round(journal, { companyId: f.companyId, budgetHooks: { gitTimeoutMs: 300 } })).toMatchObject({ status: "partial", stopReason: "resource_limit", resourceLimited: 1, candidates: 0 });
     expect(journal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "resource_limit", reason: "git_timeout",
       current: { state: "read" } });
   });
@@ -356,10 +361,13 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
   it("stops partial when Git output is too large in an ancestry proof", async () => {
     const f = await reconstructable();
     await fs.writeFile(path.join(git(f.cwd, "rev-parse", "--absolute-git-dir"), "ORIG_HEAD"), `${git(f.cwd, "rev-parse", "HEAD")}\n`);
-    faults.git = args => args.includes("merge-base") && args.includes("--is-ancestor") ? gitOutputLimit() : null;
+    // 16 MiB + 1 byte split over stdout and stderr: each stream alone stays below the cap.
+    faults.spawn = args => args.includes("merge-base") && args.includes("--is-ancestor")
+      ? ["sh", "-c", "head -c 8388608 /dev/zero; head -c 8388609 /dev/zero >&2"] : null;
     const journal = memoryJournal();
-    expect(await round(journal, { companyId: f.companyId })).toMatchObject({ status: "partial", stopReason: "resource_limit", candidates: 0 });
-    expect(journal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "resource_limit", reason: "git_output_limit" });
+    const summary = await round(journal, { companyId: f.companyId });
+    expect(summary).toMatchObject({ status: "partial", stopReason: "resource_limit", candidates: 0, drainIncomplete: false });
+    expect(journal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "resource_limit", reason: "git_output" });
   });
 
   it("refuses writes on the round's root and dedicated sessions", async () => {
@@ -596,17 +604,29 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
     });
   });
 
-  it("cancels a blocked row inspection and releases its advisory locks", async () => {
+  it("keeps the advisory locks of an aborted row until its blocked statement drains", async () => {
     const f = await seed(1);
     const controller = new AbortController();
+    const undrained: Promise<void>[] = [];
+    const journal = memoryJournal();
     await holdingTableLock("issues", async () => {
-      const pending = round(memoryJournal(), { companyId: f.companyId, signal: controller.signal });
+      const pending = round(journal, { companyId: f.companyId, signal: controller.signal, onUndrainedRow: released => undrained.push(released) });
       await waitFor(async () => await lockWaiters() > 0 && await advisoryLocks() > 0);
+      const aborted = Date.now();
       controller.abort();
-      expect(await pending).toMatchObject({ status: "partial", stopReason: "aborted", inspected: 0, lastCompletedKey: null });
-      await waitFor(async () => await lockWaiters() === 0 && await advisoryLocks() === 0 && await roundBackends() === 0);
+      const summary = await pending;
+      expect(Date.now() - aborted).toBeLessThan(ROW_DRAIN_BOUND_MS + 2_000);
+      expect(summary).toMatchObject({ status: "partial", stopReason: "aborted", inspected: 0, lastCompletedKey: null,
+        drainIncomplete: true, undrainedRow: { id: f.ids[0] } });
+      expect(journal.events.at(-1)).toMatchObject({ type: "round_finished", status: "partial", drainIncomplete: true });
+      expect(journal.events.some(event => event.type === "row_inspected")).toBe(false);
+      expect(undrained).toHaveLength(1);
+      // Both row locks stay held while the statement still waits.
+      expect(await advisoryLocks()).toBe(2);
     });
-  });
+    await undrained[0];
+    await waitFor(async () => await lockWaiters() === 0 && await advisoryLocks() === 0 && await roundBackends() === 0);
+  }, 30_000);
 
   it("ends partial when evidence cannot be recorded", async () => {
     const f = await seed(2);
