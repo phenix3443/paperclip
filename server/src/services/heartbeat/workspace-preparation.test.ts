@@ -1,6 +1,7 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile, access, rename } from "node:fs/promises";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile, access, rename, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -907,6 +908,183 @@ describe.skipIf(!support.supported)("heartbeat workspace preparation boundary", 
     expect(await workspaceActivity("execution_workspace.reopened")).toHaveLength(0);
     // The rebuilt worktree is not rolled back.
     await expect(access(f.workspace.cwd!)).resolves.toBeUndefined();
+  });
+
+  // L2: an eager reopen (the same service call the comment, PATCH and checkout
+  // routes make, without the fence, by a run bound to the target) races the
+  // successor step. A barrier holds the first caller right after it takes the
+  // lifecycle lock; rebuild calls are counted per caller.
+  async function raceHarness(f: Awaited<ReturnType<typeof archivedContinuationTarget>>) {
+    const caller = new AsyncLocalStorage<string>();
+    const rebuilds: Record<string, number> = {};
+    const runtime = await import("../workspace-runtime.js");
+    const realRebuild = runtime.ensurePersistedExecutionWorkspaceAvailable;
+    const failRebuildFor = new Set<string>();
+    vi.spyOn(runtime, "ensurePersistedExecutionWorkspaceAvailable").mockImplementation(async (...args) => {
+      const who = caller.getStore() ?? "other";
+      rebuilds[who] = (rebuilds[who] ?? 0) + 1;
+      if (failRebuildFor.has(who)) throw new Error("fixture rebuild failure");
+      return realRebuild(...args);
+    });
+    const lifecycle = await import("../execution-workspace-lifecycle-lock.js");
+    const realAcquire = lifecycle.acquireExecutionWorkspaceLifecycleLock;
+    // Gates for the first and second lifecycle-lock acquisitions on this row.
+    const gates = [0, 1].map(() => {
+      let reached!: () => void;
+      let release!: () => void;
+      return { reached: new Promise<void>(resolve => { reached = resolve; }), onReached: () => reached(),
+        released: new Promise<void>(resolve => { release = resolve; }), release: () => release() };
+    });
+    let acquisitions = 0;
+    let holdSecond = false;
+    vi.spyOn(lifecycle, "acquireExecutionWorkspaceLifecycleLock").mockImplementation(async (tx, workspaceId) => {
+      await realAcquire(tx, workspaceId);
+      if (workspaceId !== f.workspace.id) return;
+      const gate = gates[acquisitions++];
+      if (!gate || (gate === gates[1] && !holdSecond)) return;
+      gate.onReached();
+      await gate.released;
+    });
+    const [eagerRun] = await db.insert(heartbeatRuns).values({ companyId: f.issue.companyId, agentId: f.input.agent.id,
+      issueId: f.issue.id, scopeKind: "issue", status: "running", runtimeMode: "legacy",
+      contextSnapshot: { issueId: f.issue.id, taskId: f.issue.id } }).returning();
+    const eager = () => caller.run("eager", () => executionWorkspaceService(db).reopenClosedIsolatedExecutionWorkspaceForIssue({
+      workspaceId: f.workspace.id, issue: { id: f.issue.id, companyId: f.issue.companyId, projectId: f.issue.projectId },
+      actor: { agentId: f.input.agent.id, actorType: "agent" },
+      authorizationActor: { type: "agent", agentId: f.input.agent.id, companyId: f.issue.companyId, source: "agent_jwt", runId: eagerRun!.id, onBehalfOfUserId: null },
+    }));
+    const step = (run: typeof heartbeatRuns.$inferSelect) => caller.run("step", () => successorStep(run).then(
+      outcome => ({ outcome, error: null as Error | null }), (error: Error) => ({ outcome: null, error })));
+    // Give the waiting caller time to reach its lock wait before the holder goes on.
+    const settle = () => new Promise(resolve => setTimeout(resolve, 300));
+    return { rebuilds, failRebuildFor, holderReached: gates[0]!.reached, release: gates[0]!.release,
+      holdSecond: () => { holdSecond = true; }, secondReached: gates[1]!.reached, releaseSecond: gates[1]!.release,
+      eager, step, settle };
+  }
+  const branchHead = async (cwd: string) => ({
+    branch: (await execFile("git", ["-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"])).stdout.trim(),
+    head: (await execFile("git", ["-C", cwd, "rev-parse", "HEAD"])).stdout.trim(),
+  });
+
+  it("L2a: successor first, then an eager reopen that finds the row active", async () => {
+    const f = await archivedContinuationTarget();
+    const successor = await dispatchedContinuationRun(f);
+    const h = await raceHarness(f);
+    const stepDone = h.step(successor);
+    await h.holderReached;
+    const eagerDone = h.eager();
+    await h.settle();
+    h.release();
+    const [stepResult, eagerResult] = await Promise.all([stepDone, eagerDone]);
+    expect(stepResult.error).toBeNull();
+    expect(stepResult.outcome).toMatchObject({ kind: "reopened", reopened: true });
+    expect(eagerResult).toMatchObject({ ok: true, reopened: false });
+    expect(h.rebuilds).toEqual({ step: 1 });
+    expect(await workspaceActivity("execution_workspace.reopened")).toHaveLength(1);
+    expect(await closedRowFacts(f.workspace.id)).toMatchObject({ status: "active", generation: f.generation + 1 });
+    expect(await branchHead(f.workspace.cwd!)).toEqual({ branch: f.workspace.branchName, head: f.headBeforeArchive });
+  });
+
+  it("L2b: eager first, then the successor finds the row active and makes no rebuild call", async () => {
+    const f = await archivedContinuationTarget();
+    const successor = await dispatchedContinuationRun(f);
+    const h = await raceHarness(f);
+    const eagerDone = h.eager();
+    await h.holderReached;
+    const stepDone = h.step(successor);
+    await h.settle();
+    h.release();
+    const [eagerResult, stepResult] = await Promise.all([eagerDone, stepDone]);
+    expect(eagerResult).toMatchObject({ ok: true, reopened: true });
+    expect(stepResult.error).toBeNull();
+    expect(stepResult.outcome).toMatchObject({ kind: "reopened", reopened: false });
+    expect(h.rebuilds).toEqual({ eager: 1 });
+    expect(await workspaceActivity("execution_workspace.reopened")).toHaveLength(1);
+    expect(await closedRowFacts(f.workspace.id)).toMatchObject({ status: "active", generation: f.generation + 1 });
+    expect(await branchHead(f.workspace.cwd!)).toEqual({ branch: f.workspace.branchName, head: f.headBeforeArchive });
+  });
+
+  it("L2c-F3: an eager rebuild failure with committed bookkeeping stops the waiting successor at the fence", async () => {
+    const f = await archivedContinuationTarget();
+    const successor = await dispatchedContinuationRun(f);
+    const h = await raceHarness(f);
+    h.failRebuildFor.add("eager");
+    const eagerDone = h.eager();
+    await h.holderReached;
+    const stepDone = h.step(successor);
+    await h.settle();
+    h.release();
+    const [eagerResult, stepResult] = await Promise.all([eagerDone, stepDone]);
+    expect(eagerResult).toMatchObject({ ok: false, code: "rebuild_failed" });
+    expect(stepResult.error?.message).toMatch(/^Cross-task continuation could not reopen the target workspace: Execution workspace changed after the continuation request/);
+    expect(h.rebuilds).toEqual({ eager: 1 });
+    expect(await workspaceActivity("execution_workspace.reopen_failed")).toHaveLength(1);
+    expect(await workspaceActivity("execution_workspace.reopened")).toHaveLength(0);
+    expect(await closedRowFacts(f.workspace.id)).toMatchObject({ status: "archived", cleanupEligibleAt: null, generation: f.generation + 1 });
+    await expect(access(f.workspace.cwd!)).rejects.toMatchObject({ code: "ENOENT" });
+    // A step that starts after the failure committed stops at the unlocked pre-check.
+    const svc = executionWorkspaceService(db);
+    const reopen = vi.spyOn(svc, "reopenClosedIsolatedExecutionWorkspaceForIssue");
+    await expect(successorStep(successor, svc)).rejects.toThrow(/changed after the continuation request/);
+    expect(reopen).not.toHaveBeenCalled();
+  });
+
+  it.each(["activity", "update"] as const)("L2g-%s: an eager rebuild whose transaction rolls back lets the successor make the one allowed second rebuild call on the same worktree", async (fault) => {
+    const f = await archivedContinuationTarget();
+    const successor = await dispatchedContinuationRun(f);
+    const h = await raceHarness(f);
+    if (fault === "activity") {
+      const activity = await import("../activity-log.js");
+      const realLogActivity = activity.logActivity;
+      let failed = false;
+      vi.spyOn(activity, "logActivity").mockImplementation(async (database, entry) => {
+        if (!failed && entry.action === "execution_workspace.reopened") { failed = true; throw new Error("fixture activity failure"); }
+        return realLogActivity(database, entry);
+      });
+    } else {
+      // Fails the first update that publishes this row as active. A sequence is
+      // not rolled back, so only the eager call's update fails.
+      await db.execute(sql.raw(`create sequence if not exists l2g_fault_seq;
+        select setval('l2g_fault_seq', 1, false);
+        create or replace function l2g_fault() returns trigger language plpgsql as $$
+        begin
+          if new.id = '${f.workspace.id}' and new.status = 'active' and old.status <> 'active' and nextval('l2g_fault_seq') = 1 then
+            raise exception 'fixture update failure';
+          end if;
+          return new;
+        end $$;
+        drop trigger if exists l2g_fault on execution_workspaces;
+        create trigger l2g_fault before update on execution_workspaces for each row execute function l2g_fault();`));
+    }
+    try {
+      h.holdSecond();
+      const eagerDone = h.eager();
+      await h.holderReached;
+      const stepDone = h.step(successor);
+      await h.settle();
+      h.release();
+      const eagerResult = await eagerDone;
+      // The step now holds the lifecycle lock and waits at the second gate.
+      expect(eagerResult).toMatchObject({ ok: false, code: "rebuild_failed" });
+      // After the eager call: the row is unchanged at g and the rebuilt worktree stays on disk.
+      expect(await closedRowFacts(f.workspace.id)).toMatchObject({ status: "archived", generation: f.generation });
+      expect(await workspaceActivity("execution_workspace.reopened")).toHaveLength(0);
+      expect(await workspaceActivity("execution_workspace.reopen_failed")).toHaveLength(0);
+      const inodeAfterEager = (await stat(f.workspace.cwd!)).ino;
+      await h.secondReached;
+      h.releaseSecond();
+      const stepResult = await stepDone;
+      expect(stepResult.error).toBeNull();
+      expect(stepResult.outcome).toMatchObject({ kind: "reopened", reopened: true });
+      expect(h.rebuilds).toEqual({ eager: 1, step: 1 });
+      expect(await workspaceActivity("execution_workspace.reopened")).toHaveLength(1);
+      expect(await workspaceActivity("execution_workspace.reopen_failed")).toHaveLength(0);
+      expect(await closedRowFacts(f.workspace.id)).toMatchObject({ status: "active", generation: f.generation + 1 });
+      expect((await stat(f.workspace.cwd!)).ino).toBe(inodeAfterEager);
+      expect(await branchHead(f.workspace.cwd!)).toEqual({ branch: f.workspace.branchName, head: f.headBeforeArchive });
+    } finally {
+      if (fault === "update") await db.execute(sql.raw("drop trigger if exists l2g_fault on execution_workspaces"));
+    }
   });
 
   it("keeps the admitted recovery workspace when the issue now points elsewhere", async () => {
