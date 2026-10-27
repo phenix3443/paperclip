@@ -80,6 +80,20 @@ export const agentWakeupRequests = pgTable(
     )
       .on(table.companyId, table.idempotencyKey)
       .where(sql`${table.idempotencyKey} LIKE 'owner-repair-continuation:%'`),
+    // One cross-task continuation intent per (target, comment). The intent
+    // and its dispatch receipt use different key prefixes so neither index
+    // matches the other row.
+    crossTaskContinuationIntentUq: uniqueIndex(
+      "agent_wakeup_requests_cross_task_continuation_intent_uq",
+    )
+      .on(table.companyId, table.idempotencyKey)
+      .where(sql`${table.idempotencyKey} LIKE 'issue\\_cross\\_task\\_continuation:%'`),
+    // At most one dispatch receipt per continuation intent, in any status.
+    crossTaskContinuationDispatchUq: uniqueIndex(
+      "agent_wakeup_requests_cross_task_continuation_dispatch_uq",
+    )
+      .on(table.companyId, table.idempotencyKey)
+      .where(sql`${table.idempotencyKey} LIKE 'cross-task-continuation-dispatch:%'`),
     questionResponseDeliveryIdempotencyUq: uniqueIndex(
       "agent_wakeup_requests_question_response_delivery_idempotency_uq",
     )

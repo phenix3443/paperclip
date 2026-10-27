@@ -2598,6 +2598,13 @@
       "when": 1792809786245,
       "tag": "0372_aromatic_loki",
       "breakpoints": true
+    },
+    {
+      "idx": 373,
+      "version": "7",
+      "when": 1793116945747,
+      "tag": "0373_dear_sentry",
+      "breakpoints": true
     }
   ]
 }
