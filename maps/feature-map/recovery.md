@@ -331,6 +331,10 @@ only. Separately inspect the underlying execution if it is still stuck.
   agent on the Board-managed company authority list. A comment, a role name or
   a newer revision is not an approval; see
   [agent access](../agent-access-map/recovery.md#record-document-decision).
+- Admission reads a gate only after the lock that serializes its writers. A
+  pause hold, approval link, policy transition or document decision that races
+  admission either commits first and refuses it, or waits for it; see
+  [agent access](../agent-access-map/recovery.md#admit-under-gate-locks).
 - Active-run watchdogs, task watchdogs, reviewers, and recovery owners have
   different authority. No recovery card grants board permission by itself.
 - Idle Agent Chat is not stranded work. An intentional operator stop must not
