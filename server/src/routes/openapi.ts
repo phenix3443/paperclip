@@ -249,6 +249,7 @@ import {
   // Issue recovery and decomposition
   createAcceptedPlanDecompositionSchema,
   resolveIssueRecoveryActionSchema,
+  createIssueDocumentDecisionSchema,
   recoverWorkspaceSchema,
   taskRetrySchema,
   retryWorkspaceExportSchema,
@@ -10774,6 +10775,15 @@ registerCurrentRoute({
   tags: ["issues"],
   summary: "Settle an execution reconciliation idempotency key as committed or permanently abandoned",
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/issues/{id}/documents/{key}/decisions",
+  tags: ["issues"],
+  summary: "Record an approval or revoke decision on an exact issue document revision",
+  body: createIssueDocumentDecisionSchema,
+  responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
 });
 
 registerCurrentRoute({

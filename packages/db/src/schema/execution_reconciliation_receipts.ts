@@ -22,6 +22,7 @@ export const executionReconciliationReceipts = pgTable(
     authorizationRevisionId: uuid("authorization_revision_id"),
     authorizationDecisionId: uuid("authorization_decision_id"),
     authorizationBodySha256: text("authorization_body_sha256"),
+    authorizationEvidence: jsonb("authorization_evidence").$type<Record<string, unknown>>(),
     result: jsonb("result").$type<Record<string, unknown>>(),
     actorUserId: text("actor_user_id"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),

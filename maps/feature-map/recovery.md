@@ -327,6 +327,10 @@ only. Separately inspect the underlying execution if it is still stuck.
   audit row with the tombstone. Admission itself stays off until its health
   capability is published; see
   [agent access](../agent-access-map/recovery.md#settle-reconciliation-receipt).
+- A reconciliation approval is a decision on one exact document revision by an
+  agent on the Board-managed company authority list. A comment, a role name or
+  a newer revision is not an approval; see
+  [agent access](../agent-access-map/recovery.md#record-document-decision).
 - Active-run watchdogs, task watchdogs, reviewers, and recovery owners have
   different authority. No recovery card grants board permission by itself.
 - Idle Agent Chat is not stranded work. An intentional operator stop must not

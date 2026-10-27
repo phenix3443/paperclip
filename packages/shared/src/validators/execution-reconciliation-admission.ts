@@ -131,3 +131,99 @@ export type ExecutionReconciliationAdmission = z.infer<typeof executionReconcili
 
 export const executionReconciliationIdempotencyKeySchema =
   executionReconciliationAdmissionSchema.shape.idempotencyKey;
+
+export const EXECUTION_RECONCILIATION_AUTHORIZATION_SCHEMA = "execution_reconciliation_authorization_v1" as const;
+export const EXECUTION_RECONCILIATION_DECISION_SCOPE = "execution_reconciliation" as const;
+export const EXECUTION_RECONCILIATION_DECISION_MAX_LIFETIME_MS = 72 * 60 * 60 * 1000;
+
+export const executionReconciliationAuthoritySchema = z
+  .object({
+    agentIds: z.array(z.string().guid()).max(20).refine((ids) => new Set(ids).size === ids.length, "Agent IDs must be unique"),
+  })
+  .strict();
+
+export type ExecutionReconciliationAuthority = z.infer<typeof executionReconciliationAuthoritySchema>;
+
+export const createIssueDocumentDecisionSchema = z.discriminatedUnion("outcome", [
+  z
+    .object({
+      outcome: z.literal("approved"),
+      revisionId: z.string().guid(),
+      scope: z.literal(EXECUTION_RECONCILIATION_DECISION_SCOPE),
+      expiresAt: isoTimestampSchema,
+    })
+    .strict(),
+  z
+    .object({
+      outcome: z.literal("revoked"),
+      revisionId: z.string().guid(),
+      scope: z.literal(EXECUTION_RECONCILIATION_DECISION_SCOPE),
+      revokesDecisionId: z.string().guid(),
+    })
+    .strict(),
+]);
+
+export type CreateIssueDocumentDecision = z.infer<typeof createIssueDocumentDecisionSchema>;
+
+export const executionReconciliationAuthorizationPayloadSchema = z
+  .object({
+    schema: z.literal(EXECUTION_RECONCILIATION_AUTHORIZATION_SCHEMA),
+    scope: z.literal("execute"),
+    companyId: z.string().guid(),
+    issueId: z.string().guid(),
+    runId: z.string().guid(),
+    actionId: z.string().guid(),
+    expectedDigest: sha256HexSchema,
+    expiresAt: isoTimestampSchema,
+    intent: z.record(z.string(), z.unknown()),
+    evidence: z.record(z.string(), z.unknown()),
+  })
+  .strict();
+
+export type ExecutionReconciliationAuthorizationPayload = z.infer<typeof executionReconciliationAuthorizationPayloadSchema>;
+
+export type ExecutionReconciliationRequestIntent = {
+  actionId: string;
+  outcome: string;
+  sourceIssueStatus: string;
+  resolutionNote: string | null;
+  executionReconciliation: {
+    runId: string;
+    providerStopped: true;
+    actionOutcome: string;
+    outcomeEvidence: string;
+    workspaceRepairEvidence: string | null;
+  };
+};
+
+export function executionReconciliationRequestIntent(request: {
+  actionId?: string;
+  outcome: string;
+  sourceIssueStatus: string;
+  resolutionNote?: string | null;
+  executionReconciliation?: {
+    runId: string;
+    providerStopped: true;
+    actionOutcome: string;
+    outcomeEvidence: string;
+    workspaceRepairEvidence?: string;
+  };
+}): ExecutionReconciliationRequestIntent {
+  const reconciliation = request.executionReconciliation;
+  if (!request.actionId || !reconciliation) {
+    throw new Error("A request intent requires actionId and executionReconciliation");
+  }
+  return {
+    actionId: request.actionId,
+    outcome: request.outcome,
+    sourceIssueStatus: request.sourceIssueStatus,
+    resolutionNote: request.resolutionNote ?? null,
+    executionReconciliation: {
+      runId: reconciliation.runId,
+      providerStopped: reconciliation.providerStopped,
+      actionOutcome: reconciliation.actionOutcome,
+      outcomeEvidence: reconciliation.outcomeEvidence,
+      workspaceRepairEvidence: reconciliation.workspaceRepairEvidence ?? null,
+    },
+  };
+}
