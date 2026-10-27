@@ -21,6 +21,8 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { crossTaskContinuationTestHooks, issueRoutes } from "../routes/issues.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
+import * as executionWorkspacesModule from "../services/execution-workspaces.js";
+import * as lifecycleLockModule from "../services/execution-workspace-lifecycle-lock.js";
 import {
   CROSS_TASK_CONTINUATION_COMMITTER_ID,
   CROSS_TASK_CONTINUATION_MESSAGES,
@@ -74,7 +76,7 @@ const support = await getEmbeddedPostgresTestSupport();
     await instanceSettingsService(db).updateExperimental({ enableCrossTaskDeferredContinuation: enabled });
   }
 
-  async function fixture(options: { workspace?: "archived" | "missing" | "none" } = {}) {
+  async function fixture(options: { workspace?: "archived" | "missing" | "none"; actor?: "source-run" | "target-run" | "board" } = {}) {
     const companyId = randomUUID();
     const projectId = randomUUID();
     const agentId = randomUUID();
@@ -123,10 +125,19 @@ const support = await getEmbeddedPostgresTestSupport();
       id: sourceRunId, companyId, agentId, status: "running", invocationSource: "assignment", triggerDetail: "system",
       contextSnapshot: { issueId: sourceIssueId, taskId: sourceIssueId },
     });
+    const targetRunId = randomUUID();
+    if (options.actor === "target-run") {
+      await db.insert(heartbeatRuns).values({
+        id: targetRunId, companyId, agentId, status: "running", invocationSource: "assignment", triggerDetail: "system",
+        contextSnapshot: { issueId: targetIssueId, taskId: targetIssueId },
+      });
+    }
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => {
-      req.actor = { type: "agent", agentId, companyId, runId: sourceRunId, source: "agent_key" } as never;
+      req.actor = (options.actor === "board"
+        ? { type: "board", userId: "responsible-user", companyIds: [companyId], source: "local_implicit", isInstanceAdmin: true }
+        : { type: "agent", agentId, companyId, runId: options.actor === "target-run" ? targetRunId : sourceRunId, source: "agent_key" }) as never;
       next();
     });
     app.use("/api", issueRoutes(db, {} as any));
@@ -425,5 +436,57 @@ const support = await getEmbeddedPostgresTestSupport();
     const res = await request(f.app).patch(`/api/issues/${f.targetIssueId}`).send({ status: "todo" });
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(await snapshot(f.targetIssueId, f.workspaceId)).toEqual(before);
+  });
+
+  // Records every reopen input the routes pass to the workspace service. Must
+  // be installed before the fixture builds the routes.
+  function recordReopenInputs() {
+    const inputs: Array<Record<string, unknown>> = [];
+    const real = executionWorkspacesModule.executionWorkspaceService;
+    const factory = vi.spyOn(executionWorkspacesModule, "executionWorkspaceService").mockImplementation((...args) => {
+      const svc = real(...args);
+      const reopen = svc.reopenClosedIsolatedExecutionWorkspaceForIssue;
+      svc.reopenClosedIsolatedExecutionWorkspaceForIssue = (input) => { inputs.push(input as Record<string, unknown>); return reopen(input); };
+      return svc;
+    });
+    return { inputs, restore: () => factory.mockRestore() };
+  }
+
+  it("L3: the deferred path never takes the eager lifecycle-lock helper and never calls the reopen service", async () => {
+    await setFeature(true);
+    const recorder = recordReopenInputs();
+    const withLock = vi.spyOn(lifecycleLockModule, "withExecutionWorkspaceLifecycleLock");
+    try {
+      const f = await fixture();
+      const res = await post(f.app, f.targetIssueId, { body: "Continue", resume: true, clientRequestId: randomUUID() });
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(withLock).not.toHaveBeenCalled();
+      expect(recorder.inputs).toHaveLength(0);
+    } finally {
+      withLock.mockRestore();
+      recorder.restore();
+    }
+  });
+
+  it.each([
+    { name: "V4: an agent run bound to the target", actor: "target-run" as const },
+    { name: "V5: a board user", actor: "board" as const },
+  ])("G3 / $name still reopens eagerly, without the fence and without an intent", async ({ actor }) => {
+    await setFeature(true);
+    const recorder = recordReopenInputs();
+    try {
+      const f = await fixture({ actor });
+      const res = await post(f.app, f.targetIssueId, { body: "Continue", resume: true });
+      // The fixture row has no repository, so the eager rebuild itself fails, as today (#75 M3).
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body).toEqual({ error: "Failed to rebuild the execution workspace" });
+      expect(recorder.inputs).toHaveLength(1);
+      expect(recorder.inputs[0]).toMatchObject({ workspaceId: f.workspaceId, issue: { id: f.targetIssueId } });
+      expect(recorder.inputs[0]).not.toHaveProperty("expectedClosedGeneration");
+      const after = await snapshot(f.targetIssueId, f.workspaceId);
+      expect(after.intents).toHaveLength(0);
+    } finally {
+      recorder.restore();
+    }
   });
 });

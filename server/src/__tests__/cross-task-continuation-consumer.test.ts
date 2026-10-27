@@ -20,6 +20,7 @@ import {
   heartbeatRuns,
   issueComments,
   issues,
+  issueTreeHolds,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -293,6 +294,21 @@ describeEmbeddedPostgres("cross-task continuation intent consumer", () => {
     expect(await dispatchReceipts(intent.id)).toHaveLength(0);
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(0);
     expect(await readIntent(intent.id)).toMatchObject({ status: "skipped", error: expectedError });
+  });
+
+  it("V1: a pause hold added between commit and dispatch starts no run and settles the intent by the existing pause rule", async () => {
+    const { companyId, issueId, intent } = await seedTarget();
+    await db.insert(issueTreeHolds).values({ companyId, rootIssueId: issueId, mode: "pause", status: "active", reason: "fixture pause" });
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
+    await heartbeat.drainActiveRunExecutions();
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(0);
+    const receipts = await dispatchReceipts(intent.id);
+    expect(receipts.length).toBeLessThanOrEqual(1);
+    const settled = await readIntent(intent.id);
+    expect(["skipped", "coalesced"]).toContain(settled.status);
+    if (settled.status === "coalesced") expect(receipts[0]?.status).toBe("deferred_issue_execution");
+    expect(settled.runId).toBeNull();
   });
 
   it("never dispatches a coalesced intent", async () => {
