@@ -92,19 +92,23 @@ const ROUND_LIMITS = [
 const RESOURCE_LIMIT_REASONS = new Set(["managed_checkout_budget", "managed_checkout_local_tip_budget",
   "worktree_fetch_head_budget", "base_ref_verification_budget"]);
 
-export function gitExpirationResourceLimit(error: unknown): string | null {
-  if (!(error instanceof Error)) return null;
-  if (RESOURCE_LIMIT_REASONS.has(error.message)) return error.message;
-  const child = error as Error & { code?: unknown; killed?: unknown; signal?: unknown };
-  if (child.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") return "git_output_limit";
-  if (child.killed === true && child.signal === "SIGTERM") return "git_timeout";
-  return null;
+function errorChain(error: unknown) {
+  const chain: Error[] = [];
+  for (let current = error; current instanceof Error && chain.length < 8 && !chain.includes(current); current = current.cause) chain.push(current);
+  return chain;
 }
 
-function isDatabaseFailure(error: unknown) {
-  if (!(error instanceof Error)) return false;
-  const code = (error as Error & { code?: unknown }).code;
-  return error.name === "PostgresError" || (typeof code === "string" && code.startsWith("CONNECTION_"));
+export function gitExpirationRoundFailure(error: unknown): { kind: "database" | "resource_limit"; reason: string } | null {
+  for (const entry of errorChain(error)) {
+    const { code, killed, signal } = entry as Error & { code?: unknown; killed?: unknown; signal?: unknown };
+    if (entry.name === "PostgresError" || entry.name === "DrizzleQueryError" || (typeof code === "string" && code.startsWith("CONNECTION_"))) {
+      return { kind: "database", reason: "database_error" };
+    }
+    if (RESOURCE_LIMIT_REASONS.has(entry.message)) return { kind: "resource_limit", reason: entry.message };
+    if (code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") return { kind: "resource_limit", reason: "git_output_limit" };
+    if (killed === true && signal === "SIGTERM") return { kind: "resource_limit", reason: "git_timeout" };
+  }
+  return null;
 }
 
 export function readOnlyInspectionGitAuth(env: NodeJS.ProcessEnv = process.env): GitRemoteAuthProvider {
@@ -139,9 +143,9 @@ async function inspectRow(db: Db, workspace: Workspace, key: GitExpirationRoundK
     if (error instanceof IsolatedRepositorySourceBusy || (error instanceof Error && error.message === "lifecycle_busy")) {
       return { ...row, outcome: "lock_busy", reason: "lock_busy" };
     }
-    if (isDatabaseFailure(error)) throw error;
-    const limit = gitExpirationResourceLimit(error);
-    if (limit) return { ...row, outcome: "resource_limit", reason: limit };
+    const failure = gitExpirationRoundFailure(error);
+    if (failure?.kind === "database") throw error;
+    if (failure) return { ...row, outcome: "resource_limit", reason: failure.reason };
     return { ...row, reason: gitExpirationSkipReason(error) };
   }
 }

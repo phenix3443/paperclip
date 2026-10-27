@@ -92,3 +92,4 @@ These stop reasons make the round `partial`: `lock_busy`, `resource_limit`, `abo
 - A row written with an old `updatedAt` after the round starts can be missing from the round.
 - The round does not capture settings for restoration metadata. A row can show `candidate` where the live expiration fails at that step.
 - Rows that need managed or company-secret Git credentials show `rejected` with `upstream_commit_unverified`.
+- The round sets `client_connection_check_interval`. PostgreSQL supports this setting only on platforms with connection-loss detection, such as Linux and macOS. On other servers the round cannot connect and ends with `database_error`.

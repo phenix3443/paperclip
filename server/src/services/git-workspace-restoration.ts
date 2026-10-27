@@ -73,7 +73,9 @@ async function verifiedGitCacheSource(workspace: Workspace, sourcePath: string) 
 }
 
 export class GitCacheRestorationFailure extends Error {
-  constructor() { super("The saved workspace commit could not be restored. Check repository access and retry."); }
+  constructor(cause?: unknown) {
+    super("The saved workspace commit could not be restored. Check repository access and retry.", cause === undefined ? undefined : { cause });
+  }
 }
 
 export function readGitCacheRestoration(workspace: Workspace): GitCacheRestoration | null {
@@ -119,7 +121,7 @@ export async function verifyRemoteGitCommit(repoUrl: string, commit: string, res
     await execFile("git", [...auth?.configArgs ?? [], "-C", temporary, "fetch", "--no-tags", "--no-recurse-submodules", "--depth=1", "--", repoUrl, commit], options);
     const result = await execFile("git", ["-C", temporary, "rev-parse", "FETCH_HEAD^{commit}"], options);
     if (result.stdout.trim() !== commit) throw new GitCacheRestorationFailure();
-  } catch { throw new GitCacheRestorationFailure(); }
+  } catch (error) { throw error instanceof GitCacheRestorationFailure ? error : new GitCacheRestorationFailure(error); }
   finally { await fs.rm(temporary, { recursive: true, force: true }); }
 }
 
@@ -233,7 +235,7 @@ async function hasCommitsMissingUpstream(checkout: string, localTips: string[], 
         { ...options, env: { ...options.env, ...auth?.env } });
     } catch (error) {
       if (signal?.aborted) throw error;
-      throw new Error("managed_checkout_upstream_unavailable");
+      throw new Error("managed_checkout_upstream_unavailable", { cause: error });
     }
     const missing = await execFile("git", ["-C", store, "rev-list", "--max-count=1", ...localTips, "--not", "--glob=refs/upstream/*"], options);
     return missing.stdout.trim() !== "";
@@ -505,7 +507,7 @@ export async function ensureSavedGitCommit(cwd: string, repoUrl: string, commit:
       timeout: 60_000, maxBuffer: 1024 * 1024, env: { ...process.env, ...auth?.env, GIT_TERMINAL_PROMPT: "0" },
     });
     if ((await gitCacheCommand(cwd, ["rev-parse", `${commit}^{commit}`])).trim() !== commit) throw new GitCacheRestorationFailure();
-  } catch { throw new GitCacheRestorationFailure(); }
+  } catch (error) { throw error instanceof GitCacheRestorationFailure ? error : new GitCacheRestorationFailure(error); }
 }
 
 /** Runtime callers must bind the recipe to the selected workspace and base. */

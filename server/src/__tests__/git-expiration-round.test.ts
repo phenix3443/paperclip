@@ -11,7 +11,8 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { materializeIsolatedRemoteWorkspaceSource } from "../services/isolated-remote-workspace-source.js";
 import { realizeExecutionWorkspace } from "../services/workspace-runtime.js";
 import { inspectGitExpirationRound, assertGitExpirationRoundMode, GIT_EXPIRATION_ROUND_MODE, GIT_EXPIRATION_ROUND_APPLICATION_NAME,
-  GitExpirationRoundInvariantError, type GitExpirationRoundEvent, type GitExpirationRoundOptions } from "../services/git-expiration-round.js";
+  GitExpirationRoundInvariantError, gitExpirationRoundFailure, type GitExpirationRoundEvent, type GitExpirationRoundOptions } from "../services/git-expiration-round.js";
+import { GitCacheRestorationFailure } from "../services/git-workspace-restoration.js";
 import { parseGitExpirationRoundArgs, runGitExpirationRoundCli, GitExpirationRoundUsageError } from "../git-expiration-round-cli.js";
 
 const recipeFailure = vi.hoisted(() => ({ error: null as Error | null }));
@@ -50,6 +51,18 @@ describe("one-round Git expiration inspection boundaries", () => {
     expect(() => assertGitExpirationRoundMode({ enabled: true, dryRun: true, expireBase: true })).toThrow("base_expiration_forbidden");
     await expect(inspectGitExpirationRound({ databaseUrl: "postgres://127.0.0.1:1/never", mode: { enabled: true, dryRun: false, expireBase: false } as never,
       roundId: "r1", journal: memoryJournal() })).rejects.toBeInstanceOf(GitExpirationRoundInvariantError);
+  });
+
+  it("classifies wrapped database and resource failures instead of treating them as rejections", () => {
+    const readOnly = Object.assign(new Error("cannot execute UPDATE in a read-only transaction"), { name: "PostgresError", code: "25006" });
+    const wrapped = Object.assign(new Error("Failed query: update ...", { cause: readOnly }), { name: "DrizzleQueryError" });
+    expect(gitExpirationRoundFailure(wrapped)).toEqual({ kind: "database", reason: "database_error" });
+    const timeout = Object.assign(new Error("Command failed: git fetch"), { killed: true, signal: "SIGTERM" });
+    expect(gitExpirationRoundFailure(new GitCacheRestorationFailure(timeout))).toEqual({ kind: "resource_limit", reason: "git_timeout" });
+    const output = Object.assign(new Error("stdout maxBuffer length exceeded"), { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" });
+    expect(gitExpirationRoundFailure(new Error("managed_checkout_upstream_unavailable", { cause: output }))).toEqual({ kind: "resource_limit", reason: "git_output_limit" });
+    expect(gitExpirationRoundFailure(new GitCacheRestorationFailure())).toBeNull();
+    expect(gitExpirationRoundFailure(new Error("unproven_workspace_ownership"))).toBeNull();
   });
 
   it("rejects conflicting flags and environment before opening the database", async () => {
@@ -247,14 +260,21 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
     });
   });
 
-  it("stops partial when a native helper budget or Git limit is hit during inspection", async () => {
-    const f = await seed(2);
-    recipeFailure.error = new Error("worktree_fetch_head_budget");
-    expect(await round(memoryJournal(), { companyId: f.companyId }))
-      .toMatchObject({ status: "partial", stopReason: "resource_limit", resourceLimited: 1, inspected: 1, selected: 2 });
-    recipeFailure.error = Object.assign(new Error("Command failed: git fetch"), { killed: true, signal: "SIGTERM" });
+  it("stops partial when a native helper budget is hit during a real inspection", async () => {
+    const f = await reconstructable();
+    const gitDir = git(f.cwd, "rev-parse", "--absolute-git-dir");
+    const lines = Array.from({ length: 33 }, (_, index) => `${index.toString(16).padStart(40, "a")}\t\tbranch 'b${index}' of origin\n`);
+    await fs.writeFile(path.join(gitDir, "FETCH_HEAD"), lines.join(""));
     const journal = memoryJournal();
-    expect(await round(journal, { companyId: f.companyId })).toMatchObject({ status: "partial", stopReason: "resource_limit" });
+    expect(await round(journal, { companyId: f.companyId })).toMatchObject({ status: "partial", stopReason: "resource_limit", resourceLimited: 1 });
+    expect(journal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "resource_limit", reason: "worktree_fetch_head_budget" });
+  });
+
+  it("stops partial when a wrapped Git timeout ends an inspection", async () => {
+    const f = await seed(2);
+    recipeFailure.error = new GitCacheRestorationFailure(Object.assign(new Error("Command failed: git fetch"), { killed: true, signal: "SIGTERM" }));
+    const journal = memoryJournal();
+    expect(await round(journal, { companyId: f.companyId })).toMatchObject({ status: "partial", stopReason: "resource_limit", inspected: 1, selected: 2 });
     expect(journal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "resource_limit", reason: "git_timeout" });
   });
 
