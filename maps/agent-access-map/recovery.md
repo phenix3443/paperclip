@@ -384,6 +384,20 @@ Verification: `not-run` — Each run, wake, process and gate refusal leaves the 
 
 Gaps: Embedded PostgreSQL route tests, plus a mocked route test for the PATCH transition recheck. Delivery revalidation inside the queue transaction and the public capability arrive in later slices. `claimQueuedRun` still checks budget, pause and dependencies before its lock.
 
+### `deliver-admitted-reconciliation`
+
+API: `present` — no route. The execution continuation worker delivers an admitted reconciliation through the heartbeat queue.
+
+Agent access: `restricted` — system only; no actor can trigger, skip or force a delivery.
+
+Policy: The queue transaction takes the company, owner agent and subtree-hold locks, then the issue and admission rows, and decides on locked rows: deliver once, wait on a closed gate with a backoff recheck time, or invalidate when the receipt is missing, the task closed or changed stage, the owner changed or was terminated, the company was archived, or a newer run exists. Waiting and invalidated outcomes write no wake or run. A partial unique index allows one live reconciliation wake per action.
+
+Evidence: `source-only` — [delivery revalidation](../../server/src/services/execution-reconciliation-delivery.ts), [heartbeat queue](../../server/src/services/heartbeat/queue.ts), [delivery worker](../../server/src/services/execution-recovery-resolution.ts); added after the page source revision and reviewed in the PR that adds them. No live provider proof.
+
+Verification: `not-run` — One delivery with retryOfRunId and the delivered marker in one commit; a closed interaction, a paused company or agent, or disabled on-demand wakes record waiting with no wake or run and deliver after the gate opens; a review state, newer run, missing receipt, archived company or terminated owner invalidate.
+
+Gaps: Embedded PostgreSQL tests only. Producers that pull `recheckAt` forward when a gate opens are not wired; a waiting row is rechecked at its backoff time. The public admission capability stays closed.
+
 ### `resolve-chat-publication`
 
 API: `present` — POST /api/chat-endpoints/{endpointId}/publications/{publicationId}/resolve action mark_delivered/retry_anyway/cancel, optional fileTransfer phase/version.
