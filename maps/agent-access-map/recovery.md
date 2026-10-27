@@ -386,7 +386,7 @@ Gaps: Embedded PostgreSQL route tests, plus a mocked route test for the PATCH tr
 
 ### `deliver-admitted-reconciliation`
 
-API: `present` — no route. The execution continuation worker delivers an admitted reconciliation through the heartbeat queue.
+API: `not-applicable` — no route; the execution continuation worker delivers an admitted reconciliation through the heartbeat queue.
 
 Agent access: `restricted` — system only; no actor can trigger, skip or force a delivery.
 
