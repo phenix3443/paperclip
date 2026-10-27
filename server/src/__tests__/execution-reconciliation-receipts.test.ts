@@ -3,6 +3,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import {
   agents,
+  agentWakeupRequests,
   companies,
   createDb,
   executionReconciliationReceipts,
@@ -41,6 +42,7 @@ describeEmbeddedPostgres("execution reconciliation receipts", () => {
 
   afterEach(async () => {
     await db.delete(executionReconciliationReceipts);
+    await db.delete(agentWakeupRequests);
     await db.delete(issueRecoveryActions);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
@@ -218,5 +220,20 @@ describeEmbeddedPostgres("execution reconciliation receipts", () => {
     expect(mismatch).toEqual({ matches: false, digest, differingKeys: ["issue"] });
     expect(compareExpectedReconciliationState(server, { expected: server, expectedDigest: "0".repeat(64) }))
       .toEqual({ matches: false, digest, differingKeys: ["expectedDigest"] });
+  });
+  it("allows only one live reconciliation wake per action key", async () => {
+    const fixture = await seed();
+    const key = `execution-reconciliation:${fixture.actionId}`;
+    const wake = (status: string) => db.insert(agentWakeupRequests).values({
+      companyId: fixture.companyId, agentId: fixture.agentId, source: "automation", status,
+      idempotencyKey: key, payload: { issueId: fixture.issueId },
+    });
+    await wake("queued");
+    await expect(wake("queued")).rejects.toMatchObject({ cause: { code: "23505" } });
+    await db.update(agentWakeupRequests).set({ status: "completed" }).where(eq(agentWakeupRequests.idempotencyKey, key));
+    await expect(wake("claimed")).rejects.toMatchObject({ cause: { code: "23505" } });
+    await wake("skipped");
+    await wake("failed");
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey, key))).toHaveLength(3);
   });
 });
