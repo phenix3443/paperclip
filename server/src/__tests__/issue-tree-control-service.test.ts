@@ -18,8 +18,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { issueTreeControlService } from "../services/issue-tree-control.js";
-import { lockIssueTreeHolds } from "../services/execution-reconciliation-locks.js";
+import { issueTreeControlService, lockIssueTreeHolds } from "../services/issue-tree-control.js";
 import { issueService } from "../services/issues.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();

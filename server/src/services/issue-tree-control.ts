@@ -1,5 +1,4 @@
 import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
-import { lockIssueTreeHolds } from "./execution-reconciliation-locks.js";
 import type { Db } from "@paperclipai/db";
 import {
   agentWakeupRequests,
@@ -409,6 +408,17 @@ function restoreStatusFromCancelSnapshot(status: IssueStatus): IssueStatus | nul
   if (status === "in_progress") return "todo";
   if (isTerminalIssue(status)) return null;
   return status;
+}
+
+export async function lockIssueTreeHolds(
+  tx: Pick<Db, "execute">,
+  companyId: string,
+  mode: "shared" | "exclusive",
+) {
+  const key = `issue-tree-hold:${companyId}`;
+  await tx.execute(mode === "shared"
+    ? sql`select pg_advisory_xact_lock_shared(hashtextextended(${key}, 0))`
+    : sql`select pg_advisory_xact_lock(hashtextextended(${key}, 0))`);
 }
 
 export function issueTreeControlService(db: Db) {

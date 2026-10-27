@@ -1,22 +1,8 @@
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, inArray } from "drizzle-orm";
 import { agents, issueApprovals, issues, type Db } from "@paperclipai/db";
+import { lockIssueTreeHolds } from "./issue-tree-control.js";
 
 type DbOrTransaction = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
-
-export function issueTreeHoldLockKey(companyId: string) {
-  return `issue-tree-hold:${companyId}`;
-}
-
-export async function lockIssueTreeHolds(
-  tx: DbOrTransaction,
-  companyId: string,
-  mode: "shared" | "exclusive",
-) {
-  const key = issueTreeHoldLockKey(companyId);
-  await tx.execute(mode === "shared"
-    ? sql`select pg_advisory_xact_lock_shared(hashtextextended(${key}, 0))`
-    : sql`select pg_advisory_xact_lock(hashtextextended(${key}, 0))`);
-}
 
 export async function lockAdmissionOwnerAndTreeHolds(
   tx: DbOrTransaction,

@@ -10,6 +10,23 @@ interface LinkActor {
   userId?: string | null;
 }
 
+export async function insertIssueApprovalLinks(
+  tx: Parameters<Parameters<Db["transaction"]>[0]>[0],
+  input: { companyId: string; approvalId: string; issueIds: string[]; linkedByAgentId?: string | null; linkedByUserId?: string | null },
+) {
+  await lockIssuesForGateWrite(tx, input.companyId, input.issueIds);
+  await tx
+    .insert(issueApprovals)
+    .values(input.issueIds.map((issueId) => ({
+      companyId: input.companyId,
+      issueId,
+      approvalId: input.approvalId,
+      linkedByAgentId: input.linkedByAgentId ?? null,
+      linkedByUserId: input.linkedByUserId ?? null,
+    })))
+    .onConflictDoNothing();
+}
+
 export function issueApprovalService(db: Db) {
   async function getIssue(issueId: string) {
     return db
@@ -108,19 +125,10 @@ export function issueApprovalService(db: Db) {
     link: async (issueId: string, approvalId: string, actor?: LinkActor) => {
       const { issue } = await assertIssueAndApprovalSameCompany(issueId, approvalId);
 
-      await db.transaction(async (tx) => {
-        await lockIssuesForGateWrite(tx, issue.companyId, [issueId]);
-        await tx
-          .insert(issueApprovals)
-          .values({
-            companyId: issue.companyId,
-            issueId,
-            approvalId,
-            linkedByAgentId: actor?.agentId ?? null,
-            linkedByUserId: actor?.userId ?? null,
-          })
-          .onConflictDoNothing();
-      });
+      await db.transaction((tx) => insertIssueApprovalLinks(tx, {
+        companyId: issue.companyId, approvalId, issueIds: [issueId],
+        linkedByAgentId: actor?.agentId, linkedByUserId: actor?.userId,
+      }));
 
       return db
         .select()
@@ -161,21 +169,10 @@ export function issueApprovalService(db: Db) {
         }
       }
 
-      await db.transaction(async (tx) => {
-        await lockIssuesForGateWrite(tx, approval.companyId, uniqueIssueIds);
-        await tx
-          .insert(issueApprovals)
-          .values(
-            uniqueIssueIds.map((issueId) => ({
-              companyId: approval.companyId,
-              issueId,
-              approvalId,
-              linkedByAgentId: actor?.agentId ?? null,
-              linkedByUserId: actor?.userId ?? null,
-            })),
-          )
-          .onConflictDoNothing();
-      });
+      await db.transaction((tx) => insertIssueApprovalLinks(tx, {
+        companyId: approval.companyId, approvalId, issueIds: uniqueIssueIds,
+        linkedByAgentId: actor?.agentId, linkedByUserId: actor?.userId,
+      }));
     },
   };
 }
