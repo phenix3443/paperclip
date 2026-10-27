@@ -14,6 +14,7 @@ import { isRuntimeOwnedGitBranch } from "./execution-workspace-branch-ownership.
 import { recordedIsolatedRemoteSource, verifiedRecordedIsolatedRemoteSource, materializeIsolatedRemoteWorkspaceSource } from "./isolated-remote-workspace-source.js";
 import { findRegenerableWorkspaceDirs } from "./workspace-compaction.js";
 import { PROJECT_REPOSITORIES_DIR } from "@paperclipai/adapter-utils/git-workspace-sync";
+import { GitExpirationBudgetExceeded, runBoundedGit } from "./git-expiration-budget.js";
 
 const execFile = promisify(execFileCallback);
 const shaPattern = /^[a-f0-9]{40}$/;
@@ -110,7 +111,7 @@ export function onGitExit<T>(handle: (error: unknown) => T) {
 }
 
 export async function gitCacheCommand(cwd: string, args: string[], signal?: AbortSignal) {
-  const result = await execFile("git", ["-c", "core.fsmonitor=false", "-C", cwd, ...args], {
+  const result = await runBoundedGit(["-c", "core.fsmonitor=false", "-C", cwd, ...args], {
     timeout: 60_000, signal, maxBuffer: 16 * 1024 * 1024,
     env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0" },
   });
@@ -125,11 +126,14 @@ export async function verifyRemoteGitCommit(repoUrl: string, commit: string, res
     const auth = await resolveGitAuth(repoUrl);
     const env = { ...process.env, ...auth?.env, GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: os.devNull };
     const options = { timeout: 60_000, signal, maxBuffer: 1024 * 1024, env };
-    await execFile("git", ["init", "--bare", temporary], options);
-    await execFile("git", [...auth?.configArgs ?? [], "-C", temporary, "fetch", "--no-tags", "--no-recurse-submodules", "--depth=1", "--", repoUrl, commit], options);
-    const result = await execFile("git", ["-C", temporary, "rev-parse", "FETCH_HEAD^{commit}"], options);
+    await runBoundedGit(["init", "--bare", temporary], options);
+    await runBoundedGit([...auth?.configArgs ?? [], "-C", temporary, "fetch", "--no-tags", "--no-recurse-submodules", "--depth=1", "--", repoUrl, commit], options);
+    const result = await runBoundedGit(["-C", temporary, "rev-parse", "FETCH_HEAD^{commit}"], options);
     if (result.stdout.trim() !== commit) throw new GitCacheRestorationFailure();
-  } catch (error) { throw error instanceof GitCacheRestorationFailure ? error : new GitCacheRestorationFailure(error); }
+  } catch (error) {
+    if (error instanceof GitCacheRestorationFailure || error instanceof GitExpirationBudgetExceeded) throw error;
+    throw new GitCacheRestorationFailure(error);
+  }
   finally { await fs.rm(temporary, { recursive: true, force: true }); }
 }
 
@@ -139,14 +143,17 @@ async function stockGitFiles() {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-template-"));
     const files = new Map<string, Buffer>();
     try {
-      await execFile("git", ["init", "--bare", root], { timeout: 10_000,
+      await runBoundedGit(["init", "--bare", root], { timeout: 10_000, maxBuffer: 1024 * 1024,
         env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: os.devNull } });
       for (const name of ["description", "info/exclude", ...(await fs.readdir(path.join(root, "hooks"))).map(name => `hooks/${name}`)]) {
         files.set(name, await fs.readFile(path.join(root, name)));
       }
       return files;
     } finally { await fs.rm(root, { recursive: true, force: true }); }
-  })();
+  })().catch(error => {
+    templateFiles = undefined;
+    throw error;
+  });
   return templateFiles;
 }
 
@@ -234,18 +241,18 @@ async function hasCommitsMissingUpstream(checkout: string, localTips: string[], 
   try {
     const options = { timeout: 120_000, signal, maxBuffer: 16 * 1024 * 1024, cwd: os.tmpdir(),
       env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: os.devNull } };
-    await execFile("git", ["init", "--bare", "--quiet", store], options);
+    await runBoundedGit(["init", "--bare", "--quiet", store], options);
     await fs.writeFile(path.join(store, "objects", "info", "alternates"), `${path.join(await fs.realpath(checkout), ".git", "objects")}\n`);
     try {
       const auth = await resolveGitAuth(repoUrl);
-      await execFile("git", [...auth?.configArgs ?? [], "-C", store, "fetch", "--quiet", "--no-tags", "--no-recurse-submodules",
+      await runBoundedGit([...auth?.configArgs ?? [], "-C", store, "fetch", "--quiet", "--no-tags", "--no-recurse-submodules",
         "--", repoUrl, "+refs/heads/*:refs/upstream/heads/*", "+refs/tags/*:refs/upstream/tags/*"],
         { ...options, env: { ...options.env, ...auth?.env } });
     } catch (error) {
-      if (signal?.aborted) throw error;
+      if (signal?.aborted || error instanceof GitExpirationBudgetExceeded) throw error;
       throw new Error("managed_checkout_upstream_unavailable", { cause: error });
     }
-    const missing = await execFile("git", ["-C", store, "rev-list", "--max-count=1", ...localTips, "--not", "--glob=refs/upstream/*"], options);
+    const missing = await runBoundedGit(["-C", store, "rev-list", "--max-count=1", ...localTips, "--not", "--glob=refs/upstream/*"], options);
     return missing.stdout.trim() !== "";
   } finally {
     await fs.rm(store, { recursive: true, force: true });

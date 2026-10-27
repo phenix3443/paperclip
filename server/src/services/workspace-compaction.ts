@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { runBoundedGit } from "./git-expiration-budget.js";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -46,27 +46,11 @@ async function runGitRead(
   args: string[],
   options: { signal?: AbortSignal; input?: string; okExitCodes?: number[] } = {},
 ) {
-  return await new Promise<string>((resolve, reject) => {
-    const child = execFile(
-      "git",
-      ["-C", worktreePath, ...args],
-      { cwd: worktreePath, timeout: GIT_READ_TIMEOUT_MS, signal: options.signal, maxBuffer: 16 * 1024 * 1024 },
-      (error, stdout) => {
-        const exitCode = (error as { code?: unknown } | null)?.code;
-        if (!error || (typeof exitCode === "number" && options.okExitCodes?.includes(exitCode))) {
-          resolve(stdout);
-          return;
-        }
-        reject(error);
-      },
-    );
-    // Git can exit before it reads stdin (or never reads it). A write to the
-    // closed pipe then fails with EPIPE; the exit status above already reports
-    // any real failure, so the stream error is not a second outcome.
-    child.stdin?.on("error", () => {});
-    if (options.input === undefined) child.stdin?.end();
-    else child.stdin?.end(options.input);
+  const result = await runBoundedGit(["-C", worktreePath, ...args], {
+    cwd: worktreePath, timeout: GIT_READ_TIMEOUT_MS, signal: options.signal, maxBuffer: 16 * 1024 * 1024,
+    input: options.input, okExitCodes: options.okExitCodes,
   });
+  return result.stdout;
 }
 
 function splitNul(output: string) {

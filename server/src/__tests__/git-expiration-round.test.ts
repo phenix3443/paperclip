@@ -1,7 +1,7 @@
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -14,11 +14,13 @@ import { inspectGitExpirationRound, assertGitExpirationRoundMode, GIT_EXPIRATION
   GitExpirationRoundInvariantError, gitExpirationRoundFailure, readOnlyInspectionGitAuth, GIT_EXPIRATION_ROUND_SESSION_PARAMETERS,
   type GitExpirationRoundEvent, type GitExpirationRoundJournal, type GitExpirationRoundOptions } from "../services/git-expiration-round.js";
 import { GitCacheRestorationFailure } from "../services/git-workspace-restoration.js";
+import { probeGitProcessGroup, ROW_DRAIN_BOUND_MS } from "../services/git-expiration-budget.js";
 import { createGitRemoteAuthProvider } from "../services/git-credentials.js";
 import { parseGitExpirationRoundArgs, runGitExpirationRoundCli, GitExpirationRoundUsageError, fileGitExpirationRoundJournal,
   readGitExpirationRoundJournal, gitExpirationRoundExitCode } from "../git-expiration-round-cli.js";
 
-const faults = vi.hoisted(() => ({ git: null as ((args: readonly string[]) => Error | null) | null, seamWrite: false, secretServices: 0 }));
+const faults = vi.hoisted(() => ({ git: null as ((args: readonly string[]) => Error | null) | null,
+  spawn: null as ((args: readonly string[]) => string[] | null) | null, seamWrite: false, secretServices: 0 }));
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
   const { promisify: promisifyActual } = await import("node:util");
@@ -29,7 +31,11 @@ vi.mock("node:child_process", async (importOriginal) => {
       return fault ? Promise.reject(fault) : run(file, args as string[], options as never);
     },
   });
-  return { ...actual, execFile };
+  const spawn = ((file: string, args: readonly string[] = [], options?: object) => {
+    const replacement = file === "git" ? faults.spawn?.(args) : null;
+    return replacement ? actual.spawn(replacement[0]!, replacement.slice(1), options as never) : actual.spawn(file, args as string[], options as never);
+  }) as typeof actual.spawn;
+  return { ...actual, execFile, spawn };
 });
 vi.mock("../services/secrets.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../services/secrets.js")>();
@@ -44,8 +50,6 @@ vi.mock("../services/git-workspace-expiration-inspection.js", async (importOrigi
     return actual.inspectLockedGitExpirationCandidate(...args);
   } };
 });
-const gitTimeout = () => Object.assign(new Error("Command failed: git"), { killed: true, signal: "SIGTERM", code: null });
-const gitOutputLimit = () => Object.assign(new Error("stdout maxBuffer length exceeded"), { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" });
 const sqlState = (error: unknown) => {
   for (let current = error; current instanceof Error; current = current.cause) {
     const code = (current as { code?: unknown }).code;
@@ -160,7 +164,7 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
     process.env.PAPERCLIP_HOME = path.join(root, "home");
     process.env.PAPERCLIP_INSTANCE_ID = "default";
   });
-  afterEach(async () => { faults.git = null; faults.seamWrite = false; await db.execute(sql`TRUNCATE TABLE companies CASCADE`); });
+  afterEach(async () => { faults.git = null; faults.spawn = null; faults.seamWrite = false; await db.execute(sql`TRUNCATE TABLE companies CASCADE`); });
   afterAll(async () => {
     if (previousHome === undefined) delete process.env.PAPERCLIP_HOME; else process.env.PAPERCLIP_HOME = previousHome;
     if (previousInstance === undefined) delete process.env.PAPERCLIP_INSTANCE_ID; else process.env.PAPERCLIP_INSTANCE_ID = previousInstance;
@@ -346,9 +350,9 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
 
   it("stops partial when Git times out in a proof step that tolerates a normal Git failure", async () => {
     const f = await reconstructable();
-    faults.git = args => args.includes("ORIG_HEAD") ? gitTimeout() : null;
+    faults.spawn = args => args.includes("ORIG_HEAD") ? ["sleep", "30"] : null;
     const journal = memoryJournal();
-    expect(await round(journal, { companyId: f.companyId })).toMatchObject({ status: "partial", stopReason: "resource_limit", resourceLimited: 1, candidates: 0 });
+    expect(await round(journal, { companyId: f.companyId, budgetHooks: { gitTimeoutMs: 300 } })).toMatchObject({ status: "partial", stopReason: "resource_limit", resourceLimited: 1, candidates: 0 });
     expect(journal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "resource_limit", reason: "git_timeout",
       current: { state: "read" } });
   });
@@ -356,11 +360,38 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
   it("stops partial when Git output is too large in an ancestry proof", async () => {
     const f = await reconstructable();
     await fs.writeFile(path.join(git(f.cwd, "rev-parse", "--absolute-git-dir"), "ORIG_HEAD"), `${git(f.cwd, "rev-parse", "HEAD")}\n`);
-    faults.git = args => args.includes("merge-base") && args.includes("--is-ancestor") ? gitOutputLimit() : null;
+    faults.spawn = args => args.includes("merge-base") && args.includes("--is-ancestor")
+      ? ["sh", "-c", "head -c 8388608 /dev/zero; head -c 8388609 /dev/zero >&2"] : null;
     const journal = memoryJournal();
-    expect(await round(journal, { companyId: f.companyId })).toMatchObject({ status: "partial", stopReason: "resource_limit", candidates: 0 });
-    expect(journal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "resource_limit", reason: "git_output_limit" });
+    const summary = await round(journal, { companyId: f.companyId });
+    expect(summary).toMatchObject({ status: "partial", stopReason: "resource_limit", candidates: 0, drainIncomplete: false });
+    expect(journal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "resource_limit", reason: "git_output" });
   });
+
+  it("returns within the drain bound after a budget hit whose Git group is never proven empty, holding both locks", async () => {
+    const f = await reconstructable();
+    let hold = true;
+    const undrained: Promise<void>[] = [];
+    const journal = memoryJournal();
+    const started = Date.now();
+    try {
+      const summary = await round(journal, { companyId: f.companyId, onUndrainedRow: released => undrained.push(released),
+        budgetHooks: { probeGroup: pgid => hold || probeGitProcessGroup(pgid) } });
+      expect(Date.now() - started).toBeLessThan(ROW_DRAIN_BOUND_MS + 5_000);
+      expect(summary).toMatchObject({ status: "partial", stopReason: "resource_limit", resourceLimited: 1, drainIncomplete: true,
+        undrainedRow: { id: f.workspaceId } });
+      expect(journal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "resource_limit", reason: "git_group_survivor" });
+      expect(journal.events.at(-1)).toMatchObject({ type: "round_finished", status: "partial", drainIncomplete: true });
+      expect(undrained).toHaveLength(1);
+      expect(await advisoryLocks()).toBe(2);
+      expect(Number((await db.execute<{ count: string }>(sql`select count(distinct pid)::text as count from pg_locks
+        where locktype = 'advisory' and granted`))[0]!.count)).toBe(2);
+    } finally {
+      hold = false;
+    }
+    await undrained[0];
+    await waitFor(async () => await advisoryLocks() === 0 && await roundBackends() === 0);
+  }, 30_000);
 
   it("refuses writes on the round's root and dedicated sessions", async () => {
     const f = await seed(1);
@@ -596,17 +627,130 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
     });
   });
 
-  it("cancels a blocked row inspection and releases its advisory locks", async () => {
+  it("records git_timeout within the drain bound when the timed-out group is never proven empty, holding both locks", async () => {
+    const f = await reconstructable();
+    let hold = false;
+    faults.spawn = args => args.includes("ORIG_HEAD") ? (hold = true, ["sleep", "30"]) : null;
+    const undrained: Promise<void>[] = [];
+    const journal = memoryJournal();
+    const started = Date.now();
+    try {
+      const summary = await round(journal, { companyId: f.companyId, onUndrainedRow: released => undrained.push(released),
+        budgetHooks: { gitTimeoutMs: 300, probeGroup: pgid => hold || probeGitProcessGroup(pgid) } });
+      expect(Date.now() - started).toBeLessThan(ROW_DRAIN_BOUND_MS + 5_000);
+      expect(summary).toMatchObject({ status: "partial", stopReason: "resource_limit", resourceLimited: 1, drainIncomplete: true,
+        undrainedRow: { id: f.workspaceId } });
+      expect(journal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "resource_limit", reason: "git_timeout" });
+      expect(journal.events.at(-1)).toMatchObject({ type: "round_finished", status: "partial", drainIncomplete: true });
+      expect(undrained).toHaveLength(1);
+      expect(await advisoryLocks()).toBe(2);
+    } finally {
+      hold = false;
+    }
+    await undrained[0];
+    await waitFor(async () => await advisoryLocks() === 0 && await roundBackends() === 0);
+  }, 30_000);
+
+  it("keeps the source and lifecycle sessions alive past a 2 s idle transaction timeout while a row drain is held for 6 s", async () => {
+    const f = await reconstructable();
+    const [{ name }] = await db.execute<{ name: string }>(sql`select current_database() as name`);
+    const ident = `"${name!.replace(/"/g, '""')}"`;
+    await db.execute(sql.raw(`ALTER DATABASE ${ident} SET idle_in_transaction_session_timeout = '2s'`));
+    let hold = false;
+    faults.spawn = args => args.includes("ORIG_HEAD") ? (hold = true, ["sleep", "30"]) : null;
+    const undrained: Promise<void>[] = [];
+    try {
+      const pending = round(memoryJournal(), { companyId: f.companyId, onUndrainedRow: released => undrained.push(released),
+        budgetHooks: { gitTimeoutMs: 300, probeGroup: pgid => hold || probeGitProcessGroup(pgid) } });
+      expect(await pending).toMatchObject({ drainIncomplete: true });
+      await new Promise(resolve => setTimeout(resolve, 6_000));
+      expect(Number((await db.execute<{ count: string }>(sql`select count(*)::text as count from pg_stat_activity
+        where state like 'idle in transaction%' and pid in (select pid from pg_locks where locktype = 'advisory' and granted)`))[0]!.count)).toBe(2);
+    } finally {
+      faults.spawn = null;
+      hold = false;
+      await db.execute(sql.raw(`ALTER DATABASE ${ident} RESET idle_in_transaction_session_timeout`));
+    }
+    await undrained[0];
+    await waitFor(async () => await advisoryLocks() === 0 && await roundBackends() === 0);
+  }, 30_000);
+
+  it("holds both locks while a real group survivor writes scratch, then releases them only after its group is gone", async () => {
+    const f = await reconstructable();
+    const scratch = path.join(root, `survivor-${randomUUID()}`);
+    const pidFile = `${scratch}.pid`;
+    faults.spawn = args => args.includes("ORIG_HEAD")
+      ? ["sh", "-c", `sh -c 'trap "" TERM; echo $$ > "${pidFile}"; while :; do echo x >> "${scratch}"; sleep 0.05; done' </dev/null >/dev/null 2>&1 & while [ ! -s "${pidFile}" ]; do sleep 0.01; done; exit 0`]
+      : null;
+    const journal = memoryJournal();
+    const pending = round(journal, { companyId: f.companyId });
+    await waitFor(async () => (await fs.readFile(pidFile, "utf8").catch(() => "")).trim() !== "");
+    const member = Number((await fs.readFile(pidFile, "utf8")).trim());
+    expect(await advisoryLocks()).toBe(2);
+    const summary = await pending;
+    expect(summary).toMatchObject({ status: "partial", stopReason: "resource_limit", resourceLimited: 1, drainIncomplete: false });
+    expect(journal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "resource_limit", reason: "git_group_survivor" });
+    expect(() => process.kill(member, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
+    const size = (await fs.stat(scratch)).size;
+    await new Promise(resolve => setTimeout(resolve, 300));
+    expect((await fs.stat(scratch)).size).toBe(size);
+    await waitFor(async () => await advisoryLocks() === 0 && await roundBackends() === 0);
+  }, 30_000);
+
+  it("keeps the advisory locks of an aborted row until its blocked statement drains", async () => {
     const f = await seed(1);
     const controller = new AbortController();
+    const undrained: Promise<void>[] = [];
+    const journal = memoryJournal();
     await holdingTableLock("issues", async () => {
-      const pending = round(memoryJournal(), { companyId: f.companyId, signal: controller.signal });
+      const pending = round(journal, { companyId: f.companyId, signal: controller.signal, onUndrainedRow: released => undrained.push(released) });
       await waitFor(async () => await lockWaiters() > 0 && await advisoryLocks() > 0);
+      const aborted = Date.now();
       controller.abort();
-      expect(await pending).toMatchObject({ status: "partial", stopReason: "aborted", inspected: 0, lastCompletedKey: null });
-      await waitFor(async () => await lockWaiters() === 0 && await advisoryLocks() === 0 && await roundBackends() === 0);
+      const summary = await pending;
+      expect(Date.now() - aborted).toBeLessThan(ROW_DRAIN_BOUND_MS + 2_000);
+      expect(summary).toMatchObject({ status: "partial", stopReason: "aborted", inspected: 0, lastCompletedKey: null,
+        drainIncomplete: true, undrainedRow: { id: f.ids[0] } });
+      expect(journal.events.at(-1)).toMatchObject({ type: "round_finished", status: "partial", drainIncomplete: true });
+      expect(journal.events.some(event => event.type === "row_inspected")).toBe(false);
+      expect(undrained).toHaveLength(1);
+      expect(await advisoryLocks()).toBe(2);
     });
-  });
+    await undrained[0];
+    await waitFor(async () => await lockWaiters() === 0 && await advisoryLocks() === 0 && await roundBackends() === 0);
+  }, 30_000);
+
+  it("keeps a real CLI process and its locks alive across SIGTERM until SIGKILL ends it", async () => {
+    const f = await seed(1);
+    const evidenceDir = path.join(root, `cli-undrained-${randomUUID()}`);
+    const loader = path.resolve(here, "../../node_modules/tsx/dist/loader.mjs");
+    const entry = path.resolve(here, "../git-expiration-round-cli.ts");
+    let stdout = "";
+    let exited!: Promise<NodeJS.Signals | number | null>;
+    await holdingTableLock("issues", async () => {
+      const cli = spawn(process.execPath, ["--import", pathToFileURL(loader).href, entry, "--round-id", "cli-undrained", "--evidence-dir", evidenceDir,
+        "--company-id", f.companyId], { env: { ...process.env, DATABASE_URL: database.connectionString }, stdio: ["ignore", "pipe", "inherit"] });
+      exited = new Promise(resolve => cli.once("exit", (code, signal) => resolve(signal ?? code)));
+      cli.stdout.on("data", chunk => { stdout += String(chunk); });
+      try {
+        await waitFor(async () => await lockWaiters() > 0 && await advisoryLocks() === 2);
+        cli.kill("SIGTERM");
+        await waitFor(async () => stdout.includes("\n"));
+        expect(JSON.parse(stdout)).toMatchObject({ status: "partial", stopReason: "aborted", drainIncomplete: true, undrainedRow: { id: f.ids[0] } });
+        const events = (await fs.readFile(path.join(evidenceDir, "events.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line) as { type: string });
+        expect(events.at(-1)).toMatchObject({ type: "round_finished", status: "partial", drainIncomplete: true });
+        cli.kill("SIGTERM");
+        await new Promise(resolve => setTimeout(resolve, 500));
+        expect(cli.exitCode).toBeNull();
+        expect(cli.signalCode).toBeNull();
+        expect(await advisoryLocks()).toBe(2);
+      } finally {
+        cli.kill("SIGKILL");
+      }
+      expect(await exited).toBe("SIGKILL");
+    });
+    await waitFor(async () => await lockWaiters() === 0 && await advisoryLocks() === 0 && await roundBackends() === 0);
+  }, 60_000);
 
   it("ends partial when evidence cannot be recorded", async () => {
     const f = await seed(2);

@@ -40,7 +40,9 @@ Exit codes:
 | `2` | The arguments or the environment are not correct. The round did not start. |
 | `1` | The round failed. |
 
-`SIGINT` and `SIGTERM` stop the round. The round closes its database connections, also when a query is in progress, and ends partial.
+`SIGINT` and `SIGTERM` stop the round. The round ends partial. It ends its connection pool at once, also when a query is in progress. The row in progress keeps its source and lifecycle locks until its Git children and database work have stopped: each Git child runs in its own process group, gets `SIGTERM` and, after 2 s, `SIGKILL`, and counts as stopped only when the whole group is gone.
+
+If the row has not stopped 5 s after the stop, the summary has `drainIncomplete: true` and `undrainedRow` set to its key, and the journal already ends with `round_finished` `partial`. The CLI then writes the stdout summary, closes the journal and keeps running with both locks held. Further `SIGINT` or `SIGTERM` signals do not end it. It exits `3` once the row releases its locks, or ends when the host kills it (`TimeoutStopSec` or `RuntimeMaxSec`).
 
 ## What the round does
 
@@ -57,7 +59,7 @@ The round uses its own cursor. It does not use or change the cursor of the recur
 
 - All database sessions of the round are read-only (`default_transaction_read_only=on`). A write attempt fails and stops the round.
 - Remote proof uses only the `GITHUB_TOKEN` or `GH_TOKEN` server environment credentials. The round does not read company secrets or managed connections, and it does not refresh OAuth grants.
-- Git commands in the worktree use `GIT_OPTIONAL_LOCKS=0`. Remote proof fetches into a temporary repository and removes it.
+- Git commands of the round use `GIT_OPTIONAL_LOCKS=0`, `GIT_TERMINAL_PROMPT=0`, `gc.auto=0`, `maintenance.auto=false` and `core.fsmonitor=false`. Each Git child may write at most 16 MiB to stdout and stderr together, and a row runs at most one Git child at a time. A Git timeout, the output cap and a group member left after the leader exits record the row as `resource_limit` at once (`git_timeout`, `git_output`, `git_group_survivor`); the locks stay held until the group is gone, as for a stop signal. A full scratch disk or quota (`ENOSPC`, `EDQUOT`) stops the round with `resource_limit` instead of rejecting the row. Remote proof fetches into a temporary repository and removes it.
 
 ## Evidence
 
