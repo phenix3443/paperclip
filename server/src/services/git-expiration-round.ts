@@ -193,7 +193,7 @@ function inspectRow(db: Db, workspace: Workspace, key: GitExpirationRoundKey, au
   const outcome = Promise.race([finished, stopped]);
   finished.catch(() => undefined);
   stopped.catch(() => undefined);
-  return { outcome, released: chain.then(() => undefined, () => undefined) };
+  return { outcome, released: chain.then(() => undefined, () => undefined).finally(() => budget.close()) };
 }
 
 async function awaitRelease(released: Promise<void>) {

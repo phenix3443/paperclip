@@ -1,5 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { execFile, spawn } from "node:child_process";
+import type { Dirent } from "node:fs";
+import fs from "node:fs/promises";
 
 export const GIT_EXPIRATION_BUDGETS = Object.freeze({
   roundSeconds: 600,
@@ -43,24 +45,80 @@ export const probeGitProcessGroup: GitGroupProbe = pgid => {
   }
 };
 
+export type RowClock = {
+  now(): number;
+  schedule(callback: () => void, ms: number): () => void;
+};
+
+const systemRowClock: RowClock = {
+  now: () => Date.now(),
+  schedule(callback, ms) {
+    const timer = setTimeout(callback, ms);
+    timer.unref();
+    return () => clearTimeout(timer);
+  },
+};
+
+export type InspectionBudgetPeaks = { childOutputBytes: number; gitChildren: number; rowEntries: number; rowMs: number };
+
 export type InspectionBudgetHooks = {
   probeGroup?: GitGroupProbe;
   gitTimeoutMs?: number;
+  rowMs?: number;
+  clock?: RowClock;
+  beforeDirectoryRead?: (directory: string) => Promise<void>;
+  onRowClosed?: (peaks: Readonly<InspectionBudgetPeaks>) => void;
 };
 
 export class InspectionBudget {
   readonly signal: AbortSignal;
-  readonly peaks = { childOutputBytes: 0, gitChildren: 0 };
+  readonly peaks: InspectionBudgetPeaks = { childOutputBytes: 0, gitChildren: 0, rowEntries: 0, rowMs: 0 };
   readonly probeGroup: GitGroupProbe;
   readonly gitTimeoutCapMs: number;
+  readonly rowMs: number;
   private readonly controller = new AbortController();
   private readonly running = new Set<Promise<unknown>>();
+  private readonly clock: RowClock;
+  private readonly startedAt: number;
+  private readonly cancelRowTimer: () => void;
+  private readonly hooks: InspectionBudgetHooks;
   private gitChildren = 0;
 
   constructor(roundSignal: AbortSignal, hooks: InspectionBudgetHooks = {}) {
     this.signal = AbortSignal.any([roundSignal, this.controller.signal]);
     this.probeGroup = hooks.probeGroup ?? probeGitProcessGroup;
     this.gitTimeoutCapMs = hooks.gitTimeoutMs ?? Number.POSITIVE_INFINITY;
+    this.rowMs = hooks.rowMs ?? GIT_EXPIRATION_BUDGETS.rowMs;
+    this.hooks = hooks;
+    this.clock = hooks.clock ?? systemRowClock;
+    this.startedAt = this.clock.now();
+    this.cancelRowTimer = this.clock.schedule(() => this.expireRow(), this.rowMs);
+  }
+
+  rowTimeLeft() {
+    return Math.max(0, this.startedAt + this.rowMs - this.clock.now());
+  }
+
+  expireRow(): GitExpirationBudgetExceeded {
+    return this.exceeded(new GitExpirationBudgetExceeded("row_deadline", this.rowMs, this.clock.now() - this.startedAt));
+  }
+
+  async beforeDirectoryRead(directory: string) {
+    if (this.hooks.beforeDirectoryRead) await this.track(this.hooks.beforeDirectoryRead(directory));
+  }
+
+  countEntry() {
+    this.signal.throwIfAborted();
+    this.peaks.rowEntries += 1;
+    if (this.peaks.rowEntries > GIT_EXPIRATION_BUDGETS.walkerEntries) {
+      throw this.exceeded(new GitExpirationBudgetExceeded("walker_entries", GIT_EXPIRATION_BUDGETS.walkerEntries, this.peaks.rowEntries));
+    }
+  }
+
+  close() {
+    this.cancelRowTimer();
+    this.peaks.rowMs = this.clock.now() - this.startedAt;
+    this.hooks.onRowClosed?.(this.peaks);
   }
 
   run<T>(work: () => Promise<T>): Promise<T> {
@@ -104,6 +162,22 @@ const budgetStore = new AsyncLocalStorage<InspectionBudget>();
 
 export function currentInspectionBudget(): InspectionBudget | undefined {
   return budgetStore.getStore();
+}
+
+export function isInspectionStop(error: unknown, signal?: AbortSignal) {
+  return error instanceof GitExpirationBudgetExceeded || !!signal?.aborted || !!currentInspectionBudget()?.signal.aborted;
+}
+
+export async function readBoundedDirectory(directory: string, signal?: AbortSignal): Promise<Dirent[]> {
+  const budget = currentInspectionBudget();
+  const entries: Dirent[] = [];
+  await budget?.beforeDirectoryRead(directory);
+  for await (const entry of await fs.opendir(directory)) {
+    signal?.throwIfAborted();
+    budget?.countEntry();
+    entries.push(entry);
+  }
+  return entries;
 }
 
 export type BoundedGitOptions = {
@@ -188,10 +262,13 @@ function runInGroup(budget: InspectionBudget, args: string[], options: BoundedGi
     const child = spawn("git", args, { cwd: options.cwd, env: boundedGitEnv(options.env), detached: true,
       stdio: ["pipe", "pipe", "pipe"] });
     const pgid = child.pid;
-    const timeoutMs = Math.min(options.timeout, budget.gitTimeoutCapMs);
+    const commandTimeoutMs = Math.min(options.timeout, budget.gitTimeoutCapMs);
+    const rowLeftMs = budget.rowTimeLeft();
+    const timeoutMs = Math.min(commandTimeoutMs, rowLeftMs);
     const timeout = setTimeout(() => {
       if (stopCause) return;
-      budgetError = budget.exceeded(new GitExpirationBudgetExceeded("git_timeout", timeoutMs));
+      budgetError = rowLeftMs < commandTimeoutMs ? budget.expireRow()
+        : budget.exceeded(new GitExpirationBudgetExceeded("git_timeout", timeoutMs));
       stop("timeout");
     }, timeoutMs);
     const onAbort = () => stop("abort");
@@ -301,5 +378,6 @@ function runInGroup(budget: InspectionBudget, args: string[], options: BoundedGi
 }
 
 function abortError(signal: AbortSignal) {
+  if (signal.reason instanceof GitExpirationBudgetExceeded) return signal.reason;
   return Object.assign(new Error("The operation was aborted"), { name: "AbortError", code: "ABORT_ERR", cause: signal.reason });
 }

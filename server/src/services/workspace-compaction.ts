@@ -1,4 +1,4 @@
-import { runBoundedGit } from "./git-expiration-budget.js";
+import { isInspectionStop, readBoundedDirectory, runBoundedGit } from "./git-expiration-budget.js";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -119,8 +119,11 @@ export async function findRegenerableWorkspaceDirs(
   async function collect(relativeDir: string, depth: number, candidates: string[]) {
     options.signal?.throwIfAborted();
     if (depth > MAX_WALK_DEPTH) return;
-    const entries = await fs.readdir(path.join(worktreePath, relativeDir), { withFileTypes: true })
-      .catch(() => []);
+    const entries = await readBoundedDirectory(path.join(worktreePath, relativeDir), options.signal)
+      .catch((error: unknown) => {
+        if (isInspectionStop(error, options.signal) || typeof (error as NodeJS.ErrnoException)?.code !== "string") throw error;
+        return [];
+      });
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
       if (PROTECTED_WORKSPACE_DIR_NAMES.has(entry.name)) continue;

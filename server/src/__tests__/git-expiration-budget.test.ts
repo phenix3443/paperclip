@@ -105,7 +105,7 @@ sleep 30`);
     expect(second).toBeInstanceOf(GitExpirationBudgetExceeded);
     expect((second as GitExpirationBudgetExceeded).budget).toBe("git_children");
     expect(budget.peaks.gitChildren).toBe(1);
-    expect(await first).toMatchObject({ name: "AbortError" });
+    expect(await first).toBe(second);
     await budget.drain();
     expect(budget.runningCount).toBe(0);
   });

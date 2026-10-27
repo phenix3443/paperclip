@@ -60,6 +60,8 @@ The round uses its own cursor. It does not use or change the cursor of the recur
 - All database sessions of the round are read-only (`default_transaction_read_only=on`). A write attempt fails and stops the round.
 - Remote proof uses only the `GITHUB_TOKEN` or `GH_TOKEN` server environment credentials. The round does not read company secrets or managed connections, and it does not refresh OAuth grants.
 - Git commands of the round use `GIT_OPTIONAL_LOCKS=0`, `GIT_TERMINAL_PROMPT=0`, `gc.auto=0`, `maintenance.auto=false` and `core.fsmonitor=false`. Each Git child may write at most 16 MiB to stdout and stderr together, and a row runs at most one Git child at a time. A Git timeout, the output cap and a group member left after the leader exits record the row as `resource_limit` at once (`git_timeout`, `git_output`, `git_group_survivor`); the locks stay held until the group is gone, as for a stop signal. A full scratch disk or quota (`ENOSPC`, `EDQUOT`) stops the round with `resource_limit` instead of rejecting the row. Remote proof fetches into a temporary repository and removes it.
+- Each row has 60 s from the moment the round starts it. The time covers the source lock, the lifecycle transaction, eligibility, remote proof, the directory walks and the trash checks. A Git child gets the smaller of its own timeout and the time the row has left. When the 60 s are over, the row is recorded as `resource_limit` `row_deadline` and the round stops `partial`. A row deadline does not abort the round; the locks stay held until the row has drained, as for a stop signal.
+- All directory walks of one row share one counter of 100,000 entries: the size walk of the worktree, the search for regenerable directories, the walk of the base Git storage and the reads of single Git directories. Directories are read in batches. The 100,001st entry records the row as `resource_limit` `walker_entries` and the round stops `partial`. A walk never turns a budget hit or an abort into a rejection.
 
 ## Evidence
 
@@ -115,7 +117,7 @@ Row outcomes:
 | `rejected` | Native expiration would skip the workspace. The reason is the native reason. |
 | `not_candidate` | The sweep selects the row, but the row does not go to Git expiration. |
 | `lock_busy` | Another process holds the source lock or the lifecycle lock. |
-| `resource_limit` | A Git command timeout, a Git output limit or a native helper budget stopped the inspection. Only a normal non-zero Git exit can give a rejection. |
+| `resource_limit` | A Git command timeout, a Git output limit, the row deadline, the walker entry budget or a native helper budget stopped the inspection. Only a normal non-zero Git exit can give a rejection. |
 
 ## Complete and partial
 
