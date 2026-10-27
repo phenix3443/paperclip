@@ -1,5 +1,5 @@
-import { and, eq, sql } from "drizzle-orm";
-import { agents, type Db } from "@paperclipai/db";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import { agents, issueApprovals, issues, type Db } from "@paperclipai/db";
 
 type DbOrTransaction = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 
@@ -29,4 +29,19 @@ export async function lockAdmissionOwnerAndTreeHolds(
       .for("share");
   }
   await lockIssueTreeHolds(tx, companyId, "shared");
+}
+
+export async function lockIssuesForGateWrite(tx: DbOrTransaction, companyId: string, issueIds: string[]) {
+  const ids = Array.from(new Set(issueIds)).sort();
+  if (ids.length === 0) return;
+  await tx.select({ id: issues.id }).from(issues)
+    .where(and(eq(issues.companyId, companyId), inArray(issues.id, ids)))
+    .orderBy(asc(issues.id))
+    .for("update");
+}
+
+export async function lockIssuesLinkedToApproval(tx: DbOrTransaction, companyId: string, approvalId: string) {
+  const linked = await tx.select({ issueId: issueApprovals.issueId }).from(issueApprovals)
+    .where(and(eq(issueApprovals.companyId, companyId), eq(issueApprovals.approvalId, approvalId)));
+  await lockIssuesForGateWrite(tx, companyId, linked.map((row) => row.issueId));
 }

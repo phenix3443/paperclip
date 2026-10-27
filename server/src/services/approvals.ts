@@ -7,6 +7,7 @@ import { approvalComments, approvals } from "@paperclipai/db";
 import { unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { createAgentLifecycle } from "./agent-lifecycle.js";
+import { lockIssuesLinkedToApproval } from "./execution-reconciliation-locks.js";
 
 import { instanceSettingsService } from "./instance-settings.js";
 
@@ -85,18 +86,21 @@ export function approvalRecords(db: Db) {
       }
 
       const now = new Date();
-      return db
-        .update(approvals)
-        .set({
-          status: "revision_requested",
-          decidedByUserId,
-          decisionNote: decisionNote ?? null,
-          decidedAt: now,
-          updatedAt: now,
-        })
-        .where(eq(approvals.id, id))
-        .returning()
-        .then((rows) => rows[0]);
+      return db.transaction(async (tx) => {
+        await lockIssuesLinkedToApproval(tx, existing.companyId, id);
+        return tx
+          .update(approvals)
+          .set({
+            status: "revision_requested",
+            decidedByUserId,
+            decisionNote: decisionNote ?? null,
+            decidedAt: now,
+            updatedAt: now,
+          })
+          .where(eq(approvals.id, id))
+          .returning()
+          .then((rows) => rows[0]);
+      });
     },
 
     resubmit: async (id: string, payload?: Record<string, unknown>) => {
@@ -106,19 +110,22 @@ export function approvalRecords(db: Db) {
       }
 
       const now = new Date();
-      return db
-        .update(approvals)
-        .set({
-          status: "pending",
-          payload: payload ?? existing.payload,
-          decisionNote: null,
-          decidedByUserId: null,
-          decidedAt: null,
-          updatedAt: now,
-        })
-        .where(eq(approvals.id, id))
-        .returning()
-        .then((rows) => rows[0]);
+      return db.transaction(async (tx) => {
+        await lockIssuesLinkedToApproval(tx, existing.companyId, id);
+        return tx
+          .update(approvals)
+          .set({
+            status: "pending",
+            payload: payload ?? existing.payload,
+            decisionNote: null,
+            decidedByUserId: null,
+            decidedAt: null,
+            updatedAt: now,
+          })
+          .where(eq(approvals.id, id))
+          .returning()
+          .then((rows) => rows[0]);
+      });
     },
 
     listComments: async (approvalId: string) => {

@@ -3,6 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { approvals, issueApprovals, issues } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
 import { redactEventPayload } from "../redaction.js";
+import { lockIssuesForGateWrite } from "./execution-reconciliation-locks.js";
 
 interface LinkActor {
   agentId?: string | null;
@@ -107,16 +108,19 @@ export function issueApprovalService(db: Db) {
     link: async (issueId: string, approvalId: string, actor?: LinkActor) => {
       const { issue } = await assertIssueAndApprovalSameCompany(issueId, approvalId);
 
-      await db
-        .insert(issueApprovals)
-        .values({
-          companyId: issue.companyId,
-          issueId,
-          approvalId,
-          linkedByAgentId: actor?.agentId ?? null,
-          linkedByUserId: actor?.userId ?? null,
-        })
-        .onConflictDoNothing();
+      await db.transaction(async (tx) => {
+        await lockIssuesForGateWrite(tx, issue.companyId, [issueId]);
+        await tx
+          .insert(issueApprovals)
+          .values({
+            companyId: issue.companyId,
+            issueId,
+            approvalId,
+            linkedByAgentId: actor?.agentId ?? null,
+            linkedByUserId: actor?.userId ?? null,
+          })
+          .onConflictDoNothing();
+      });
 
       return db
         .select()
@@ -157,18 +161,21 @@ export function issueApprovalService(db: Db) {
         }
       }
 
-      await db
-        .insert(issueApprovals)
-        .values(
-          uniqueIssueIds.map((issueId) => ({
-            companyId: approval.companyId,
-            issueId,
-            approvalId,
-            linkedByAgentId: actor?.agentId ?? null,
-            linkedByUserId: actor?.userId ?? null,
-          })),
-        )
-        .onConflictDoNothing();
+      await db.transaction(async (tx) => {
+        await lockIssuesForGateWrite(tx, approval.companyId, uniqueIssueIds);
+        await tx
+          .insert(issueApprovals)
+          .values(
+            uniqueIssueIds.map((issueId) => ({
+              companyId: approval.companyId,
+              issueId,
+              approvalId,
+              linkedByAgentId: actor?.agentId ?? null,
+              linkedByUserId: actor?.userId ?? null,
+            })),
+          )
+          .onConflictDoNothing();
+      });
     },
   };
 }

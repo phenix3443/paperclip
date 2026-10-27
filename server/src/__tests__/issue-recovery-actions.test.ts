@@ -5,6 +5,8 @@ import path from "node:path";
 import express from "express";
 import request from "supertest";
 import { and, eq, sql } from "drizzle-orm";
+import { issueApprovalService } from "../services/issue-approvals.js";
+import { approvalService } from "../services/approvals.js";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import {
@@ -2415,6 +2417,69 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         expect(sourceFinishedAt.toISOString()).toBe(body.executionReconciliation.admission.expected.run.finishedAt);
         await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(200);
         await db.delete(nativeRunFinalizations);
+      });
+    });
+
+    describe("approval gate writers lock the task first (G2)", () => {
+      const holdIssueLock = async (issueId: string) => {
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => { release = resolve; });
+        let locked!: () => void;
+        const lockedSignal = new Promise<void>((resolve) => { locked = resolve; });
+        const holder = db.transaction(async (tx) => {
+          await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, issueId)).for("update");
+          locked();
+          await held;
+        });
+        await lockedSignal;
+        return { release, holder };
+      };
+      const waitingOnIssueLock = async () => (await db.execute(sql`select count(*)::int as n from pg_stat_activity
+        where wait_event_type = 'Lock' and query ilike '%from "issues"%for update%'`) as unknown as { n: number }[])[0]!.n;
+
+      it.each([
+        ["link", async (f: Awaited<ReturnType<typeof seedAdmission>>, approvalId: string) =>
+          issueApprovalService(db).link(f.sourceIssueId, approvalId, { userId: "board-user" })],
+        ["linkManyForApproval", async (f: Awaited<ReturnType<typeof seedAdmission>>, approvalId: string) =>
+          issueApprovalService(db).linkManyForApproval(approvalId, [f.sourceIssueId], { userId: "board-user" })],
+      ])("%s waits for an admission that holds the task row", async (_name, linkApproval) => {
+        const fixture = await seedAdmission();
+        const [approval] = await db.insert(approvals).values({ companyId: fixture.companyId, type: "approve_ceo_strategy",
+          status: "pending", payload: {} }).returning();
+        try {
+          const { release, holder } = await holdIssueLock(fixture.sourceIssueId);
+          const linking = linkApproval(fixture, approval!.id);
+          for (let attempt = 0; attempt < 50 && await waitingOnIssueLock() === 0; attempt += 1) await new Promise((r) => setTimeout(r, 50));
+          expect(await waitingOnIssueLock()).toBe(1);
+          expect(await db.select().from(issueApprovals).where(eq(issueApprovals.approvalId, approval!.id))).toHaveLength(0);
+          release();
+          await holder;
+          await linking;
+          expect(await db.select().from(issueApprovals).where(eq(issueApprovals.approvalId, approval!.id))).toHaveLength(1);
+        } finally {
+          await db.delete(issueApprovals).where(eq(issueApprovals.companyId, fixture.companyId));
+          await db.delete(approvals).where(eq(approvals.companyId, fixture.companyId));
+        }
+      });
+
+      it("resubmit waits for an admission that holds a linked task row", async () => {
+        const fixture = await seedAdmission();
+        const [approval] = await db.insert(approvals).values({ companyId: fixture.companyId, type: "approve_ceo_strategy",
+          status: "revision_requested", payload: {} }).returning();
+        await db.insert(issueApprovals).values({ companyId: fixture.companyId, issueId: fixture.sourceIssueId, approvalId: approval!.id } as any);
+        try {
+          const { release, holder } = await holdIssueLock(fixture.sourceIssueId);
+          const resubmitting = approvalService(db).resubmit(approval!.id);
+          for (let attempt = 0; attempt < 50 && await waitingOnIssueLock() === 0; attempt += 1) await new Promise((r) => setTimeout(r, 50));
+          expect(await waitingOnIssueLock()).toBe(1);
+          expect((await db.select().from(approvals).where(eq(approvals.id, approval!.id)))[0]!.status).toBe("revision_requested");
+          release();
+          await holder;
+          expect((await resubmitting)!.status).toBe("pending");
+        } finally {
+          await db.delete(issueApprovals).where(eq(issueApprovals.companyId, fixture.companyId));
+          await db.delete(approvals).where(eq(approvals.companyId, fixture.companyId));
+        }
       });
     });
 

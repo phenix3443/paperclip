@@ -1,4 +1,5 @@
 import type { runPromptInjectionProvider } from "./prompt-injection-provider.js";
+import { lockIssuesForGateWrite } from "./execution-reconciliation-locks.js";
 import { promptInjectionPreventionService } from "./prompt-injection-prevention.js";
 import { adapterExecutionControls } from "./adapter-execution-control.js";
 import type { BudgetServiceHooks } from "./budgets.js";
@@ -2578,15 +2579,18 @@ export function createToolGatewayService(
         })
         .returning();
       formalApprovalId = approval.id;
-      await db
-        .insert(issueApprovals)
-        .values({
-          companyId: input.session.companyId,
-          issueId: input.session.issueId,
-          approvalId: approval.id,
-          linkedByAgentId: input.session.agentId,
-        })
-        .onConflictDoNothing();
+      await db.transaction(async (tx) => {
+        await lockIssuesForGateWrite(tx, input.session.companyId, [input.session.issueId]);
+        await tx
+          .insert(issueApprovals)
+          .values({
+            companyId: input.session.companyId,
+            issueId: input.session.issueId,
+            approvalId: approval.id,
+            linkedByAgentId: input.session.agentId,
+          })
+          .onConflictDoNothing();
+      });
     }
 
     const interaction = await interactions.create(
