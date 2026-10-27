@@ -1,7 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { inspectGitExpirationRound, GIT_EXPIRATION_ROUND_MODE, type GitExpirationRoundEvent, type GitExpirationRoundJournal } from "./services/git-expiration-round.js";
+import { inspectGitExpirationRound, GIT_EXPIRATION_ROUND_MODE, type GitExpirationRoundEvent, type GitExpirationRoundJournal,
+  type GitExpirationRoundStatus, type GitExpirationRoundStopReason } from "./services/git-expiration-round.js";
 
 export class GitExpirationRoundUsageError extends Error {}
 
@@ -63,16 +64,52 @@ export function parseGitExpirationRoundArgs(argv: string[], env: NodeJS.ProcessE
   return { roundId, evidenceDir, databaseUrl, companyId, maxRows, deadlineSeconds };
 }
 
-export async function openGitExpirationRoundJournal(evidenceDir: string): Promise<GitExpirationRoundJournal & { close(): Promise<void> }> {
-  await fs.mkdir(evidenceDir, { mode: 0o700 });
-  const handle = await fs.open(path.join(evidenceDir, "events.jsonl"), "wx", 0o600);
+export type GitExpirationRoundJournalFile = {
+  write(buffer: Buffer, offset: number, length: number, position: number): Promise<{ bytesWritten: number }>;
+  datasync(): Promise<void>;
+  truncate(length: number): Promise<void>;
+  close(): Promise<void>;
+};
+
+export function fileGitExpirationRoundJournal(file: GitExpirationRoundJournalFile): GitExpirationRoundJournal & { close(): Promise<void> } {
+  let size = 0;
   return {
     async append(event: GitExpirationRoundEvent) {
-      await handle.appendFile(`${JSON.stringify({ at: new Date().toISOString(), ...event })}\n`);
-      await handle.datasync();
+      const line = Buffer.from(`${JSON.stringify({ at: new Date().toISOString(), ...event })}\n`);
+      try {
+        for (let written = 0; written < line.length;) {
+          written += (await file.write(line, written, line.length - written, size + written)).bytesWritten;
+        }
+        await file.datasync();
+      } catch (error) {
+        await file.truncate(size).then(() => file.datasync()).catch(() => undefined);
+        throw error;
+      }
+      size += line.length;
     },
-    close: () => handle.close(),
+    close: () => file.close(),
   };
+}
+
+export async function openGitExpirationRoundJournal(evidenceDir: string): Promise<GitExpirationRoundJournal & { close(): Promise<void> }> {
+  await fs.mkdir(evidenceDir, { mode: 0o700 });
+  return fileGitExpirationRoundJournal(await fs.open(path.join(evidenceDir, "events.jsonl"), "wx", 0o600));
+}
+
+export function readGitExpirationRoundJournal(content: string): { status: GitExpirationRoundStatus; stopReason: GitExpirationRoundStopReason } {
+  const lines = content.split("\n");
+  if (lines.pop() !== "") return { status: "partial", stopReason: "evidence_lost" };
+  const events: GitExpirationRoundEvent[] = [];
+  for (const line of lines) {
+    try { events.push(JSON.parse(line) as GitExpirationRoundEvent); } catch { return { status: "partial", stopReason: "evidence_lost" }; }
+  }
+  const [first, pending, last] = [events[0], events.at(-2), events.at(-1)];
+  if (last?.type === "round_committed" && first?.type === "round_started" && first.roundId === last.roundId
+    && pending?.type === "round_finished" && pending.status === "pending_commit" && pending.roundId === last.roundId) {
+    return { status: "complete", stopReason: null };
+  }
+  if (last?.type === "round_finished" && last.status === "partial") return { status: "partial", stopReason: last.stopReason };
+  return { status: "partial", stopReason: "evidence_lost" };
 }
 
 export async function runGitExpirationRoundCli(argv: string[], env: NodeJS.ProcessEnv): Promise<number> {

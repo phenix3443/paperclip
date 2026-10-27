@@ -69,7 +69,8 @@ export type GitExpirationRoundEvent =
     companyId: string | null; maxRows: number | null; deadline: string | null }
   | { type: "page_selected"; page: number; keys: GitExpirationRoundKey[] }
   | ({ type: "row_inspected" } & GitExpirationRoundRow)
-  | ({ type: "round_finished" } & GitExpirationRoundSummary);
+  | ({ type: "round_finished" } & Omit<GitExpirationRoundSummary, "status"> & { status: "partial" | "pending_commit" })
+  | { type: "round_committed"; roundId: string; status: "complete" };
 
 export type GitExpirationRoundJournal = { append(event: GitExpirationRoundEvent): Promise<void> };
 
@@ -249,12 +250,24 @@ export async function inspectGitExpirationRound(options: GitExpirationRoundOptio
   }
 
   summary.stopReason ??= stopReason() ?? (evidenceLost ? "evidence_lost" : null);
-  summary.status = summary.exhausted && !summary.stopReason && summary.inspected === summary.selected ? "complete" : "partial";
-  const finished = await record({ type: "round_finished", ...summary });
-  if (summary.status !== "complete") return summary;
-  summary.stopReason = finished ? stopReason() : "evidence_lost";
-  if (!summary.stopReason) return summary;
-  summary.status = "partial";
-  if (finished && !await record({ type: "round_finished", ...summary })) summary.stopReason = "evidence_lost";
+  const complete = summary.exhausted && !summary.stopReason && summary.inspected === summary.selected;
+  if (!complete) {
+    await record({ type: "round_finished", ...summary, status: "partial" });
+    return summary;
+  }
+  if (!await record({ type: "round_finished", ...summary, status: "pending_commit" })) {
+    summary.stopReason = "evidence_lost";
+    return summary;
+  }
+  summary.stopReason = stopReason();
+  if (summary.stopReason) {
+    if (!await record({ type: "round_finished", ...summary, status: "partial" })) summary.stopReason = "evidence_lost";
+    return summary;
+  }
+  if (!await record({ type: "round_committed", roundId: options.roundId, status: "complete" })) {
+    summary.stopReason = "evidence_lost";
+    return summary;
+  }
+  summary.status = "complete";
   return summary;
 }
