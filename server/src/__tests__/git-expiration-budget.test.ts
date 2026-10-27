@@ -101,6 +101,14 @@ sleep 30`);
     expect(budget.signal.aborted).toBe(false);
   });
 
+  it("applies a caller's buffer to each stream, not to their sum", async () => {
+    const env = await fakeGit("split", "head -c 800 /dev/zero; head -c 800 /dev/zero >&2");
+    const budget = new InspectionBudget(new AbortController().signal);
+    const result = await budget.run(() => runBoundedGit(["status"], { env, timeout: 30_000, maxBuffer: 1024 }));
+    expect(result.stdout).toHaveLength(800);
+    expect(result.stderr).toHaveLength(800);
+  });
+
   it("classifies a full scratch disk as a budget hit instead of a Git rejection", async () => {
     const env = await fakeGit("full", `echo "fatal: unable to write new index file: No space left on device" >&2
 exit 128`);

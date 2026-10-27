@@ -197,6 +197,7 @@ function runInGroup(budget: InspectionBudget, args: string[], options: BoundedGi
     const stderr: Buffer[] = [];
     let outputBytes = 0;
     let stopCause: StopCause | null = null;
+    let maxBufferStream: "stdout" | "stderr" | null = null;
     // A budget hit aborts the row when it happens, not when the group is later proven empty.
     let budgetError: GitExpirationBudgetExceeded | null = null;
     let leaderExit: { code: number | null; signal: NodeJS.Signals | null } | null = null;
@@ -223,9 +224,11 @@ function runInGroup(budget: InspectionBudget, args: string[], options: BoundedGi
       killTimer = setTimeout(() => signalGroup("SIGKILL"), GIT_CHILD_KILL_GRACE_MS);
     }
 
-    function collect(target: Buffer[]) {
+    function collect(target: Buffer[], name: "stdout" | "stderr") {
+      let streamBytes = 0;
       return (chunk: Buffer) => {
         outputBytes += chunk.length;
+        streamBytes += chunk.length;
         budget.peaks.childOutputBytes = Math.max(budget.peaks.childOutputBytes, outputBytes);
         if (outputBytes > GIT_EXPIRATION_BUDGETS.childOutputBytes) {
           if (!stopCause) {
@@ -234,8 +237,9 @@ function runInGroup(budget: InspectionBudget, args: string[], options: BoundedGi
           }
           return;
         }
-        // A caller's smaller buffer keeps its old `execFile` meaning: a per-call error, not a budget hit.
-        if (outputBytes > options.maxBuffer) {
+        // A caller's smaller buffer keeps its old per-stream `execFile` meaning: a per-call error, not a budget hit.
+        if (streamBytes > options.maxBuffer) {
+          maxBufferStream ??= name;
           stop("max_buffer");
           return;
         }
@@ -243,8 +247,8 @@ function runInGroup(budget: InspectionBudget, args: string[], options: BoundedGi
       };
     }
 
-    child.stdout!.on("data", collect(stdout));
-    child.stderr!.on("data", collect(stderr));
+    child.stdout!.on("data", collect(stdout, "stdout"));
+    child.stderr!.on("data", collect(stderr, "stderr"));
     child.stdin!.on("error", () => {});
     if (options.input === undefined) child.stdin!.end();
     else child.stdin!.end(options.input);
@@ -294,7 +298,7 @@ function runInGroup(budget: InspectionBudget, args: string[], options: BoundedGi
       if (budgetError) return reject(budgetError);
       if (stopCause === "abort") return reject(abortError(signal));
       if (stopCause === "max_buffer") {
-        return reject(Object.assign(new RangeError("stdout maxBuffer length exceeded"), { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+        return reject(Object.assign(new RangeError(`${maxBufferStream ?? "stdout"} maxBuffer length exceeded`), { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
           stdout: out, stderr: err }));
       }
       if (stopCause === "timeout") {
