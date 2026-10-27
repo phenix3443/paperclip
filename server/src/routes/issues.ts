@@ -21,6 +21,7 @@ import {
   lockCompanyForAdmission,
   verifyExecutionReconciliationAuthorization,
 } from "../services/issue-document-decisions.js";
+import { admitExecutionReconciliationRuns, lockAdmissionRows } from "../services/execution-reconciliation-admission.js";
 import { lockAdmissionOwnerAndTreeHolds } from "../services/execution-reconciliation-locks.js";
 import { assertNoCaseHandoffMutation } from "../services/heartbeat/case-handoff-lifecycle.js";
 import { assertLegacyRunTaskOwnership } from "../legacy-run-task-ownership.js";
@@ -9777,6 +9778,9 @@ export function issueRoutes(
         if (!lockedIssue) throw notFound("Issue not found");
         let admissionCheck: Awaited<ReturnType<typeof checkExecutionReconciliationAdmission>> | null = null;
         if (admission) {
+          const lockedAdmissionRows = priorReceipt ? null : await lockAdmissionRows(tx, {
+            companyId: lockedIssue.companyId, issueId: lockedIssue.id, runId: executionReconciliation!.runId,
+          });
           admissionCheck = await checkExecutionReconciliationAdmission(tx, {
             issue: lockedIssue, actionId: actionId!, runId: executionReconciliation!.runId,
             admission, requestDigest: admissionRequestDigest!, priorReceipt,
@@ -9789,6 +9793,10 @@ export function issueRoutes(
             runId: executionReconciliation!.runId, authority: admissionCompany!.executionReconciliationAuthority,
             admission, expectedDigest: admissionCheck.expectedDigest, request: req.body,
           }));
+          await admitExecutionReconciliationRuns(tx, {
+            issue: lockedIssue, actionId: actionId!, locked: lockedAdmissionRows!,
+            unstartedRunIds: admissionCheck.expected.unstartedRunIds,
+          });
         }
         // Reconciling a reviewer run keeps the task in review; no status change is requested.
         const pendingReviewResume =

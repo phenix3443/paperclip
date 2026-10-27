@@ -2341,6 +2341,83 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(await db.select().from(executionReconciliationReceipts)).toHaveLength(0);
     });
 
+    describe("run, wake and recovery checks under lock (slice A3a)", () => {
+      const sourceFinishedAt = new Date("2026-05-13T18:30:00.000Z");
+      type Setup = (fixture: Awaited<ReturnType<typeof seedAdmission>>) => Promise<void>;
+      const memberRun = (fixture: Awaited<ReturnType<typeof seedAdmission>>, values: Record<string, unknown>) =>
+        db.insert(heartbeatRuns).values({ id: randomUUID(), companyId: fixture.companyId, agentId: fixture.coderId,
+          invocationSource: "manual", status: "failed", ...values } as any);
+      const coordinator = async (fixture: Awaited<ReturnType<typeof seedAdmission>>, values: Record<string, unknown>) => {
+        await db.update(heartbeatRuns).set({ nativeIssueId: fixture.sourceIssueId }).where(eq(heartbeatRuns.id, fixture.runId));
+        await db.insert(nativeRunFinalizations).values({ runId: fixture.runId, companyId: fixture.companyId,
+          issueId: fixture.sourceIssueId, phase: "terminal_failure", ...values } as any);
+      };
+      const refusedCases: Array<[string, Setup | null, Setup | null, string, string | undefined]> = [
+        ["a queued run for the task", null,
+          (f) => memberRun(f, { issueId: f.sourceIssueId, status: "queued" }), "newer_execution_exists", "active_run"],
+        ["a run filed elsewhere that continues the source run", null,
+          (f) => memberRun(f, { retryOfRunId: f.runId, status: "scheduled_retry" }), "newer_execution_exists", "active_run"],
+        ["a finished run created after the source finished", null,
+          (f) => memberRun(f, { contextSnapshot: { taskId: f.sourceIssueId }, finishedAt: new Date() }), "newer_execution_exists", "newer_run"],
+        ["an earlier run that finished after the source", null,
+          (f) => memberRun(f, { nativeIssueId: f.sourceIssueId, createdAt: new Date("2026-05-13T17:00:00.000Z"),
+            finishedAt: new Date("2026-05-13T19:00:00.000Z") }), "newer_execution_exists", "newer_run"],
+        ["a pending wake for the task", null,
+          (f) => db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.coderId, source: "automation",
+            status: "deferred_issue_execution", payload: { issueId: f.sourceIssueId } }).then(() => undefined),
+          "newer_execution_exists", "pending_wake"],
+        ["another open recovery action", null,
+          (f) => db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.sourceIssueId,
+            kind: "active_run_watchdog", status: "escalated", ownerType: "board", returnOwnerAgentId: f.coderId,
+            cause: "uncertain_external_action", fingerprint: randomUUID(), nextAction: "Review.", evidence: {} }).then(() => undefined),
+          "newer_execution_exists", "recovery_action"],
+        ["a coordinator that still holds a lease", null,
+          (f) => coordinator(f, { leaseOwner: "controller-1" }),
+          "run_not_settled", "coordinator"],
+        ["a coordinator that is not in a final phase", null,
+          (f) => coordinator(f, { phase: "workspace_finalizing" }),
+          "run_not_settled", "coordinator"],
+        ["a coordinator that names a successor run", null,
+          (f) => coordinator(f, { failureDetail: { successorRunId: randomUUID() } }),
+          "run_not_settled", "coordinator"],
+        ["a source run that succeeded",
+          (f) => db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.runId)).then(() => undefined),
+          null, "run_not_settled", undefined],
+        ["a conversation task",
+          (f) => db.update(issues).set({ assigneeAgentId: f.coderId, assigneeUserId: null,
+            conversationAgentId: f.coderId, conversationUserId: "board-user", conversationState: "active" })
+            .where(eq(issues.id, f.sourceIssueId)).then(() => undefined),
+          null, "issue_kind_not_supported", undefined],
+      ];
+
+      it.each(refusedCases)("refuses %s and writes nothing but the refusal audit", async (_name, beforeBody, afterBody, code, reason) => {
+        const fixture = await seedAdmission();
+        await beforeBody?.(fixture);
+        const body = await admissionBody(fixture, `recon:a3a-${randomUUID().slice(0, 8)}`);
+        await afterBody?.(fixture);
+        const before = await snapshot(fixture);
+        const response = await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(409);
+        expect(refusalCode(response.body)).toBe(code);
+        if (reason) expect(response.body.details).toMatchObject({ reason });
+        expect(await snapshot(fixture)).toEqual(before);
+        expect((await refusals()).map((row) => (row.details as any).code)).toEqual([code]);
+        await db.delete(nativeRunFinalizations);
+      });
+
+      it("admits past an earlier finished member run and a listed unstarted hold run", async () => {
+        const fixture = await seedAdmission();
+        await memberRun(fixture, { issueId: fixture.sourceIssueId, createdAt: new Date("2026-05-13T17:00:00.000Z"),
+          finishedAt: new Date("2026-05-13T18:00:00.000Z") });
+        await memberRun(fixture, { issueId: fixture.sourceIssueId, status: "cancelled", errorCode: "execution_reconciliation_required" });
+        await coordinator(fixture, {});
+        const body = await admissionBody(fixture, "recon:a3a-admits-0001");
+        expect(body.executionReconciliation.admission.expected.unstartedRunIds).toHaveLength(1);
+        expect(sourceFinishedAt.toISOString()).toBe(body.executionReconciliation.admission.expected.run.finishedAt);
+        await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(200);
+        await db.delete(nativeRunFinalizations);
+      });
+    });
+
     it("rejects a non-integer number in the request with 400 before hashing and audits the refusal", async () => {
       const fixture = await seedAdmission();
       const body = await admissionBody(fixture, "recon:fraction-number-1");
