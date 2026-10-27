@@ -2392,6 +2392,233 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       const retry = await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(200);
       expect(retry.body.replayed).toBe(true);
     });
+
+    describe("authorization binding (slice A2)", () => {
+      const refuse = async (fixture: Awaited<ReturnType<typeof seedAdmission>>, body: any) => {
+        const before = await snapshot(fixture);
+        const response = await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(409);
+        expect(await snapshot(fixture)).toEqual(before);
+        const audited = await refusals();
+        expect(audited.at(-1)!.details).toMatchObject({ code: refusalCode(response.body) });
+        return response.body;
+      };
+
+      it("records the payload digest and the exact approval in the receipt and the action evidence", async () => {
+        const fixture = await seedAdmission();
+        const body = await admissionBody(fixture, "recon:a2-admit-000001");
+        const auth = body.executionReconciliation.admission.authorization;
+        await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(200);
+        const [receipt] = await db.select().from(executionReconciliationReceipts);
+        expect(receipt).toMatchObject({ authorizationPayloadDigest: auth.bodyDigest, authorizationRevisionId: auth.revisionId,
+          authorizationDecisionId: auth.decisionId, authorizationBodySha256: auth.bodyDigest });
+        const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, fixture.actionId));
+        expect((action!.evidence as any).executionReconciliation).toMatchObject({
+          authorizationPayloadDigest: auth.bodyDigest, admission: { authorization: auth } });
+      });
+
+      it("refuses an empty authority list and a decision by an actor that is not on the list", async () => {
+        const empty = await seedAdmission();
+        const body = await admissionBody(empty, "recon:a2-no-authority1");
+        await db.update(companies).set({ executionReconciliationAuthority: { agentIds: [] } }).where(eq(companies.id, empty.companyId));
+        expect(refusalCode(await refuse(empty, body))).toBe("authority_not_configured");
+
+        const outsider = await seedAdmission();
+        const outsiderBody = await admissionBody(outsider, "recon:a2-outsider-0001", {}, { decision: { actorAgentId: outsider.coderId } });
+        const refused = await refuse(outsider, outsiderBody);
+        expect(refused).toMatchObject({ details: { code: "authorization_invalid", reason: "actor_not_authorized" } });
+      });
+
+      it("refuses an approval that a newer revision replaced before admission", async () => {
+        const fixture = await seedAdmission();
+        const body = await admissionBody(fixture, "recon:a2-newer-revision");
+        const { documentId } = body.executionReconciliation.admission.authorization;
+        const [r2] = await db.insert(documentRevisions).values({ companyId: fixture.companyId, documentId, revisionNumber: 2,
+          format: "markdown", body: "{}" }).returning();
+        await db.update(documents).set({ latestRevisionId: r2!.id, latestRevisionNumber: 2, latestBody: "{}" })
+          .where(eq(documents.id, documentId));
+        expect(refusalCode(await refuse(fixture, body))).toBe("authorization_stale");
+      });
+
+      it("keeps a committed receipt when a newer revision arrives after admission", async () => {
+        const fixture = await seedAdmission();
+        const body = await admissionBody(fixture, "recon:a2-revision-after");
+        const { documentId } = body.executionReconciliation.admission.authorization;
+        await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(200);
+        const [r2] = await db.insert(documentRevisions).values({ companyId: fixture.companyId, documentId, revisionNumber: 2,
+          format: "markdown", body: "{}" }).returning();
+        await db.update(documents).set({ latestRevisionId: r2!.id, latestRevisionNumber: 2 }).where(eq(documents.id, documentId));
+        const replay = await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(200);
+        expect(replay.body.replayed).toBe(true);
+        expect(await db.select().from(executionReconciliationReceipts)).toHaveLength(1);
+      });
+
+      it.each([
+        ["an expired decision", { decision: { expiresAt: new Date(Date.now() - 60_000) } }, "authorization_expired", undefined],
+        ["an expired payload while the decision is still valid",
+          { payload: (p: any) => { p.expiresAt = new Date(Date.now() - 60_000).toISOString(); } }, "authorization_expired", undefined],
+        ["a payload that outlives its decision",
+          { payload: (p: any) => { p.expiresAt = new Date(Date.now() + 73 * 60 * 60 * 1000).toISOString(); } },
+          "authorization_invalid", "payload_outlives_decision"],
+        ["a body with whitespace", { body: (text: string) => text.replace(/,/, ", ") }, "authorization_invalid", "body_not_canonical"],
+        ["a fenced body", { body: (text: string) => `\`\`\`json\n${text}\n\`\`\`` }, "authorization_invalid", "body_not_canonical"],
+        ["a payload with an extra key", { payload: (p: any) => { p.note = "extra"; } }, "authorization_invalid", "payload_schema"],
+        ["a payload with a missing key", { payload: (p: any) => { delete p.evidence; } }, "authorization_invalid", "payload_schema"],
+      ] as const)("refuses %s", async (_name, options, code, reason) => {
+        const fixture = await seedAdmission();
+        const body = await admissionBody(fixture, `recon:a2-${randomUUID().slice(0, 12)}`, {}, options as AuthorizationOptions);
+        const refused = await refuse(fixture, body);
+        expect(refusalCode(refused)).toBe(code);
+        if (reason) expect(refused.details.reason).toBe(reason);
+      });
+
+      it("refuses a revoked decision and a decision for another revision", async () => {
+        const revoked = await seedAdmission();
+        const body = await admissionBody(revoked, "recon:a2-revoked-00001");
+        const auth = body.executionReconciliation.admission.authorization;
+        await db.insert(issueDocumentDecisions).values({ companyId: revoked.companyId, issueId: revoked.sourceIssueId,
+          documentId: auth.documentId, revisionId: auth.revisionId, revisionNumber: 1, bodySha256: auth.bodyDigest,
+          scope: "execution_reconciliation", outcome: "revoked", revokesDecisionId: auth.decisionId, actorAgentId: revoked.managerId });
+        expect((await refuse(revoked, body)).details.reason).toBe("decision_revoked");
+
+        const other = await seedAdmission();
+        const otherBody = await admissionBody(other, "recon:a2-other-revision");
+        const otherAuth = otherBody.executionReconciliation.admission.authorization;
+        const [r0] = await db.insert(documentRevisions).values({ companyId: other.companyId, documentId: otherAuth.documentId,
+          revisionNumber: 0, format: "markdown", body: "{}" }).returning();
+        await db.update(issueDocumentDecisions).set({ revisionId: r0!.id }).where(eq(issueDocumentDecisions.id, otherAuth.decisionId));
+        expect((await refuse(other, otherBody)).details.reason).toBe("decision_revision");
+      });
+
+      it("refuses a request whose body digest does not match the revision", async () => {
+        const fixture = await seedAdmission();
+        const body = await admissionBody(fixture, "recon:a2-body-digest-01");
+        body.executionReconciliation.admission.authorization.bodyDigest = "c".repeat(64);
+        expect((await refuse(fixture, body)).details.reason).toBe("body_digest");
+      });
+
+      it.each([
+        ["outcomeEvidence", (p: any) => { p.intent.executionReconciliation.outcomeEvidence = "Another account of the stopped run and its side effects."; }, "intent"],
+        ["workspaceRepairEvidence", (p: any) => { p.intent.executionReconciliation.workspaceRepairEvidence = "The retained workspace was repaired by hand."; }, "intent"],
+        ["resolutionNote", (p: any) => { p.intent.resolutionNote = "approved note"; }, "intent"],
+        ["outcome", (p: any) => { p.intent.outcome = "false_positive"; }, "intent"],
+        ["sourceIssueStatus", (p: any) => { p.intent.sourceIssueStatus = "done"; }, "intent"],
+        ["the source run", (p: any) => { p.runId = randomUUID(); }, "runId"],
+        ["the expected digest", (p: any) => { p.expectedDigest = "d".repeat(64); }, "expectedDigest"],
+      ] as const)("refuses a request that differs from the approved payload in %s", async (_name, change, field) => {
+        const fixture = await seedAdmission();
+        const body = await admissionBody(fixture, `recon:a2-${randomUUID().slice(0, 12)}`, {}, { payload: change });
+        const refused = await refuse(fixture, body);
+        expect(refusalCode(refused)).toBe("authorization_payload_mismatch");
+        expect(refused.details.field).toBe(field);
+      });
+
+      it("treats the same key with another revision as a different request", async () => {
+        const fixture = await seedAdmission();
+        const body = await admissionBody(fixture, "recon:a2-same-key-rev1");
+        await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(200);
+        const changed = structuredClone(body);
+        changed.executionReconciliation.admission.authorization.revisionId = randomUUID();
+        const conflict = await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(changed).expect(409);
+        expect(refusalCode(conflict.body)).toBe("idempotency_conflict");
+      });
+
+      it("refuses admission while an authority-list change holds the list, then admits after it commits", async () => {
+        const fixture = await seedAdmission();
+        const body = await admissionBody(fixture, "recon:a2-authority-race");
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => { release = resolve; });
+        let locked!: () => void;
+        const lockedSignal = new Promise<void>((resolve) => { locked = resolve; });
+        const change = db.transaction(async (tx) => {
+          await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`exec-recon-authority:${fixture.companyId}`}, 0))`);
+          await tx.update(companies).set({ executionReconciliationAuthority: { agentIds: [] } }).where(eq(companies.id, fixture.companyId));
+          locked();
+          await held;
+        });
+        await lockedSignal;
+        const pending = request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body);
+        const settled = pending.then((response) => response);
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(await db.select().from(executionReconciliationReceipts)).toHaveLength(0);
+        release();
+        await change;
+        const response = await settled;
+        expect(response.status).toBe(409);
+        expect(refusalCode(response.body)).toBe("authority_not_configured");
+      });
+    });
+  });
+
+  describe("issue document decisions", () => {
+    async function seedDocument() {
+      const fixture = await seedCompany();
+      const documentId = randomUUID();
+      const revisionId = randomUUID();
+      const body = '{"schema":"example"}';
+      await db.insert(documents).values({ id: documentId, companyId: fixture.companyId, format: "markdown",
+        latestBody: body, latestRevisionId: revisionId, latestRevisionNumber: 1 });
+      await db.insert(documentRevisions).values({ id: revisionId, companyId: fixture.companyId, documentId,
+        revisionNumber: 1, format: "markdown", body });
+      await db.insert(issueDocuments).values({ companyId: fixture.companyId, issueId: fixture.sourceIssueId, documentId, key: "approval" });
+      return { ...fixture, documentId, revisionId, body };
+    }
+    const decisionsPath = (issueId: string, key = "approval") => `/api/issues/${issueId}/documents/${key}/decisions`;
+    const inHours = (hours: number) => new Date(Date.now() + hours * 60 * 60 * 1000).toISOString();
+
+    it("records an approval with a server-computed digest and server-owned actor, and audits it", async () => {
+      const fixture = await seedDocument();
+      const response = await request(createApp({ type: "board", source: "local_implicit", userId: "board-user" }))
+        .post(decisionsPath(fixture.sourceIssueId))
+        .send({ outcome: "approved", revisionId: fixture.revisionId, scope: "execution_reconciliation", expiresAt: inHours(24) })
+        .expect(201);
+      expect(response.body).toMatchObject({ documentId: fixture.documentId, revisionId: fixture.revisionId, revisionNumber: 1,
+        bodySha256: sha256HexOfText(fixture.body), outcome: "approved", actorUserId: "board-user", actorAgentId: null });
+      const logged = await db.select().from(activityLog).where(eq(activityLog.action, "issue.document_decision_recorded"));
+      expect(logged).toHaveLength(1);
+      expect(logged[0]!.details).toMatchObject({ decisionId: response.body.id, outcome: "approved" });
+    });
+
+    it("records an agent decision with the agent and run from authentication and requires a run", async () => {
+      const fixture = await seedDocument();
+      const runId = randomUUID();
+      await seedHeartbeatRun({ companyId: fixture.companyId, agentId: fixture.managerId, runId, issueId: fixture.sourceIssueId, status: "running" });
+      const payload = { outcome: "approved", revisionId: fixture.revisionId, scope: "execution_reconciliation", expiresAt: inHours(1) };
+      const withRun = await request(createApp({ type: "agent", agentId: fixture.managerId, companyId: fixture.companyId, runId, source: "agent_jwt" }))
+        .post(decisionsPath(fixture.sourceIssueId)).set("X-Paperclip-Run-Id", runId).send(payload);
+      expect(withRun.status).toBe(201);
+      expect(withRun.body).toMatchObject({ actorAgentId: fixture.managerId, actorUserId: null, createdByRunId: runId });
+      await request(createApp({ type: "agent", agentId: fixture.managerId, companyId: fixture.companyId, source: "agent_key" }))
+        .post(decisionsPath(fixture.sourceIssueId)).send(payload).expect((res) => expect(res.status).toBeGreaterThanOrEqual(400));
+      await request(createApp({ type: "board", source: "local_implicit" })).post(decisionsPath(fixture.sourceIssueId))
+        .send({ ...payload, actorAgentId: fixture.managerId }).expect(400);
+    });
+
+    it("rejects an expiry in the past or beyond 72 hours, an unknown key and an unknown revision", async () => {
+      const fixture = await seedDocument();
+      const app = createApp({ type: "board", source: "local_implicit", userId: "board-user" });
+      const base = { outcome: "approved", revisionId: fixture.revisionId, scope: "execution_reconciliation" };
+      await request(app).post(decisionsPath(fixture.sourceIssueId)).send({ ...base, expiresAt: inHours(-1) }).expect(422);
+      await request(app).post(decisionsPath(fixture.sourceIssueId)).send({ ...base, expiresAt: inHours(73) }).expect(422);
+      await request(app).post(decisionsPath(fixture.sourceIssueId, "missing")).send({ ...base, expiresAt: inHours(1) }).expect(404);
+      await request(app).post(decisionsPath(fixture.sourceIssueId)).send({ ...base, revisionId: randomUUID(), expiresAt: inHours(1) }).expect(404);
+      expect(await db.select().from(issueDocumentDecisions)).toHaveLength(0);
+    });
+
+    it("revokes only an approval of the same revision", async () => {
+      const fixture = await seedDocument();
+      const app = createApp({ type: "board", source: "local_implicit", userId: "board-user" });
+      const approval = await request(app).post(decisionsPath(fixture.sourceIssueId))
+        .send({ outcome: "approved", revisionId: fixture.revisionId, scope: "execution_reconciliation", expiresAt: inHours(1) }).expect(201);
+      const [r2] = await db.insert(documentRevisions).values({ companyId: fixture.companyId, documentId: fixture.documentId,
+        revisionNumber: 2, format: "markdown", body: "{}" }).returning();
+      await request(app).post(decisionsPath(fixture.sourceIssueId))
+        .send({ outcome: "revoked", revisionId: r2!.id, scope: "execution_reconciliation", revokesDecisionId: approval.body.id }).expect(422);
+      const revoke = await request(app).post(decisionsPath(fixture.sourceIssueId))
+        .send({ outcome: "revoked", revisionId: fixture.revisionId, scope: "execution_reconciliation", revokesDecisionId: approval.body.id }).expect(201);
+      expect(revoke.body).toMatchObject({ outcome: "revoked", revokesDecisionId: approval.body.id, expiresAt: null });
+      await request(app).post(decisionsPath(fixture.sourceIssueId))
+        .send({ outcome: "revoked", revisionId: fixture.revisionId, scope: "execution_reconciliation", revokesDecisionId: revoke.body.id }).expect(422);
+    });
   });
 
   async function seedReconciledDelivery() {

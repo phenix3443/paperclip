@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { resolveIssueRecoveryActionSchema } from "./issue.js";
+import { updateCompanyBrandingSchema, updateCompanySchema } from "./company.js";
+import {
+  createIssueDocumentDecisionSchema,
+  executionReconciliationAuthoritySchema,
+  executionReconciliationRequestIntent,
+} from "./execution-reconciliation-admission.js";
 
 const id = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
 
@@ -68,5 +74,36 @@ describe("executionReconciliation.admission schema", () => {
     expect(
       resolveIssueRecoveryActionSchema.safeParse(request({ workspaceBaseRef: { requestedRef: "main", branch: "main" } })).success,
     ).toBe(false);
+  });
+});
+
+describe("execution reconciliation authorization schemas", () => {
+  it("accepts the authority list only in the Board company update schema", () => {
+    const agentIds = ["11111111-1111-4111-8111-111111111111"];
+    expect(updateCompanySchema.parse({ executionReconciliationAuthority: { agentIds } }))
+      .toEqual({ executionReconciliationAuthority: { agentIds } });
+    expect(updateCompanyBrandingSchema.safeParse({ name: "x", executionReconciliationAuthority: { agentIds } }).success).toBe(false);
+    expect(executionReconciliationAuthoritySchema.safeParse({ agentIds: [agentIds[0], agentIds[0]] }).success).toBe(false);
+  });
+
+  it("requires an expiry for an approval and a target for a revoke", () => {
+    const revisionId = "22222222-2222-4222-8222-222222222222";
+    expect(createIssueDocumentDecisionSchema.safeParse({ outcome: "approved", revisionId, scope: "execution_reconciliation" }).success).toBe(false);
+    expect(createIssueDocumentDecisionSchema.safeParse({ outcome: "revoked", revisionId, scope: "execution_reconciliation",
+      expiresAt: "2026-10-28T00:00:00.000Z" }).success).toBe(false);
+    expect(createIssueDocumentDecisionSchema.safeParse({ outcome: "approved", revisionId, scope: "execution_reconciliation",
+      expiresAt: "2026-10-28T00:00:00.000Z", actorAgentId: revisionId }).success).toBe(false);
+  });
+
+  it("projects the request intent with nulls for absent optional fields and without the admission", () => {
+    const runId = "33333333-3333-4333-8333-333333333333";
+    const intent = executionReconciliationRequestIntent({
+      actionId: runId, outcome: "restored", sourceIssueStatus: "todo",
+      executionReconciliation: { runId, providerStopped: true, actionOutcome: "mixed", outcomeEvidence: "evidence text",
+        admission: { idempotencyKey: "ignored" } } as never,
+    });
+    expect(intent).toEqual({ actionId: runId, outcome: "restored", sourceIssueStatus: "todo", resolutionNote: null,
+      executionReconciliation: { runId, providerStopped: true, actionOutcome: "mixed", outcomeEvidence: "evidence text",
+        workspaceRepairEvidence: null } });
   });
 });
