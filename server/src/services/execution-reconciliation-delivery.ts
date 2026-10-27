@@ -125,3 +125,22 @@ export async function recordReconciledDeliveryOutcome(
     .set({ evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify(evidence)}::jsonb` })
     .where(and(eq(issueRecoveryActions.companyId, action.companyId), eq(issueRecoveryActions.id, action.id)));
 }
+
+export async function isGuardedReconciliationDelivery(
+  db: DbOrTransaction,
+  companyId: string,
+  issueId: string,
+  recoveryActionId: unknown,
+) {
+  if (typeof recoveryActionId !== "string") return false;
+  const [action] = await db
+    .select({ evidence: issueRecoveryActions.evidence })
+    .from(issueRecoveryActions)
+    .where(and(
+      eq(issueRecoveryActions.companyId, companyId),
+      eq(issueRecoveryActions.sourceIssueId, issueId),
+      eq(issueRecoveryActions.id, recoveryActionId),
+    ));
+  const decision = action?.evidence.executionReconciliation;
+  return Boolean(decision && typeof decision === "object" && isAdmittedReconciliation(decision as Record<string, unknown>));
+}

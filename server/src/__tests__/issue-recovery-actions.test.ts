@@ -2676,6 +2676,25 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       });
 
       it.each([
+        ["company paused", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.update(companies)
+          .set({ status: "paused" }).where(eq(companies.id, f.companyId)), "company_pause"],
+        ["agent paused", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.update(agents)
+          .set({ status: "paused" }).where(eq(agents.id, f.coderId)), "agent_pause"],
+        ["on-demand wakes off", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.update(agents)
+          .set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1, wakeOnDemand: false } } }).where(eq(agents.id, f.coderId)), "wake_policy"],
+      ])("records waiting instead of dropping the wake before the queue transaction when %s", async (_name, change, gate) => {
+        const fixture = await admitted(`recon:a3b-pretx-${randomUUID().slice(0, 8)}`);
+        await change(fixture);
+        const runsBefore = (await db.select().from(heartbeatRuns)).length;
+        await deliver();
+        expect((await actionRow(fixture.actionId)).evidence).toMatchObject({
+          continuationDelivery: "waiting", continuationWait: { gate },
+        });
+        expect(await reconciliationWakes(fixture.actionId)).toHaveLength(0);
+        expect(await db.select().from(heartbeatRuns)).toHaveLength(runsBefore);
+      });
+
+      it.each([
         ["a review state", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.update(issues)
           .set({ executionState: { status: "pending" } as any }).where(eq(issues.id, f.sourceIssueId)), "stage_changed"],
         ["a newer run", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.insert(heartbeatRuns).values({ id: randomUUID(),
