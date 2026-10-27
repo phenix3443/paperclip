@@ -642,6 +642,40 @@ describe.skipIf(!support.supported)("heartbeat workspace preparation boundary", 
     expect(await readFile(join(next.executionWorkspace.cwd, "retained.txt"), "utf8")).toBe("keep this work");
   });
 
+  it("does not restore an archived git_worktree for a target-bound successor run (deferred continuation premise R2)", async () => {
+    const { input, source, issue } = await fixture(true);
+    const first = await prepareHeartbeatWorkspace(db, input);
+    const workspace = first.persistedExecutionWorkspace!;
+    await writeFile(join(workspace.cwd!, "archived-branch-work.txt"), "work on the archived branch\n");
+    await execFile("git", ["-C", workspace.cwd!, "add", "."]);
+    await execFile("git", ["-C", workspace.cwd!, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-m", "Archived work"]);
+    const cleanup = await cleanupExecutionWorkspaceArtifacts({ workspace,
+      projectWorkspace: { cwd: source, cleanupCommand: null }, runCleanupCommands: false });
+    // Archiving keeps the unmerged branch; only the worktree directory is removed.
+    expect(cleanup.warnings).toEqual([expect.stringContaining("not fully merged")]);
+    await expect(access(workspace.cwd!)).rejects.toMatchObject({ code: "ENOENT" });
+    await db.update(executionWorkspaces).set({ status: "archived" }).where(eq(executionWorkspaces.id, workspace.id));
+    // The deferred continuation commits `todo` and leaves the binding untouched.
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, issue.id));
+    const target = await readIssue(issue.id);
+    expect(target).toMatchObject({ executionWorkspaceId: workspace.id, executionWorkspacePreference: "reuse_existing" });
+    const stored = await executionWorkspaceService(db).getStoredById(issue.companyId, workspace.id);
+    const reuseRequest = resolveExecutionWorkspaceReuseRequestForIssue({ issueExecutionWorkspaceId: target.executionWorkspaceId,
+      issueExecutionWorkspacePreference: target.executionWorkspacePreference, existingExecutionWorkspaceStatus: stored?.status ?? null });
+    // Same inputs as environment-selection.ts: restore is requested, but an archived row is not "available".
+    expect(reuseRequest).toEqual({ requestedExecutionWorkspaceId: workspace.id, requestedShouldReuseExisting: true, existingExecutionWorkspaceAvailable: false });
+    const [successor] = await db.insert(heartbeatRuns).values({ companyId: issue.companyId, agentId: input.agent.id, issueId: issue.id, scopeKind: "issue", status: "running", runtimeMode: "legacy",
+      contextSnapshot: { issueId: issue.id, source: "cross_task_continuation" } }).returning();
+    input.run = successor;
+    input.task.issueRef = target;
+    input.reuse.requestedShouldReuseExisting = true;
+    input.reuse.existingExecutionWorkspace = stored;
+    input.reuse.reusableExistingExecutionWorkspace = null;
+    input.reuse.workspaceReuseRequest = reuseRequest;
+    await expect(prepareHeartbeatWorkspace(db, input)).rejects.toThrow(/could not be restored/);
+    expect((await executionWorkspaceService(db).getStoredById(issue.companyId, workspace.id))?.status).toBe("archived");
+  });
+
   it("keeps the admitted recovery workspace when the issue now points elsewhere", async () => {
     const { input, issue } = await fixture(true);
     const first = await prepareHeartbeatWorkspace(db, input);
