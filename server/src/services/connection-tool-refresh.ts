@@ -12,7 +12,7 @@ export type ConnectionToolRefresh = "not_needed" | "requested" | "deduplicated" 
 type ReadyCandidate = { state: string; interactionId: string | null; connectionId: string | null; instruction: string };
 
 const QUEUED_INSTRUCTION = "Access is already authorized. A continuation with updated tools is queued. Finish independent work, then yield. Do not request authorization again.";
-const UNAVAILABLE_INSTRUCTION = "Access is already authorized, but this run started without these tools and no continuation could be queued. Report this to the responsible user. Do not request authorization again.";
+const UNAVAILABLE_INSTRUCTION = "Access is already authorized, but this run started without these tools and no continuation could be scheduled. Report this to the responsible user. Do not request authorization again.";
 
 export async function refreshReadyConnectionTools<T extends ReadyCandidate>(
   db: Db,
