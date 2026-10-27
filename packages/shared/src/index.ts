@@ -1129,6 +1129,8 @@ export type {
   IssueExecutionStagePrincipal,
   IssueExecutionDecision,
   IssueComment,
+  IssueCommentContinuationReceipt,
+  IssueCommentCreateResponse,
   IssueQueuedCommentEntry,
   IssueQueuedCommentProtocol,
   IssueQueuedCommentQueue,

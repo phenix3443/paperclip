@@ -1112,6 +1112,8 @@ export const issueCommentMetadataSchema = z
 export type IssueCommentMetadata = z.infer<typeof issueCommentMetadataSchema>;
 
 export const addIssueCommentSchema = z.object({
+  // Required (422 without it) when an agent run bound to another task resumes a
+  // task whose isolated workspace is closed, so a lost response can be retried.
   clientRequestId: z.string().uuid().optional(),
   body: multilineTextSchema.pipe(z.string().min(1)),
   attachmentIds: issueCommentAttachmentIdsSchema.optional(),

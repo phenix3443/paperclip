@@ -7,6 +7,7 @@ import {
   issues,
   type Db,
 } from "@paperclipai/db";
+import type { IssueCommentContinuationReceipt } from "@paperclipai/shared";
 import { and, desc, eq, inArray, isNotNull, like, or } from "drizzle-orm";
 import { acquireExecutionWorkspaceLifecycleLock } from "./execution-workspace-lifecycle-lock.js";
 import { readExecutionWorkspaceLifecycleGeneration } from "./execution-workspaces.js";
@@ -135,12 +136,7 @@ export async function classifyIssueExecutionWorkspaceBinding(
   return { kind: "open_or_shared", workspaceId };
 }
 
-export type CrossTaskContinuationReceipt = {
-  wakeupRequestId: string;
-  status: string;
-  runId: string | null;
-  coalescedIntoWakeupRequestId?: string;
-};
+export type CrossTaskContinuationReceipt = IssueCommentContinuationReceipt;
 
 export type CrossTaskContinuationReplay =
   | { kind: "fresh" }
