@@ -2702,6 +2702,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           finishedAt: new Date() } as any), "newer_run"],
         ["a missing receipt", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.delete(executionReconciliationReceipts)
           .where(eq(executionReconciliationReceipts.actionId, f.actionId)), "receipt_missing"],
+        ["an archived company", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.update(companies)
+          .set({ status: "archived" }).where(eq(companies.id, f.companyId)), "company_inactive"],
+        ["a terminated owner", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.update(agents)
+          .set({ status: "terminated" }).where(eq(agents.id, f.coderId)), "owner_not_invokable"],
       ])("invalidates delivery after %s without a wake or run", async (_name, change, reason) => {
         const fixture = await admitted(`recon:a3b-inval-${randomUUID().slice(0, 8)}`);
         await change(fixture);

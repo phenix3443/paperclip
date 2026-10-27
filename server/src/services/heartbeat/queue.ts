@@ -3413,9 +3413,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             if (!["pending", "waiting"].includes(String(action.evidence.continuationDelivery)))
               return { kind: "skipped" as const };
             if (isAdmittedReconciliation(decision)) {
-              const delivery = guardedWaitingGate
+              const revalidated = await revalidateReconciledDelivery(tx, { issue, action });
+              const delivery = revalidated.kind !== "invalidated" && guardedWaitingGate
                 ? { kind: "waiting" as const, gate: guardedWaitingGate }
-                : await revalidateReconciledDelivery(tx, { issue, action });
+                : revalidated;
               if (delivery.kind !== "deliver") {
                 await recordReconciledDeliveryOutcome(tx, action, delivery);
                 return { kind: "skipped" as const };

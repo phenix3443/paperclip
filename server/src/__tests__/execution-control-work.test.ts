@@ -4,7 +4,7 @@ import { localAiLoginService } from "../services/local-ai-login.js";
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq, sql } from "drizzle-orm";
-import { agents, companies, createDb, heartbeatRuns, issues, nativeRunFinalizations, applyPendingMigrations } from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, applyPendingMigrations } from "@paperclipai/db";
 import { installDatabaseWorkSignals } from "../../../packages/db/src/work-signals.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
@@ -284,6 +284,22 @@ describe.skipIf(!support.supported)("execution-control durable work", () => {
     await settle(); expect(wake).toHaveBeenCalledTimes(1); await quiet(c);
     const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successor.id));
     expect(saved?.retryOfRunId).toBe(run.id);
+  });
+  it("schedules the next continuation pass at the earliest waiting recheck time", async () => {
+    const run = await runRow("failed");
+    const action = await issueRecoveryActionService(db).upsertSourceScoped({ companyId, sourceIssueId: issueId,
+      kind: "active_run_watchdog", cause: "execution_finalization_deadline_exceeded", fingerprint: run.id,
+      returnOwnerAgentId: agentId, evidence: { runId: run.id }, nextAction: "Recover execution" });
+    const recheckAt = new Date(Date.now() + 10 * 60_000);
+    await db.update(issueRecoveryActions).set({ status: "resolved", evidence: { runId: run.id, continuationDelivery: "waiting",
+      continuationWait: { gate: "interaction", since: new Date().toISOString(), recheckAt: recheckAt.toISOString(), attempts: 1 } } })
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(await executionControlSchedule(db).continuation()).toBe(recheckAt.getTime());
+    await db.update(issueRecoveryActions).set({ evidence: { runId: run.id, continuationDelivery: "pending" } })
+      .where(eq(issueRecoveryActions.id, action.id));
+    const pending = await executionControlSchedule(db).continuation();
+    expect(pending).not.toBeNull();
+    expect(pending!).toBeLessThan(recheckAt.getTime());
   });
 
 });

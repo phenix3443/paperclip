@@ -1,6 +1,7 @@
 import { and, asc, eq, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  agents,
   companies,
   executionReconciliationReceipts,
   heartbeatRuns,
@@ -52,6 +53,12 @@ export async function revalidateReconciledDelivery(
     return { kind: "invalidated", reason: "owner_mismatch" };
   }
   if (isConversation(issue)) return { kind: "invalidated", reason: "issue_kind_not_supported" };
+  const [company] = await tx.select({ status: companies.status }).from(companies).where(eq(companies.id, issue.companyId));
+  if (!company || company.status === "archived") return { kind: "invalidated", reason: "company_inactive" };
+  const [owner] = await tx.select({ status: agents.status }).from(agents)
+    .where(and(eq(agents.companyId, issue.companyId), eq(agents.id, issue.assigneeAgentId)));
+  if (!owner) return { kind: "invalidated", reason: "owner_missing" };
+  if (owner.status === "terminated") return { kind: "invalidated", reason: "owner_not_invokable" };
 
   const locked = await lockAdmissionRows(tx, { companyId: issue.companyId, issueId: issue.id, runId: receipt.runId });
   if (!locked.run) return { kind: "invalidated", reason: "source_run_missing" };
