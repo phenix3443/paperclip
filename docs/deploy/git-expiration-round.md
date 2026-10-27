@@ -21,8 +21,8 @@ DATABASE_URL=postgres://... node server/dist/git-expiration-round-cli.js \
 | `--round-id` | Identifier of the round. Use 1 to 64 characters from `A-Z a-z 0-9 . _ -`. |
 | `--evidence-dir` | Normalized absolute path. The round creates this directory. The directory must not exist. |
 | `--company-id` | Optional. Limit the round to one company. |
-| `--max-rows` | Optional. Stop after this number of inspected rows. |
-| `--deadline-seconds` | Optional. Stop when this time is over. |
+| `--max-rows` | Optional. 1 to 10,000. The round selects at most this number of rows. Without the flag the cap is 10,000. A larger value exits `2` before the database opens. |
+| `--deadline-seconds` | Optional. 1 to 600. Stop when this time is over. Without the flag the deadline is 600 s. A larger value exits `2`. The host timer stays authoritative. |
 | `--enabled=true`, `--dry-run=true`, `--expire-base=false` | Optional. The round accepts only these values. |
 
 The round reads the database URL from `DATABASE_URL`. It rejects these environment values before it opens the database:
@@ -61,6 +61,10 @@ The round uses its own cursor. It does not use or change the cursor of the recur
 - Remote proof uses only the `GITHUB_TOKEN` or `GH_TOKEN` server environment credentials. The round does not read company secrets or managed connections, and it does not refresh OAuth grants.
 - Git commands of the round use `GIT_OPTIONAL_LOCKS=0`, `GIT_TERMINAL_PROMPT=0`, `gc.auto=0`, `maintenance.auto=false` and `core.fsmonitor=false`. Each Git child may write at most 16 MiB to stdout and stderr together, and a row runs at most one Git child at a time. A Git timeout, the output cap and a group member left after the leader exits record the row as `resource_limit` at once (`git_timeout`, `git_output`, `git_group_survivor`); the locks stay held until the group is gone, as for a stop signal. A full scratch disk or quota (`ENOSPC`, `EDQUOT`) stops the round with `resource_limit` instead of rejecting the row. Remote proof fetches into a temporary repository and removes it.
 - Each row has 60 s from the moment the round starts it. The time covers the source lock, the lifecycle transaction, eligibility, remote proof, the directory walks and the trash checks. A Git child gets the smaller of its own timeout and the time the row has left. When the 60 s are over, the row is recorded as `resource_limit` `row_deadline` and the round stops `partial`. A row deadline does not abort the round; the locks stay held until the row has drained, as for a stop signal.
+- The round selects at most 10,000 rows (or `--max-rows`) and runs at most 200 full pages. A page asks only for the rows left under the cap, so no selected key beyond the cap is recorded. When the cap or the page budget is reached, the round runs one exhaustion query with the same filter and cursor and `limit 1`, and records `selection_exhaustion_checked` with `more`. If no row is left, the selection is exhausted. Otherwise the round stops `partial` with `row_budget` after it inspects the selected rows.
+- Every statement of the round has `statement_timeout=10s`, and a connect has 10 s. A statement timeout (SQLSTATE `57014`, `canceling statement due to statement timeout`) stops the round `partial` with `resource_limit` and `budgetHit.budget` `statement_timeout`. In a row it records the row as `resource_limit` `statement_timeout`. Any other `57014`, for example a cancel by an operator, stays `database_error`.
+- The round uses at most 4 database connections: the pool of 2 and one dedicated connection each for the source lock and the lifecycle lock. Dedicated connections use the round application name, `paperclip-git-expiration-round`. A fifth connection is refused with `db_connections` before it connects.
+- The CLI journal refuses a non-terminal event that would leave less than 64 KiB below 64 MiB. The round then stops `partial` with `resource_limit` and `budgetHit.budget` `evidence`, and writes `round_finished` into the reserve. If a write fails (`EFBIG`, `ENOSPC`, `EDQUOT` or another error), the round ends with `evidence_lost`.
 - All directory walks of one row share one counter of 100,000 entries: the size walk of the worktree, the search for regenerable directories, the walk of the base Git storage and the reads of single Git directories. Directories are read in batches. The 100,001st entry records the row as `resource_limit` `walker_entries` and the round stops `partial`. A walk never turns a budget hit or an abort into a rejection.
 
 ## Evidence
@@ -69,10 +73,11 @@ The round writes `events.jsonl` in the evidence directory. Each line is one even
 
 | Event | Content |
 | --- | --- |
-| `round_started` | Round identifier, `upperBound`, mode, page size and limits |
+| `round_started` | Round identifier, `upperBound`, mode, page size, limits, the fixed `budgets` and `scratchDir` |
 | `page_selected` | Page number and selected keys |
+| `selection_exhaustion_checked` | `more`: whether a row is left after the cap. No key is recorded. |
 | `row_inspected` | Selected key, current row, workspace, outcome, reason and candidate bytes |
-| `round_finished` | Summary. `status` is `partial` or `pending_commit`. |
+| `round_finished` | Summary. `status` is `partial` or `pending_commit`. It includes `fullPages`, `exhaustionChecked`, `budgetHit` (`budget`, `scope` `row` or `round`, `limit`, `observed`, or `null`), `peaks` (`rowMs`, `rowEntries`, `childOutputBytes`, `dbClients`, `gitChildren`, `journalBytes`), `drainIncomplete`, `undrainedRow` and `budgets`. When a row does not drain within 5 s and no other budget is named, `budgetHit.budget` is `row_drain`. `peaks.dbClients` counts the configured pool of 2 plus the dedicated connections open at that moment, including dedicated connections opened from a dedicated connection. `peaks.journalBytes` is the size of the journal before its first `round_finished` record, so the journal and the stdout summary report the same value. The stdout summary has the same fields. |
 | `round_committed` | Round identifier and status `complete` |
 
 `current` in `row_inspected` is the row that the round read again under the lifecycle lock:
@@ -117,7 +122,7 @@ Row outcomes:
 | `rejected` | Native expiration would skip the workspace. The reason is the native reason. |
 | `not_candidate` | The sweep selects the row, but the row does not go to Git expiration. |
 | `lock_busy` | Another process holds the source lock or the lifecycle lock. |
-| `resource_limit` | A Git command timeout, a Git output limit, the row deadline, the walker entry budget or a native helper budget stopped the inspection. Only a normal non-zero Git exit can give a rejection. |
+| `resource_limit` | A Git command timeout, a Git output limit, the row deadline, the walker entry budget, a statement timeout, the connection cap or a native helper budget stopped the inspection. Only a normal non-zero Git exit can give a rejection. |
 
 ## Complete and partial
 
