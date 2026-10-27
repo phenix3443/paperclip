@@ -1087,6 +1087,64 @@ describe.skipIf(!support.supported)("heartbeat workspace preparation boundary", 
     }
   });
 
+  it("L2c-F1: an eager call and the successor that both fail before any rebuild call leave the row unchanged", async () => {
+    const f = await archivedContinuationTarget();
+    await db.update(executionWorkspaces).set({
+      metadata: sql`coalesce(${executionWorkspaces.metadata}, '{}'::jsonb) || '{"gitCacheRestoration":{"schema":"malformed"}}'::jsonb` })
+      .where(eq(executionWorkspaces.id, f.workspace.id));
+    const successor = await dispatchedContinuationRun(f);
+    const before = await closedRowFacts(f.workspace.id);
+    const h = await raceHarness(f);
+    await expect(h.eager()).resolves.toMatchObject({ ok: false, code: "rebuild_failed" });
+    const stepResult = await h.step(successor);
+    expect(stepResult.error?.message).toMatch(/^Cross-task continuation could not reopen the target workspace: /);
+    expect(h.rebuilds).toEqual({});
+    expect(await closedRowFacts(f.workspace.id)).toEqual(before);
+    expect(await workspaceActivity("execution_workspace.reopen_failed")).toHaveLength(0);
+    expect(await workspaceActivity("execution_workspace.reopened")).toHaveLength(0);
+    await expect(access(f.workspace.cwd!)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each(["null", "other workspace"] as const)("L2d: a rebind to %s while the successor holds the lifecycle lock gives not_reopenable with no writes", async (rebind) => {
+    const f = await archivedContinuationTarget();
+    const successor = await dispatchedContinuationRun(f);
+    const [other] = rebind === "other workspace" ? await db.insert(executionWorkspaces).values({
+      companyId: f.issue.companyId, projectId: f.issue.projectId, sourceIssueId: f.issue.id, mode: "isolated_workspace",
+      strategyType: "git_worktree", name: "Other workspace", status: "archived", providerType: f.workspace.providerType,
+    }).returning() : [null];
+    const before = await closedRowFacts(f.workspace.id);
+    const otherBefore = other ? await closedRowFacts(other.id) : null;
+    const h = await raceHarness(f);
+    const stepDone = h.step(successor);
+    await h.holderReached;
+    await db.update(issues).set({ executionWorkspaceId: other?.id ?? null }).where(eq(issues.id, f.issue.id));
+    h.release();
+    const stepResult = await stepDone;
+    expect(stepResult.error?.message).toMatch(/^Cross-task continuation could not reopen the target workspace: Execution workspace is not reopenable/);
+    expect(h.rebuilds).toEqual({});
+    expect(await closedRowFacts(f.workspace.id)).toEqual(before);
+    if (other) expect(await closedRowFacts(other.id)).toEqual(otherBefore);
+    expect((await readIssue(f.issue.id)).executionWorkspaceId).toBe(other?.id ?? null);
+    expect(await workspaceActivity("execution_workspace.reopened")).toHaveLength(0);
+  });
+
+  it("E7 in-lock: a generation change while the successor holds the lifecycle lock is caught by the fence", async () => {
+    const f = await archivedContinuationTarget();
+    const successor = await dispatchedContinuationRun(f);
+    const h = await raceHarness(f);
+    const stepDone = h.step(successor);
+    await h.holderReached;
+    await db.update(executionWorkspaces).set({
+      metadata: sql`jsonb_set(coalesce(${executionWorkspaces.metadata}, '{}'::jsonb), '{lifecycleGeneration}', to_jsonb(${f.generation + 1}::int))` })
+      .where(eq(executionWorkspaces.id, f.workspace.id));
+    const changed = await closedRowFacts(f.workspace.id);
+    h.release();
+    const stepResult = await stepDone;
+    expect(stepResult.error?.message).toMatch(/^Cross-task continuation could not reopen the target workspace: Execution workspace changed after the continuation request/);
+    expect(h.rebuilds).toEqual({});
+    expect(await closedRowFacts(f.workspace.id)).toEqual(changed);
+  });
+
   it("keeps the admitted recovery workspace when the issue now points elsewhere", async () => {
     const { input, issue } = await fixture(true);
     const first = await prepareHeartbeatWorkspace(db, input);
