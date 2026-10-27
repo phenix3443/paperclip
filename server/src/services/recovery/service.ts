@@ -162,7 +162,6 @@ import {
   OWNER_REPAIR_CONTINUATION_REMAINING_SCOPE,
   ownerRepairContinuationKey,
   ownerRepairIssueBinding,
-  ownerRepairRebindAllowed,
   unknownEffectRecoveryFingerprints,
   readOwnerRepairSettlement,
   sameOwnerRepairIssueBinding,
@@ -3741,83 +3740,6 @@ export function recoveryService(
   }
 
   /**
-   * A wait released by a native status decision moves the issue's version.
-   * Under the issue lock, rebind the reservation only to the version that this
-   * decision produced, mark the wait released by it, and record the move. Any
-   * other mismatch stays stale for the queue to refuse.
-   */
-  async function rebindOwnerRepairAfterWait(
-    action: typeof issueRecoveryActions.$inferSelect,
-    settlement: OwnerRepairSettlement,
-  ): Promise<OwnerRepairSettlement> {
-    if (!settlement.lastWait) return settlement;
-    return db.transaction(async (tx) => {
-      const [issue] = await tx.select().from(issues).where(and(
-        eq(issues.id, action.sourceIssueId), eq(issues.companyId, action.companyId))).for("update");
-      const [locked] = await tx.select().from(issueRecoveryActions).where(and(
-        eq(issueRecoveryActions.id, action.id), eq(issueRecoveryActions.companyId, action.companyId),
-        eq(issueRecoveryActions.status, "active"))).for("update");
-      const current = readOwnerRepairSettlement(locked?.evidence);
-      if (!issue || !current || current.state !== "pending_dispatch" || current.wakeupRequestId !== settlement.wakeupRequestId ||
-          !current.lastWait || !issue.lastStatusDecisionId) return current ?? settlement;
-      const [decision] = await tx.select({
-        id: statusDecisions.id,
-        companyId: statusDecisions.companyId,
-        issueId: statusDecisions.issueId,
-        decisionVersion: statusDecisions.decisionVersion,
-        fromStatus: statusDecisions.fromStatus,
-        toStatus: statusDecisions.toStatus,
-        applicationState: statusDecisions.applicationState,
-        createdAt: statusDecisions.createdAt,
-      }).from(statusDecisions).where(and(
-        eq(statusDecisions.id, issue.lastStatusDecisionId),
-        eq(statusDecisions.companyId, issue.companyId),
-        eq(statusDecisions.issueId, issue.id)));
-      if (!ownerRepairRebindAllowed(current, issue, decision ?? null)) return current;
-      const at = new Date().toISOString();
-      const wait = current.lastWait;
-      const next: OwnerRepairSettlement = {
-        ...current,
-        expectedIssueStatusVersion: issue.statusVersion,
-        issueBinding: ownerRepairIssueBinding(issue),
-        lastWait: { ...wait, releasedByDecisionId: decision!.id, releasedAt: at },
-        rebinds: [...(current.rebinds ?? []), {
-          fromStatusVersion: current.expectedIssueStatusVersion,
-          toStatusVersion: issue.statusVersion,
-          fromStatusDecisionId: current.issueBinding.lastStatusDecisionId,
-          toStatusDecisionId: decision!.id,
-          waitReason: wait.reason,
-          waitRecordedAt: wait.at,
-          at,
-        }],
-      };
-      await tx.update(issueRecoveryActions).set({
-        evidence: sql`coalesce(${issueRecoveryActions.evidence}, '{}'::jsonb) || ${JSON.stringify({ ownerRepairSettlement: next })}::jsonb`,
-        updatedAt: new Date(),
-      }).where(eq(issueRecoveryActions.id, action.id));
-      await logActivity(tx as unknown as Db, {
-        companyId: issue.companyId,
-        actorType: "system",
-        actorId: "recovery",
-        agentId: null,
-        runId: current.repairRunId,
-        action: "issue.owner_repair_rebound",
-        entityType: "issue_recovery_action",
-        entityId: action.id,
-        details: {
-          sourceIssueId: issue.id,
-          continuationKey: current.continuationKey,
-          waitReason: wait.reason,
-          releasedByDecisionId: decision!.id,
-          fromStatusVersion: current.expectedIssueStatusVersion,
-          toStatusVersion: issue.statusVersion,
-        },
-      });
-      return next;
-    });
-  }
-
-  /**
    * Saves why a reserved continuation is waiting, with the issue version and
    * decision it was observed at under the issue lock. An unchanged open wait
    * writes nothing, so a repeated refusal keeps its original observation.
@@ -3839,8 +3761,7 @@ export function recoveryService(
       if (!current || current.state !== "pending_dispatch" || current.wakeupRequestId !== settlement.wakeupRequestId) return;
       const typedReason = reason.slice(0, 200);
       const previous = current.lastWait;
-      if (previous && !previous.releasedByDecisionId && previous.reason === typedReason
-        && previous.statusVersion === issue.statusVersion) return;
+      if (previous && previous.reason === typedReason && previous.statusVersion === issue.statusVersion) return;
       const lastWait: OwnerRepairWait = {
         reason: typedReason,
         message: message?.slice(0, 500) ?? null,
@@ -3874,7 +3795,6 @@ export function recoveryService(
   ): Promise<OwnerRepairContinuationOutcome> {
     // Recover the commit/ack gap first: an accepted receipt is the successor.
     let receipt = await acceptedOwnerRepairReceipt(action, settlement);
-    if (!receipt) settlement = await rebindOwnerRepairAfterWait(action, settlement);
     if (!receipt) {
       try {
         await deps.enqueueWakeup(settlement.ownerAgentId, {

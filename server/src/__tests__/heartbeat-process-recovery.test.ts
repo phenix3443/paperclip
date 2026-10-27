@@ -8778,7 +8778,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     return waiting;
   }
 
-  it("rebinds a waiting continuation to the version its wait resolution produced, once, with an audit entry", async () => {
+  it.each([
+    ["an unrelated decision that never left the wait", [{ fromStatus: "todo", toStatus: "todo" }]],
+    ["an unrelated blocked round trip that did not release the wait", [
+      { fromStatus: "todo", toStatus: "blocked" },
+      { fromStatus: "blocked", toStatus: "todo" },
+    ]],
+    ["a direct version bump without a decision", null],
+  ] as const)("admits no successor when a recorded wait sees %s", async (_label, transitions) => {
     const fixture = await seedCompletedOwnerRepairFixture();
     const { reservedId, reopened } = await reserveOwnerRepairContinuation(fixture);
     const waiting = await waitOnPausedOwner(fixture);
@@ -8786,48 +8793,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       statusVersion: reopened.statusVersion,
       statusDecisionId: reopened.lastStatusDecisionId ?? null,
     });
-    expect(waiting.settlement.lastWait.releasedByDecisionId ?? null).toBeNull();
 
-    // The wait ends through a native status round trip: the task is blocked,
-    // then a decision releases it back to open work.
-    await applyNativeStatusDecision(fixture, { fromStatus: "todo", toStatus: "blocked" });
-    const release = await applyNativeStatusDecision(fixture, { fromStatus: "blocked", toStatus: "todo" });
-    await db.update(agents).set({ status: "idle", pauseReason: null, pausedAt: null })
-      .where(eq(agents.id, fixture.agentId));
-    await heartbeatService(db).reconcileStrandedAssignedIssues();
-    await heartbeatService(db).reconcileStrandedAssignedIssues();
-
-    const after = await observeOwnerRepairContinuation(fixture);
-    expect(after.repeatedRepairs).toHaveLength(0);
-    expect(after.businessSuccessors).toHaveLength(1);
-    expect(after.receipts.map((receipt) => receipt.id)).toEqual([reservedId]);
-    expect(after.receipts[0]!.runId).toBe(after.businessSuccessors[0]!.id);
-    expect(after.settlement).toMatchObject({
-      state: "delivered",
-      expectedIssueStatusVersion: release.decisionVersion,
-      lastWait: { releasedByDecisionId: release.decisionId },
-      rebinds: [expect.objectContaining({
-        fromStatusVersion: reopened.statusVersion,
-        toStatusVersion: release.decisionVersion,
-        toStatusDecisionId: release.decisionId,
-      })],
-    });
-    expect(after.action).toMatchObject({ status: "resolved", attemptCount: 1 });
-    const audit = await db.select().from(activityLog).where(and(
-      eq(activityLog.action, "issue.owner_repair_rebound"), eq(activityLog.entityId, fixture.actionId)));
-    expect(audit).toHaveLength(1);
-    expect(audit[0]!.details).toMatchObject({ releasedByDecisionId: release.decisionId, toStatusVersion: release.decisionVersion });
-  });
-
-  it.each([
-    ["an unrelated decision that never left the wait", { fromStatus: "todo", toStatus: "todo" }],
-    ["a direct version bump without a decision", null],
-  ] as const)("admits no successor when a recorded wait sees %s", async (_label, transition) => {
-    const fixture = await seedCompletedOwnerRepairFixture();
-    const { reservedId, reopened } = await reserveOwnerRepairContinuation(fixture);
-    await waitOnPausedOwner(fixture);
-
-    if (transition) await applyNativeStatusDecision(fixture, transition);
+    if (transitions) for (const transition of transitions) await applyNativeStatusDecision(fixture, transition);
     else await db.update(issues).set({ statusVersion: reopened.statusVersion + 2 }).where(eq(issues.id, fixture.issueId));
     await db.update(agents).set({ status: "idle", pauseReason: null, pausedAt: null })
       .where(eq(agents.id, fixture.agentId));
@@ -8840,12 +8807,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .toHaveLength(0);
     expect(after.receipts).toHaveLength(1);
     expect(after.receipts[0]).toMatchObject({ id: reservedId, status: "skipped", runId: null });
-    expect(after.settlement).toMatchObject({ state: "denied", wakeupRequestId: reservedId });
-    expect(after.settlement.rebinds ?? []).toHaveLength(0);
-    expect(after.settlement.lastWait?.releasedByDecisionId ?? null).toBeNull();
-    const audit = await db.select().from(activityLog).where(and(
-      eq(activityLog.action, "issue.owner_repair_rebound"), eq(activityLog.entityId, fixture.actionId)));
-    expect(audit).toHaveLength(0);
+    expect(after.settlement).toMatchObject({
+      state: "denied",
+      wakeupRequestId: reservedId,
+      expectedIssueStatusVersion: reopened.statusVersion,
+    });
   });
 
   it("never re-admits a delivered continuation after its receipt row is compacted away", async () => {
@@ -8883,7 +8849,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(after.receipts).toHaveLength(1);
     expect(after.receipts[0]).toMatchObject({ id: reservedId, status: "skipped", runId: null });
     expect(after.settlement).toMatchObject({ state: "denied", wakeupRequestId: reservedId });
-    expect(after.settlement.rebinds ?? []).toHaveLength(0);
   });
 
   it("holds an owner-repair continuation behind a budget block without consuming its receipt", async () => {

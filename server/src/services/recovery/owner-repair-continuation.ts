@@ -42,13 +42,12 @@ export type OwnerRepairSettlement = {
   deliveredAt?: string | null;
   deliveredRunId?: string | null;
   deniedReason?: string | null;
-  /** Latest temporary refusal; it never consumes the reserved receipt. */
-  lastWait?: OwnerRepairWait | null;
   /**
-   * Audit trail of each accepted rebind. It records what a release decision
-   * already consumed; it never authorizes a rebind by itself.
+   * Latest temporary refusal; it never consumes the reserved receipt. Every
+   * queue wait is released at the bound version, so a version change after a
+   * wait is never its release and the old request stays stale.
    */
-  rebinds?: OwnerRepairRebind[];
+  lastWait?: OwnerRepairWait | null;
 };
 
 /**
@@ -62,79 +61,7 @@ export type OwnerRepairWait = {
   at: string;
   statusVersion?: number;
   statusDecisionId?: string | null;
-  /** The native decision that released this wait. A wait is released once. */
-  releasedByDecisionId?: string | null;
-  releasedAt?: string | null;
 };
-
-export type OwnerRepairRebind = {
-  fromStatusVersion: number;
-  toStatusVersion: number;
-  fromStatusDecisionId: string | null;
-  toStatusDecisionId: string | null;
-  waitReason: string;
-  waitRecordedAt?: string;
-  at: string;
-};
-
-/** The applied native status decision that the issue currently points at. */
-export type OwnerRepairReleaseDecision = {
-  id: string;
-  companyId: string;
-  issueId: string;
-  decisionVersion: number;
-  fromStatus: string;
-  toStatus: string;
-  applicationState: string;
-  createdAt: Date;
-};
-
-/** Statuses a native decision must leave to count as releasing a wait. */
-const OWNER_REPAIR_WAIT_STATUSES = ["blocked"];
-
-/**
- * A reserved continuation may follow the issue to a new version only when the
- * native decision that released its recorded wait produced that version:
- *
- * - the wait was recorded at the bound version and is not released yet;
- * - the issue's current version and last decision come from one applied
- *   decision, made after the wait, that moved the task out of a waiting status
- *   back to open work;
- * - no earlier rebind consumed that decision;
- * - the same owner still holds the open task, and the responsible human,
- *   workspace binding and execution stage are unchanged.
- *
- * Any other version change, including a direct version bump or an unrelated
- * decision, stays stale and the queue refuses the old request.
- */
-export function ownerRepairRebindAllowed(
-  settlement: OwnerRepairSettlement,
-  issue: { id: string; companyId: string; assigneeAgentId: string | null; status: string; statusVersion: number }
-    & Parameters<typeof ownerRepairIssueBinding>[0],
-  decision: OwnerRepairReleaseDecision | null,
-) {
-  const wait = settlement.lastWait;
-  if (!wait || !Number.isSafeInteger(wait.statusVersion) || wait.releasedByDecisionId) return false;
-  if (wait.statusVersion !== settlement.expectedIssueStatusVersion) return false;
-  if (issue.statusVersion <= wait.statusVersion!) return false;
-  if (issue.assigneeAgentId !== settlement.ownerAgentId || !["todo", "in_progress"].includes(issue.status)) return false;
-  const waitedAt = Date.parse(wait.at);
-  if (!decision || !Number.isFinite(waitedAt)
-    || decision.id !== issue.lastStatusDecisionId
-    || decision.id === (wait.statusDecisionId ?? null)
-    || decision.companyId !== issue.companyId || decision.issueId !== issue.id
-    || decision.applicationState !== "applied"
-    || decision.decisionVersion !== issue.statusVersion
-    || decision.createdAt.getTime() < waitedAt
-    || !OWNER_REPAIR_WAIT_STATUSES.includes(decision.fromStatus)
-    || decision.toStatus !== issue.status) return false;
-  if ((settlement.rebinds ?? []).some((rebind) => rebind.toStatusDecisionId === decision.id)) return false;
-  const current = ownerRepairIssueBinding(issue);
-  const bound = settlement.issueBinding;
-  return current.responsibleUserId === bound.responsibleUserId
-    && current.workspaceBindingRevision === bound.workspaceBindingRevision
-    && current.executionStageId === bound.executionStageId;
-}
 
 /** Queue admission request for one reserved owner-repair continuation. */
 export type OwnerRepairContinuationRequest = {
