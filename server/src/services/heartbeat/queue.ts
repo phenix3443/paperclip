@@ -5160,7 +5160,6 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         responsibleUserId: issues.responsibleUserId, executionWorkspaceId: issues.executionWorkspaceId,
       }).from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, receipt.companyId)));
       if (!intent || !target) continue;
-      if (!(await isTrustedDeferredDispatchReceipt(db, receipt, { companyId: receipt.companyId, agentId: receipt.agentId, issueId }))) continue;
       const intentPayload = parseObject(intent.payload);
       let gateError: string | null = null;
       if (target.status === "done" || target.status === "cancelled") {
@@ -5195,12 +5194,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           promoted += 1;
           await db.update(agentWakeupRequests).set({ runId: run.id, updatedAt: new Date() })
             .where(and(eq(agentWakeupRequests.id, intent.id), isNull(agentWakeupRequests.runId)));
-          await db.update(agentWakeupRequests).set({ error: null })
+          await db.update(agentWakeupRequests).set({ error: null, updatedAt: new Date() })
             .where(and(eq(agentWakeupRequests.id, receipt.id), eq(agentWakeupRequests.error, DEFERRED_RECEIPT_READMISSION_DECLINED)));
         } else {
           await db.update(agentWakeupRequests).set({ error: DEFERRED_RECEIPT_READMISSION_DECLINED, updatedAt: new Date() })
             .where(and(eq(agentWakeupRequests.id, receipt.id), eq(agentWakeupRequests.status, "deferred_issue_execution"),
-              isNull(agentWakeupRequests.runId)));
+              isNull(agentWakeupRequests.runId),
+              sql`${agentWakeupRequests.error} is distinct from ${DEFERRED_RECEIPT_READMISSION_DECLINED}`));
         }
       } catch (error) {
         logger.warn({ err: error, wakeupRequestId: receipt.id }, "failed to re-admit a deferred dispatch receipt");

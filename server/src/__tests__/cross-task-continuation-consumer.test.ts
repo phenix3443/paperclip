@@ -646,6 +646,36 @@ describeEmbeddedPostgres("cross-task continuation intent consumer", () => {
     expect((await readCrossTaskContinuationWork(db)).pending).toBe(false);
   });
 
+  it("a receipt marked declined by an earlier attempt is not counted as pending, and the real resolution notification still promotes it", async () => {
+    const f = await deferUnderRecoveryHold();
+    await db.update(agentWakeupRequests).set({ error: DEFERRED_RECEIPT_READMISSION_DECLINED }).where(eq(agentWakeupRequests.id, f.receipt.id));
+    const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: () => {} });
+    try {
+      const worker = registerCrossTaskContinuationWork(db, coordinator, () => heartbeatService(db).dispatchPendingNativeStatusWakeups());
+      await worker.ready;
+      await f.resolve();
+      expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+      await vi.waitFor(async () => expect(await f.runsFor()).toHaveLength(1), { timeout: 10_000 });
+      expect(await dispatchReceipts(f.intent.id)).toMatchObject([{ id: f.receipt.id, error: null }]);
+      await vi.waitFor(() => expect(coordinator.nextWakeAt()).toBeNull(), { timeout: 10_000 });
+    } finally {
+      await coordinator.stop();
+    }
+    await heartbeat.drainActiveRunExecutions();
+  });
+
+  it("an untrusted deferred receipt is neither a candidate nor pending work, and a sweep leaves it untouched", async () => {
+    const f = await deferUnderRecoveryHold();
+    await f.resolve();
+    await db.update(agentWakeupRequests).set({ payload: { issueId: randomUUID() } }).where(eq(agentWakeupRequests.id, f.intent.id));
+    const [before] = await dispatchReceipts(f.intent.id);
+    expect((await listPromotableDeferredDispatchReceipts(db, { limit: 100 })).promotable).toHaveLength(0);
+    expect((await readCrossTaskContinuationWork(db)).pending).toBe(false);
+    expect(await heartbeat.dispatchPendingNativeStatusWakeups({})).toMatchObject({ promoted: 0 });
+    expect(await dispatchReceipts(f.intent.id)).toEqual([before]);
+    expect(await f.runsFor()).toHaveLength(0);
+  });
+
   it("a workspace restore hold survives a newer /new boundary and keeps the receipt deferred with no run", async () => {
     const f = await deferUnderRecoveryHold();
     await db.update(issueRecoveryActions).set({ evidence: { workspaceRestoreFailure: "restore_unsafe_archive" } })

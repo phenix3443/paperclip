@@ -525,6 +525,7 @@ export async function listPromotableDeferredDispatchReceipts(
   for (const { receipt } of rows) {
     const issueId = (receipt.payload as Record<string, unknown> | null)?.issueId;
     if (deferredDispatchReceiptIntentId(receipt) && typeof issueId === "string"
+      && await isTrustedDeferredDispatchReceipt(db, receipt, { companyId: receipt.companyId, agentId: receipt.agentId, issueId })
       && !(await getExecutionBlocker(db, receipt.companyId, issueId))) {
       promotable.push(receipt);
     }
