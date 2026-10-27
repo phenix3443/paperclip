@@ -1,7 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.ts";
+import { executionPolicyTransitionInputFingerprint, normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.ts";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -776,6 +776,40 @@ describe("issue execution policy routes", () => {
       }),
       expect.anything(),
     );
+  });
+
+  it("passes the transition inputs it read to the locked update", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_progress",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1010",
+      title: "Transition inputs",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue, ...patch, updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+    })).patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").send({ title: "Renamed" });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update.mock.calls[0]?.[1]).toMatchObject({
+      expectedExecutionPolicyTransition: {
+        inputs: executionPolicyTransitionInputFingerprint(issue),
+        changesTask: false,
+      },
+    });
   });
 
   it("allows an agent-authored in_review transition with a scheduled monitor", async () => {

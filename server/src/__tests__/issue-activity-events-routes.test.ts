@@ -197,6 +197,7 @@ function issueUpdateWithReceipt(issue: ReturnType<typeof makeIssue>, patch: Reco
     actorUserId: _actorUserId,
     workspaceSelectionActor: _workspaceSelectionActor,
     blockedByIssueIds: _blockedByIssueIds,
+    expectedExecutionPolicyTransition: _expectedExecutionPolicyTransition,
     ...issuePatch
   } = patch;
   const updated = {

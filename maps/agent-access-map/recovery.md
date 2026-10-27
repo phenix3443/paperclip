@@ -354,7 +354,7 @@ Evidence: `source-only` — [recovery routes](../../server/src/routes/issues.ts)
 
 Verification: `not-run` — Agent read/settle denied. Unknown key reads unsettled, settles to abandoned once with one audit row; failed audit leaves the key unsettled. Committed key settles to committed and a same-key retry replays without new writes.
 
-Gaps: Embedded PostgreSQL route tests only; the public admission capability, gate locks and delivery checks arrive in a later slice. No UI client calls these routes yet.
+Gaps: Embedded PostgreSQL route tests only; the public admission capability and delivery checks arrive in a later slice. No UI client calls these routes yet.
 
 ### `record-document-decision`
 
@@ -369,6 +369,20 @@ Evidence: `source-only` — [recovery routes](../../server/src/routes/issues.ts)
 Verification: `not-run` — Board and agent-with-run decisions record server-owned actors; body actor fields, past or over-72-hour expiry, unknown key or revision, and cross-revision revokes are refused. Admission refuses an empty list, an unlisted actor, a newer revision, expired or revoked decisions, an expired payload, non-canonical or wrong-shape bodies, and each changed intent field, with no write and one refusal row.
 
 Gaps: Embedded PostgreSQL route tests only; the public admission capability stays off. No UI edits the authority list yet.
+
+### `admit-under-gate-locks`
+
+API: `present` — POST /api/issues/{id}/recovery-actions/resolve with `executionReconciliation.admission`. The public route still refuses `admission` with 400 `capability_unsupported` until the health capability is published.
+
+Agent access: `restricted` — Board only; agents and the operator cannot call admission. Gate writers stay available to their existing actors and only gain locks.
+
+Policy: Admission takes its locks in one fixed order (key, company authority, owner agent, subtree hold, issue, blockers, recovery actions, open wakes, coordinator, runs, leases, authorization document) and reads every gate after them. It refuses a non-terminal or unsettled source run, a live process or unreleased lease, a conversation task, another open action, an active or newer run, a pending wake, and each closed gate as `gate_closed:<gate>`. Subtree hold creation, approval links, approval moves into `pending` or `revision_requested`, execution policy transitions and document decisions lock the row admission holds before they write. Every refusal rolls back and writes one `issue.execution_reconciliation_refused` row.
+
+Evidence: `source-only` — [admission checks](../../server/src/services/execution-reconciliation-admission.ts), [gate-writer locks](../../server/src/services/execution-reconciliation-locks.ts), [recovery routes](../../server/src/routes/issues.ts); added after the page source revision and reviewed in the PR that adds them. No live provider proof.
+
+Verification: `not-run` — Each run, wake, process and gate refusal leaves the task, action, receipt, wakes and runs unchanged with one refusal row. Hold creation, approval link and resubmit, and decision insert wait on the row an admission holds. A PATCH transition computed on a changed row is refused.
+
+Gaps: Embedded PostgreSQL route tests, plus a mocked route test for the PATCH transition recheck. Delivery revalidation inside the queue transaction and the public capability arrive in later slices. `claimQueuedRun` still checks budget, pause and dependencies before its lock.
 
 ### `resolve-chat-publication`
 

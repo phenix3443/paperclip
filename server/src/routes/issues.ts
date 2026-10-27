@@ -21,6 +21,8 @@ import {
   lockCompanyForAdmission,
   verifyExecutionReconciliationAuthorization,
 } from "../services/issue-document-decisions.js";
+import { admitExecutionReconciliationGates, assertSourceProcessesAndLeasesStopped, admitExecutionReconciliationRuns, lockAdmissionRows } from "../services/execution-reconciliation-admission.js";
+import { lockAdmissionOwnerAndTreeHolds } from "../services/execution-reconciliation-locks.js";
 import { assertNoCaseHandoffMutation } from "../services/heartbeat/case-handoff-lifecycle.js";
 import { assertLegacyRunTaskOwnership } from "../legacy-run-task-ownership.js";
 import { enqueueFastResponse } from "../services/fast-responses.js";
@@ -349,6 +351,7 @@ import {
 } from "../services/company-search-rate-limit.js";
 import {
   applyIssueExecutionPolicyTransition,
+  executionPolicyTransitionInputFingerprint,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
@@ -9759,6 +9762,7 @@ export function issueRoutes(
           assertBoard(req);
           await lockReconciliationKey(tx, existing.companyId, admission.idempotencyKey);
           admissionCompany = await lockCompanyForAdmission(tx, existing.companyId);
+          await lockAdmissionOwnerAndTreeHolds(tx, existing.companyId, existing.assigneeAgentId);
           priorReceipt = await selectReconciliationReceipt(tx, existing.companyId, admission.idempotencyKey);
         }
         const lockedIssue = await tx
@@ -9773,8 +9777,14 @@ export function issueRoutes(
           .for("update")
           .then((rows) => rows[0] ?? null);
         if (!lockedIssue) throw notFound("Issue not found");
+        if (admission && lockedIssue.assigneeAgentId !== existing.assigneeAgentId) {
+          throw executionReconciliationRefusal("concurrent_change", "The task owner changed while the request was prepared. Re-read and retry with the same key.");
+        }
         let admissionCheck: Awaited<ReturnType<typeof checkExecutionReconciliationAdmission>> | null = null;
         if (admission) {
+          const lockedAdmissionRows = priorReceipt ? null : await lockAdmissionRows(tx, {
+            companyId: lockedIssue.companyId, issueId: lockedIssue.id, runId: executionReconciliation!.runId,
+          });
           admissionCheck = await checkExecutionReconciliationAdmission(tx, {
             issue: lockedIssue, actionId: actionId!, runId: executionReconciliation!.runId,
             admission, requestDigest: admissionRequestDigest!, priorReceipt,
@@ -9787,6 +9797,15 @@ export function issueRoutes(
             runId: executionReconciliation!.runId, authority: admissionCompany!.executionReconciliationAuthority,
             admission, expectedDigest: admissionCheck.expectedDigest, request: req.body,
           }));
+          await admitExecutionReconciliationRuns(tx, {
+            issue: lockedIssue, actionId: actionId!, locked: lockedAdmissionRows!,
+            unstartedRunIds: admissionCheck.expected.unstartedRunIds,
+          });
+          await assertSourceProcessesAndLeasesStopped(tx, { issue: lockedIssue, decision: executionReconciliation! });
+          await admitExecutionReconciliationGates(tx, {
+            issue: lockedIssue, action: admissionCheck.expected.action, locked: lockedAdmissionRows!,
+            expected: admissionCheck.expected,
+          });
         }
         // Reconciling a reviewer run keeps the task in review; no status change is requested.
         const pendingReviewResume =
@@ -10062,7 +10081,7 @@ export function issueRoutes(
                 { code: "recovery_review_resume_unverified" },
               );
             }
-            await assertSafeRecoveryHandBackGates({
+            if (!admission) await assertSafeRecoveryHandBackGates({
               req,
               issue: lockedIssue,
               recoveryAction: activeRecoveryAction,
@@ -10163,7 +10182,7 @@ export function issueRoutes(
             lockedIssue.assigneeAgentId ===
               activeRecoveryAction.returnOwnerAgentId;
           if (safeHandBack) {
-            await assertSafeRecoveryHandBackGates({
+            if (!admission) await assertSafeRecoveryHandBackGates({
               req,
               issue: lockedIssue,
               recoveryAction: activeRecoveryAction,
@@ -14377,6 +14396,12 @@ export function issueRoutes(
         monitorExplicitlyUpdated:
           req.body.executionPolicy !== undefined && monitorChanged,
       });
+      const expectedExecutionPolicyTransition = expectedStatusVersion === undefined
+        ? {
+          inputs: executionPolicyTransitionInputFingerprint(existing),
+          changesTask: Object.keys(transition.patch).length > 0 || Boolean(transition.decision),
+        }
+        : undefined;
       const decisionId = transition.decision ? randomUUID() : null;
       if (decisionId) {
         const nextExecutionState = transition.patch.executionState;
@@ -14733,6 +14758,7 @@ export function issueRoutes(
         workspaceSelectionActor: req.actor,
         expectedExecutionPolicy,
         expectedStatusVersion,
+        expectedExecutionPolicyTransition,
         actorAgentId: actor.agentId ?? null,
         actorRunId: actor.agentId ? actor.runId : null,
         actorRunStopId: actor.agentId && interruptedRunId === actor.runId ? issueMutationStopId : null,

@@ -54,6 +54,11 @@ export async function createIssueDocumentDecision(
         eq(issueDocuments.key, input.key),
       ));
     if (!link) throw notFound("Document not found");
+    await tx
+      .select({ id: documents.id })
+      .from(documents)
+      .where(and(eq(documents.companyId, input.companyId), eq(documents.id, link.documentId)))
+      .for("update");
     const [revision] = await tx
       .select()
       .from(documentRevisions)
@@ -120,7 +125,8 @@ export async function lockCompanyForAdmission(tx: DbOrTransaction, companyId: st
   const [company] = await tx
     .select({ id: companies.id, executionReconciliationAuthority: companies.executionReconciliationAuthority })
     .from(companies)
-    .where(eq(companies.id, companyId));
+    .where(eq(companies.id, companyId))
+    .for("share");
   if (!company) throw notFound("Company not found");
   return company;
 }

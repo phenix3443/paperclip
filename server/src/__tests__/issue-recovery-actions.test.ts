@@ -5,6 +5,9 @@ import path from "node:path";
 import express from "express";
 import request from "supertest";
 import { and, eq, sql } from "drizzle-orm";
+import { issueApprovalService } from "../services/issue-approvals.js";
+import { approvalService } from "../services/approvals.js";
+import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import {
@@ -12,6 +15,7 @@ import {
   agents,
   agentRuntimeState,
   approvals,
+  budgetPolicies,
   authUsers,
   agentWakeupRequests,
   activityLog,
@@ -2176,6 +2180,83 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(logged[0]!.details).toMatchObject({ idempotencyKey: key, state: "abandoned" });
   });
 
+  describe("PATCH rechecks execution policy transition inputs under the row lock (G3)", () => {
+    const reviewPolicy = (agentId: string) => normalizeIssueExecutionPolicy({
+      stages: [{ id: randomUUID(), type: "review", participants: [{ type: "agent", agentId }] }],
+    })!;
+    const issueRowLockWaiters = async () => (await db.execute(sql`select count(*)::int as n from pg_stat_activity
+      where wait_event_type = 'Lock' and query ilike 'select "id", "company_id", "conversation_agent_id"%'`) as unknown as { n: number }[])[0]!.n;
+
+    it("refuses a PATCH computed before a review policy committed under the lock it waited on", async () => {
+      const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+      await db.update(issues).set({ status: "in_progress", assigneeAgentId: coderId, executionPolicy: null, executionState: null })
+        .where(eq(issues.id, sourceIssueId));
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      let locked!: () => void;
+      const lockedSignal = new Promise<void>((resolve) => { locked = resolve; });
+      const policyWriter = db.transaction(async (tx) => {
+        await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, sourceIssueId)).for("update");
+        locked();
+        await held;
+        await tx.update(issues).set({ executionPolicy: reviewPolicy(managerId) as any }).where(eq(issues.id, sourceIssueId));
+      });
+      await lockedSignal;
+      const pending = request(createApp({ type: "board", source: "local_implicit", userId: "board-user" }))
+        .patch(`/api/issues/${sourceIssueId}`).send({ status: "done" }).then((response) => response);
+      for (let attempt = 0; attempt < 50 && await issueRowLockWaiters() === 0; attempt += 1) await new Promise((r) => setTimeout(r, 50));
+      expect(await issueRowLockWaiters()).toBe(1);
+      release();
+      await policyWriter;
+      const response = await pending;
+      expect(response.status).toBe(409);
+      expect(response.body).toMatchObject({ details: { code: "execution_policy_transition_stale" } });
+      const [after] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(after!.status).toBe("in_progress");
+      expect(after!.executionPolicy).not.toBeNull();
+      expect(companyId).toBeTruthy();
+    });
+
+    it("keeps a PATCH that committed before the policy writer, and the policy written after it", async () => {
+      const { managerId, coderId, sourceIssueId } = await seedCompany();
+      await db.update(issues).set({ status: "in_progress", assigneeAgentId: coderId, executionPolicy: null, executionState: null })
+        .where(eq(issues.id, sourceIssueId));
+      const app = createApp({ type: "board", source: "local_implicit", userId: "board-user" });
+      const done = await request(app).patch(`/api/issues/${sourceIssueId}`).send({ status: "done" });
+      expect(done.status).toBe(200);
+      const policy = await request(app).patch(`/api/issues/${sourceIssueId}`).send({ executionPolicy: reviewPolicy(managerId) });
+      expect(policy.status).toBe(200);
+      const [after] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(after!.status).toBe("done");
+      expect(after!.executionPolicy).not.toBeNull();
+    });
+
+    it("lets an unrelated edit through when the locked row changed but neither row is policy-governed", async () => {
+      const { coderId, sourceIssueId } = await seedCompany();
+      await db.update(issues).set({ status: "in_progress", assigneeAgentId: coderId, executionPolicy: null, executionState: null })
+        .where(eq(issues.id, sourceIssueId));
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      let locked!: () => void;
+      const lockedSignal = new Promise<void>((resolve) => { locked = resolve; });
+      const writer = db.transaction(async (tx) => {
+        await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, sourceIssueId)).for("update");
+        locked();
+        await held;
+        await tx.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+      });
+      await lockedSignal;
+      const pending = request(createApp({ type: "board", source: "local_implicit", userId: "board-user" }))
+        .patch(`/api/issues/${sourceIssueId}`).send({ title: "Renamed while blocked" }).then((response) => response);
+      for (let attempt = 0; attempt < 50 && await issueRowLockWaiters() === 0; attempt += 1) await new Promise((r) => setTimeout(r, 50));
+      release();
+      await writer;
+      expect((await pending).status).toBe(200);
+      const [after] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(after!).toMatchObject({ title: "Renamed while blocked", status: "blocked" });
+    });
+  });
+
   describe("execution reconciliation admission (slice A1)", () => {
     const refusalCode = (body: any) => body?.code ?? body?.details?.code;
 
@@ -2339,6 +2420,274 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       const refused = await request(admissionApp()).post(resolvePath(unfinished.sourceIssueId)).send(body).expect(409);
       expect(refusalCode(refused.body)).toBe("run_not_settled");
       expect(await db.select().from(executionReconciliationReceipts)).toHaveLength(0);
+    });
+
+    describe("run, wake and recovery checks under lock (slice A3a)", () => {
+      const sourceFinishedAt = new Date("2026-05-13T18:30:00.000Z");
+      type Setup = (fixture: Awaited<ReturnType<typeof seedAdmission>>) => Promise<void>;
+      const memberRun = (fixture: Awaited<ReturnType<typeof seedAdmission>>, values: Record<string, unknown>) =>
+        db.insert(heartbeatRuns).values({ id: randomUUID(), companyId: fixture.companyId, agentId: fixture.coderId,
+          invocationSource: "manual", status: "failed", ...values } as any);
+      const coordinator = async (fixture: Awaited<ReturnType<typeof seedAdmission>>, values: Record<string, unknown>) => {
+        await db.update(heartbeatRuns).set({ nativeIssueId: fixture.sourceIssueId }).where(eq(heartbeatRuns.id, fixture.runId));
+        await db.insert(nativeRunFinalizations).values({ runId: fixture.runId, companyId: fixture.companyId,
+          issueId: fixture.sourceIssueId, phase: "terminal_failure", ...values } as any);
+      };
+      const refusedCases: Array<[string, Setup | null, Setup | null, string, string | undefined]> = [
+        ["a queued run for the task", null,
+          (f) => memberRun(f, { issueId: f.sourceIssueId, status: "queued" }), "newer_execution_exists", "active_run"],
+        ["a run filed elsewhere that continues the source run", null,
+          (f) => memberRun(f, { retryOfRunId: f.runId, status: "scheduled_retry" }), "newer_execution_exists", "active_run"],
+        ["a finished run created after the source finished", null,
+          (f) => memberRun(f, { contextSnapshot: { taskId: f.sourceIssueId }, finishedAt: new Date() }), "newer_execution_exists", "newer_run"],
+        ["an earlier run that finished after the source", null,
+          (f) => memberRun(f, { nativeIssueId: f.sourceIssueId, createdAt: new Date("2026-05-13T17:00:00.000Z"),
+            finishedAt: new Date("2026-05-13T19:00:00.000Z") }), "newer_execution_exists", "newer_run"],
+        ["a pending wake for the task", null,
+          (f) => db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.coderId, source: "automation",
+            status: "deferred_issue_execution", payload: { issueId: f.sourceIssueId } }).then(() => undefined),
+          "newer_execution_exists", "pending_wake"],
+        ["another open recovery action", null,
+          (f) => db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.sourceIssueId,
+            kind: "active_run_watchdog", status: "escalated", ownerType: "board", returnOwnerAgentId: f.coderId,
+            cause: "uncertain_external_action", fingerprint: randomUUID(), nextAction: "Review.", evidence: {} }).then(() => undefined),
+          "newer_execution_exists", "recovery_action"],
+        ["a coordinator that still holds a lease", null,
+          (f) => coordinator(f, { leaseOwner: "controller-1" }),
+          "run_not_settled", "coordinator"],
+        ["a coordinator that is not in a final phase", null,
+          (f) => coordinator(f, { phase: "workspace_finalizing" }),
+          "run_not_settled", "coordinator"],
+        ["a coordinator that names a successor run", null,
+          (f) => coordinator(f, { failureDetail: { successorRunId: randomUUID() } }),
+          "run_not_settled", "coordinator"],
+        ["an environment lease that was not released", null,
+          (f) => db.insert(environmentLeases).values({ companyId: f.companyId, heartbeatRunId: f.runId, issueId: f.sourceIssueId,
+            status: "active" } as any).then(() => undefined),
+          "run_not_settled", "process_or_lease"],
+        ["a source run that succeeded",
+          (f) => db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.runId)).then(() => undefined),
+          null, "run_not_settled", undefined],
+        ["a conversation task",
+          (f) => db.update(issues).set({ assigneeAgentId: f.coderId, assigneeUserId: null,
+            conversationAgentId: f.coderId, conversationUserId: "board-user", conversationState: "active" })
+            .where(eq(issues.id, f.sourceIssueId)).then(() => undefined),
+          null, "issue_kind_not_supported", undefined],
+      ];
+
+      it.each(refusedCases)("refuses %s and writes nothing but the refusal audit", async (_name, beforeBody, afterBody, code, reason) => {
+        const fixture = await seedAdmission();
+        await beforeBody?.(fixture);
+        const body = await admissionBody(fixture, `recon:a3a-${randomUUID().slice(0, 8)}`);
+        await afterBody?.(fixture);
+        const before = await snapshot(fixture);
+        const response = await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(409);
+        expect(refusalCode(response.body)).toBe(code);
+        if (reason) expect(response.body.details).toMatchObject({ reason });
+        expect(await snapshot(fixture)).toEqual(before);
+        expect((await refusals()).map((row) => (row.details as any).code)).toEqual([code]);
+        await db.delete(nativeRunFinalizations);
+      });
+
+      it("admits past an earlier finished member run and a listed unstarted hold run", async () => {
+        const fixture = await seedAdmission();
+        await memberRun(fixture, { issueId: fixture.sourceIssueId, createdAt: new Date("2026-05-13T17:00:00.000Z"),
+          finishedAt: new Date("2026-05-13T18:00:00.000Z") });
+        await memberRun(fixture, { issueId: fixture.sourceIssueId, status: "cancelled", errorCode: "execution_reconciliation_required" });
+        await coordinator(fixture, {});
+        const body = await admissionBody(fixture, "recon:a3a-admits-0001");
+        expect(body.executionReconciliation.admission.expected.unstartedRunIds).toHaveLength(1);
+        expect(sourceFinishedAt.toISOString()).toBe(body.executionReconciliation.admission.expected.run.finishedAt);
+        await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(200);
+        await db.delete(nativeRunFinalizations);
+      });
+    });
+
+    describe("approval gate writers lock the task first (G2)", () => {
+      const holdIssueLock = async (issueId: string) => {
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => { release = resolve; });
+        let locked!: () => void;
+        const lockedSignal = new Promise<void>((resolve) => { locked = resolve; });
+        const holder = db.transaction(async (tx) => {
+          await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, issueId)).for("update");
+          locked();
+          await held;
+        });
+        await lockedSignal;
+        return { release, holder };
+      };
+      const waitingOnIssueLock = async () => (await db.execute(sql`select count(*)::int as n from pg_stat_activity
+        where wait_event_type = 'Lock' and query ilike '%from "issues"%for update%'`) as unknown as { n: number }[])[0]!.n;
+
+      it.each([
+        ["link", async (f: Awaited<ReturnType<typeof seedAdmission>>, approvalId: string) =>
+          issueApprovalService(db).link(f.sourceIssueId, approvalId, { userId: "board-user" })],
+        ["linkManyForApproval", async (f: Awaited<ReturnType<typeof seedAdmission>>, approvalId: string) =>
+          issueApprovalService(db).linkManyForApproval(approvalId, [f.sourceIssueId], { userId: "board-user" })],
+      ])("%s waits for an admission that holds the task row", async (_name, linkApproval) => {
+        const fixture = await seedAdmission();
+        const [approval] = await db.insert(approvals).values({ companyId: fixture.companyId, type: "approve_ceo_strategy",
+          status: "pending", payload: {} }).returning();
+        try {
+          const { release, holder } = await holdIssueLock(fixture.sourceIssueId);
+          const linking = linkApproval(fixture, approval!.id);
+          for (let attempt = 0; attempt < 50 && await waitingOnIssueLock() === 0; attempt += 1) await new Promise((r) => setTimeout(r, 50));
+          expect(await waitingOnIssueLock()).toBe(1);
+          expect(await db.select().from(issueApprovals).where(eq(issueApprovals.approvalId, approval!.id))).toHaveLength(0);
+          release();
+          await holder;
+          await linking;
+          expect(await db.select().from(issueApprovals).where(eq(issueApprovals.approvalId, approval!.id))).toHaveLength(1);
+        } finally {
+          await db.delete(issueApprovals).where(eq(issueApprovals.companyId, fixture.companyId));
+          await db.delete(approvals).where(eq(approvals.companyId, fixture.companyId));
+        }
+      });
+
+      it("resubmit waits for an admission that holds a linked task row", async () => {
+        const fixture = await seedAdmission();
+        const [approval] = await db.insert(approvals).values({ companyId: fixture.companyId, type: "approve_ceo_strategy",
+          status: "revision_requested", payload: {} }).returning();
+        await db.insert(issueApprovals).values({ companyId: fixture.companyId, issueId: fixture.sourceIssueId, approvalId: approval!.id } as any);
+        try {
+          const { release, holder } = await holdIssueLock(fixture.sourceIssueId);
+          const resubmitting = approvalService(db).resubmit(approval!.id);
+          for (let attempt = 0; attempt < 50 && await waitingOnIssueLock() === 0; attempt += 1) await new Promise((r) => setTimeout(r, 50));
+          expect(await waitingOnIssueLock()).toBe(1);
+          expect((await db.select().from(approvals).where(eq(approvals.id, approval!.id)))[0]!.status).toBe("revision_requested");
+          release();
+          await holder;
+          expect((await resubmitting)!.status).toBe("pending");
+        } finally {
+          await db.delete(issueApprovals).where(eq(issueApprovals.companyId, fixture.companyId));
+          await db.delete(approvals).where(eq(approvals.companyId, fixture.companyId));
+        }
+      });
+    });
+
+    describe("company and owner locks before the task lock (slice A3a)", () => {
+      const holdRow = async (lock: (tx: any) => Promise<unknown>, whileHeld: (tx: any) => Promise<unknown> = async () => {}) => {
+        let release!: () => void;
+        const held = new Promise<void>((resolve) => { release = resolve; });
+        let locked!: () => void;
+        const lockedSignal = new Promise<void>((resolve) => { locked = resolve; });
+        const holder = db.transaction(async (tx) => {
+          await lock(tx);
+          locked();
+          await held;
+          await whileHeld(tx);
+        });
+        await lockedSignal;
+        return { release, holder };
+      };
+      const lockWaiters = async (pattern: string) => (await db.execute(sql`select count(*)::int as n from pg_stat_activity
+        where wait_event_type = 'Lock' and query ilike ${pattern}`) as unknown as { n: number }[])[0]!.n;
+
+      it("waits for a company writer and then reads the company gate it committed", async () => {
+        const fixture = await seedAdmission();
+        const body = await admissionBody(fixture, "recon:a3a-company-wait1");
+        const { release, holder } = await holdRow(
+          (tx) => tx.select({ id: companies.id }).from(companies).where(eq(companies.id, fixture.companyId)).for("update"),
+          (tx) => tx.update(companies).set({ status: "paused" }).where(eq(companies.id, fixture.companyId)),
+        );
+        const pending = request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).then((response) => response);
+        for (let attempt = 0; attempt < 50 && await lockWaiters('%from "companies"%for share%') === 0; attempt += 1) await new Promise((r) => setTimeout(r, 50));
+        expect(await lockWaiters('%from "companies"%for share%')).toBe(1);
+        release();
+        await holder;
+        const response = await pending;
+        expect(response.status).toBe(409);
+        expect(refusalCode(response.body)).toBe("gate_closed:company_pause");
+      });
+
+      it("refuses when the owner changes between the unlocked read and the task lock", async () => {
+        const fixture = await seedAdmission();
+        const body = await admissionBody(fixture, "recon:a3a-owner-race-01");
+        const { release, holder } = await holdRow(
+          (tx) => tx.select({ id: issues.id }).from(issues).where(eq(issues.id, fixture.sourceIssueId)).for("update"),
+          (tx) => tx.update(issues).set({ assigneeAgentId: fixture.managerId }).where(eq(issues.id, fixture.sourceIssueId)),
+        );
+        const pending = request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).then((response) => response);
+        const issueRowSelect = 'select "id", "company_id", "conversation_agent_id"%';
+        for (let attempt = 0; attempt < 50 && await lockWaiters(issueRowSelect) === 0; attempt += 1) await new Promise((r) => setTimeout(r, 50));
+        expect(await lockWaiters(issueRowSelect)).toBe(1);
+        release();
+        await holder;
+        const response = await pending;
+        expect(response.status).toBe(409);
+        expect(refusalCode(response.body)).toBe("concurrent_change");
+        expect(await db.select().from(executionReconciliationReceipts)).toHaveLength(0);
+      });
+    });
+
+    describe("gates on locked rows (slice A3a)", () => {
+      type Fixture = Awaited<ReturnType<typeof seedAdmission>>;
+      type Setup = (fixture: Fixture) => Promise<unknown>;
+      const otherRun = async (f: Fixture) => {
+        const id = randomUUID();
+        await db.insert(heartbeatRuns).values({ id, companyId: f.companyId, agentId: f.managerId, invocationSource: "manual", status: "running" });
+        return id;
+      };
+      const cases: Array<[string, Setup | null, Setup | null]> = [
+        ["dependency", null, async (f) => {
+          const [blocker] = await db.insert(issues).values({ companyId: f.companyId, title: "Blocker", status: "in_progress", priority: "medium" }).returning();
+          await db.insert(issueRelations).values({ companyId: f.companyId, issueId: blocker!.id, relatedIssueId: f.sourceIssueId, type: "blocks" });
+        }],
+        ["interaction", null, (f) => db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.sourceIssueId,
+          kind: "request_confirmation", payload: {} as any })],
+        ["approval", null, async (f) => {
+          const [approval] = await db.insert(approvals).values({ companyId: f.companyId, type: "approve_ceo_strategy", status: "revision_requested", payload: {} }).returning();
+          await db.insert(issueApprovals).values({ companyId: f.companyId, issueId: f.sourceIssueId, approvalId: approval!.id } as any);
+        }],
+        ["subtree_pause", null, (f) => db.insert(issueTreeHolds).values({ companyId: f.companyId, rootIssueId: f.sourceIssueId,
+          mode: "pause", status: "active", releasePolicy: {} })],
+        ["project_pause", async (f) => {
+          const [project] = await db.insert(projects).values({ companyId: f.companyId, name: "Paused project" }).returning();
+          await db.update(issues).set({ projectId: project!.id }).where(eq(issues.id, f.sourceIssueId));
+        }, async (f) => {
+          await db.update(projects).set({ pausedAt: new Date() }).where(eq(projects.companyId, f.companyId));
+        }],
+        ["budget", null, async (f) => {
+          await db.insert(budgetPolicies).values({ companyId: f.companyId, scopeType: "agent", scopeId: f.coderId,
+            metric: "billed_cents", windowKind: "lifetime", amount: 1, hardStopEnabled: true, notifyEnabled: false } as any);
+          await db.insert(costEvents).values({ companyId: f.companyId, agentId: f.coderId, provider: "test", biller: "test",
+            billingType: "metered_api", model: "budget-fixture", costCents: 500, occurredAt: new Date() } as any);
+        }],
+        ["company_pause", null, (f) => db.update(companies).set({ status: "paused" }).where(eq(companies.id, f.companyId))],
+        ["agent_pause", null, (f) => db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.coderId))],
+        ["monitor", (f) => db.update(issues).set({ monitorNextCheckAt: new Date(Date.now() + 60 * 60 * 1000) })
+          .where(eq(issues.id, f.sourceIssueId)), null],
+        ["workspace", null, (f) => db.update(issues).set({ workspacePendingSelection: { mode: "isolated_workspace" } as any })
+          .where(eq(issues.id, f.sourceIssueId))],
+        ["checkout", null, async (f) => {
+          const runId = await otherRun(f);
+          await db.update(issues).set({ checkoutRunId: runId }).where(eq(issues.id, f.sourceIssueId));
+        }],
+        ["owner", (f) => db.update(issueRecoveryActions).set({ returnOwnerAgentId: f.managerId })
+          .where(eq(issueRecoveryActions.id, f.actionId)), null],
+      ];
+
+      it.each(cases)("refuses gate_closed:%s and writes nothing but the refusal audit", async (gate, beforeBody, afterBody) => {
+        const fixture = await seedAdmission();
+        try {
+          await beforeBody?.(fixture);
+          const body = await admissionBody(fixture, `recon:gate-${gate}`.slice(0, 40).padEnd(16, "0"));
+          await afterBody?.(fixture);
+          const before = await snapshot(fixture);
+          const response = await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(409);
+          expect(refusalCode(response.body)).toBe(`gate_closed:${gate}`);
+          expect(await snapshot(fixture)).toEqual(before);
+          expect((await refusals()).map((row) => (row.details as any).code)).toEqual([`gate_closed:${gate}`]);
+        } finally {
+          await db.update(issues).set({ projectId: null, checkoutRunId: null }).where(eq(issues.companyId, fixture.companyId));
+          await db.delete(issueApprovals).where(eq(issueApprovals.companyId, fixture.companyId));
+          await db.delete(approvals).where(eq(approvals.companyId, fixture.companyId));
+          await db.delete(issueTreeHolds).where(eq(issueTreeHolds.companyId, fixture.companyId));
+          await db.delete(projects).where(eq(projects.companyId, fixture.companyId));
+          await db.delete(budgetPolicies).where(eq(budgetPolicies.companyId, fixture.companyId));
+        }
+      });
     });
 
     it("rejects a non-integer number in the request with 400 before hashing and audits the refusal", async () => {
@@ -2647,6 +2996,33 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       await request(app).post(decisionsPath(fixture.sourceIssueId, "missing")).send({ ...base, expiresAt: inHours(1) }).expect(404);
       await request(app).post(decisionsPath(fixture.sourceIssueId)).send({ ...base, revisionId: randomUUID(), expiresAt: inHours(1) }).expect(404);
       expect(await db.select().from(issueDocumentDecisions)).toHaveLength(0);
+    });
+
+    it("waits for an admission that holds the document row before inserting a decision", async () => {
+      const fixture = await seedDocument();
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      let locked!: () => void;
+      const lockedSignal = new Promise<void>((resolve) => { locked = resolve; });
+      const admission = db.transaction(async (tx) => {
+        await tx.select({ id: documents.id }).from(documents).where(eq(documents.id, fixture.documentId)).for("share");
+        locked();
+        await held;
+      });
+      await lockedSignal;
+      const pending = request(createApp({ type: "board", source: "local_implicit", userId: "board-user" }))
+        .post(decisionsPath(fixture.sourceIssueId))
+        .send({ outcome: "approved", revisionId: fixture.revisionId, scope: "execution_reconciliation", expiresAt: inHours(1) })
+        .then((response) => response);
+      const waiting = async () => (await db.execute(sql`select count(*)::int as n from pg_stat_activity
+        where wait_event_type = 'Lock' and query ilike '%from "documents"%for update%'`) as unknown as { n: number }[])[0]!.n;
+      for (let attempt = 0; attempt < 50 && await waiting() === 0; attempt += 1) await new Promise((r) => setTimeout(r, 50));
+      expect(await waiting()).toBe(1);
+      expect(await db.select().from(issueDocumentDecisions)).toHaveLength(0);
+      release();
+      await admission;
+      expect((await pending).status).toBe(201);
+      expect(await db.select().from(issueDocumentDecisions)).toHaveLength(1);
     });
 
     it("revokes only an approval of the same revision", async () => {

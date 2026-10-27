@@ -1,4 +1,5 @@
 import type { runPromptInjectionProvider } from "./prompt-injection-provider.js";
+import { insertIssueApprovalLinks } from "./issue-approvals.js";
 import { promptInjectionPreventionService } from "./prompt-injection-prevention.js";
 import { adapterExecutionControls } from "./adapter-execution-control.js";
 import type { BudgetServiceHooks } from "./budgets.js";
@@ -59,7 +60,6 @@ import {
   connectionGrants,
   documents,
   heartbeatRuns,
-  issueApprovals,
   issueDocuments,
   issueThreadInteractions,
   issues,
@@ -2578,15 +2578,11 @@ export function createToolGatewayService(
         })
         .returning();
       formalApprovalId = approval.id;
-      await db
-        .insert(issueApprovals)
-        .values({
-          companyId: input.session.companyId,
-          issueId: input.session.issueId,
-          approvalId: approval.id,
-          linkedByAgentId: input.session.agentId,
-        })
-        .onConflictDoNothing();
+      const linkedIssueId = input.session.issueId;
+      await db.transaction((tx) => insertIssueApprovalLinks(tx, {
+        companyId: input.session.companyId, approvalId: approval.id, issueIds: [linkedIssueId],
+        linkedByAgentId: input.session.agentId,
+      }));
     }
 
     const interaction = await interactions.create(

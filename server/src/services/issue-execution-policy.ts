@@ -1229,6 +1229,21 @@ export function buildIssueMonitorClearedPatch(input: {
   };
 }
 
+export function executionPolicyTransitionInputFingerprint(issue: {
+  status: string; assigneeAgentId: string | null; assigneeUserId: string | null;
+  responsibleUserId?: string | null; createdByUserId?: string | null;
+  executionPolicy?: unknown; executionState?: unknown;
+  monitorNextCheckAt?: Date | null; monitorWakeRequestedAt?: Date | null; monitorLastTriggeredAt?: Date | null;
+  monitorAttemptCount?: number | null; monitorNotes?: string | null; monitorScheduledBy?: string | null;
+}) {
+  const iso = (value: Date | null | undefined) => (value ? new Date(value).toISOString() : null);
+  return JSON.stringify([
+    issue.status, issue.assigneeAgentId, issue.assigneeUserId, issue.responsibleUserId ?? null, issue.createdByUserId ?? null,
+    issue.executionPolicy ?? null, issue.executionState ?? null, iso(issue.monitorNextCheckAt), iso(issue.monitorWakeRequestedAt),
+    iso(issue.monitorLastTriggeredAt), issue.monitorAttemptCount ?? null, issue.monitorNotes ?? null, issue.monitorScheduledBy ?? null,
+  ]);
+}
+
 export function applyIssueExecutionPolicyTransition(input: TransitionInput): TransitionResult {
   const stageResult = applyIssueExecutionStageTransition(input);
   const monitorPatch = applyMonitorTransition(input, stageResult.patch);

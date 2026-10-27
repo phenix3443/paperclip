@@ -410,6 +410,17 @@ function restoreStatusFromCancelSnapshot(status: IssueStatus): IssueStatus | nul
   return status;
 }
 
+export async function lockIssueTreeHolds(
+  tx: Pick<Db, "execute">,
+  companyId: string,
+  mode: "shared" | "exclusive",
+) {
+  const key = `issue-tree-hold:${companyId}`;
+  await tx.execute(mode === "shared"
+    ? sql`select pg_advisory_xact_lock_shared(hashtextextended(${key}, 0))`
+    : sql`select pg_advisory_xact_lock(hashtextextended(${key}, 0))`);
+}
+
 export function issueTreeControlService(db: Db) {
   async function listTreeIssues(companyId: string, rootIssueId: string): Promise<TreeIssue[]> {
     const root = await db
@@ -811,6 +822,7 @@ export function issueTreeControlService(db: Db) {
     }
 
     const { hold, members } = await db.transaction(async (tx) => {
+      await lockIssueTreeHolds(tx, companyId, "exclusive");
       const [createdHold] = await tx
         .insert(issueTreeHolds)
         .values({
