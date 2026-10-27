@@ -160,13 +160,34 @@ Provenance and trust:
 - The responsible user is not copied from the source run. `_paperclipWakeContext` has no `responsibleUserId`, so `resolveResponsibleUserIdForRunSeed` falls back to the target issue's context, because the wake comment author is an agent. `expectedResponsibleUserId` is the target's value read under the locks, and the consumer refuses delivery if it changed (6.4).
 - `crossTaskContinuation` is audit and fixture data only. No code path may read it as authorization. The successor's authority comes from its own binding to the target (6.4).
 
-Add a partial unique index, the same pattern as the existing `task-retry:%` index:
+#### Two identity domains: intent and dispatch receipt
+
+The intent and the consumer's dispatch receipt are two different `agent_wakeup_requests` rows. Today the consumer passes the intent's own `idempotencyKey` to `enqueueWakeup` (`queue.ts:4949`), and every receipt that `enqueueWakeup` writes copies `opts.idempotencyKey`: the admitted path (`queue.ts:4307–4321`), the skipped receipt (`queue.ts:2452–2465`) and the deferred follow-up receipt (`queue.ts:4021–4029`). A single unique index over one shared key would therefore reject the dispatch receipt. This producer gives each row its own key and its own index:
+
+| Row | Written by | `requestedByActorId` | `idempotencyKey` |
+|---|---|---|---|
+| Intent | D8, in the route transaction | `cross-task-continuation-committer` | `issue_cross_task_continuation:<targetIssueId>:<commentId>` |
+| Dispatch receipt | `enqueueWakeup`, called by the consumer (6.4) | `cross-task-continuation-dispatch:<intentId>` | `cross-task-continuation-dispatch:<intentId>` |
+
+The two prefixes do not overlap, so neither index can match the other row. (The LIKE patterns below escape `_`, because `_` is a LIKE wildcard.)
 
 ```
-agent_wakeup_requests_cross_task_continuation_idempotency_uq
+-- one intent per (target, comment)
+agent_wakeup_requests_cross_task_continuation_intent_uq
   ON agent_wakeup_requests (company_id, idempotency_key)
-  WHERE idempotency_key LIKE 'issue_cross_task_continuation:%'
+  WHERE idempotency_key LIKE 'issue\_cross\_task\_continuation:%'
+
+-- at most one dispatch receipt per intent, in any status
+agent_wakeup_requests_cross_task_continuation_dispatch_uq
+  ON agent_wakeup_requests (company_id, idempotency_key)
+  WHERE idempotency_key LIKE 'cross-task-continuation-dispatch:%'
 ```
+
+The dispatch index has no status filter on purpose. One intent gets one dispatch receipt for its whole life, whether that receipt ends up admitted (linked to a run), `skipped`, or `deferred_issue_execution`. A retry never writes a second receipt; it finds the first one (6.4). This is the backstop that keeps two concurrent sweeps from creating two successors.
+
+The receipt and the run are inserted in the same `enqueueWakeup` transaction (`queue.ts:4307` and `queue.ts:4398` use the same `tx`). So a unique violation on the receipt also rolls back the run. The implementation confirms this with fixture K6; if any receipt-writing branch of `enqueueWakeup` inserts the run outside that transaction, or writes more than one receipt per call, the implementation stops and reports rather than relaxing the index The same applies if the deferred-release path promotes a `deferred_issue_execution` receipt by inserting a new row with its key instead of updating that row (fixture K8).
+
+The key `cross-task-continuation-dispatch:` does not start with any prefix that `enqueueWakeup` treats specially today (`execution-reconciliation:`, `chat-inbound:`, `case-handoff:`, `task-retry:` and the other checks in `queue.ts`). The implementation PR lists those prefix checks to show it.
 
 ## 5. Ordering, locks and atomicity
 
@@ -220,7 +241,7 @@ Exactly one successor runs. The successor sees both comments, because both are o
 
 ### 6.2 Replay (R0 and D3)
 
-R0 runs when the actor is an agent and the body has a `clientRequestId`. It needs only the checks that run before it: authentication, company access, and comment read access on the issue. It looks up the comment by `(company, issue, author_agent_id = actor.agentId, client_request_id)`, then the intent by `issue_cross_task_continuation:<issueId>:<commentId>`.
+R0 runs when the actor is an agent and the body has a `clientRequestId`. It needs only the checks that run before it: authentication, company access, and comment read access on the issue. It looks up the comment by `(company, issue, author_agent_id = actor.agentId, client_request_id)`, then the intent by `issue_cross_task_continuation:<issueId>:<commentId>`. This key only ever matches the intent row; the dispatch receipt has its own key (4.2). The `runId` in the replay comes from the intent, which the consumer links.
 
 - **No comment.** The request is fresh and continues to D0.
 - **Comment and intent, same digest.** `201` with the original comment, `replayed: true`, and `continuation: { wakeupRequestId, status, runId, coalescedIntoWakeupRequestId? }` read from the intent now. No gate is re-checked, because the original admission already committed. Nothing is written, including activity.
@@ -238,7 +259,10 @@ If the client loses the response, it retries with the same `clientRequestId` and
 **Owner.** The consumer is `dispatchPendingNativeStatusWakeups` in `services/heartbeat/queue.ts`. It already bridges durable intents into the scheduler through `enqueueWakeup`, and it already recovers crashes. It is extended, not copied:
 
 - The candidate selector accepts `requestedByActorId IN ('native-status-committer', 'cross-task-continuation-committer')`, still with `requestedByActorType = system`, `status IN (queued, claimed)` and `runId IS NULL`.
-- Each producer has its own dispatch actor id: `cross-task-continuation-dispatch:<intentId>` for this producer. The existing `existingDispatch` lookup uses it to find a dispatch that was inserted before a crash.
+- Each producer has its own dispatch actor id: `cross-task-continuation-dispatch:<intentId>` for this producer. For this producer the consumer also passes `idempotencyKey: "cross-task-continuation-dispatch:<intentId>"` to `enqueueWakeup`, not the intent's key (4.2). The status-committer branch keeps passing its intent key, unchanged.
+- For this producer, `existingDispatch` is looked up by `(company_id, idempotency_key = dispatch key)`, which the dispatch index makes unique. The existing recovery then applies unchanged: a receipt with a `runId` → intent `coalesced` with that `runId`; a `deferred_issue_execution` receipt → intent `coalesced` (the receipt is now the pending work, as for status intents); a `skipped` receipt → intent `skipped` with the receipt's error.
+- For this producer, a stale reclaim is fenced on the old claim time: the claim update adds `claimed_at = <candidate.claimedAt>` to its `WHERE`. Two sweeps that both read the same stale claim cannot both win it. If both still reach `enqueueWakeup` (for example because one sweep's claim is older than `staleClaimMs` again), the dispatch index rejects the second receipt, its transaction rolls back with its run, and the catch path treats that unique violation as "already dispatched": it runs the `existingDispatch` recovery instead of requeueing the intent.
+- An `enqueueWakeup` failure other than that unique violation rolls back its own transaction, so no receipt exists, and the intent is requeued as today. The retry inserts the receipt for the first time.
 - For this producer, the `contextSnapshot` passed to `enqueueWakeup` uses `source: "cross_task_continuation"` and `crossTaskContinuationIntentId`, not the status-decision values. `issueId` and `taskId` are the target, as today.
 - The other code that matches `native-status-committer` (`chat-control-recovery-stop.ts`, `recovery/service.ts`, `native-runtime/native-child-completion-delivery.ts`) is not changed. The implementation shows that none of them needs the new producer.
 
@@ -258,7 +282,9 @@ After that, `enqueueWakeup` applies the normal run-dispatch policy (pause holds,
 |---|---|---|
 | K1: after D9, before notify | Intent `queued` | Next sweep claims and dispatches it. One run. |
 | K2: after claim, before `enqueueWakeup` | Intent `claimed` | After `staleClaimMs` the next sweep reclaims it. One run. |
-| K3: after `enqueueWakeup` created the dispatch row and run, before the intent is linked | Dispatch row with the deterministic actor id, linked to the run; intent `claimed`, `runId` null | Next sweep finds `existingDispatch`, marks the intent `coalesced` with that `runId`. No second run. |
+| K3: after `enqueueWakeup` created the dispatch row and run, before the intent is linked | Dispatch receipt with key `cross-task-continuation-dispatch:<intentId>`, linked to the run; intent `claimed`, `runId` null | Next sweep finds `existingDispatch` by the dispatch key, marks the intent `coalesced` with that `runId`. No second run. If that sweep had instead called `enqueueWakeup`, the dispatch index would reject it. |
+| K6: two sweeps reclaim the same stale `claimed` intent | Intent `claimed` | The claim fence lets one win. If both reach `enqueueWakeup`, one receipt and one run commit; the other rolls back on the dispatch index and recovers through `existingDispatch`. One run. |
+| K8: `enqueueWakeup` wrote a `skipped` or `deferred_issue_execution` receipt, then the process stopped before the intent was updated | Receipt with the dispatch key; intent `claimed` | Next sweep finds it and sets the intent `skipped` or `coalesced`. No second receipt. A deferred receipt is released later by the existing deferred-release path, which must update that same row. |
 
 **Workspace restore.** The successor's workspace preparation restores the archived workspace through `ensurePersistedExecutionWorkspaceAvailable` under its own identity. If the rebuild fails, the run fails through the existing workspace-preparation failure path. The issue then gets the existing execution blocker with `workspaceRepairRequired`, and the source task is not touched. A target-bound resume gets the same outcome today when the rebuild fails.
 
@@ -355,7 +381,15 @@ Delivery and crashes:
 - **K1.** Commit, then the process stops before notify. The startup sweep delivers exactly one target-bound run.
 - **K2.** The sweep claims the intent, then the process stops before `enqueueWakeup`. After `staleClaimMs` the next sweep delivers exactly one run.
 - **K3.** `enqueueWakeup` creates the dispatch row and the run, then the process stops before the intent is linked. The next sweep links the intent to that run and creates no second run.
-- **K4.** A status-committer intent and a continuation intent are pending for different issues. One sweep delivers both, each with its own context `source`.
+- **K4.** A status-committer intent and a continuation intent are pending for different issues. One sweep delivers both, each with its own context `source`. The status-committer dispatch still carries its intent key, as today.
+
+Intent and dispatch identity (real PostgreSQL with the implementation's migration applied, not a hand-written schema):
+
+- **K5.** End to end: the route commits the intent; the consumer calls `enqueueWakeup` with the dispatch key; the dispatch receipt and the run commit; the intent is linked (`coalesced`, `runId` set). Assert one intent row with the intent key, one receipt row with `cross-task-continuation-dispatch:<intentId>`, one run with `contextSnapshot.issueId = T`, and no unique violation in the log. This is R2 with the migration installed.
+- **K6.** Concurrent stale reclaim: an intent is `claimed` with an old `claimedAt`. Two sweeps on two connections, with a barrier right before `enqueueWakeup`. Exactly one receipt and one run commit. The other call's transaction rolls back (no orphan run row), and that sweep leaves the intent linked to the winner's run, not requeued. A variant drops the claim fence to show that the dispatch index alone still allows one run.
+- **K7.** K3 with the migration installed: inject a stop after the `enqueueWakeup` transaction commits and before the intent update. The next sweep links the intent to the existing run through the dispatch key and inserts no receipt.
+- **K8.** Skip and defer receipts: (a) the target got a pause hold after commit, so `enqueueWakeup` writes a `skipped` or `deferred_issue_execution` receipt with the dispatch key; the intent becomes `skipped` or `coalesced`. A further sweep does nothing. (b) For the deferred case, release the hold: the existing deferred-release path promotes that same receipt to a run. Assert no second row with the dispatch key and exactly one run. (c) Inject a stop between the receipt and the intent update; the next sweep recovers it without a second receipt (crash window K8 in 6.4).
+- **K9.** Replay after dispatch: after K5, the lost-response retry (6.2) finds the intent by its intent key, not the receipt, and returns the intent's `runId`.
 
 Guard invariants:
 
@@ -364,17 +398,17 @@ Guard invariants:
 
 ## 11. Schema, API and docs to update in the implementation
 
-- `packages/db`: two partial unique indexes (4.1, 4.2), in one migration. No new columns.
+- `packages/db`: three partial unique indexes in one migration: the agent comment `clientRequestId` index (4.1), and the intent and dispatch indexes on `agent_wakeup_requests` (4.2). No new columns.
 - `packages/shared`: the comment create response adds optional `replayed?: boolean` and `continuation?: { wakeupRequestId, status, runId, coalescedIntoWakeupRequestId? }`. The validator documents that `clientRequestId` is required for cross-task continuation.
 - `server/src/routes/issues.ts`: the R0 replay lookup, `classifyIssueExecutionWorkspaceBinding`, and the deferred branch in the comments route. `getClosedIssueExecutionWorkspace` becomes a wrapper; the PATCH and checkout routes are otherwise unchanged.
 - `server/src/services/task-workspace-access.ts`: the `runBindsIssueForWorkspaceExecution` predicate only.
-- `server/src/services/heartbeat/queue.ts`: `dispatchPendingNativeStatusWakeups` accepts the `cross-task-continuation-committer` producer, with its dispatch actor id, context `source`, and revalidation (6.4). No new consumer or sweep.
+- `server/src/services/heartbeat/queue.ts`: `dispatchPendingNativeStatusWakeups` accepts the `cross-task-continuation-committer` producer. For that producer: the dispatch actor id and the separate dispatch idempotency key, the `existingDispatch` lookup by dispatch key, the claim fence on `claimedAt`, mapping a dispatch-index unique violation to `existingDispatch` recovery, the context `source`, and revalidation (6.4). The status-committer branch keeps its current key and behavior. No new consumer or sweep.
 - Docs: the C1 continuation section of the agent-facing API docs must say that cross-task resume needs `clientRequestId`, that the workspace reopens when the successor starts, and how to reconcile a lost response. Update the access and feature maps where the comment route is listed.
 
 ## 12. Rollout and rollback
 
-- The migration only adds indexes. It is compatible with the running build, because no current code writes agent `clientRequestId` values or the `issue_cross_task_continuation:` key. A build without the consumer change ignores `cross-task-continuation-committer` rows, so the consumer change ships in the same release as the deferred branch.
-- Before the indexes are created, check for duplicates (expected none) with a read-only query. If any exist, stop and report. Do not delete rows.
+- The migration only adds indexes. It is compatible with the running build, because no current code writes agent `clientRequestId` values, the `issue_cross_task_continuation:` key, or the `cross-task-continuation-dispatch:` key. A build without the consumer change ignores `cross-task-continuation-committer` rows, so the consumer change ships in the same release as the deferred branch.
+- Before the indexes are created, check for duplicates (expected none) with a read-only query, one per index. If any exist, stop and report. Do not delete rows.
 - The deferred branch ships behind an instance experimental setting, `enableCrossTaskDeferredContinuation`, default off, in the same release. With it off, behavior is exactly today's, including the 403.
 - Ops enables it after deployment. Acceptance is a disposable fixture task pair in a test company: R1 to R3 and V3 are repeated in that company. A production business task is not used for acceptance.
 - Rollback: turn the setting off. Requests already committed keep their intents, which the consumer still delivers, and R0 still replays them. The indexes can stay, because they are harmless with the setting off.
