@@ -81,6 +81,7 @@ import {
   notInArray,
   or,
   sql,
+  like,
 } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { AGENT_DEFAULT_MAX_CONCURRENT_RUNS } from "@paperclipai/shared";
@@ -172,6 +173,7 @@ import {
   CROSS_TASK_CONTINUATION_SOURCE,
   crossTaskContinuationDeliveryGate,
   crossTaskContinuationDispatchKey,
+  isTrustedContinuationDispatchReceipt,
 } from "../cross-task-continuation.js";
 import { retryChatControlAdmission } from "../chat-control-admission-retry.js";
 
@@ -2833,6 +2835,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );
 
+          let reusedContinuationReceipt: typeof agentWakeupRequests.$inferSelect | null = null;
+          const continuationReceiptReadmission = Boolean(executionWaitRequestId)
+            && opts.crossTaskContinuationReceiptId === executionWaitRequestId;
           if (executionWaitRequestId) {
             const [pending] = await tx.select().from(agentWakeupRequests).where(and(
               eq(agentWakeupRequests.id, executionWaitRequestId), eq(agentWakeupRequests.companyId, agent.companyId),
@@ -2840,7 +2845,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               // A user message can join a queue originally created by a
               // system wake. Admission validates the saved user comment or board click.
               (opts.queuedCommentInterruptId ?? opts.queuedCommentRequestId) === executionWaitRequestId
-                ? undefined : eq(agentWakeupRequests.requestedByActorType, "user"),
+                ? undefined : eq(agentWakeupRequests.requestedByActorType, continuationReceiptReadmission ? "system" : "user"),
               opts.queuedCommentInterruptId === executionWaitRequestId
                 ? sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt'->>'actorId' = ${opts.requestedByActorId ?? ""}`
                 : opts.queuedCommentRequestId === executionWaitRequestId ? undefined
@@ -2849,7 +2854,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             ));
             // The issue lock serializes cleanup callbacks and periodic workers.
             // An adopted, discarded, or edited receipt is no longer authority.
-            if (!pending || (!opts.taskRetryRequestId && !(wakeCommentId && queuedCommentIdsFromWakePayload(pending.payload).includes(wakeCommentId)) &&
+            if (pending && continuationReceiptReadmission) {
+              if (!(await isTrustedContinuationDispatchReceipt(tx as unknown as Db, pending, {
+                companyId: agent.companyId, agentId, issueId,
+              }))) return { kind: "deferred" as const };
+              reusedContinuationReceipt = pending;
+            } else if (!pending || (!opts.taskRetryRequestId && !(wakeCommentId && queuedCommentIdsFromWakePayload(pending.payload).includes(wakeCommentId)) &&
                 !(opts.queuedCommentInterruptId && await readQueuedInteractionResponse(tx as unknown as Db,
                   agent.companyId, issueId, pending.payload)))) {
               return { kind: "deferred" as const };
@@ -4312,7 +4322,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             enrichedContextSnapshot.explicitUserContinuation = explicitContinuation;
           }
 
-          const wakeupRequest = await tx
+          const wakeupRequest = reusedContinuationReceipt
+            ? await tx.update(agentWakeupRequests)
+              .set({ status: "queued", error: null, updatedAt: new Date() })
+              .where(and(eq(agentWakeupRequests.id, reusedContinuationReceipt.id),
+                eq(agentWakeupRequests.status, "deferred_issue_execution")))
+              .returning()
+              .then((rows) => rows[0])
+            : await tx
             .insert(agentWakeupRequests)
             .values({
               ...durableReceiptFields,
@@ -4329,6 +4346,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             })
             .returning()
             .then((rows) => rows[0]);
+          if (!wakeupRequest) return { kind: "deferred" as const };
 
           // A handoff changes the executor, not the owner of saved user input.
           // Validate its exact stopped source while the issue row is locked;
@@ -4349,7 +4367,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // Consume it with its successor even when chat keeps other messages
           // in separate turns, or finalization will deliver it a second time.
           const adoptableWakeIds = [
-            ...(executionWaitRequestId ? [executionWaitRequestId] : []),
+            ...(executionWaitRequestId && !reusedContinuationReceipt ? [executionWaitRequestId] : []),
             ...(decidedReviewAdmitted?.foldedWakeIds ?? []),
           ];
           const pendingComments =
@@ -5098,7 +5116,70 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       }
     }
 
-    return { scanned: candidates.length, dispatched, recovered, deferred };
+    const promoted = await promoteDeferredContinuationReceipts(input);
+    return { scanned: candidates.length, dispatched, recovered, deferred, promoted };
+  }
+
+  async function promoteDeferredContinuationReceipts(input: { companyId?: string; limit?: number }) {
+    const receipts = await db.select().from(agentWakeupRequests).where(and(
+      input.companyId ? eq(agentWakeupRequests.companyId, input.companyId) : undefined,
+      eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      eq(agentWakeupRequests.requestedByActorType, "system"),
+      sql`${agentWakeupRequests.requestedByActorId} = ${agentWakeupRequests.idempotencyKey}`,
+      like(agentWakeupRequests.idempotencyKey, `${crossTaskContinuationDispatchKey("").replace(/[_%]/g, "\\$&")}%`),
+      isNull(agentWakeupRequests.runId),
+    )).orderBy(asc(agentWakeupRequests.requestedAt))
+      .limit(Math.max(1, Math.min(input.limit ?? 100, 500)));
+    let promoted = 0;
+    for (const receipt of receipts) {
+      const payload = parseObject(receipt.payload);
+      const issueId = readNonEmptyString(payload.issueId);
+      const intentId = receipt.idempotencyKey!.slice(crossTaskContinuationDispatchKey("").length);
+      if (!issueId) continue;
+      if (await getExecutionBlocker(db, receipt.companyId, issueId)) continue;
+      const [intent] = await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.id, intentId), eq(agentWakeupRequests.companyId, receipt.companyId),
+      ));
+      const [target] = await db.select({
+        status: issues.status, assigneeAgentId: issues.assigneeAgentId,
+        responsibleUserId: issues.responsibleUserId, executionWorkspaceId: issues.executionWorkspaceId,
+      }).from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, receipt.companyId)));
+      if (!intent || !target) continue;
+      const unresolvedBlockerCount = target.status === "blocked"
+        ? ((await issuesSvc.listDependencyReadiness(receipt.companyId, [issueId])).get(issueId)?.unresolvedBlockerCount ?? 0)
+        : 0;
+      const intentPayload = parseObject(intent.payload);
+      const gateError = target.status === "done" || target.status === "cancelled"
+        ? `Native status wake target is already ${target.status}`
+        : crossTaskContinuationDeliveryGate(intentPayload, target, unresolvedBlockerCount);
+      if (gateError) {
+        await db.update(agentWakeupRequests).set({ status: "skipped", error: gateError, finishedAt: new Date(), updatedAt: new Date() })
+          .where(and(eq(agentWakeupRequests.id, receipt.id), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+        continue;
+      }
+      try {
+        const run = await enqueueWakeup(receipt.agentId, {
+          allowRunCoalescing: false,
+          source: receipt.source as WakeupOptions["source"],
+          triggerDetail: (receipt.triggerDetail ?? "system") as WakeupOptions["triggerDetail"],
+          reason: receipt.reason,
+          payload: intentPayload,
+          idempotencyKey: receipt.idempotencyKey,
+          requestedByActorType: "system",
+          requestedByActorId: receipt.requestedByActorId ?? undefined,
+          crossTaskContinuationReceiptId: receipt.id,
+          contextSnapshot: parseObject(payload[DEFERRED_WAKE_CONTEXT_KEY]),
+        }, receipt.id);
+        if (run) {
+          promoted += 1;
+          await db.update(agentWakeupRequests).set({ runId: run.id, updatedAt: new Date() })
+            .where(and(eq(agentWakeupRequests.id, intent.id), isNull(agentWakeupRequests.runId)));
+        }
+      } catch (error) {
+        logger.warn({ err: error, wakeupRequestId: receipt.id }, "failed to re-admit a deferred cross-task continuation receipt");
+      }
+    }
+    return promoted;
   }
 
   return {

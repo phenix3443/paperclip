@@ -29,6 +29,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { LEGACY_RECOVERY_CAUSE } from "../services/legacy-execution-recovery.js";
+import { readCrossTaskContinuationWork } from "../services/cross-task-continuation-worker.js";
 import { runningProcesses } from "../adapters/index.ts";
 import {
   CROSS_TASK_CONTINUATION_COMMITTER_ID,
@@ -379,32 +380,47 @@ describeEmbeddedPostgres("cross-task continuation intent consumer", () => {
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(1);
   });
 
-  it("K8 characterization (open gap): a recovery hold defers delivery to one receipt, and releasing the hold and the execution lock does not promote it", async () => {
+  it("K8 (b): a recovery hold defers delivery; while it holds nothing runs, and once resolved a sweep promotes the same receipt to the intent's only run", async () => {
     const { companyId, agentId, issueId, intent } = await seedTarget();
     const [action] = await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issueId, kind: "active_run_watchdog",
       ownerType: "board", returnOwnerAgentId: agentId, cause: LEGACY_RECOVERY_CAUSE, fingerprint: `k8:${issueId}`,
       evidence: {}, nextAction: "Reconcile stopped work" }).returning();
-    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
     await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
     const [receipt, ...extra] = await dispatchReceipts(intent.id);
     expect(extra).toHaveLength(0);
     expect(receipt).toMatchObject({ status: "deferred_issue_execution", runId: null });
     expect(await readIntent(intent.id)).toMatchObject({ status: "coalesced" });
 
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
+    expect(await dispatchReceipts(intent.id)).toMatchObject([{ id: receipt!.id, status: "deferred_issue_execution", runId: null }]);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(0);
+    expect((await readCrossTaskContinuationWork(db)).pending).toBe(false);
+
     await db.update(issueRecoveryActions).set({ status: "resolved", outcome: "restored", resolvedAt: new Date() })
       .where(eq(issueRecoveryActions.id, action!.id));
-    const [holder] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "running", invocationSource: "assignment",
-      triggerDetail: "system", issueId, scopeKind: "issue", contextSnapshot: { issueId, taskId: issueId } }).returning();
-    await db.update(issues).set({ executionRunId: holder!.id, executionLockedAt: new Date() }).where(eq(issues.id, issueId));
-    await heartbeat.cancelRun(holder!.id, "fixture holder ends");
-    await heartbeat.resumeQueuedRuns();
+    expect((await readCrossTaskContinuationWork(db)).pending).toBe(true);
+    const result = await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
+    expect(result).toMatchObject({ promoted: 1 });
     await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
     await heartbeat.drainActiveRunExecutions();
 
-    const [after] = await dispatchReceipts(intent.id);
-    expect(after).toMatchObject({ status: "deferred_issue_execution", runId: null });
-    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, receipt!.id))).toHaveLength(0);
-    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.executionRunId).toBeNull();
+    const receipts = await dispatchReceipts(intent.id);
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]!.id).toBe(receipt!.id);
+    expect(receipts[0]!.status).not.toBe("deferred_issue_execution");
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+    expect(runs).toHaveLength(1);
+    expect(runs[0]!.wakeupRequestId).toBe(receipt!.id);
+    expect(await readIntent(intent.id)).toMatchObject({ runId: runs[0]!.id });
+    const { reopenTargetBoundSuccessorWorkspace } = await import("../services/heartbeat/target-bound-successor-reopen.js");
+    const run = runs[0]!;
+    await expect(reopenTargetBoundSuccessorWorkspace(db, {
+      run: { id: run.id, companyId: run.companyId, agentId: run.agentId, wakeupRequestId: run.wakeupRequestId,
+        issueId: run.issueId, nativeIssueId: run.nativeIssueId, contextSnapshot: run.contextSnapshot as Record<string, unknown> },
+      responsibleUserId: "responsible-user", externalProvider: false, hasPersistedNativeExecutionInput: false,
+      freshIsolatedWorkspaceRequested: false,
+      executionWorkspacesSvc: { reopenClosedIsolatedExecutionWorkspaceForIssue: vi.fn(), clearReopenPendingConsumptionForUnconsumedReopen: vi.fn() } as never,
+    })).rejects.toThrow(/workspace binding changed/);
   });
 
   it("never dispatches a coalesced intent", async () => {

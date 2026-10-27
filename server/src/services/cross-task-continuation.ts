@@ -441,3 +441,31 @@ export function crossTaskContinuationDeliveryGate(
   }
   return null;
 }
+
+/**
+ * A deferred dispatch receipt that the queue may re-admit as itself: written by
+ * the consumer for a committed continuation intent of this target and agent.
+ */
+export async function isTrustedContinuationDispatchReceipt(
+  db: Db | Transaction,
+  receipt: typeof agentWakeupRequests.$inferSelect,
+  scope: { companyId: string; agentId: string; issueId: string },
+) {
+  const key = receipt.idempotencyKey;
+  if (!isCrossTaskContinuationDispatchKey(key) || receipt.requestedByActorType !== "system"
+    || receipt.requestedByActorId !== key || receipt.companyId !== scope.companyId
+    || receipt.agentId !== scope.agentId || (receipt.payload as Record<string, unknown> | null)?.issueId !== scope.issueId) {
+    return false;
+  }
+  const intentId = key!.slice(DISPATCH_KEY_PREFIX.length);
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(intentId)) return false;
+  const [intent] = await db.select().from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.id, intentId), eq(agentWakeupRequests.companyId, scope.companyId),
+  ));
+  return Boolean(intent
+    && intent.requestedByActorType === "system"
+    && intent.requestedByActorId === CROSS_TASK_CONTINUATION_COMMITTER_ID
+    && intent.agentId === scope.agentId
+    && intent.idempotencyKey?.startsWith(crossTaskContinuationIntentKey(scope.issueId, ""))
+    && (intent.payload as Record<string, unknown> | null)?.issueId === scope.issueId);
+}
