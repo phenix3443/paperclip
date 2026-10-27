@@ -311,6 +311,24 @@ describeEmbeddedPostgres("cross-task continuation intent consumer", () => {
     expect(settled.runId).toBeNull();
   });
 
+  it("K6: two concurrent sweeps that read the same stale claim deliver exactly one receipt and one run", async () => {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const { companyId, intent } = await seedTarget();
+      await db.update(agentWakeupRequests)
+        .set({ status: "claimed", claimedAt: new Date(Date.now() - 120_000) })
+        .where(eq(agentWakeupRequests.id, intent.id));
+      const sweeps = [heartbeatService(db), heartbeatService(db)];
+      await Promise.all(sweeps.map((sweep) => sweep.dispatchPendingNativeStatusWakeups({ companyId })));
+      await Promise.all(sweeps.map((sweep) => sweep.drainActiveRunExecutions()));
+      const receipts = await dispatchReceipts(intent.id);
+      expect(receipts).toHaveLength(1);
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+      expect(runs).toHaveLength(1);
+      expect(runs[0]!.wakeupRequestId).toBe(receipts[0]!.id);
+      expect(await readIntent(intent.id)).toMatchObject({ status: "coalesced", runId: runs[0]!.id });
+    }
+  });
+
   it("never dispatches a coalesced intent", async () => {
     const { companyId, intent } = await seedTarget();
     await db.update(agentWakeupRequests).set({ status: "coalesced" }).where(eq(agentWakeupRequests.id, intent.id));

@@ -1145,6 +1145,55 @@ describe.skipIf(!support.supported)("heartbeat workspace preparation boundary", 
     expect(await closedRowFacts(f.workspace.id)).toEqual(changed);
   });
 
+  // V3-repair: after the successor's single failed attempt, fixing the cause and
+  // reopening eagerly (a run bound to the target, as the comment route does)
+  // restores the row. No cleanup round runs in between.
+  async function eagerReopen(f: Awaited<ReturnType<typeof archivedContinuationTarget>>) {
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.issue.companyId, agentId: f.input.agent.id,
+      issueId: f.issue.id, scopeKind: "issue", status: "running", runtimeMode: "legacy",
+      contextSnapshot: { issueId: f.issue.id, taskId: f.issue.id } }).returning();
+    return executionWorkspaceService(db).reopenClosedIsolatedExecutionWorkspaceForIssue({
+      workspaceId: f.workspace.id, issue: { id: f.issue.id, companyId: f.issue.companyId, projectId: f.issue.projectId },
+      actor: { agentId: f.input.agent.id, actorType: "agent" },
+      authorizationActor: { type: "agent", agentId: f.input.agent.id, companyId: f.issue.companyId, source: "agent_jwt", runId: run!.id, onBehalfOfUserId: null },
+    });
+  }
+
+  it.each(["F1", "F2", "F3"] as const)("V3-repair after %s: fixing the cause and reopening eagerly restores the row", async (kind) => {
+    const f = await archivedContinuationTarget();
+    const successor = await dispatchedContinuationRun(f);
+    const runtime = await import("../workspace-runtime.js");
+    const activity = await import("../activity-log.js");
+    const realLogActivity = activity.logActivity;
+    if (kind === "F1") {
+      await db.update(executionWorkspaces).set({
+        metadata: sql`coalesce(${executionWorkspaces.metadata}, '{}'::jsonb) || '{"gitCacheRestoration":{"schema":"malformed"}}'::jsonb` })
+        .where(eq(executionWorkspaces.id, f.workspace.id));
+    } else if (kind === "F3") {
+      vi.spyOn(runtime, "ensurePersistedExecutionWorkspaceAvailable").mockRejectedValueOnce(new Error("fixture rebuild failure"));
+    } else {
+      vi.spyOn(activity, "logActivity").mockImplementationOnce(async (database, entry) => {
+        if (entry.action === "execution_workspace.reopened") throw new Error("fixture activity failure");
+        return realLogActivity(database, entry);
+      });
+    }
+    await expect(successorStep(successor)).rejects.toThrow(/^Cross-task continuation could not reopen the target workspace: /);
+    const failedGeneration = (await closedRowFacts(f.workspace.id)).generation;
+    expect(failedGeneration).toBe(kind === "F3" ? f.generation + 1 : f.generation);
+    const inodeAfterFailure = kind === "F2" ? (await stat(f.workspace.cwd!)).ino : null;
+    // Fix the cause.
+    vi.restoreAllMocks();
+    if (kind === "F1") {
+      await db.update(executionWorkspaces).set({ metadata: sql`${executionWorkspaces.metadata} - 'gitCacheRestoration'` })
+        .where(eq(executionWorkspaces.id, f.workspace.id));
+    }
+    const repaired = await eagerReopen(f);
+    expect(repaired).toMatchObject({ ok: true, reopened: true, generation: failedGeneration + 1 });
+    expect(await closedRowFacts(f.workspace.id)).toMatchObject({ status: "active", generation: failedGeneration + 1 });
+    if (inodeAfterFailure !== null) expect((await stat(f.workspace.cwd!)).ino).toBe(inodeAfterFailure);
+    expect(await branchHead(f.workspace.cwd!)).toEqual({ branch: f.workspace.branchName, head: f.headBeforeArchive });
+  });
+
   it("keeps the admitted recovery workspace when the issue now points elsewhere", async () => {
     const { input, issue } = await fixture(true);
     const first = await prepareHeartbeatWorkspace(db, input);
