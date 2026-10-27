@@ -134,17 +134,23 @@ A 201 proves the comment row. It does not prove a successor. In M2 the wake is e
 Lost response handling:
 
 - Today, on an archived workspace: a 403 commits only the cap audit row. A retry gets the same 403 and spends one more cap unit (cap 20 per run). It cannot duplicate a comment. Callers must not retry it. They read back once and record the block.
-- Today, on a target without a closed workspace: agent comments have no request idempotency key. The route passes `clientRequestId` to the comment service only for user actors (`routes/issues.ts` comment insert). A retry after a lost 201 can write a second comment and a second wake request.
-- An empty read-back does not make a retry safe. This order gives two comments:
+- Today, on a target without a closed workspace, a resume comment commits in three separate steps (`routes/issues.ts` comment route, same on `fdbafff72` and `ef2f4565b`):
+  1. The parent moves to `todo` in its own update, before the comment.
+  2. The comment is inserted by `addComment` (`services/issues.ts`). For a run-attributed comment it opens a transaction, locks the issue row (`FOR UPDATE`), and looks for a live comment with the same company, issue, `createdByRunId`, author type, author agent and redacted body. If one exists, it returns that comment and does not insert.
+  3. The wake request for the assignee is built and sent after the comment returns.
+- Agent comments have no request idempotency key. The route passes `clientRequestId` to the comment service only for user actors. The run and body lookup in step 2 is the only comment deduplication for an agent.
+- Retry from the same run with the same body: the lookup in step 2 finds A's comment, under the same row lock, so there is still one comment. This holds even if A and B race, because whichever transaction takes the lock second sees the first one's row. Step 1 has nothing to do on B once A has moved the parent to `todo`. Step 3 is not deduplicated. B is checked against the cap again and spends one more cap unit. B also sends its own wake request for the same parent. This plan does not characterize whether the heartbeat merges that request with A's, so callers must not assume one successor.
+- Retry from a different run, or with a changed body (for example a new timestamp or a different marker line): the lookup in step 2 does not match. This order gives two comments:
   1. The caller sends request A. The response is lost, or the client times out while A is still in the server.
-  2. The caller reads back comments. A has not committed yet, so the read is empty.
-  3. The caller sends retry B.
-  4. A commits its comment, the `todo` move and its wake request.
-  5. B commits a second comment and a second wake request.
-- So without an idempotency key, a caller must not resend after a lost response unless it has proof that A can no longer commit, and a read-back made after that proof shows no comment. Accepted proof:
-  - The caller received a final error response for A, or
-  - The service process that received A has stopped. For example, the service start time is later than the time A was sent. Writes that A had not committed die with that process, so nothing from A can commit later.
-- Without that proof, the outcome of A stays unknown. The caller records it as unknown, does not resend, and reconciles: read back comments by author agent, `createdByRunId` and the marker line, and read the successor evidence above. A later read that finds the comment ends the uncertainty. If the comment is still absent, the caller still does not resend without the proof above. It hands the unknown outcome to CTO on its own task.
+  2. The caller reads back comments. A has not committed its comment yet, so the read is empty.
+  3. The caller sends retry B from another run, or with a changed body.
+  4. A commits its comment and sends its wake request.
+  5. B commits a second comment and sends a second wake request.
+- An empty read-back is not proof that A failed. A statement that the database has already received can still commit after the client process, or the Paperclip service process that sent it, has exited. Stopping or restarting the Paperclip service is therefore not proof either. A reviewer reproduced this on embedded PostgreSQL: an INSERT waiting on a lock, the sending process killed with SIGKILL, a read returning 0 rows, then the lock released and a read returning 1 row.
+- So a caller must not resend a lost resume comment under a new run or a changed body unless both hold:
+  - A has settled in the database. Accepted evidence: the caller received a final HTTP response for A, or ops confirms from the database side that no backend still holds a transaction started at or before the time A was sent (for example in `pg_stat_activity`), or the PostgreSQL server itself restarted after A was sent.
+  - A read-back made after that evidence shows no comment from A.
+- Without that evidence, the outcome of A stays unknown. The caller records it as unknown, does not resend, and reconciles: read back comments by author agent, `createdByRunId` and the marker line, and read the successor evidence above. A later read that finds the comment ends the uncertainty. If the comment is still absent, the caller hands the unknown outcome to CTO on its own task. A resend from the same run with the same body is allowed, since step 2 makes it a comment no-op, but it still spends a cap unit and sends one more wake request.
 - After #69 with the setting on: the deferred path requires `clientRequestId`. A sequential retry with the same id and body replays (`replayed: true`, same comment and intent). The same id with a different body gets 409. Concurrent identical requests commit one comment and one intent (#69 cases I1, I2, I9, I10). Routines that send cross-task resumes must send a stable `clientRequestId` derived from the request task and parent.
 
 ## 7. Interim continuation without code changes
