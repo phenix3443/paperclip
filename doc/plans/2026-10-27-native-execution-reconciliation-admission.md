@@ -681,6 +681,12 @@ deployed commit in `health` must equal the approved merge SHA of the slice.
 
 ## Bootstrap: the implementation task's own hold
 
+Follow-up proposal: [independent output-hold bootstrap (#70)](2026-10-27-output-hold-independent-bootstrap.md).
+It addresses the native implementation's own output-bearing hold and proposes a
+separate release path. It requires independent approval; it grants no agent access
+to the user-only path below and no live recovery authority. The following section
+preserves the originally reviewed #59 choice and its limits.
+
 The ai-team operator task (ai-team#489, which implements `reconcile_execution_with_output`)
 now has its own execution reconciliation hold. Its last run stopped by the active-run
 watchdog after it had posted its blocked comment. Native records show cause
