@@ -92,7 +92,7 @@ Read the journal in this way:
 
 `readGitExpirationRoundJournal` in `server/src/git-expiration-round-cli.ts` applies these rules.
 
-If an abort or the deadline arrives while the round writes `pending_commit`, the round does not write `round_committed`. It writes a `round_finished` with status `partial` and returns `partial`. If that record cannot be written, the journal ends with `pending_commit` and the result is still partial.
+If an abort or the deadline arrives while the round writes `pending_commit`, the round does not write `round_committed`. It writes a `round_finished` with status `partial` and returns `partial`. If that record cannot be written, the journal ends with `pending_commit` and the round returns `partial` with `evidence_lost`.
 
 If a record cannot be written or synced, the round truncates the file to the end of the previous record and ends partial with `evidence_lost`. If the truncation also fails, the journal can be wrong. In that case exit code `3` from the command is the result. An abort that arrives after `round_committed` is on disk does not change the result.
 

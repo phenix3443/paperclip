@@ -12,7 +12,7 @@ import { materializeIsolatedRemoteWorkspaceSource } from "../services/isolated-r
 import { realizeExecutionWorkspace } from "../services/workspace-runtime.js";
 import { inspectGitExpirationRound, assertGitExpirationRoundMode, GIT_EXPIRATION_ROUND_MODE, GIT_EXPIRATION_ROUND_APPLICATION_NAME,
   GitExpirationRoundInvariantError, gitExpirationRoundFailure, readOnlyInspectionGitAuth, GIT_EXPIRATION_ROUND_SESSION_PARAMETERS,
-  type GitExpirationRoundEvent, type GitExpirationRoundOptions } from "../services/git-expiration-round.js";
+  type GitExpirationRoundEvent, type GitExpirationRoundJournal, type GitExpirationRoundOptions } from "../services/git-expiration-round.js";
 import { GitCacheRestorationFailure } from "../services/git-workspace-restoration.js";
 import { createGitRemoteAuthProvider } from "../services/git-credentials.js";
 import { parseGitExpirationRoundArgs, runGitExpirationRoundCli, GitExpirationRoundUsageError, fileGitExpirationRoundJournal,
@@ -205,7 +205,7 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
     return { companyId, workspaceId, cwd: workspace.cwd };
   }
 
-  const round = (journal = memoryJournal(), options: Partial<GitExpirationRoundOptions> = {}) =>
+  const round = (journal: GitExpirationRoundJournal = memoryJournal(), options: Partial<GitExpirationRoundOptions> = {}) =>
     inspectGitExpirationRound({ databaseUrl: database.connectionString, mode: GIT_EXPIRATION_ROUND_MODE, roundId: "round-test", journal, ...options });
 
   const waitFor = async (check: () => Promise<boolean>) => {
@@ -496,13 +496,38 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
   it("keeps the persisted outcome partial when the correction record fails before any byte is written", async () => {
     const f = await seed(1);
     const controller = new AbortController();
-    const journal = await fileJournal(line => correctionLine(line) ? "write" : null,
+    const aborted = await fileJournal(line => correctionLine(line) ? "write" : null,
       event => { if (event.type === "round_finished") controller.abort(); });
-    expect(await round(journal, { companyId: f.companyId, signal: controller.signal })).toMatchObject({ status: "partial", stopReason: "evidence_lost" });
-    const persisted = await journal.persisted();
-    expect(persisted.content).not.toContain("round_committed");
-    expect(persisted.finished).toEqual(["round_finished:pending_commit"]);
-    expect(persisted.outcome).toEqual({ status: "partial", stopReason: "evidence_lost" });
+    expect(await round(aborted, { companyId: f.companyId, signal: controller.signal })).toMatchObject({ status: "partial", stopReason: "evidence_lost" });
+    const abortedEvidence = await aborted.persisted();
+    expect(abortedEvidence.content).not.toContain("round_committed");
+    expect(abortedEvidence.finished).toEqual(["round_finished:pending_commit"]);
+    expect(abortedEvidence.outcome).toEqual({ status: "partial", stopReason: "evidence_lost" });
+
+    const deadline = new Date(Date.now() + 10_000);
+    const late = await fileJournal(line => correctionLine(line) ? "write" : null,
+      event => { if (event.type === "round_finished") vi.setSystemTime(deadline.getTime() + 1); });
+    try {
+      expect(await round(late, { companyId: f.companyId, deadline })).toMatchObject({ status: "partial", stopReason: "evidence_lost" });
+    } finally { vi.useRealTimers(); }
+    const lateEvidence = await late.persisted();
+    expect(lateEvidence.finished).toEqual(["round_finished:pending_commit"]);
+    expect(lateEvidence.outcome).toEqual({ status: "partial", stopReason: "evidence_lost" });
+  });
+
+  it("keeps the persisted outcome partial when the pending terminal record or a partial terminal record cannot be written", async () => {
+    const f = await seed(1);
+    const pending = await fileJournal(line => line.includes('"status":"pending_commit"') ? "sync" : null);
+    expect(await round(pending, { companyId: f.companyId })).toMatchObject({ status: "partial", stopReason: "evidence_lost" });
+    const pendingEvidence = await pending.persisted();
+    expect(pendingEvidence.finished).toEqual([]);
+    expect(pendingEvidence.outcome).toEqual({ status: "partial", stopReason: "evidence_lost" });
+
+    const partial = await fileJournal(line => correctionLine(line) ? "write" : null);
+    expect(await round(partial, { companyId: f.companyId, maxRows: 0 })).toMatchObject({ status: "partial", stopReason: "evidence_lost" });
+    const partialEvidence = await partial.persisted();
+    expect(partialEvidence.finished).toEqual([]);
+    expect(partialEvidence.outcome).toEqual({ status: "partial", stopReason: "evidence_lost" });
   });
 
   it("cancels a blocked page query and releases its connections", async () => {

@@ -78,7 +78,9 @@ export function fileGitExpirationRoundJournal(file: GitExpirationRoundJournalFil
       const line = Buffer.from(`${JSON.stringify({ at: new Date().toISOString(), ...event })}\n`);
       try {
         for (let written = 0; written < line.length;) {
-          written += (await file.write(line, written, line.length - written, size + written)).bytesWritten;
+          const { bytesWritten } = await file.write(line, written, line.length - written, size + written);
+          if (bytesWritten <= 0) throw new Error("journal_write_stalled");
+          written += bytesWritten;
         }
         await file.datasync();
       } catch (error) {

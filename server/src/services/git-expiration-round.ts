@@ -252,7 +252,7 @@ export async function inspectGitExpirationRound(options: GitExpirationRoundOptio
   summary.stopReason ??= stopReason() ?? (evidenceLost ? "evidence_lost" : null);
   const complete = summary.exhausted && !summary.stopReason && summary.inspected === summary.selected;
   if (!complete) {
-    await record({ type: "round_finished", ...summary, status: "partial" });
+    if (!await record({ type: "round_finished", ...summary, status: "partial" })) summary.stopReason = "evidence_lost";
     return summary;
   }
   if (!await record({ type: "round_finished", ...summary, status: "pending_commit" })) {
