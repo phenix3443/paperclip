@@ -1,3 +1,4 @@
+import { lockExecutionReconciliationAuthority } from "./execution-reconciliation-authority-lock.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { isRunnerApiResponseAsset } from "./asset-content-access.js";
 import { deleteCompany } from "./company-deletion.js";
@@ -302,6 +303,9 @@ export function companyService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
       const result = await db.transaction(async (tx) => {
         if (data.status !== undefined || data.budgetMonthlyCents !== undefined) {
           await tx.select({ id: companies.id }).from(companies).where(eq(companies.id, id)).for("no key update");
+        }
+        if (data.executionReconciliationAuthority !== undefined) {
+          await lockExecutionReconciliationAuthority(tx, id, "exclusive");
         }
         const existing = await getCompanyQuery(tx)
           .where(eq(companies.id, id))

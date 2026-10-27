@@ -23,6 +23,8 @@ import {
   createDb,
   executionReconciliationReceipts,
   documentRevisions,
+  issueDocumentDecisions,
+  issueDocuments,
   documents,
   environmentLeases,
   environments,
@@ -60,7 +62,12 @@ import { instanceSettingsService } from "../services/instance-settings.js";
 import { withNativeWorkspaceFinalizationOwnership } from "../services/native-runtime/native-workspace-finalization-ownership.js";
 import { noticeMetadataReferencesRecoveryAction } from "../services/recovery/successful-run-handoff.js";
 import { buildExpectedReconciliationState, listUnstartedHoldRunIds } from "../services/execution-reconciliation-receipts.js";
-import { canonicalReconciliationDigest } from "@paperclipai/shared/execution-reconciliation-canonical";
+import {
+  canonicalReconciliationDigest,
+  canonicalizeReconciliationJson,
+  sha256HexOfText,
+} from "@paperclipai/shared/execution-reconciliation-canonical";
+import { executionReconciliationRequestIntent } from "@paperclipai/shared";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -174,6 +181,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
   afterEach(async () => {
     await db.delete(executionReconciliationReceipts);
+    await db.delete(issueDocumentDecisions);
     await db.delete(caseHandoffs);
     await db.delete(cases);
     await db.delete(documentRevisions);
@@ -2171,7 +2179,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const refusalCode = (body: any) => body?.code ?? body?.details?.code;
 
     async function seedAdmission() {
-      const { companyId, coderId, sourceIssueId } = await seedCompany();
+      const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
       const runId = randomUUID();
       await seedHeartbeatRun({ companyId, agentId: coderId, runId, issueId: sourceIssueId, status: "failed" });
       await db.update(heartbeatRuns).set({ finishedAt: new Date("2026-05-13T18:30:00.000Z") }).where(eq(heartbeatRuns.id, runId));
@@ -2182,16 +2190,60 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         nextAction: "Preserve recorded work without replay.",
         evidence: { runId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } },
       }).returning();
-      return { companyId, coderId, sourceIssueId, runId, actionId: action!.id };
+      await db.update(companies).set({ executionReconciliationAuthority: { agentIds: [managerId] } })
+        .where(eq(companies.id, companyId));
+      return { companyId, managerId, coderId, sourceIssueId, runId, actionId: action!.id };
     }
 
-    async function admissionBody(fixture: Awaited<ReturnType<typeof seedAdmission>>, key: string, overrides: Record<string, unknown> = {}) {
+    type AuthorizationOptions = {
+      payload?: (payload: Record<string, any>) => void;
+      body?: (canonical: string) => string;
+      decision?: Record<string, unknown>;
+    };
+
+    async function authorize(
+      fixture: Awaited<ReturnType<typeof seedAdmission>>,
+      request: any,
+      options: AuthorizationOptions = {},
+    ) {
+      const admission = request.executionReconciliation.admission;
+      const payload: Record<string, any> = {
+        schema: "execution_reconciliation_authorization_v1", scope: "execute",
+        companyId: fixture.companyId, issueId: fixture.sourceIssueId, runId: fixture.runId, actionId: fixture.actionId,
+        expectedDigest: admission.expectedDigest,
+        expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+        intent: executionReconciliationRequestIntent(request),
+        evidence: { artifacts: ["comment", "commit"] },
+      };
+      options.payload?.(payload);
+      const canonical = canonicalizeReconciliationJson(payload);
+      const body = options.body ? options.body(canonical) : canonical;
+      const documentId = randomUUID();
+      const revisionId = randomUUID();
+      await db.insert(documents).values({ id: documentId, companyId: fixture.companyId, title: "Reconciliation approval",
+        format: "markdown", latestBody: body, latestRevisionId: revisionId, latestRevisionNumber: 1 });
+      await db.insert(documentRevisions).values({ id: revisionId, companyId: fixture.companyId, documentId,
+        revisionNumber: 1, format: "markdown", body });
+      await db.insert(issueDocuments).values({ companyId: fixture.companyId, issueId: fixture.sourceIssueId, documentId,
+        key: `reconciliation-${documentId.slice(0, 8)}` });
+      const [decision] = await db.insert(issueDocumentDecisions).values({
+        companyId: fixture.companyId, issueId: fixture.sourceIssueId, documentId, revisionId, revisionNumber: 1,
+        bodySha256: sha256HexOfText(body), scope: "execution_reconciliation", outcome: "approved",
+        expiresAt: new Date(Date.now() + 72 * 60 * 60 * 1000 - 60_000), actorAgentId: fixture.managerId,
+        ...options.decision,
+      }).returning();
+      admission.authorization = { documentId, revisionId, revisionNumber: 1, bodyDigest: sha256HexOfText(body), decisionId: decision!.id };
+      return { documentId, revisionId, decisionId: decision!.id, body };
+    }
+
+    async function admissionBody(fixture: Awaited<ReturnType<typeof seedAdmission>>, key: string, overrides: Record<string, unknown> = {},
+      authorization: AuthorizationOptions = {}) {
       const [issue] = await db.select().from(issues).where(eq(issues.id, fixture.sourceIssueId));
       const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
       const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, fixture.actionId));
       const expected = buildExpectedReconciliationState({ issue: issue!, run: run!, action: action!,
         unstartedRunIds: await listUnstartedHoldRunIds(db, fixture.companyId, fixture.sourceIssueId) });
-      return {
+      const request = {
         actionId: fixture.actionId, outcome: "restored", sourceIssueStatus: "todo",
         executionReconciliation: {
           runId: fixture.runId, providerStopped: true, actionOutcome: "not_performed",
@@ -2199,11 +2251,13 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           admission: {
             schema: "execution_reconciliation_admission_v1", idempotencyKey: key,
             expected, expectedDigest: canonicalReconciliationDigest(expected),
-            authorization: { documentId: randomUUID(), revisionId: randomUUID(), revisionNumber: 1, bodyDigest: "b".repeat(64), decisionId: randomUUID() },
+            authorization: null as any,
           },
         },
         ...overrides,
       };
+      await authorize(fixture, request, authorization);
+      return request;
     }
 
     const admissionApp = () => createApp({ type: "board", source: "local_implicit", userId: "board-user" },

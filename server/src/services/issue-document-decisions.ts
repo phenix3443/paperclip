@@ -24,6 +24,7 @@ import {
 } from "@paperclipai/shared/execution-reconciliation-canonical";
 import { notFound, unprocessable } from "../errors.js";
 import { executionReconciliationRefusal } from "./execution-reconciliation-receipts.js";
+import { lockExecutionReconciliationAuthority } from "./execution-reconciliation-authority-lock.js";
 
 type DbOrTransaction = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 export type IssueDocumentDecisionRow = typeof issueDocumentDecisions.$inferSelect;
@@ -111,11 +112,11 @@ export async function createIssueDocumentDecision(
 }
 
 export async function lockCompanyForAdmission(tx: DbOrTransaction, companyId: string) {
+  await lockExecutionReconciliationAuthority(tx, companyId, "shared");
   const [company] = await tx
     .select({ id: companies.id, executionReconciliationAuthority: companies.executionReconciliationAuthority })
     .from(companies)
-    .where(eq(companies.id, companyId))
-    .for("share");
+    .where(eq(companies.id, companyId));
   if (!company) throw notFound("Company not found");
   return company;
 }
