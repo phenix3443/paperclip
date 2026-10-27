@@ -4,15 +4,17 @@ import {
   executionWorkspaces,
   heartbeatRuns,
   issueComments,
+  issueRecoveryActions,
   issues,
   type Db,
 } from "@paperclipai/db";
 import type { IssueCommentContinuationReceipt } from "@paperclipai/shared";
-import { and, desc, eq, inArray, isNotNull, like, or } from "drizzle-orm";
+import { and, asc, desc, eq, exists, gt, inArray, isNotNull, isNull, like, not, or, sql } from "drizzle-orm";
 import { acquireExecutionWorkspaceLifecycleLock } from "./execution-workspace-lifecycle-lock.js";
 import { isClosedExecutionWorkspaceStatus, readExecutionWorkspaceLifecycleGeneration } from "./execution-workspaces.js";
 import { isDeadlockDetected, isUniqueViolation } from "../db-errors.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
+import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
 
 
 type Transaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -484,4 +486,51 @@ export async function isTrustedDeferredDispatchReceipt(
       && Boolean(intent.idempotencyKey?.startsWith(crossTaskContinuationIntentKey(scope.issueId, "")))
     : intent.requestedByActorId === "native-status-committer"
       && intent.idempotencyKey === receipt.idempotencyKey;
+}
+
+export async function listPromotableDeferredDispatchReceipts(
+  db: Db,
+  input: { companyId?: string; limit: number; after?: { requestedAt: Date; id: string } | null },
+) {
+  const rows = await db.select({ receipt: agentWakeupRequests }).from(agentWakeupRequests)
+    .innerJoin(issues, and(
+      eq(issues.companyId, agentWakeupRequests.companyId),
+      sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
+    ))
+    .where(and(
+      input.companyId ? eq(agentWakeupRequests.companyId, input.companyId) : undefined,
+      eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      eq(agentWakeupRequests.requestedByActorType, "system"),
+      isNull(agentWakeupRequests.runId),
+      or(
+        and(sql`${agentWakeupRequests.requestedByActorId} = ${agentWakeupRequests.idempotencyKey}`,
+          like(agentWakeupRequests.idempotencyKey, `${DISPATCH_KEY_PREFIX}%`)),
+        like(agentWakeupRequests.requestedByActorId, `${NATIVE_STATUS_DISPATCH_ACTOR_PREFIX}%`),
+      ),
+      or(isNull(issues.executionRunId), not(exists(db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, issues.executionRunId),
+        inArray(heartbeatRuns.status, [...LIVE_RUN_STATUSES]),
+      ))))),
+      not(exists(db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.companyId, issues.companyId),
+        eq(issueRecoveryActions.sourceIssueId, issues.id),
+        executionBlockerPredicate(),
+      )))),
+      input.after ? or(
+        gt(agentWakeupRequests.requestedAt, input.after.requestedAt),
+        and(eq(agentWakeupRequests.requestedAt, input.after.requestedAt), gt(agentWakeupRequests.id, input.after.id)),
+      ) : undefined,
+    ))
+    .orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id))
+    .limit(Math.max(1, input.limit));
+  const promotable: (typeof agentWakeupRequests.$inferSelect)[] = [];
+  for (const { receipt } of rows) {
+    const issueId = (receipt.payload as Record<string, unknown> | null)?.issueId;
+    if (deferredDispatchReceiptIntentId(receipt) && typeof issueId === "string"
+      && !(await getExecutionBlocker(db, receipt.companyId, issueId))) {
+      promotable.push(receipt);
+    }
+  }
+  const last = rows.at(-1)?.receipt;
+  return { promotable, scanned: rows.length, cursor: last ? { requestedAt: last.requestedAt, id: last.id } : null };
 }

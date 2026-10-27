@@ -523,6 +523,37 @@ describeEmbeddedPostgres("cross-task continuation intent consumer", () => {
     expect(await readIntent(statusIntent!.id)).toMatchObject({ runId: runs[0]!.id });
   });
 
+  it("a long-held receipt ahead in the batch does not starve a ready one behind it", async () => {
+    const held = await deferUnderRecoveryHold();
+    const ready = await deferUnderRecoveryHold();
+    await ready.resolve();
+    expect(await heartbeat.dispatchPendingNativeStatusWakeups({ limit: 1 })).toMatchObject({ promoted: 1 });
+    expect(await ready.runsFor()).toHaveLength(1);
+    expect(await held.runsFor()).toHaveLength(0);
+    expect(await dispatchReceipts(held.intent.id)).toMatchObject([{ status: "deferred_issue_execution", runId: null }]);
+  });
+
+  it("the worker counts an unblocked native status receipt as pending, and is quiet again once it is promoted", async () => {
+    const { companyId, agentId, issueId } = await seedTarget();
+    await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+    await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issueId, kind: "active_run_watchdog",
+      ownerType: "board", returnOwnerAgentId: agentId, cause: LEGACY_RECOVERY_CAUSE, fingerprint: `sc-worker:${issueId}`,
+      evidence: {}, nextAction: "Reconcile stopped work" });
+    await db.insert(agentWakeupRequests).values({
+      companyId, agentId, source: "automation", triggerDetail: "system", reason: "issue_blockers_resolved",
+      requestedByActorType: "system", requestedByActorId: "native-status-committer",
+      idempotencyKey: `native-dependency:${issueId}`,
+      payload: { issueId, taskId: issueId, _paperclipWakeContext: { issueId, taskId: issueId } },
+    });
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
+    expect((await readCrossTaskContinuationWork(db)).pending).toBe(false);
+    await issueRecoveryActionService(db).resolveActiveForIssue({ companyId, sourceIssueId: issueId, status: "resolved", outcome: "restored" } as never);
+    expect((await readCrossTaskContinuationWork(db)).pending).toBe(true);
+    expect(await heartbeat.dispatchPendingNativeStatusWakeups({ companyId })).toMatchObject({ promoted: 1 });
+    expect((await readCrossTaskContinuationWork(db)).pending).toBe(false);
+    await heartbeat.drainActiveRunExecutions();
+  });
+
   it("never dispatches a coalesced intent", async () => {
     const { companyId, intent } = await seedTarget();
     await db.update(agentWakeupRequests).set({ status: "coalesced" }).where(eq(agentWakeupRequests.id, intent.id));

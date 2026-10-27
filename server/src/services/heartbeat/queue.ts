@@ -175,6 +175,7 @@ import {
   crossTaskContinuationDispatchKey,
   deferredDispatchReceiptIntentId,
   isTrustedDeferredDispatchReceipt,
+  listPromotableDeferredDispatchReceipts,
   NATIVE_STATUS_DISPATCH_ACTOR_PREFIX,
 } from "../cross-task-continuation.js";
 import { retryChatControlAdmission } from "../chat-control-admission-retry.js";
@@ -4050,6 +4051,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               return { kind: "coalesced" as const, run: activeExecutionRun };
             }
 
+            if (reusedDispatchReceipt) return { kind: "deferred" as const };
             const admissionScope = wakeQueue.createAdmissionTransactionScope(
               agent.companyId,
               tx as unknown as Db,
@@ -5123,18 +5125,16 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
   }
 
   async function promoteDeferredDispatchReceipts(input: { companyId?: string; limit?: number }) {
-    const receipts = await db.select().from(agentWakeupRequests).where(and(
-      input.companyId ? eq(agentWakeupRequests.companyId, input.companyId) : undefined,
-      eq(agentWakeupRequests.status, "deferred_issue_execution"),
-      eq(agentWakeupRequests.requestedByActorType, "system"),
-      or(
-        and(sql`${agentWakeupRequests.requestedByActorId} = ${agentWakeupRequests.idempotencyKey}`,
-          like(agentWakeupRequests.idempotencyKey, `${crossTaskContinuationDispatchKey("")}%`)),
-        like(agentWakeupRequests.requestedByActorId, `${NATIVE_STATUS_DISPATCH_ACTOR_PREFIX}%`),
-      ),
-      isNull(agentWakeupRequests.runId),
-    )).orderBy(asc(agentWakeupRequests.requestedAt))
-      .limit(Math.max(1, Math.min(input.limit ?? 100, 500)));
+    const pageSize = Math.max(1, Math.min(input.limit ?? 100, 500));
+    const receipts: (typeof agentWakeupRequests.$inferSelect)[] = [];
+    let cursor: { requestedAt: Date; id: string } | null = null;
+    for (let scanned = 0; scanned < 500;) {
+      const page = await listPromotableDeferredDispatchReceipts(db, { companyId: input.companyId, limit: pageSize, after: cursor });
+      receipts.push(...page.promotable);
+      scanned += page.scanned;
+      if (page.scanned < pageSize || !page.cursor || receipts.length >= pageSize) break;
+      cursor = page.cursor;
+    }
     let promoted = 0;
     for (const receipt of receipts) {
       const identity = deferredDispatchReceiptIntentId(receipt);
