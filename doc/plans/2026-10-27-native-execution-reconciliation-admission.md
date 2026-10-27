@@ -85,16 +85,19 @@ repair), and a capability flag lets the operator refuse to call an old server.
 
 ```
 resolve(request)
-  └─ tx: lock order L1..L9 (below)
-       ├─ receipt lookup by (company, idempotencyKey)  → same digest: return receipt
-       │                                               → different digest: 409, no write
+  └─ tx: L0 key lock, then lock order L1..L11 (below)
+       ├─ receipt lookup by (company, idempotencyKey)  → committed, same request digest: return receipt
+       │                                               → committed, other digest: 409, no write
+       │                                               → abandoned (settled): 409, no write
        ├─ compare expected snapshot digest             → mismatch: refusal, rollback
-       ├─ verify authorization decision                → invalid: refusal, rollback
+       ├─ verify decision and approved payload         → invalid or expired: refusal, rollback
        ├─ admission checks (runs, wakes, leases, gates) → any failure: refusal, rollback
        ├─ write action evidence + receipt + status     (one commit)
        └─ commit
   └─ refusal: separate short tx writes one audit row only
-worker: deliver → lock order → revalidate gates → wake exactly once, or record invalidated/waiting
+settle(key): tx: L0 key lock → committed receipt, or insert an abandoned tombstone
+worker: select due rows → heartbeat.wakeup(guard) → guard runs inside the queue's own
+        issue-locked tx → one wake and run, or record invalidated/waiting, same commit
 ```
 
 ## Mapping of the seven prerequisites
@@ -105,11 +108,11 @@ Each row names the slice that delivers it. Slice A is the base admission. Slice 
 | # | Contract prerequisite | Native implementation | Slice |
 | --- | --- | --- | --- |
 | 1 | Request and state binding | `admission.expected` snapshot and `admission.expectedDigest`; canonicalization below; comparison under lock | A |
-| 2 | Native authorization binding | `issue_document_decisions` table, company `executionReconciliationAuthority`, decision verification under lock | A |
+| 2 | Native authorization binding | `issue_document_decisions` table, company `executionReconciliationAuthority`, authorization payload that fixes the whole request intent, decision and payload verification under lock | A |
 | 3 | Transactional admission | New `admitExecutionReconciliation(tx, …)` with run, successor, wake, lease and coordinator checks after locks | A |
-| 4 | Concurrent gates | Lock order L1-L9, gate writers lock the issue row first, delivery revalidation in the worker | A |
+| 4 | Concurrent gates | Lock order L0-L11, gate writers lock the issue row first, delivery revalidation inside the queue transaction | A |
 | 5 | Stage preservation | A refuses every non-null `executionState`; B admits only eligible `changes_requested` with whole-state equality | A (refusal), B (support) |
-| 6 | Request idempotency | `execution_reconciliation_receipts` table with key, digest, revision, decision, expected snapshot, result | A |
+| 6 | Request idempotency | `execution_reconciliation_receipts` table with key, request digest, payload digest, revision, decision, expected snapshot, result; key settlement for lost responses | A |
 | 7 | Atomic refusal | Single transaction for all writes; refusal audit in a separate transaction with no action, delivery, wake or run | A |
 
 ### 1. Request and state binding
@@ -127,9 +130,11 @@ admission: {
     bodyDigest: string,              // sha256 hex of the revision body bytes
     decisionId: uuid,
   },
-  targetStatus: "todo" | "in_progress", // must equal sourceIssueStatus
 }
 ```
+
+The target status is the request's `sourceIssueStatus`. It is bound to the approved
+payload through `intent` (section 2), so `admission` has no separate target field.
 
 `ExpectedReconciliationState` contains, with no optional keys:
 
@@ -192,25 +197,78 @@ the listed agent call `resolve`. An empty list refuses every request with
 `admission`. The role field cannot be used: the CTO agent's role is
 `engineering-manager`, which is not unique, and names are display data.
 
-Admission verifies, under lock:
+#### Authorization payload
+
+The authorization document revision body is exactly `canonical(P)`, the canonical
+JSON bytes of one payload object `P` (section 1 rules). The server parses the body,
+re-canonicalizes it and requires byte equality, so a body with whitespace, a fence or
+a second object is `authorization_invalid`. `P` has exactly these keys:
+
+```ts
+P = {
+  schema: "execution_reconciliation_authorization_v1",
+  scope: "execute",
+  companyId, issueId, runId, actionId,   // the source tuple
+  expectedDigest: string,                // equals admission.expectedDigest
+  expiresAt: string,                     // ISO UTC; the payload's own expiry
+  intent: RequestIntent,                 // the exact request it approves
+  evidence: object,                      // artifacts, side effects, coverage; stored, not interpreted
+}
+
+RequestIntent = canonical projection of the resolve request:
+  { actionId, outcome, sourceIssueStatus, resolutionNote,
+    executionReconciliation: { runId, providerStopped, actionOutcome,
+                               outcomeEvidence, workspaceRepairEvidence } }
+```
+
+`RequestIntent` is every request field except `executionReconciliation.admission`.
+Optional request fields are written as `null` when absent (`resolutionNote`,
+`workspaceRepairEvidence`); `workspaceBaseRef` must be absent on the `admission`
+path (400 otherwise), so it is not part of the intent. String values are compared
+after the same trimming the validator applies.
+
+Two digests, with fixed and separate inputs:
+
+| Digest | Input | Contains approval references? |
+| --- | --- | --- |
+| `authorizationPayloadDigest` | `sha256(canonical(P))`, which is also `bodyDigest` because the body is `canonical(P)` | No. `P` holds no revision ID, decision ID, its own digest or the idempotency key |
+| `requestDigest` | `sha256(canonical(request))` where `request` is the whole parsed resolve body with only `executionReconciliation.admission.idempotencyKey` removed | Yes. It includes `admission.authorization` and `admission.expected`, so the same key with a different revision or decision is a different request |
+
+The order is acyclic: `P` → `authorizationPayloadDigest` → immutable revision R →
+decision on R → request (which carries the references and its own key) →
+`requestDigest`. Nothing earlier in the chain contains anything later. The free text
+in `outcomeEvidence` therefore must not carry the payload digest; the server writes
+`authorizationPayloadDigest`, revision and decision IDs into the action evidence
+and the receipt itself.
+
+#### Checks under lock
+
+Admission verifies, under lock, with `now` taken once per transaction from the
+database (`statement_timestamp()` of the first check):
 
 1. The document belongs to the recovery issue named in the decision, in the same
    company.
 2. `documents.latest_revision_id = authorization.revisionId`. A newer revision R2
    makes R invalid even if R was approved.
 3. The server-computed `sha256(body)` equals `bodyDigest` and the decision's
-   `body_sha256`.
-4. The decision is `approved`, scope `execution_reconciliation`, not expired, not
-   revoked by a later row, and its `actor_agent_id` is in the authority list at
-   admission time.
-5. The revision body is JSON with `scope = "execute"` and contains the exact
-   `{issueId, runId, actionId}` tuple, the `expectedDigest`, the `actionOutcome`, the
-   `targetStatus` and an `expiresAt` no later than the decision's. Other fields of
-   the body are evidence and are not interpreted by the server.
+   `body_sha256`, and the body re-canonicalizes to itself.
+4. The decision is `approved`, scope `execution_reconciliation`, not revoked by a
+   later row, its `actor_agent_id` is in the authority list at admission time, and
+   `now < decision.expires_at`.
+5. `P` has exactly the keys above, `P.schema` and `P.scope` match, and
+   `now < P.expiresAt` and `P.expiresAt <= decision.expires_at`. A payload that
+   expires at T+1h is refused at T+2h even while its decision is valid until T+72h
+   (`authorization_expired`).
+6. `P.companyId`, `P.issueId`, `P.runId`, `P.actionId` equal the locked rows and the
+   request; `P.expectedDigest = admission.expectedDigest` = the server digest.
+7. `canonical(RequestIntent(request)) = canonical(P.intent)`, byte for byte. A
+   request that keeps the tuple, digest, outcome and target but changes
+   `outcomeEvidence`, `workspaceRepairEvidence`, `resolutionNote`, `outcome` or
+   `sourceIssueStatus` is refused (`authorization_payload_mismatch`).
 
-The receipt stores the revision and decision IDs. The payload digest does not
-include them, which keeps the contract's acyclic order: payload → digest →
-revision → decision → request.
+`P.evidence` is stored with the receipt and not interpreted. It is still covered by
+`authorizationPayloadDigest`, so a changed artifact list is a different revision
+and needs a new decision.
 
 A revoke, a new revision, an expiry or an authority-list change all take effect at
 the next admission. Once a receipt exists, later changes do not undo it; they
@@ -231,17 +289,35 @@ locks below and before any write. It refuses unless all hold:
 - The coordinator row has no `lease_owner`, its phase is final, and it has no
   `failureDetail.successorRunId`.
 - No other action on the issue is `active` or `escalated`.
-- No run for the issue (by `issueId`, `nativeIssueId`, `contextSnapshot.issueId` or
-  `retryOfRunId` = source run) is `queued`, `running` or `scheduled_retry`.
+- No member run (the membership predicate below) is `queued`, `running` or
+  `scheduled_retry`.
 - No wake for the issue is `queued`, `claimed` or `deferred_issue_execution`.
-- No run for the issue was created after the source run, in any status, and no run
-  has `retryOfRunId` or `contextSnapshot.previousRunId` equal to the source run.
-  This covers successors linked only through context. The definition matches #397's
-  "newer run". One exception: a run that the hold itself cancelled before start
+- No newer run exists, in any status. This keeps the #397 definition
+  ([ai-team `output-reconciliation-plan.md` at `4e580fe`](https://github.com/phenix3443/ai-team/blob/4e580fea6dbd0ff12e9762b556b118583aa0d524/docs/paperclip/output-reconciliation-plan.md),
+  prerequisite 3) as the minimum, plus context successors:
+  - Baseline: the source run's `finished_at`, read from the locked source row. If it
+    is null, refuse (`run_not_settled`).
+  - Membership: `company_id` equals the source company, `id` is not the source run,
+    and at least one of: `issue_id`, `native_issue_id`, `context_snapshot->>'issueId'`,
+    `context_snapshot->>'taskId'`, `context_snapshot->>'taskKey'` or
+    `context_snapshot->'paperclipIssue'->>'id'` equals the source issue id; or
+    `retry_of_run_id` or `context_snapshot->>'previousRunId'` equals the source run
+    id (a direct or context successor, whatever issue it is filed under).
+  - Newer: `created_at >= source.finished_at`, or `finished_at > source.finished_at`,
+    or it is a direct or context successor (`retry_of_run_id` or
+    `context_snapshot->>'previousRunId'` = source run).
+  - A member run that was created before the source finished and also finished
+    before it is not newer, and is allowed. A member run created earlier that
+    finished later is newer and refuses.
+  - The query runs after L9 in the default READ COMMITTED isolation, so every run
+    committed before the locks is visible. The admission transaction must not run
+    as `repeatable read`.
+  One exception: a run that the hold itself cancelled before start
   (`status = cancelled`, `errorCode = execution_reconciliation_required`, and
   `startedAt`, `processPid`, `processGroupId`, `nativeSessionId` all null; the same
   test as `unusedAdmission` in `explicit-native-continuation.ts`) is allowed only when
-  its ID is listed in `expected.unstartedRunIds`. The caller must have seen it.
+  its ID is listed in `expected.unstartedRunIds`. The caller must have seen it. No
+  other run is exempt.
 - Gates (section 4) all pass on locked rows.
 - The request outcome is `completed`, `not_performed` or `mixed`; the schema has no
   `unknown`. `mixed` is for saved results plus remaining work, never for effects
@@ -268,6 +344,7 @@ Admission lock order (the delivery worker uses the same order):
 
 | Step | Row or lock | Mode | Serializes against |
 | --- | --- | --- | --- |
+| L0 | Advisory `exec-recon-key:<companyId>:<idempotencyKey>` | `pg_advisory_xact_lock` | Another resolve or a settle with the same key (section 6) |
 | L1 | `companies` row | `FOR SHARE` | Budget hard-stop, budget project pause, company pause, authority-list change (all write the company row or hold its accounting lock) |
 | L2 | Owner agent row | `FOR SHARE` | Agent pause and terminate (lifecycle store: accounting lock → agent `FOR UPDATE`) |
 | L3 | Advisory `issue-tree-hold:<companyId>` | `pg_advisory_xact_lock_shared` | Subtree hold creation (changed to take it exclusively, G1) |
@@ -312,7 +389,7 @@ Gate writers that must change in slice A:
 | G2 | Approval link (`server/src/services/issue-approvals.ts:107`) and approval moves into `pending` or `revision_requested` (`server/src/services/approvals.ts:185`) | No transaction, no issue lock | Run in a transaction that first locks every linked issue `FOR UPDATE` in ascending id |
 | G3 | PATCH execution policy transition (`server/src/routes/issues.ts:14136` computes on the unlocked row, writes at `:14677`) | Transition may use a stale row | Recompute on the locked row; if the result differs from the pre-lock result, return 409 |
 | G4 | New decision insert | n/a | Lock the `documents` row `FOR UPDATE` before inserting, so it conflicts with L11 |
-| G5 | Delivery worker (`execution-recovery-resolution.ts:286-386`) | Unlocked select, three checks | Per action: L1-L10, same gates, then wake or record a wait (next section) |
+| G5 | Delivery worker (`execution-recovery-resolution.ts:286-386`) and queue admission (`heartbeat/queue.ts:2146-4436`) | Unlocked select, three checks, then a separate wakeup transaction | Revalidation runs as a guard inside the queue's own transaction (see "Durable delivery revalidation") |
 
 Writers that already serialize and need no change: PATCH and status (issue lock,
 `issues.ts:11142`); monitor set and scheduler claims (issue lock or row update);
@@ -347,7 +424,7 @@ Slice B adds `changes_requested` support. It is admitted only when all hold:
   responsible human).
 - No pending interaction, pending or `revision_requested` approval, or human
   takeover (`assigneeUserId` set) exists.
-- `targetStatus` is `in_progress`. `todo` is refused in slice B, because the PATCH
+- `sourceIssueStatus` (bound through `P.intent`) is `in_progress`. `todo` is refused in slice B, because the PATCH
   path for `todo` can recompute the stage. Any other target needs a new reviewed
   plan.
 
@@ -371,20 +448,26 @@ New table `execution_reconciliation_receipts`:
 | --- | --- |
 | `id`, `company_id`, `issue_id`, `action_id`, `run_id` | Scope |
 | `idempotency_key` | Unique per company |
-| `request_digest` | sha256 of the canonical request without the key |
+| `state` | `committed` (an admitted reconciliation) or `abandoned` (a settled key that never committed) |
+| `request_digest` | `requestDigest` from section 2: the whole request without the key; null for `abandoned` |
+| `authorization_payload_digest` | `authorizationPayloadDigest` from section 2; null for `abandoned` |
 | `expected_digest`, `expected_snapshot` jsonb | What admission compared |
 | `authorization_revision_id`, `authorization_decision_id`, `authorization_body_sha256` | What authorized it |
 | `result` jsonb | Final issue status, statusVersion, action status/outcome, `continuationDelivery` |
 | `actor_user_id`, `created_at` | Board caller and time |
 
-Unique indexes: `(company_id, idempotency_key)` and `(company_id, action_id)`, so one
-action has at most one admitted reconciliation.
+`action_id`, `run_id` and the result columns are null for `abandoned` rows.
+
+Unique indexes: `(company_id, idempotency_key)` for every row, and
+`(company_id, action_id) WHERE state = 'committed'`, so one action has at most one
+admitted reconciliation and a settled key can never be reused.
 
 Rules:
 
 - Same key, same digest: return `200` with the stored receipt and `replayed: true`.
   No write. The response also carries the current delivery state read now.
 - Same key, different digest: `409 idempotency_conflict`. No write.
+- Same key, `abandoned` row: `409 idempotency_key_settled`. No write.
 - Different key, same action already admitted: `409 action_already_reconciled`
   with the existing receipt ID.
 - The old `replayed: true` for settled actions is no longer returned on the
@@ -393,10 +476,34 @@ Rules:
   adds a partial unique index on `agent_wakeup_requests (company_id, idempotency_key)`
   for that prefix, so a second wake cannot be inserted.
 
-A lost response is handled by reading `GET /api/issues/:id/recovery-actions/receipts/:key`
-(Board-only, read-only). It returns the receipt or 404. 404 is proof that nothing
-committed under that key, because the receipt and the action write share one
-transaction.
+#### Lost responses and key settlement
+
+A receipt that is not visible does not prove that the original POST has ended. The
+original transaction may still be running, paused before commit, and commit later.
+Atomic writes only make the action and the receipt visible together. So:
+
+- `GET /api/issues/:id/recovery-actions/receipts/:key` (Board-only, read-only)
+  returns `{state: "committed", receipt}`, `{state: "abandoned", settledAt}`, or
+  `{state: "unsettled"}`. `unsettled` means "unknown". It never authorizes a retry
+  with a new intent or a different key.
+- `POST /api/issues/:id/recovery-actions/receipts/:key/settle` (Board-only) settles
+  the key. In one transaction it takes L0 for the key, which waits for any
+  in-flight resolve that holds L0, then reads the receipt row. If a committed row
+  exists, it returns it. Otherwise it inserts an `abandoned` row for the key and
+  commits. Any later resolve with that key takes L0, sees the row and returns
+  `409 idempotency_key_settled` with no write. A resolve that never reached L0
+  before the settle also meets the row. The unique key index is a second guard: if
+  a resolve somehow inserts after a settle, the insert fails and its transaction
+  rolls back.
+- Resolve takes L0 first, before L1, and holds it until commit or rollback. It
+  writes the receipt last, so a resolve that holds L0 has either committed both the
+  action and the receipt, or rolled back both.
+
+Operator rules after an unclear response: retry with the same key and a
+byte-identical request (always safe: it returns the stored receipt, or admits once,
+or refuses), or call settle. A new intent or a new key for the same action is
+allowed only after settle returns `abandoned`. A bare 404 or `unsettled` is never
+evidence of "not committed".
 
 ### 7. Atomic refusal
 
@@ -415,26 +522,96 @@ not touch source run events. The original failure history stays.
 
 Refusal codes are stable strings: `capability_unsupported`,
 `expected_state_mismatch`, `authorization_invalid`, `authorization_stale`,
-`authority_not_configured`, `idempotency_conflict`, `action_already_reconciled`,
+`authority_not_configured`, `authorization_expired`, `authorization_payload_mismatch`,
+`idempotency_conflict`, `idempotency_key_settled`, `action_already_reconciled`,
 `execution_state_not_supported`, `run_not_settled`, `newer_execution_exists`,
 `gate_closed:<gate>`, `concurrent_change`.
 
 ## Durable delivery revalidation
 
-`deliverReconciledExecutions` changes in slice A:
+Today the worker gets the root-db `heartbeat.wakeup` (`server/src/index.ts:1356-1358`).
+`enqueueWakeup` (`server/src/services/heartbeat/queue.ts:2146`) runs budget, agent and
+wake-policy checks before any lock (2691-2758), then opens its own transaction that
+locks the issue (2823-2826) and inserts the wake and run. After commit it calls
+`startNextQueuedRunForAgent` (4507-4529). If the worker held L4 in its own transaction
+and then called `wakeup`, the inner transaction would wait on the worker's own lock. If
+the worker released the lock first, the gate check and the insert would be separate.
+Neither is acceptable, so slice A puts the revalidation inside the queue transaction.
 
-- It selects candidates without locks, as now, then for each action opens a
-  transaction and takes the same lock order (L1-L10).
-- It re-runs the gate checks of section 4 and the "no newer execution" check, except
-  that the run it is about to create is excluded.
-- If a gate is closed, it does not wake. It records `continuationDelivery = "waiting"`
-  with the gate name and leaves the action resolved. The gate's normal release
-  path (dependency resolution, interaction answer, unpause) notifies the
-  continuation queue, which retries. This is a native wait, not a host wake.
-- If the issue changed owner, was closed, or the receipt is missing, it records
-  `invalidated` as today.
-- The existing queue admission (`heartbeat/queue.ts:3283-3342`) also checks that a
-  receipt exists for actions reconciled with `admission`.
+### Seam: a guard inside the queue transaction
+
+`WakeupOptions` gains one internal field, `reconciliationGuard: { actionId, receiptId }`.
+It is set only by `deliverReconciledExecutions` and is not reachable from any route.
+When it is set, `enqueueWakeup`:
+
+1. Skips the pre-lock budget, invokability and wake-policy early returns. They become
+   gates checked under lock in step 3. (Without this, a paused agent would make the
+   worker spin on a `pending` row with no recorded reason.)
+2. Opens its transaction and, before the issue lock, takes L1-L3 for the action's
+   company, owner agent and tree-hold lock. Then it takes the existing issue lock (L4,
+   `queue.ts:2825`).
+3. Calls `revalidateReconciledDelivery(tx, guard)`, which takes L5-L10 in order and
+   decides on the locked rows:
+   - `invalidated` when the receipt is missing or not `committed`, the action is no
+     longer `resolved` with the receipt's `executionReconciliation`, the issue is
+     `done` or `cancelled`, the assignee is not the action's `returnOwnerAgentId`,
+     the stage no longer matches (below), or a newer run exists (section 3 predicate,
+     with the receipt time as the baseline instead of `source.finished_at`). The
+     newer run already carries the work; a second run would duplicate it.
+   - `waiting:<gate>` when any section 4 gate is closed.
+   - `deliver` otherwise.
+4. On `invalidated` or `waiting`, writes the action evidence in the same transaction
+   and returns `{ kind: "skipped" }`. No wake row and no run row are written.
+5. On `deliver`, continues the normal insert. The existing
+   `ownsReconstructionContinuation` branch (`queue.ts:3467`, `4433-4439`) already
+   writes `continuationDelivery = "delivered"` and `continuationRunId` in the same
+   transaction. The partial unique wake key index makes a second insert fail.
+6. Commits. Only after commit does it call `startNextQueuedRunForAgent`, as today.
+   The lock owner is the queue transaction from step 2 to step 6; the worker holds
+   no lock and no transaction while it calls `wakeup`.
+
+The worker's own follow-up transaction that sets `retryOfRunId`
+(`execution-recovery-resolution.ts:356-381`) moves into step 5, so the run is written
+with `retryOfRunId = source run` in the same commit.
+
+Stage revalidation in step 3: slice A requires `executionState` to be null. Slice B
+requires `canonical({executionPolicy, executionState})` of the locked issue to equal
+the receipt's `expected_snapshot` values, the last decision row to be unchanged, and
+the status to equal the receipt's result status. Any difference is `invalidated`,
+because admission's basis no longer holds. An issue that is `blocked` only because
+a section 4 gate closed is `waiting`, not `invalidated`.
+
+### `waiting` rows and recovery
+
+Evidence states are `pending` → `delivered` | `invalidated` | `waiting`, and
+`waiting` → `pending` again through the recheck below. A `waiting` row stores
+`continuationWait: { gate, since, recheckAt, attempts }`.
+
+- Selection: the worker selects rows where `status = 'resolved'` and
+  `continuationDelivery = 'pending'`, or `continuationDelivery = 'waiting'` and
+  `continuationWait.recheckAt <= now()`. A partial index on `(recheckAt)` for
+  `waiting` rows keeps this cheap.
+- Deadline: `recheckAt = now + min(5 min * 2^attempts, 60 min)`. The schedule's
+  `continuation()` (`server/src/services/execution-control-work.ts:72-78`) returns
+  `retry()` when a `pending` row exists, otherwise the earliest `recheckAt`, otherwise
+  null. It is computed from the database, so a restart recovers every `waiting` row
+  with no in-memory state.
+- Early release: these producers, in their own transaction, set
+  `recheckAt = now()` on `waiting` actions for the affected issue and call
+  `notifyDeliveryWork(tx, DELIVERY_QUEUES.executionContinuation)`:
+  blocker issue moves to `done` or `cancelled` (dependency), interaction leaves
+  `pending` (answer, accept, reject, expire, cancel), approval leaves `pending` or
+  `revision_requested`, tree hold release, project, company or agent resume, budget
+  change that lifts a block, monitor cleared or fired, and checkout or execution run
+  released. A missed producer only delays delivery until `recheckAt`. It never loses
+  or duplicates a delivery, because the guard decides under lock each time.
+- Concurrent workers: two workers may select the same row. Both call `wakeup`; the
+  second waits on L4, then sees `delivered` (or the wake key index rejects it) and
+  skips. Two rechecks of a `waiting` row serialize the same way.
+- A waiting row never leaves `resolved`. It ends as `delivered` or `invalidated`.
+
+The existing queue admission check (`heartbeat/queue.ts:3283-3342`) also requires a
+committed receipt for actions reconciled with `admission`.
 
 ## Capability and version proof
 
@@ -508,7 +685,7 @@ Delivers prerequisites 1, 2, 3, 4, 6, 7 and the refusal part of 5. Scope:
   `companies.execution_reconciliation_authority`, partial unique wake key index.
 - `packages/shared`: canonical JSON and digest helper with test vectors,
   `admission` schema, decision schema, refusal codes, health capability.
-- Server: decision route, receipt read route, admission service, route changes,
+- Server: decision route, receipt read and settle routes, admission service, route changes,
   gate-writer lock changes, delivery revalidation.
 - UI: company settings field for the authority list (Board only); API client types.
 - Docs: `doc/SPEC-implementation.md` recovery section, this plan's status.
@@ -521,7 +698,8 @@ deployed. Scope: eligibility checks, whole-state preservation assertion, target
 
 Slice A is larger than one review can hold safely. Under its one Issue it ships as
 ordered PRs, each reviewed on its exact head: A1 canonical digest, expected-state
-binding, receipts and atomic refusal; A2 decisions and the authority list; A3 gate
+binding, receipts, key settlement and atomic refusal; A2 decisions, the authority list and
+authorization payload binding; A3 gate
 writer locks (G1-G4), admission gates and delivery revalidation (G5). The health
 capability is set only in A3, so a partly deployed slice A still refuses
 `admission` requests with 400.
@@ -547,12 +725,27 @@ commit orders run. No test uses production data or claims live recovery.
 | Authorization: R2 written before admit | Refused `authorization_stale` |
 | Authorization: admit commits before R2 | Receipt fixed on R; R2 does not undo it |
 | Decision expired, revoked, wrong scope, wrong revision, actor not on list, empty list | Refused, no write |
+| Payload expired (`P.expiresAt` = T+1h, checked at T+2h) while the decision is valid until T+72h | Refused `authorization_expired`, no write |
+| Request keeps tuple, `expectedDigest`, `actionOutcome` and `sourceIssueStatus` but changes `outcomeEvidence`; same with `workspaceRepairEvidence`, `resolutionNote` or `outcome` | Refused `authorization_payload_mismatch`, no write |
+| Body not canonical (whitespace, fenced, extra or missing key in `P`) | Refused `authorization_invalid` |
+| Same key, same intent, different `authorization.revisionId` or `decisionId` | 409 `idempotency_conflict` (request digest differs) |
 | Run not terminal, process alive, lease held, coordinator lease or successor | Refused `run_not_settled` |
 | Live or queued run, scheduled retry, queued/claimed/deferred wake, newer terminal run, run linked only by `contextSnapshot.previousRunId` or `retryOfRunId` | Refused `newer_execution_exists` |
+| Newer terminal run (`succeeded`, `failed`, `cancelled`) linked only by each of `issueId`, `nativeIssueId`, `contextSnapshot.issueId`, `taskId`, `taskKey`, `paperclipIssue.id` | Refused `newer_execution_exists`, one case per key |
+| Run created before the source finished and finished after it | Refused `newer_execution_exists` |
+| Run created and finished before the source finished; run of another issue or company | Allowed (not newer) |
+| Source `finishedAt` null | Refused `run_not_settled` |
 | Each gate (dependency, interaction, approval, subtree pause, project pause, agent pause, budget, monitor, workspace binding) changed concurrently, both commit orders | Either admission refused, or gate write waits and then sees the resolved issue; never a delivery past a closed gate |
-| Gate closes after admit, before delivery | Delivery records `waiting:<gate>`, no wake; reopening the gate delivers once |
-| Response lost after commit | Receipt read returns the receipt; retry with same key returns it; one run |
-| Failure before commit (injected) | Receipt read 404; no action change |
+| Gate closes after admit, before delivery, for each gate; both orders (gate commit before the guard takes L4, and gate write waiting behind the guard's L4) | Gate first: `waiting:<gate>`, no wake, no run. Guard first: one run, and the gate writer commits after it |
+| Gate reopens through its release producer; gate reopens with no producer | Delivers once after the producer; delivers once at `recheckAt` |
+| Two workers deliver the same action concurrently | One wake, one run, one `delivered` |
+| Server restart with `pending` and `waiting` rows | Schedule recomputed from the database; each row delivered or rechecked once |
+| Stage changed after admit (slice B state or policy edited) | `invalidated`, no run |
+| Pre-lock budget or agent pause with the guard | `waiting:budget` or `waiting:agent_pause` recorded, no skipped request, no spin |
+| Response lost after commit | Receipt read returns `committed`; retry with same key returns it; one run |
+| Barrier: POST paused after L0 and before commit; GET receipt; then POST commits | GET returns `unsettled` (not proof); settle blocks on L0 and then returns `committed`; one run |
+| Barrier: POST paused before commit, then aborts (injected failure) | Settle returns `abandoned`; a later POST with that key returns 409 `idempotency_key_settled`, no write |
+| Settle first, then POST with that key | 409 `idempotency_key_settled`, no write |
 | Refusal | Action, issue, coordinator, wakes and runs byte-identical; one refusal activity row |
 | Settled hold with `replay = blocked` refused | Hold unchanged (not reopened) |
 | Non-null `executionState` in slice A | Refused `execution_state_not_supported`, state unchanged |
