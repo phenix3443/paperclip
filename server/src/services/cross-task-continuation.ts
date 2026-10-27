@@ -335,7 +335,10 @@ export async function commitCrossTaskContinuation(
       if ((issue.responsibleUserId ?? null) !== (input.admitted.responsibleUserId ?? null)) {
         throw new CrossTaskContinuationRefusal(409, CROSS_TASK_CONTINUATION_MESSAGES.responsibleUserChanged);
       }
-      const [sourceRun] = await tx.select({ agentId: heartbeatRuns.agentId, status: heartbeatRuns.status })
+      const [sourceRun] = await tx.select({
+        agentId: heartbeatRuns.agentId, status: heartbeatRuns.status,
+        issueId: heartbeatRuns.issueId, contextSnapshot: heartbeatRuns.contextSnapshot,
+      })
         .from(heartbeatRuns)
         .where(and(eq(heartbeatRuns.id, input.sourceRunId), eq(heartbeatRuns.companyId, input.companyId)));
       if (!sourceRun || sourceRun.agentId !== input.actorAgentId || sourceRun.status !== "running") {
@@ -349,7 +352,10 @@ export async function commitCrossTaskContinuation(
             companyId: input.companyId, issueId: input.issueId, agentId: issue.assigneeAgentId,
           })
         : null;
-      const reopenable = issue.status === "done" || issue.status === "cancelled" || issue.status === "blocked";
+      // Resume-capable as at D0. An `in_progress` target with no live execution
+      // (checked below) is resumed like a closed one; `todo` only coalesces.
+      const reopenable = issue.status === "done" || issue.status === "cancelled"
+        || issue.status === "blocked" || issue.status === "in_progress";
       if (!reopenable && !pendingIntent) {
         throw new CrossTaskContinuationRefusal(409, CROSS_TASK_CONTINUATION_MESSAGES.notResumable, {
           issueId: issue.id, status: issue.status,
@@ -412,6 +418,10 @@ export async function commitCrossTaskContinuation(
         crossTaskContinuation: {
           requestedByAgentId: input.actorAgentId,
           sourceRunId: input.sourceRunId,
+          sourceIssueId: sourceRun.issueId
+            ?? (typeof (sourceRun.contextSnapshot as Record<string, unknown> | null)?.issueId === "string"
+              ? (sourceRun.contextSnapshot as Record<string, string>).issueId
+              : null),
           workspaceId: input.binding.workspaceId,
           workspaceGeneration: input.binding.generation,
           expectedAssigneeAgentId: issue.assigneeAgentId,

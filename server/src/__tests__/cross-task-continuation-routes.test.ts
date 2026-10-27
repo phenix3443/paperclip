@@ -182,6 +182,7 @@ const support = await getEmbeddedPostgresTestSupport();
       commentId: after.comments[0]!.id,
       crossTaskContinuation: {
         sourceRunId: f.sourceRunId,
+        sourceIssueId: f.sourceIssueId,
         workspaceId: f.workspaceId,
         expectedAssigneeAgentId: f.agentId,
       },
@@ -577,6 +578,20 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(after.comments).toHaveLength(0);
     expect(after.intents).toHaveLength(0);
     expect(after.issue.status).toBe(before.issue.status);
+    expect(after.workspace).toEqual(before.workspace);
+  });
+
+  it("D4 accepts an in_progress target with no live execution, like D0, and moves it to todo", async () => {
+    await setFeature(true);
+    const f = await fixture();
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, f.targetIssueId));
+    const before = await snapshot(f.targetIssueId, f.workspaceId);
+    const res = await post(f.app, f.targetIssueId, { body: "Continue", resume: true, clientRequestId: randomUUID() });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const after = await snapshot(f.targetIssueId, f.workspaceId);
+    expect(after.issue.status).toBe("todo");
+    expect(after.intents).toHaveLength(1);
+    expect(after.intents[0]!.payload).toMatchObject({ reopenedFrom: "in_progress" });
     expect(after.workspace).toEqual(before.workspace);
   });
 });
