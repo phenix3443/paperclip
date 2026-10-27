@@ -2702,6 +2702,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           finishedAt: new Date() } as any), "newer_run"],
         ["a missing receipt", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.delete(executionReconciliationReceipts)
           .where(eq(executionReconciliationReceipts.actionId, f.actionId)), "receipt_missing"],
+        ["a receipt that no longer matches the action", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.update(issueRecoveryActions)
+          .set({ evidence: sql`jsonb_set(${issueRecoveryActions.evidence}, '{executionReconciliation,authorizationPayloadDigest}', '"0000"'::jsonb)` })
+          .where(eq(issueRecoveryActions.id, f.actionId)), "receipt_mismatch"],
         ["an archived company", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.update(companies)
           .set({ status: "archived" }).where(eq(companies.id, f.companyId)), "company_inactive"],
         ["a terminated owner", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.update(agents)

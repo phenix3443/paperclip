@@ -1,5 +1,5 @@
 {
-  "id": "a977ed5a-65bb-4673-b147-fdc04b4db176",
+  "id": "74916b58-5eb9-4266-928b-07dca56f7a04",
   "prevId": "c5e83539-76b0-4aba-a45f-1977e455e899",
   "version": "7",
   "dialect": "postgresql",
@@ -38231,6 +38231,28 @@
           ],
           "isUnique": false,
           "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "issue_recovery_actions_continuation_wait_due_idx": {
+          "name": "issue_recovery_actions_continuation_wait_due_idx",
+          "columns": [
+            {
+              "expression": "(\"evidence\"#>>'{continuationWait,recheckAt}')",
+              "asc": true,
+              "isExpression": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"issue_recovery_actions\".\"status\" = 'resolved' and \"issue_recovery_actions\".\"evidence\"->>'continuationDelivery' = 'waiting'",
+          "concurrently": true,
           "method": "btree",
           "with": {}
         },

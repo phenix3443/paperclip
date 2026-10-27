@@ -76,7 +76,7 @@ export function executionControlSchedule(db: Db) {
       )).limit(1);
       if (rows.length) return retry();
       const [waiting] = await db.select({
-        at: sql<string>`min((${issueRecoveryActions.evidence}->'continuationWait'->>'recheckAt')::timestamptz)`,
+        at: sql<string | null>`min(${issueRecoveryActions.evidence}#>>'{continuationWait,recheckAt}')`,
       }).from(issueRecoveryActions).where(and(
         eq(issueRecoveryActions.status, "resolved"),
         sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'waiting'`,

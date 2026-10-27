@@ -46,6 +46,10 @@ export const issueRecoveryActions = pgTable(
   (table) => ({
     sourceRunIdx: index("issue_recovery_actions_source_run_idx")
       .on(table.companyId, table.sourceIssueId, sql`(${table.evidence}->>'runId')`),
+    continuationWaitDueIdx: index("issue_recovery_actions_continuation_wait_due_idx")
+      .on(sql`(${table.evidence}#>>'{continuationWait,recheckAt}')`, table.id)
+      .concurrently()
+      .where(sql`${table.status} = 'resolved' and ${table.evidence}->>'continuationDelivery' = 'waiting'`),
     systemRecoveryDueIdx: index("issue_recovery_actions_system_recovery_due_idx")
       .on(sql`(${table.evidence}#>'{systemRecovery,nextAttemptAt}')`, table.id)
       .where(sql`${table.evidence} ? 'systemRecovery'`),

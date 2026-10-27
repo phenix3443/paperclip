@@ -296,7 +296,7 @@ export async function deliverReconciledExecutions(
         or(
           sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`,
           sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'waiting'
-            and (${issueRecoveryActions.evidence}->'continuationWait'->>'recheckAt')::timestamptz <= now()`,
+            and (${issueRecoveryActions.evidence}#>>'{continuationWait,recheckAt}') <= ${new Date().toISOString()}`,
         ),
       ),
     )
