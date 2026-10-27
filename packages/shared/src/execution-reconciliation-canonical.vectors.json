@@ -1,0 +1,77 @@
+{
+  "valid": [
+    {
+      "name": "empty object",
+      "input": {},
+      "canonical": "{}",
+      "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+    },
+    {
+      "name": "scalars and null",
+      "input": {
+        "z": null,
+        "a": true,
+        "m": false,
+        "n": 0,
+        "neg": -42,
+        "s": "text"
+      },
+      "canonical": "{\"a\":true,\"m\":false,\"n\":0,\"neg\":-42,\"s\":\"text\",\"z\":null}",
+      "sha256": "180f0308c87ee6f6115bb3d31313907f759bf285a1923418fdb9878a4d0e4b0d"
+    },
+    {
+      "name": "nested and arrays keep order",
+      "input": {
+        "b": [
+          3,
+          1,
+          {
+            "y": 1,
+            "x": []
+          }
+        ],
+        "a": {
+          "d": null,
+          "c": "é"
+        }
+      },
+      "canonical": "{\"a\":{\"c\":\"é\",\"d\":null},\"b\":[3,1,{\"x\":[],\"y\":1}]}",
+      "sha256": "92e9ad2cba3cec64669f45bc2d55a146e2cd9ce6d44735d3013f51354c33c3ea"
+    },
+    {
+      "name": "escapes",
+      "input": {
+        "q": "line\nbreak \"quoted\" \\ tab\t ctrl\u0001"
+      },
+      "canonical": "{\"q\":\"line\\nbreak \\\"quoted\\\" \\\\ tab\\t ctrl\\u0001\"}",
+      "sha256": "93d8758767da4587ba1c313754d92b438ae9263ee7d7bf41a1b80ad9e6560a97"
+    },
+    {
+      "name": "max safe integer",
+      "input": {
+        "n": 9007199254740991,
+        "m": -9007199254740991
+      },
+      "canonical": "{\"m\":-9007199254740991,\"n\":9007199254740991}",
+      "sha256": "3f54c80abdfbc38f08ed5654622eea6e7d7e58cbac36cf5a0670c8aeb054703d"
+    },
+    {
+      "name": "expected snapshot shape",
+      "input": {
+        "companyId": "11111111-1111-4111-8111-111111111111",
+        "issue": {
+          "executionState": null,
+          "statusVersion": 7,
+          "monitorNotes": null
+        },
+        "run": {
+          "finishedAt": "2026-10-27T12:00:00.000Z",
+          "processPid": null
+        },
+        "unstartedRunIds": []
+      },
+      "canonical": "{\"companyId\":\"11111111-1111-4111-8111-111111111111\",\"issue\":{\"executionState\":null,\"monitorNotes\":null,\"statusVersion\":7},\"run\":{\"finishedAt\":\"2026-10-27T12:00:00.000Z\",\"processPid\":null},\"unstartedRunIds\":[]}",
+      "sha256": "f1df77ed7c4654cfa8c1183c8e80c3a4db69d4bd6e1fc4912ed8cadb8c8f37d1"
+    }
+  ]
+}

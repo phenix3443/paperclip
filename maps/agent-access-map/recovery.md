@@ -342,6 +342,34 @@ Verification: `not-run` — Inspect external provider first; wrong source/flag w
 
 Gaps: Unknown stays unknown until corroborated. Evidence text alone can't override independent fences.
 
+### `settle-reconciliation-receipt`
+
+API: `present` — GET /api/issues/{id}/recovery-actions/receipts/{key}; POST /api/issues/{id}/recovery-actions/receipts/{key}/settle. The resolve `executionReconciliation.admission` body stays refused with 400 `capability_unsupported` until the health capability is published.
+
+Agent access: `restricted` — Board only for both routes; agents and the operator have no receipt read or settle authority.
+
+Policy: Same-company task read authorization. GET is read-only: `unsettled` means unknown because a resolve may still be in flight. Settle takes the per-key lock, waits for any in-flight resolve, and returns the committed receipt or writes a permanent `abandoned` tombstone that blocks the key. The tombstone and its `issue.execution_reconciliation_key_settled` activity row commit in one transaction; a repeated settle writes nothing. A key used for another task is an `idempotency_conflict`. Admission requests with duplicate JSON keys or non-canonical numbers get 400 before hashing, and every admission refusal writes one `issue.execution_reconciliation_refused` row after rollback.
+
+Evidence: `source-only` — [recovery routes](../../server/src/routes/issues.ts), [reconciliation receipts](../../server/src/services/execution-reconciliation-receipts.ts); added after the page source revision and reviewed in the PR that adds them. No live provider proof.
+
+Verification: `not-run` — Agent read/settle denied. Unknown key reads unsettled, settles to abandoned once with one audit row; failed audit leaves the key unsettled. Committed key settles to committed and a same-key retry replays without new writes.
+
+Gaps: Embedded PostgreSQL route tests only; the public admission capability, gate locks and delivery checks arrive in a later slice. No UI client calls these routes yet.
+
+### `record-document-decision`
+
+API: `present` — POST /api/issues/{id}/documents/{key}/decisions with `outcome` `approved` (exact `revisionId`, scope `execution_reconciliation`, `expiresAt` at most 72 hours ahead) or `revoked` (`revokesDecisionId` of an approval of the same revision). Company PATCH `executionReconciliationAuthority.agentIds` sets the authority list.
+
+Agent access: `restricted` — any actor that can read the task may record a decision; an agent needs its run ID. Recording grants nothing: admission counts a decision only when its agent is on the company authority list. Only Board can change that list (the agent company PATCH schema accepts branding fields only), and listing an agent does not let it call `resolve`.
+
+Policy: Append-only rows. The server sets the actor and run from authentication and computes the revision body digest. Admission verifies under lock that the document belongs to the task, the approved revision is still the latest (`authorization_stale` otherwise), both body digests match, the decision is an unexpired approval by a listed agent that no listed agent has revoked, the body is exactly the canonical authorization payload, the payload has not expired and does not outlive the decision, and the payload fixes the source tuple, expected digest and the whole request intent (`authorization_payload_mismatch` names the field). An empty list refuses as `authority_not_configured`. A list change waits for in-flight admissions on a shared advisory lock. The payload digest and the approval references go into the receipt and the action evidence; the receipt also stores the payload's uninterpreted `evidence`.
+
+Evidence: `source-only` — [recovery routes](../../server/src/routes/issues.ts), [document decisions](../../server/src/services/issue-document-decisions.ts); added after the page source revision and reviewed in the PR that adds them. No live provider proof.
+
+Verification: `not-run` — Board and agent-with-run decisions record server-owned actors; body actor fields, past or over-72-hour expiry, unknown key or revision, and cross-revision revokes are refused. Admission refuses an empty list, an unlisted actor, a newer revision, expired or revoked decisions, an expired payload, non-canonical or wrong-shape bodies, and each changed intent field, with no write and one refusal row.
+
+Gaps: Embedded PostgreSQL route tests only; the public admission capability stays off. No UI edits the authority list yet.
+
 ### `resolve-chat-publication`
 
 API: `present` — POST /api/chat-endpoints/{endpointId}/publications/{publicationId}/resolve action mark_delivered/retry_anyway/cancel, optional fileTransfer phase/version.

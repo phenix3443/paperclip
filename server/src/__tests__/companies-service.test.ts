@@ -37,6 +37,7 @@ import { startAgentLifecycle } from "../services/agent-lifecycle.js";
 import { createLifecycleDriver } from "../services/agent-lifecycle-driver.js";
 import { reserveRunBudget } from "../services/budget-reservations.js";
 import { companyService } from "../services/companies.js";
+import { lockExecutionReconciliationAuthority } from "../services/execution-reconciliation-authority-lock.js";
 import { deriveIssuePrefixBase } from "../services/issue-prefix.js";
 import { readBuiltInAgentMarker } from "../lib/built-in-agent-metadata.js";
 import { builtInAgentService, reconcileBuiltInAgentsOnStartup } from "../services/built-in-agents.js";
@@ -121,6 +122,30 @@ describeEmbeddedPostgres("companyService", () => {
       .toEqual(["manual", "company_paused"]);
     await lifecycleWorker.sweep();
     expect((await db.select().from(agents).where(eq(agents.id, agent.id)))[0].lifecycleHolds).toEqual(["manual"]);
+  });
+
+  it("defaults the reconciliation authority list to empty and waits for admission before changing it", async () => {
+    const [company] = await db.insert(companies).values({ name: "Authority", issuePrefix: "AUT" }).returning();
+    expect(company.executionReconciliationAuthority).toEqual({ agentIds: [] });
+    const agentId = randomUUID();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let locked!: () => void;
+    const lockedSignal = new Promise<void>((resolve) => { locked = resolve; });
+    const admission = db.transaction(async (tx) => {
+      await lockExecutionReconciliationAuthority(tx, company.id, "shared");
+      locked();
+      await held;
+    });
+    await lockedSignal;
+    let changed = false;
+    const update = companyService(db).update(company.id, { executionReconciliationAuthority: { agentIds: [agentId] } })
+      .then((result) => { changed = true; return result; });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(changed).toBe(false);
+    release();
+    await admission;
+    expect((await update)?.executionReconciliationAuthority).toEqual({ agentIds: [agentId] });
   });
 
   it("does not auto-provision bundled built-in agents for a freshly created company", async () => {

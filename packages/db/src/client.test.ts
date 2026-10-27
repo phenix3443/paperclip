@@ -204,6 +204,11 @@ describeEmbeddedPostgres("merged Muse migration histories", () => {
     return { columns: Array.from(columns), indexes: Array.from(indexes), constraints: Array.from(constraints) };
   }
 
+  function existingColumns<T extends Record<string, Record<string, unknown> | null>>(after: T, before: T | undefined) {
+    return Object.fromEntries(Object.entries(after).map(([name, row]) => [name,
+      row && before?.[name] ? Object.fromEntries(Object.keys(before[name]!).map(key => [key, row[key]])) : row]));
+  }
+
   async function historyRows(sql: ReturnType<typeof postgres>) {
     return Array.from(await sql`SELECT id, hash, created_at::text AS created_at FROM drizzle.__drizzle_migrations ORDER BY id`);
   }
@@ -319,7 +324,7 @@ describeEmbeddedPostgres("merged Muse migration histories", () => {
         const currentHash = await migrationHash(entry.file);
         expect(afterHistory.filter(row => row.hash === currentHash)).toHaveLength(1);
       }
-      if (retainedRows) expect(await retainedRows()).toEqual(beforeRows);
+      if (retainedRows) expect(existingColumns(await retainedRows(), beforeRows)).toEqual(beforeRows);
       const indexes = await sql`
         SELECT c.relname, i.indisvalid, i.indisready, pg_get_indexdef(c.oid) AS definition
         FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -336,7 +341,7 @@ describeEmbeddedPostgres("merged Muse migration histories", () => {
       expect((await inspectMigrations(connectionString)).status).toBe("upToDate");
       expect(await historyRows(sql)).toEqual(afterHistory);
       expect(await schemaShape(sql)).toEqual(finalShape);
-      if (retainedRows) expect(await retainedRows()).toEqual(beforeRows);
+      if (retainedRows) expect(existingColumns(await retainedRows(), beforeRows)).toEqual(beforeRows);
     } finally {
       await Promise.all([sql.end(), reference.end()]);
     }
