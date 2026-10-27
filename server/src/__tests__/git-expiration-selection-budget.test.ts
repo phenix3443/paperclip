@@ -146,6 +146,13 @@ describeEmbeddedPostgres("Git expiration selection and DB budgets", () => {
     expect(exhaustionChecks(journal.events)).toEqual([{ type: "selection_exhaustion_checked", more: status === "partial" }]);
   }, 60_000);
 
+  it("selects 9,999 rows without reaching the cap", async () => {
+    const { companyId } = await seed(9_999);
+    const journal = memoryJournal();
+    expect(await round(journal, { companyId })).toMatchObject({ status: "complete", selected: 9_999, fullPages: 199, exhaustionChecked: false });
+    expect(exhaustionChecks(journal.events)).toEqual([]);
+  }, 120_000);
+
   it.each([[10_000, "complete"], [10_001, "partial"]] as const)("selects at most 10,000 rows with %i rows", async (count, status) => {
     const { companyId } = await seed(count);
     const journal = memoryJournal();
@@ -246,13 +253,27 @@ describeEmbeddedPostgres("Git expiration selection and DB budgets", () => {
     expect(summary.peaks.journalBytes).toBeGreaterThan(0);
   });
 
+  it("ends with evidence_lost when the host write limit fails a journal write", async () => {
+    const { companyId } = await seed(1);
+    let writes = 0;
+    const journal = fileGitExpirationRoundJournal({
+      write: async (_buffer, _offset, length) => {
+        writes += 1;
+        if (writes === 2) throw Object.assign(new Error("file too large"), { code: "EFBIG" });
+        return { bytesWritten: length };
+      },
+      datasync: async () => undefined, truncate: async () => undefined, close: async () => undefined,
+    });
+    expect(await round(journal, { companyId })).toMatchObject({ status: "partial", stopReason: "evidence_lost", budgetHit: null });
+  });
+
   it("reports budgets, scratch, peaks and selection evidence for a complete round", async () => {
     const { companyId } = await seed(2);
     const journal = memoryJournal();
     const summary = await round(journal, { companyId });
     expect(journal.events[0]).toMatchObject({ type: "round_started", budgets: GIT_EXPIRATION_BUDGETS, scratchDir: os.tmpdir() });
     expect(summary).toMatchObject({ status: "complete", fullPages: 0, exhaustionChecked: false, budgetHit: null, drainIncomplete: false,
-      undrainedRow: null, peaks: { dbClients: 2 } });
+      undrainedRow: null, peaks: { dbClients: 2 }, budgets: GIT_EXPIRATION_BUDGETS });
     expect(journal.events.find(event => event.type === "round_finished")).toMatchObject({ peaks: summary.peaks, budgetHit: null, fullPages: 0 });
   });
 });

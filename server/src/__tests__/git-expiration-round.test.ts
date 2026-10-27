@@ -487,7 +487,8 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
     expect(summary).toMatchObject({ status: "partial", stopReason: "resource_limit", resourceLimited: 1, candidates: 0,
       drainIncomplete: true, undrainedRow: { id: f.workspaceId } });
     expect(journal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "resource_limit", reason: "row_deadline" });
-    expect(journal.events.at(-1)).toMatchObject({ type: "round_finished", status: "partial", drainIncomplete: true });
+    expect(journal.events.at(-1)).toMatchObject({ type: "round_finished", status: "partial", drainIncomplete: true,
+      budgetHit: { budget: "row_deadline", scope: "row", limit: GIT_EXPIRATION_BUDGETS.rowMs } });
     expect(undrained).toHaveLength(1);
     expect(await advisoryLocks()).toBe(2);
 
@@ -520,7 +521,8 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
       expect(summary).toMatchObject({ status: "partial", stopReason: "resource_limit", resourceLimited: 1, drainIncomplete: true,
         undrainedRow: { id: f.workspaceId } });
       expect(journal.events.find(event => event.type === "row_inspected")).toMatchObject({ outcome: "resource_limit", reason: "git_group_survivor" });
-      expect(journal.events.at(-1)).toMatchObject({ type: "round_finished", status: "partial", drainIncomplete: true });
+      expect(journal.events.at(-1)).toMatchObject({ type: "round_finished", status: "partial", drainIncomplete: true,
+        budgetHit: { budget: "git_group_survivor", scope: "row" }, peaks: { gitChildren: 1 } });
       expect(undrained).toHaveLength(1);
       expect(await advisoryLocks()).toBe(2);
       expect(Number((await db.execute<{ count: string }>(sql`select count(distinct pid)::text as count from pg_locks

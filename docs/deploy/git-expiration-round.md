@@ -77,7 +77,7 @@ The round writes `events.jsonl` in the evidence directory. Each line is one even
 | `page_selected` | Page number and selected keys |
 | `selection_exhaustion_checked` | `more`: whether a row is left after the cap. No key is recorded. |
 | `row_inspected` | Selected key, current row, workspace, outcome, reason and candidate bytes |
-| `round_finished` | Summary. `status` is `partial` or `pending_commit`. It includes `fullPages`, `exhaustionChecked`, `budgetHit` (`budget`, `scope` `row` or `round`, `limit`, `observed`, or `null`), `peaks` (`rowMs`, `rowEntries`, `childOutputBytes`, `dbClients`, `gitChildren`, `journalBytes`), `drainIncomplete` and `undrainedRow`. The stdout summary has the same fields. |
+| `round_finished` | Summary. `status` is `partial` or `pending_commit`. It includes `fullPages`, `exhaustionChecked`, `budgetHit` (`budget`, `scope` `row` or `round`, `limit`, `observed`, or `null`), `peaks` (`rowMs`, `rowEntries`, `childOutputBytes`, `dbClients`, `gitChildren`, `journalBytes`), `drainIncomplete`, `undrainedRow` and `budgets`. When a row does not drain within 5 s and no other budget is named, `budgetHit.budget` is `row_drain`. `peaks.dbClients` counts the configured pool of 2 plus the dedicated connections open at that moment. The stdout summary has the same fields. |
 | `round_committed` | Round identifier and status `complete` |
 
 `current` in `row_inspected` is the row that the round read again under the lifecycle lock:

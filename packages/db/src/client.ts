@@ -275,8 +275,8 @@ export async function withDedicatedDbConnection<T>(db: Db, action: (dedicated: D
   open.add(dedicated);
   try { return await action(dedicated); }
   finally {
-    open.delete(dedicated);
-    await dedicated.$client.end({ timeout: 1 });
+    try { await dedicated.$client.end({ timeout: 1 }); }
+    finally { open.delete(dedicated); }
   }
 }
 

@@ -79,6 +79,7 @@ export type GitExpirationRoundSummary = {
   undrainedRow: GitExpirationRoundKey | null;
   budgetHit: GitExpirationRoundBudgetHit | null;
   peaks: GitExpirationRoundPeaks;
+  budgets: typeof GIT_EXPIRATION_BUDGETS;
   limits: string[];
 };
 
@@ -170,6 +171,7 @@ type RowInspection = {
   outcome: Promise<GitExpirationRoundRow>;
   released: Promise<void>;
   budgetHit(): GitExpirationRoundBudgetHit | null;
+  peaks(): Readonly<InspectionBudgetPeaks> | null;
 };
 
 function inspectRow(db: Db, workspace: Workspace, key: GitExpirationRoundKey, auth: GitRemoteAuthProvider,
@@ -178,7 +180,7 @@ function inspectRow(db: Db, workspace: Workspace, key: GitExpirationRoundKey, au
   const row = (): GitExpirationRoundRow => ({ key, workspaceId: workspace.id, companyId: workspace.companyId, status: workspace.status,
     current, outcome: "rejected", reason: null, pendingExpiration: false, candidateBytes: 0 });
   const settled = (value: GitExpirationRoundRow): RowInspection => ({ outcome: Promise.resolve(value), released: Promise.resolve(),
-    budgetHit: () => null });
+    budgetHit: () => null, peaks: () => null });
   if (!isGitExpirationCandidate(workspace)) return settled({ ...row(), outcome: "not_candidate", reason: "not_git_expiration_candidate" });
   if (!workspace.sourceIssueId) return settled({ ...row(), reason: "missing_source_issue" });
   const sourceIssueId = workspace.sourceIssueId;
@@ -234,7 +236,8 @@ function inspectRow(db: Db, workspace: Workspace, key: GitExpirationRoundKey, au
   const outcome = Promise.race([finished, stopped]);
   finished.catch(() => undefined);
   stopped.catch(() => undefined);
-  return { outcome, released: chain.then(() => undefined, () => undefined).finally(() => budget.close()), budgetHit: () => hit };
+  return { outcome, released: chain.then(() => undefined, () => undefined).finally(() => budget.close()), budgetHit: () => hit,
+    peaks: () => budget.peaks };
 }
 
 async function awaitRelease(released: Promise<void>) {
@@ -269,16 +272,18 @@ export async function inspectGitExpirationRound(options: GitExpirationRoundOptio
     exhausted: false, pages: 0, selected: 0, inspected: 0, candidates: 0, rejected: 0, notCandidates: 0, lockBusy: 0,
     resourceLimited: 0, candidateBytes: 0, lastSelectedKey: null, lastCompletedKey: null, fullPages: 0, exhaustionChecked: false,
     drainIncomplete: false, undrainedRow: null, budgetHit: null,
-    peaks: { rowMs: 0, rowEntries: 0, childOutputBytes: 0, dbClients: 0, gitChildren: 0, journalBytes: 0 }, limits: ROUND_LIMITS };
+    peaks: { rowMs: 0, rowEntries: 0, childOutputBytes: 0, dbClients: 0, gitChildren: 0, journalBytes: 0 },
+    budgets: GIT_EXPIRATION_BUDGETS, limits: ROUND_LIMITS };
   const peak = (name: keyof GitExpirationRoundPeaks, value: number) => { summary.peaks[name] = Math.max(summary.peaks[name], value); };
-  const hooks: InspectionBudgetHooks = { ...options.budgetHooks, onRowClosed: peaks => {
-    for (const name of ["rowMs", "rowEntries", "childOutputBytes", "gitChildren"] as const) peak(name, peaks[name]);
-    options.budgetHooks?.onRowClosed?.(peaks);
-  } };
-  const roundStop = (error: unknown): GitExpirationRoundStopReason => {
+  const rowPeaks = (peaks: Readonly<InspectionBudgetPeaks> | null, rowMs: number) => {
+    if (!peaks) return;
+    for (const name of ["rowEntries", "childOutputBytes", "gitChildren"] as const) peak(name, peaks[name]);
+    peak("rowMs", Math.max(peaks.rowMs, rowMs));
+  };
+  const classifyRoundError = (error: unknown, scope: GitExpirationRoundBudgetHit["scope"]): GitExpirationRoundStopReason => {
     const cancelled = stopReason();
     if (cancelled) return cancelled;
-    const hit = gitExpirationBudgetHit(error, "round");
+    const hit = gitExpirationBudgetHit(error, scope);
     if (!hit) return "database_error";
     summary.budgetHit ??= hit;
     return "resource_limit";
@@ -290,7 +295,7 @@ export async function inspectGitExpirationRound(options: GitExpirationRoundOptio
       return true;
     } catch (error) {
       if (error instanceof GitExpirationBudgetExceeded && error.budget === "evidence") {
-        summary.budgetHit ??= { budget: error.budget, scope: "round", limit: error.limit, observed: error.observed };
+        summary.budgetHit ??= gitExpirationBudgetHit(error, "round");
         summary.stopReason ??= "resource_limit";
       } else evidenceLost = true;
       return false;
@@ -314,6 +319,7 @@ export async function inspectGitExpirationRound(options: GitExpirationRoundOptio
     sql`${executionWorkspaces.updatedAt} <= ${upperBound}::timestamptz`,
     cursor ? sql`(${executionWorkspaces.updatedAt}, ${executionWorkspaces.id}) > (${cursor.updatedAt}::timestamptz, ${cursor.id}::uuid)` : undefined,
   );
+  const selectionOrder = [asc(executionWorkspaces.updatedAt), asc(executionWorkspaces.id)];
   try {
     scan: {
       summary.stopReason = stopReason();
@@ -323,7 +329,7 @@ export async function inspectGitExpirationRound(options: GitExpirationRoundOptio
         const [clock] = await db.execute<{ upper_bound: string }>(options.upperBoundQuery ?? sql`select clock_timestamp()::text as upper_bound`);
         upperBound = clock!.upper_bound;
       } catch (error) {
-        summary.stopReason = roundStop(error);
+        summary.stopReason = classifyRoundError(error, "round");
         break scan;
       }
       summary.upperBound = upperBound;
@@ -338,10 +344,10 @@ export async function inspectGitExpirationRound(options: GitExpirationRoundOptio
           let more: boolean;
           try {
             const next = await db.select({ id: executionWorkspaces.id }).from(executionWorkspaces)
-              .where(selectionFilter(upperBound, cursor)).orderBy(asc(executionWorkspaces.updatedAt), asc(executionWorkspaces.id)).limit(1);
+              .where(selectionFilter(upperBound, cursor)).orderBy(...selectionOrder).limit(1);
             more = next.length > 0;
           } catch (error) {
-            summary.stopReason = roundStop(error);
+            summary.stopReason = classifyRoundError(error, "round");
             break scan;
           }
           summary.exhaustionChecked = true;
@@ -356,10 +362,10 @@ export async function inspectGitExpirationRound(options: GitExpirationRoundOptio
           page = await db.select({ workspace: executionWorkspaces, updatedAtKey: sql<string>`${executionWorkspaces.updatedAt}::text` })
             .from(executionWorkspaces)
             .where(selectionFilter(upperBound, cursor))
-            .orderBy(asc(executionWorkspaces.updatedAt), asc(executionWorkspaces.id))
+            .orderBy(...selectionOrder)
             .limit(limit);
         } catch (error) {
-          summary.stopReason = roundStop(error);
+          summary.stopReason = classifyRoundError(error, "round");
           break scan;
         }
         const keys = page.map(entry => ({ updatedAt: entry.updatedAtKey, id: entry.workspace.id }));
@@ -371,7 +377,8 @@ export async function inspectGitExpirationRound(options: GitExpirationRoundOptio
         for (const [index, entry] of page.entries()) {
           summary.stopReason = stopReason();
           if (summary.stopReason) break scan;
-          const inspection = inspectRow(db, entry.workspace, keys[index]!, auth, signal, hooks);
+          const rowStartedAt = Date.now();
+          const inspection = inspectRow(db, entry.workspace, keys[index]!, auth, signal, options.budgetHooks);
           let row: GitExpirationRoundRow | null = null;
           let failure: unknown;
           try {
@@ -384,9 +391,13 @@ export async function inspectGitExpirationRound(options: GitExpirationRoundOptio
             summary.undrainedRow = keys[index]!;
             options.onUndrainedRow?.(inspection.released);
           }
+          rowPeaks(inspection.peaks(), Date.now() - rowStartedAt);
+          if (summary.drainIncomplete && !stopReason()) {
+            summary.budgetHit ??= inspection.budgetHit()
+              ?? { budget: "row_drain", scope: "row", limit: ROW_DRAIN_BOUND_MS, observed: null };
+          }
           if (!row) {
-            summary.stopReason = roundStop(failure);
-            if (summary.budgetHit?.scope === "round") summary.budgetHit.scope = "row";
+            summary.stopReason = classifyRoundError(failure, "row");
             break scan;
           }
           if (!await record({ type: "row_inspected", ...row })) break scan;
