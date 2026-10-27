@@ -155,6 +155,7 @@ export interface DatabaseClientOptions {
    * `postgres.js`).
    */
   applicationName?: string;
+  sessionParameters?: Record<string, string>;
 }
 
 /**
@@ -248,9 +249,9 @@ export function postgresJsOptions(options: DatabaseClientOptions): Record<string
   if (options.idleTimeoutSeconds !== undefined) driverOptions.idle_timeout = options.idleTimeoutSeconds;
   if (options.connectTimeoutSeconds !== undefined) driverOptions.connect_timeout = options.connectTimeoutSeconds;
   if (options.maxLifetimeSeconds !== undefined) driverOptions.max_lifetime = options.maxLifetimeSeconds;
-  if (options.applicationName !== undefined) {
-    driverOptions.connection = { application_name: options.applicationName };
-  }
+  const connection: Record<string, string> = { ...options.sessionParameters };
+  if (options.applicationName !== undefined) connection.application_name = options.applicationName;
+  if (Object.keys(connection).length) driverOptions.connection = connection;
   return driverOptions;
 }
 
@@ -259,12 +260,25 @@ export function postgresJsOptions(options: DatabaseClientOptions): Record<string
 // originating Db lifetime; callers receive neither URLs nor credentials.
 const dedicatedDbFactories = new WeakMap<object, () => Db>();
 
+const openDedicatedDbs = new WeakMap<object, Set<Db>>();
+
 export async function withDedicatedDbConnection<T>(db: Db, action: (dedicated: Db) => Promise<T>): Promise<T> {
   const factory = dedicatedDbFactories.get(db);
   if (!factory) throw new Error("dedicated_connection_requires_create_db");
   const dedicated = factory();
+  const open = openDedicatedDbs.get(db) ?? new Set<Db>();
+  openDedicatedDbs.set(db, open);
+  open.add(dedicated);
   try { return await action(dedicated); }
-  finally { await dedicated.$client.end({ timeout: 1 }); }
+  finally {
+    open.delete(dedicated);
+    await dedicated.$client.end({ timeout: 1 });
+  }
+}
+
+export async function terminateDbConnections(db: Db): Promise<void> {
+  const dedicated = [...(openDedicatedDbs.get(db) ?? [])];
+  await Promise.allSettled([db, ...dedicated].map(client => client.$client.end({ timeout: 0 })));
 }
 
 // postgres.js pipelines a query onto a busy connection when none is idle, so
