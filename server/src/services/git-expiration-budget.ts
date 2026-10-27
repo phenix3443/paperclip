@@ -167,7 +167,7 @@ function boundedGitEnv(env: NodeJS.ProcessEnv | undefined): NodeJS.ProcessEnv {
   return base;
 }
 
-type StopCause = "timeout" | "abort" | "output" | "survivor";
+type StopCause = "timeout" | "abort" | "output" | "max_buffer" | "survivor";
 
 /**
  * Runs one Git child of the inspection. Without a ledger it is the old `execFile`
@@ -193,7 +193,6 @@ function runInGroup(budget: InspectionBudget, args: string[], options: BoundedGi
       reject(abortError(signal));
       return;
     }
-    const outputCap = Math.min(options.maxBuffer, GIT_EXPIRATION_BUDGETS.childOutputBytes);
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let outputBytes = 0;
@@ -228,11 +227,16 @@ function runInGroup(budget: InspectionBudget, args: string[], options: BoundedGi
       return (chunk: Buffer) => {
         outputBytes += chunk.length;
         budget.peaks.childOutputBytes = Math.max(budget.peaks.childOutputBytes, outputBytes);
-        if (outputBytes > outputCap) {
+        if (outputBytes > GIT_EXPIRATION_BUDGETS.childOutputBytes) {
           if (!stopCause) {
             budgetError = budget.exceeded(new GitExpirationBudgetExceeded("git_output", GIT_EXPIRATION_BUDGETS.childOutputBytes, outputBytes));
             stop("output");
           }
+          return;
+        }
+        // A caller's smaller buffer keeps its old `execFile` meaning: a per-call error, not a budget hit.
+        if (outputBytes > options.maxBuffer) {
+          stop("max_buffer");
           return;
         }
         if (!stopCause) target.push(chunk);
@@ -289,6 +293,10 @@ function runInGroup(budget: InspectionBudget, args: string[], options: BoundedGi
       const err = Buffer.concat(stderr).toString("utf8");
       if (budgetError) return reject(budgetError);
       if (stopCause === "abort") return reject(abortError(signal));
+      if (stopCause === "max_buffer") {
+        return reject(Object.assign(new RangeError("stdout maxBuffer length exceeded"), { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+          stdout: out, stderr: err }));
+      }
       if (stopCause === "timeout") {
         return reject(Object.assign(new Error(`git ${args[0] ?? ""} timed out`), { code: null, killed: true, signal: "SIGTERM",
           stdout: out, stderr: err }));

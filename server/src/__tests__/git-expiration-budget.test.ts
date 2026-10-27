@@ -93,6 +93,14 @@ sleep 30`);
     expect(budget.runningCount).toBe(0);
   });
 
+  it("keeps a caller's smaller output buffer as a per-call error instead of a budget hit", async () => {
+    const env = await fakeGit("chatty", "head -c 2048 /dev/zero");
+    const budget = new InspectionBudget(new AbortController().signal);
+    const error = await budget.run(() => runBoundedGit(["status"], { env, timeout: 30_000, maxBuffer: 1024 })).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" });
+    expect(budget.signal.aborted).toBe(false);
+  });
+
   it("classifies a full scratch disk as a budget hit instead of a Git rejection", async () => {
     const env = await fakeGit("full", `echo "fatal: unable to write new index file: No space left on device" >&2
 exit 128`);
