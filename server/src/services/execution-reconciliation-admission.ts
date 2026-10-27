@@ -32,7 +32,7 @@ const ACTIVE_MEMBER_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
 const ACTIVE_WAKE_STATUSES = ["queued", "claimed", "deferred_issue_execution"];
 const SETTLED_COORDINATOR_PHASES = ["committed", "terminal_failure"];
 
-function memberRunPredicate(companyId: string, issueId: string, sourceRunId: string) {
+export function memberRunPredicate(companyId: string, issueId: string, sourceRunId: string) {
   return and(
     eq(heartbeatRuns.companyId, companyId),
     ne(heartbeatRuns.id, sourceRunId),

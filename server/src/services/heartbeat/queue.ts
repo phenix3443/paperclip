@@ -2845,8 +2845,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
       const cancelledRunsToEmit: (typeof heartbeatRuns.$inferSelect)[] = [];
 
+      let guardedDeliveryAction: typeof issueRecoveryActions.$inferSelect | null = null;
       const outcome = await db
         .transaction(async (tx) => {
+          guardedDeliveryAction = null;
+          const result = await (async () => {
           if (executionReconciliationWake) await lockReconciledDeliveryPrefix(tx, agent.companyId, agentId);
           await tx.execute(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
@@ -3413,7 +3416,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             if (!["pending", "waiting"].includes(String(action.evidence.continuationDelivery)))
               return { kind: "skipped" as const };
             if (isAdmittedReconciliation(decision)) {
-              const revalidated = await revalidateReconciledDelivery(tx, { issue, action });
+              const revalidated = await revalidateReconciledDelivery(tx, { companyId: issue.companyId, issueId: issue.id, action });
               const delivery = revalidated.kind !== "invalidated" && guardedWaitingGate
                 ? { kind: "waiting" as const, gate: guardedWaitingGate }
                 : revalidated;
@@ -3422,6 +3425,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 return { kind: "skipped" as const };
               }
               admittedDeliveryActionId = action.id;
+              guardedDeliveryAction = action;
             }
             const [reconciledRun] = await tx.select().from(heartbeatRuns).where(and(
               eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, sourceRunId),
@@ -4521,6 +4525,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // transitions to "running" — Fix A (lazy locking).
 
           return { kind: "queued" as const, run: newRun };
+          })();
+          if (guardedDeliveryAction && result.kind !== "queued") {
+            await recordReconciledDeliveryOutcome(tx, guardedDeliveryAction, {
+              kind: "invalidated", reason: `queue_${result.kind}`,
+            });
+          }
+          return result;
         })
         .catch((error) => {
           if (isExternalChatWaitAuthorizationContention(error))

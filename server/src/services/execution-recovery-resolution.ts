@@ -322,10 +322,13 @@ export async function deliverReconciledExecutions(
             eq(issues.id, action.sourceIssueId),
           ),
         );
+      const admitted = typeof (decision as { authorizationPayloadDigest?: unknown }).authorizationPayloadDigest === "string";
       if (
         !task ||
-        task.assigneeAgentId !== action.returnOwnerAgentId ||
-        ["done", "cancelled"].includes(task.status)
+        (!admitted && (
+          task.assigneeAgentId !== action.returnOwnerAgentId ||
+          ["done", "cancelled"].includes(task.status)
+        ))
       ) {
         await db
           .update(issueRecoveryActions)

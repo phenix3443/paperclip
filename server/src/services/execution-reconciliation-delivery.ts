@@ -1,7 +1,8 @@
-import { and, asc, eq, ne, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
+  caseHandoffs,
   companies,
   executionReconciliationReceipts,
   heartbeatRuns,
@@ -10,7 +11,8 @@ import {
 } from "@paperclipai/db";
 import type { ExpectedReconciliationState } from "@paperclipai/shared";
 import { isConversation } from "./agent-conversations.js";
-import { admitExecutionReconciliationGates, lockAdmissionRows } from "./execution-reconciliation-admission.js";
+import { admitExecutionReconciliationGates, lockAdmissionRows, memberRunPredicate } from "./execution-reconciliation-admission.js";
+import { isHeartbeatWakeOnDemandEnabled } from "./heartbeat-policy.js";
 import { lockAdmissionOwnerAndTreeHolds } from "./execution-reconciliation-locks.js";
 import { toExecutionReconciliationRefusal } from "./execution-reconciliation-receipts.js";
 
@@ -35,9 +37,12 @@ export async function lockReconciledDeliveryPrefix(tx: DbOrTransaction, companyI
 
 export async function revalidateReconciledDelivery(
   tx: DbOrTransaction,
-  input: { issue: typeof issues.$inferSelect; action: typeof issueRecoveryActions.$inferSelect },
+  input: { companyId: string; issueId: string; action: typeof issueRecoveryActions.$inferSelect },
 ): Promise<ReconciledDeliveryDecision> {
-  const { issue, action } = input;
+  const { action } = input;
+  const [issue] = await tx.select().from(issues)
+    .where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)));
+  if (!issue) return { kind: "invalidated", reason: "issue_missing" };
   const [receipt] = await tx
     .select()
     .from(executionReconciliationReceipts)
@@ -47,6 +52,10 @@ export async function revalidateReconciledDelivery(
       eq(executionReconciliationReceipts.state, "committed"),
     ));
   if (!receipt || receipt.issueId !== issue.id || !receipt.runId) return { kind: "invalidated", reason: "receipt_missing" };
+  const decision = action.evidence.executionReconciliation as { authorizationPayloadDigest?: unknown } | undefined;
+  if (action.status !== "resolved" || decision?.authorizationPayloadDigest !== receipt.authorizationPayloadDigest) {
+    return { kind: "invalidated", reason: "receipt_mismatch" };
+  }
   if (["done", "cancelled"].includes(issue.status)) return { kind: "invalidated", reason: "issue_closed" };
   if (issue.executionState != null) return { kind: "invalidated", reason: "stage_changed" };
   if (!issue.assigneeAgentId || issue.assigneeAgentId !== action.returnOwnerAgentId) {
@@ -55,10 +64,16 @@ export async function revalidateReconciledDelivery(
   if (isConversation(issue)) return { kind: "invalidated", reason: "issue_kind_not_supported" };
   const [company] = await tx.select({ status: companies.status }).from(companies).where(eq(companies.id, issue.companyId));
   if (!company || company.status === "archived") return { kind: "invalidated", reason: "company_inactive" };
-  const [owner] = await tx.select({ status: agents.status }).from(agents)
+  const [owner] = await tx.select().from(agents)
     .where(and(eq(agents.companyId, issue.companyId), eq(agents.id, issue.assigneeAgentId)));
   if (!owner) return { kind: "invalidated", reason: "owner_missing" };
   if (owner.status === "terminated") return { kind: "invalidated", reason: "owner_not_invokable" };
+  if (!isHeartbeatWakeOnDemandEnabled(owner)) return { kind: "waiting", gate: "wake_policy" };
+  const [handoff] = await tx.select({ id: caseHandoffs.id }).from(caseHandoffs).where(and(
+    eq(caseHandoffs.companyId, issue.companyId), eq(caseHandoffs.issueId, issue.id),
+    inArray(caseHandoffs.state, ["awaiting_release", "pending_dispatch"]),
+  )).limit(1);
+  if (handoff) return { kind: "waiting", gate: "case_handoff" };
 
   const locked = await lockAdmissionRows(tx, { companyId: issue.companyId, issueId: issue.id, runId: receipt.runId });
   if (!locked.run) return { kind: "invalidated", reason: "source_run_missing" };
@@ -68,16 +83,7 @@ export async function revalidateReconciledDelivery(
     .select({ id: heartbeatRuns.id })
     .from(heartbeatRuns)
     .where(and(
-      eq(heartbeatRuns.companyId, issue.companyId),
-      ne(heartbeatRuns.id, receipt.runId),
-      or(
-        eq(heartbeatRuns.issueId, issue.id),
-        eq(heartbeatRuns.nativeIssueId, issue.id),
-        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
-        sql`${heartbeatRuns.contextSnapshot} ->> 'taskId' = ${issue.id}`,
-        eq(heartbeatRuns.retryOfRunId, receipt.runId),
-        sql`${heartbeatRuns.contextSnapshot} ->> 'previousRunId' = ${receipt.runId}`,
-      ),
+      memberRunPredicate(issue.companyId, issue.id, receipt.runId),
       or(
         sql`${heartbeatRuns.createdAt} >= ${baseline}::timestamptz`,
         sql`${heartbeatRuns.finishedAt} > ${baseline}::timestamptz`,
