@@ -489,4 +489,36 @@ const support = await getEmbeddedPostgresTestSupport();
       recorder.restore();
     }
   });
+
+  it.each(["rebind", "generation"] as const)("L1 (%s): a concurrent writer blocks until the deferred transaction commits, then sees todo and the unchanged workspace", async (write) => {
+    await setFeature(true);
+    const f = await fixture();
+    const before = await snapshot(f.targetIssueId, f.workspaceId);
+    let writer: Promise<unknown> | null = null;
+    let writerSettledInsideTransaction = false;
+    crossTaskContinuationTestHooks.beforeCommit = async () => {
+      // A separate connection; the deferred transaction holds the issue and workspace rows FOR UPDATE.
+      writer = write === "rebind"
+        ? db.update(issues).set({ executionWorkspaceId: null }).where(eq(issues.id, f.targetIssueId))
+        : db.update(executionWorkspaces).set({ metadata: { lifecycleGeneration: 7 } }).where(eq(executionWorkspaces.id, f.workspaceId));
+      writer.then(() => { writerSettledInsideTransaction = true; }, () => { writerSettledInsideTransaction = true; });
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(writerSettledInsideTransaction).toBe(false);
+    };
+    const res = await post(f.app, f.targetIssueId, { body: "Continue", resume: true, clientRequestId: randomUUID() });
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    await writer;
+    const after = await snapshot(f.targetIssueId, f.workspaceId);
+    expect(after.issue.status).toBe("todo");
+    expect(after.intents).toHaveLength(1);
+    expect(after.comments).toHaveLength(1);
+    // The writer applied after the commit, on top of the committed state.
+    if (write === "rebind") {
+      expect(after.issue.executionWorkspaceId).toBeNull();
+      expect(after.workspace).toEqual(before.workspace);
+    } else {
+      expect(after.workspace?.metadata).toMatchObject({ lifecycleGeneration: 7 });
+      expect({ ...after.workspace, metadata: null, updatedAt: null }).toEqual({ ...before.workspace, metadata: null, updatedAt: null });
+    }
+  });
 });
