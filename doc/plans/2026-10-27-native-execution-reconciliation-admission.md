@@ -289,6 +289,8 @@ locks below and before any write. It refuses unless all hold:
 - The coordinator row has no `lease_owner`, its phase is final, and it has no
   `failureDetail.successorRunId`.
 - No other action on the issue is `active` or `escalated`.
+- The issue is not a conversation issue (`isConversation`, `server/src/services/agent-conversations.ts:28`); otherwise
+  `issue_kind_not_supported`. The queue skips delivery for these, so admitting one could never deliver.
 - No member run (the membership predicate below) is `queued`, `running` or
   `scheduled_retry`.
 - No wake for the issue is `queued`, `claimed` or `deferred_issue_execution`.
@@ -524,6 +526,7 @@ Refusal codes are stable strings: `capability_unsupported`,
 `expected_state_mismatch`, `authorization_invalid`, `authorization_stale`,
 `authority_not_configured`, `authorization_expired`, `authorization_payload_mismatch`,
 `idempotency_conflict`, `idempotency_key_settled`, `action_already_reconciled`,
+`issue_kind_not_supported`,
 `execution_state_not_supported`, `run_not_settled`, `newer_execution_exists`,
 `gate_closed:<gate>`, `concurrent_change`.
 
@@ -544,9 +547,14 @@ Neither is acceptable, so slice A puts the revalidation inside the queue transac
 It is set only by `deliverReconciledExecutions` and is not reachable from any route.
 When it is set, `enqueueWakeup`:
 
-1. Skips the pre-lock budget, invokability and wake-policy early returns. They become
-   gates checked under lock in step 3. (Without this, a paused agent would make the
-   worker spin on a `pending` row with no recorded reason.)
+1. Takes none of the generic pre-transaction exits. Every condition that today
+   returns before the transaction (`queue.ts:2146-2813`) is either unreachable for a
+   guarded wake (and throws), or is decided in step 3 under lock. The full list is in
+   "Pre-transaction exits for guarded wakes" below. Before the transaction it only
+   builds the enriched context and checks that no other admission option is set.
+   (Otherwise a closed gate would return before the guard, write only an
+   `execution-wait:*` skipped diagnostic, and leave the action `pending`, so the
+   worker would retry it on every pass.)
 2. Opens its transaction and, before the issue lock, takes L1-L3 for the action's
    company, owner agent and tree-hold lock. Then it takes the existing issue lock (L4,
    `queue.ts:2825`).
@@ -558,7 +566,8 @@ When it is set, `enqueueWakeup`:
      the stage no longer matches (below), or a newer run exists (section 3 predicate,
      with the receipt time as the baseline instead of `source.finished_at`). The
      newer run already carries the work; a second run would duplicate it.
-   - `waiting:<gate>` when any section 4 gate is closed.
+   - `waiting:<gate>` when any section 4 gate, or any temporary gate from the
+     pre-transaction table below, is closed.
    - `deliver` otherwise.
 4. On `invalidated` or `waiting`, writes the action evidence in the same transaction
    and returns `{ kind: "skipped" }`. No wake row and no run row are written.
@@ -569,6 +578,52 @@ When it is set, `enqueueWakeup`:
 6. Commits. Only after commit does it call `startNextQueuedRunForAgent`, as today.
    The lock owner is the queue transaction from step 2 to step 6; the worker holds
    no lock and no transaction while it calls `wakeup`.
+
+### Pre-transaction exits for guarded wakes
+
+Audit of every exit in `enqueueWakeup` before its transaction opens
+(`queue.ts:2146-2813` at the base). Ordinary wakes without a guard keep all of them
+unchanged. With a guard, each one has exactly one of four treatments:
+
+- **Unreachable:** the guard's options make the branch impossible. If it is reached
+  anyway, `enqueueWakeup` throws `invalid_reconciliation_guard` before any write.
+  This is a programming error, covered by a unit test, not a wait.
+- **Waiting:** a temporary gate. Decided in step 3 under the lock named, recorded as
+  `waiting:<gate>` with `recheckAt`, in the queue transaction.
+- **Invalidated:** permanent for this delivery. Recorded as `invalidated:<reason>`
+  in the queue transaction.
+- **Unchanged:** not an exit, or already safe.
+
+| Source (base lines) | Exit today | Guarded treatment |
+| --- | --- | --- |
+| 2161-2163 `manualUserWake`; 2191-2207 `taskRetryRequestId`; 2264-2289 `failedRunId`; 2291-2319 case handoff and owner repair requests; 2320-2396 durable chat, Dot, Muse and receipt requests; 2398-2403 prior durable receipt | Throw or return null | Unreachable. The guard is exclusive with all of these options |
+| 2188 reconciliation wake without `issueId` | Return null | Unreachable. The guard carries the action's `sourceIssueId`, and `enqueueWakeup` takes `issueId` from it |
+| 2213 agent not found | Throw 404 | Decided under L2: missing owner agent is `invalidated:owner_missing` |
+| 2214-2218 pending case handoff on the issue (`awaiting_release`, `pending_dispatch`) | Return null, no record | Decided under L4: `waiting:case_handoff`. A handoff that later changes the assignee makes the next recheck `invalidated` (owner mismatch) |
+| 2221 `issue_comment_mentioned` | Return null | Unreachable. The guard's reason is fixed (`issue_recovery_action_restored`) |
+| 2222-2234 conversation issue checks | Return null | Admission refuses an issue that `isConversation` matches (new refusal `issue_kind_not_supported`). If one is seen under the guard anyway: `invalidated:issue_kind_not_supported` |
+| 2236-2262 `paperclip_runner` config normalization | Write, no exit | Unchanged |
+| 2490-2508 scheduling suppression other than `task_drain` | Skipped request, return null | Decided in step 3: `waiting:operational_suppression`. It is a process setting, not a row, so there is no lock; flipping it on later is caught by the dispatch-side checks that already hold queued runs. `task_drain` stays as today (the wake is queued and dispatch holds it) |
+| 2521-2530 company not `active` | Skipped request, return null | Decided under L1: `paused` is `waiting:company_pause`; `archived` or missing is `invalidated:company_inactive` |
+| 2589-2637 issue not found by id or identifier | Falls through with no issue | Decided under L4: missing issue is `invalidated:issue_missing` |
+| 2613-2626 worktree execution cutoff | Skipped request, return null | Decided in step 3: `waiting:operational_suppression`, because the cutoff is a removable instance setting |
+| 2691-2708 budget invocation block | Skipped request, then throw | Decided under L1 (the budget hard-stop writes the company row or its accounting lock): `waiting:budget` |
+| 2710-2726 agent not invokable | Skipped request or throw | Decided under L2: `paused` and `pending_approval` are `waiting:agent_pause`; `terminated` is `invalidated:owner_not_invokable` |
+| 2729-2731 timer with heartbeat disabled | Skipped request, return null | Unreachable. The guard's source is `automation` |
+| 2733-2735 `wakeOnDemand` disabled | Skipped request, return null | Decided under L2 (agent config writes update the agent row): `waiting:wake_policy` |
+| 2737-2755 generic timer with no actionable work | Skipped request, return null | Unreachable. The guard's source is not `timer` and it has an issue |
+| 2757-2800 active subtree pause hold | Skipped request, return null | Decided under L3 and L4: `waiting:subtree_pause`. The tree-hold interaction exception is unreachable for the guard |
+
+Exits inside the transaction after the guard (the reconciliation branch at
+`queue.ts:3284-3342`, the execution blocker, dependency deferral and active-run
+deferral) are covered by step 3, which runs first and checks the same conditions
+on locked rows. As a backstop, when the guard is set, any in-transaction path that
+would return without inserting the run instead writes `invalidated:<reason>` in the
+same transaction, using the reason the path would have logged. So a guarded call
+always commits exactly one of `delivered`, `waiting` or `invalidated`. A thrown
+error (including `40P01` and `40001`) rolls the whole transaction back; the row
+stays `pending` and the existing delivery-queue retry backoff applies. That is a
+fault path, not a gate, and it is logged.
 
 The worker's own follow-up transaction that sets `retryOfRunId`
 (`execution-recovery-resolution.ts:356-381`) moves into step 5, so the run is written
@@ -602,8 +657,10 @@ Evidence states are `pending` → `delivered` | `invalidated` | `waiting`, and
   blocker issue moves to `done` or `cancelled` (dependency), interaction leaves
   `pending` (answer, accept, reject, expire, cancel), approval leaves `pending` or
   `revision_requested`, tree hold release, project, company or agent resume, budget
-  change that lifts a block, monitor cleared or fired, and checkout or execution run
-  released. A missed producer only delays delivery until `recheckAt`. It never loses
+  change that lifts a block, agent `wakeOnDemand` re-enabled, case handoff leaving
+  `awaiting_release` or `pending_dispatch`, monitor cleared or fired, and checkout or
+  execution run released. `operational_suppression` has no producer; it is rechecked
+  at `recheckAt` only. A missed producer only delays delivery until `recheckAt`. It never loses
   or duplicates a delivery, because the guard decides under lock each time.
 - Concurrent workers: two workers may select the same row. Both call `wakeup`; the
   second waits on L4, then sees `delivered` (or the wake key index rejects it) and
@@ -742,6 +799,15 @@ commit orders run. No test uses production data or claims live recovery.
 | Server restart with `pending` and `waiting` rows | Schedule recomputed from the database; each row delivered or rechecked once |
 | Stage changed after admit (slice B state or policy edited) | `invalidated`, no run |
 | Pre-lock budget or agent pause with the guard | `waiting:budget` or `waiting:agent_pause` recorded, no skipped request, no spin |
+| Company pause committed before the worker calls `wakeup`; subtree hold committed before the worker calls `wakeup` | `waiting:company_pause` or `waiting:subtree_pause` with `recheckAt` set; no wake row, no run row, no `execution-wait:*` skipped request; the row is not selected again before `recheckAt` (worker pass count does not change the row) |
+| Same two gates, then released with the producer (company resume, tree hold release) | One delivery right after release; one wake, one run |
+| Same two gates, released with the producer disabled | One delivery at `recheckAt`, not before |
+| Same two gates, server restarted while `waiting`, then released | Schedule recomputed from the database; one delivery after release |
+| Each remaining pre-transaction exit with the guard: case handoff pending, `wakeOnDemand` off, scheduling suppression, worktree cutoff | `waiting:<gate>` with `recheckAt`; no wake, no run |
+| Company archived, agent terminated, owner agent or issue deleted, conversation issue | `invalidated:<reason>`; no wake, no run; not selected again |
+| Guard set together with any exclusive option (manual, task retry, failed run, case, owner repair, durable, Dot, Muse) | Throws `invalid_reconciliation_guard`; nothing written |
+| Ordinary wakes without a guard for each exit above | Existing behavior and existing tests unchanged |
+| In-transaction path returns without a run while the guard is set | `invalidated:<reason>` in the same commit; never left `pending` |
 | Response lost after commit | Receipt read returns `committed`; retry with same key returns it; one run |
 | Barrier: POST paused after L0 and before commit; GET receipt; then POST commits | GET returns `unsettled` (not proof); settle blocks on L0 and then returns `committed`; one run |
 | Barrier: POST paused before commit, then aborts (injected failure) | Settle returns `abandoned`; a later POST with that key returns 409 `idempotency_key_settled`, no write |
