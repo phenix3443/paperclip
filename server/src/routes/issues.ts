@@ -21,6 +21,7 @@ import {
   lockCompanyForAdmission,
   verifyExecutionReconciliationAuthorization,
 } from "../services/issue-document-decisions.js";
+import { lockAdmissionOwnerAndTreeHolds } from "../services/execution-reconciliation-locks.js";
 import { assertNoCaseHandoffMutation } from "../services/heartbeat/case-handoff-lifecycle.js";
 import { assertLegacyRunTaskOwnership } from "../legacy-run-task-ownership.js";
 import { enqueueFastResponse } from "../services/fast-responses.js";
@@ -9759,6 +9760,7 @@ export function issueRoutes(
           assertBoard(req);
           await lockReconciliationKey(tx, existing.companyId, admission.idempotencyKey);
           admissionCompany = await lockCompanyForAdmission(tx, existing.companyId);
+          await lockAdmissionOwnerAndTreeHolds(tx, existing.companyId, existing.assigneeAgentId);
           priorReceipt = await selectReconciliationReceipt(tx, existing.companyId, admission.idempotencyKey);
         }
         const lockedIssue = await tx

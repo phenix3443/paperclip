@@ -1,4 +1,5 @@
 import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { lockIssueTreeHolds } from "./execution-reconciliation-locks.js";
 import type { Db } from "@paperclipai/db";
 import {
   agentWakeupRequests,
@@ -811,6 +812,7 @@ export function issueTreeControlService(db: Db) {
     }
 
     const { hold, members } = await db.transaction(async (tx) => {
+      await lockIssueTreeHolds(tx, companyId, "exclusive");
       const [createdHold] = await tx
         .insert(issueTreeHolds)
         .values({

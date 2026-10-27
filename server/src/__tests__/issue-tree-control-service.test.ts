@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, inArray } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -19,6 +19,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { issueTreeControlService } from "../services/issue-tree-control.js";
+import { lockIssueTreeHolds } from "../services/execution-reconciliation-locks.js";
 import { issueService } from "../services/issues.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -703,5 +704,51 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
       resumedPauseHoldIds: [subtreePause.hold.id],
       resumeMode: "subtree",
     });
+  });
+  it("serializes hold creation behind an admission that holds the shared tree-hold lock", async () => {
+    const companyId = randomUUID();
+    const rootIssueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({ id: rootIssueId, companyId, title: "Root", status: "todo", priority: "medium" });
+
+    const admissionDb = createDb(tempDb!.connectionString);
+    let releaseAdmission!: () => void;
+    let admissionLocked!: () => void;
+    const locked = new Promise<void>((resolve) => { admissionLocked = resolve; });
+    const admission = admissionDb.transaction(async (tx) => {
+      await lockIssueTreeHolds(tx, companyId, "shared");
+      admissionLocked();
+      await new Promise<void>((resolve) => { releaseAdmission = resolve; });
+    });
+    await locked;
+
+    let created = false;
+    const creating = issueTreeControlService(db).createHold(companyId, rootIssueId, {
+      mode: "pause",
+      actor: { actorType: "user", actorId: "board-user", userId: "board-user" },
+    }).then((result) => { created = true; return result; });
+
+    let waiting = false;
+    for (let attempt = 0; attempt < 100 && !waiting; attempt += 1) {
+      const rows = await db.execute(sql`
+        select 1 from pg_stat_activity
+        where wait_event_type = 'Lock' and wait_event = 'advisory' and query ilike '%pg_advisory_xact_lock(%'
+      `);
+      waiting = (rows as unknown as unknown[]).length > 0;
+      if (!waiting) await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(waiting).toBe(true);
+    expect(created).toBe(false);
+    expect(await db.select().from(issueTreeHolds).where(eq(issueTreeHolds.companyId, companyId))).toHaveLength(0);
+
+    releaseAdmission();
+    await admission;
+    const result = await creating;
+    expect(result.hold.status).toBe("active");
   });
 });
