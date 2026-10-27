@@ -156,6 +156,8 @@ export interface DatabaseClientOptions {
    */
   applicationName?: string;
   sessionParameters?: Record<string, string>;
+  dedicatedApplicationName?: string;
+  beforeDedicatedConnection?: () => () => void;
 }
 
 /**
@@ -261,24 +263,31 @@ export function postgresJsOptions(options: DatabaseClientOptions): Record<string
 const dedicatedDbFactories = new WeakMap<object, () => Db>();
 
 const openDedicatedDbs = new WeakMap<object, Set<Db>>();
+const dedicatedDbGuards = new WeakMap<object, () => () => void>();
 
 export async function withDedicatedDbConnection<T>(db: Db, action: (dedicated: Db) => Promise<T>): Promise<T> {
   const factory = dedicatedDbFactories.get(db);
   if (!factory) throw new Error("dedicated_connection_requires_create_db");
-  const dedicated = factory();
   const open = openDedicatedDbs.get(db) ?? new Set<Db>();
+  const release = dedicatedDbGuards.get(db)?.();
+  let dedicated: Db;
+  try { dedicated = factory(); }
+  catch (error) { release?.(); throw error; }
   openDedicatedDbs.set(db, open);
   open.add(dedicated);
   try { return await action(dedicated); }
   finally {
-    open.delete(dedicated);
-    await dedicated.$client.end({ timeout: 1 });
+    try { await dedicated.$client.end({ timeout: 1 }); }
+    finally { open.delete(dedicated); release?.(); }
   }
 }
 
+function openDedicatedDescendants(db: Db): Db[] {
+  return [...(openDedicatedDbs.get(db) ?? [])].flatMap(child => [child, ...openDedicatedDescendants(child)]);
+}
+
 export async function terminateDbConnections(db: Db): Promise<void> {
-  const dedicated = [...(openDedicatedDbs.get(db) ?? [])];
-  await Promise.allSettled([db, ...dedicated].map(client => client.$client.end({ timeout: 0 })));
+  await Promise.allSettled([db, ...openDedicatedDescendants(db)].map(client => client.$client.end({ timeout: 0 })));
 }
 
 // postgres.js pipelines a query onto a busy connection when none is idle, so
@@ -321,8 +330,9 @@ function createDbClient(url: string, resolved: DatabaseClientOptions, owner?: ob
   // message cannot establish that replay is safe. Leave retries to callers
   // that know the complete operation is idempotent.
   const db = installDatabaseWorkSignals(drizzlePg(sql, { schema }), owner);
+  if (resolved.beforeDedicatedConnection) dedicatedDbGuards.set(db, resolved.beforeDedicatedConnection);
   dedicatedDbFactories.set(db, () => createDbClient(url, {
-    ...resolved, maxConnections: 1, applicationName: "paperclip-workspace-finalization-lock",
+    ...resolved, maxConnections: 1, applicationName: resolved.dedicatedApplicationName ?? "paperclip-workspace-finalization-lock",
   }, db));
   livenessDbFactories.set(db, () => createDbClient(url, {
     ...resolved, maxConnections: LIVENESS_POOL_MAX_CONNECTIONS, applicationName: "paperclip-controller-lease",

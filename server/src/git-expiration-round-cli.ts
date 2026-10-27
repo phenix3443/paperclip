@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { GitExpirationBudgetExceeded, GIT_EXPIRATION_BUDGETS } from "./services/git-expiration-budget.js";
 import { inspectGitExpirationRound, GIT_EXPIRATION_ROUND_MODE, type GitExpirationRoundEvent, type GitExpirationRoundJournal,
   type GitExpirationRoundStatus, type GitExpirationRoundStopReason } from "./services/git-expiration-round.js";
 
@@ -12,7 +13,7 @@ export type GitExpirationRoundCliArgs = {
   databaseUrl: string;
   companyId?: string;
   maxRows?: number;
-  deadlineSeconds?: number;
+  deadlineSeconds: number;
 };
 
 const FIXED_FLAGS: Record<string, string> = { "--enabled": "true", "--dry-run": "true", "--expire-base": "false" };
@@ -23,8 +24,8 @@ const FIXED_ENV: Record<string, string> = {
 };
 const VALUE_FLAGS = new Set(["--round-id", "--evidence-dir", "--company-id", "--max-rows", "--deadline-seconds"]);
 
-function positiveInteger(name: string, value: string) {
-  if (!/^[1-9][0-9]{0,8}$/.test(value)) throw new GitExpirationRoundUsageError(`${name} must be a positive integer`);
+function boundedInteger(name: string, value: string, max: number) {
+  if (!/^[1-9][0-9]{0,8}$/.test(value) || Number(value) > max) throw new GitExpirationRoundUsageError(`${name} must be an integer from 1 to ${max}`);
   return Number(value);
 }
 
@@ -59,8 +60,9 @@ export function parseGitExpirationRoundArgs(argv: string[], env: NodeJS.ProcessE
   }
   const databaseUrl = env.DATABASE_URL;
   if (!databaseUrl) throw new GitExpirationRoundUsageError("DATABASE_URL is required");
-  const maxRows = values.has("--max-rows") ? positiveInteger("--max-rows", values.get("--max-rows")!) : undefined;
-  const deadlineSeconds = values.has("--deadline-seconds") ? positiveInteger("--deadline-seconds", values.get("--deadline-seconds")!) : undefined;
+  const maxRows = values.has("--max-rows") ? boundedInteger("--max-rows", values.get("--max-rows")!, GIT_EXPIRATION_BUDGETS.selectedRows) : undefined;
+  const deadlineSeconds = values.has("--deadline-seconds")
+    ? boundedInteger("--deadline-seconds", values.get("--deadline-seconds")!, GIT_EXPIRATION_BUDGETS.roundSeconds) : GIT_EXPIRATION_BUDGETS.roundSeconds;
   return { roundId, evidenceDir, databaseUrl, companyId, maxRows, deadlineSeconds };
 }
 
@@ -71,11 +73,18 @@ export type GitExpirationRoundJournalFile = {
   close(): Promise<void>;
 };
 
-export function fileGitExpirationRoundJournal(file: GitExpirationRoundJournalFile): GitExpirationRoundJournal & { close(): Promise<void> } {
+export const GIT_EXPIRATION_JOURNAL_TERMINAL_RESERVE_BYTES = 64 * 1024;
+const TERMINAL_EVENTS = new Set<GitExpirationRoundEvent["type"]>(["round_finished", "round_committed"]);
+
+export function fileGitExpirationRoundJournal(file: GitExpirationRoundJournalFile,
+  limitBytes: number = GIT_EXPIRATION_BUDGETS.evidenceBytes): GitExpirationRoundJournal & { close(): Promise<void> } {
   let size = 0;
   return {
     async append(event: GitExpirationRoundEvent) {
       const line = Buffer.from(`${JSON.stringify({ at: new Date().toISOString(), ...event })}\n`);
+      if (!TERMINAL_EVENTS.has(event.type) && size + line.length > limitBytes - GIT_EXPIRATION_JOURNAL_TERMINAL_RESERVE_BYTES) {
+        throw new GitExpirationBudgetExceeded("evidence", limitBytes, size + line.length);
+      }
       try {
         for (let written = 0; written < line.length;) {
           const { bytesWritten } = await file.write(line, written, line.length - written, size + written);
@@ -89,6 +98,7 @@ export function fileGitExpirationRoundJournal(file: GitExpirationRoundJournalFil
       }
       size += line.length;
     },
+    bytes: () => size,
     close: () => file.close(),
   };
 }
@@ -138,7 +148,7 @@ export async function runGitExpirationRoundCli(argv: string[], env: NodeJS.Proce
     try {
       summary = await inspectGitExpirationRound({
         databaseUrl: args.databaseUrl, mode: GIT_EXPIRATION_ROUND_MODE, roundId: args.roundId, journal, companyId: args.companyId, signal: controller.signal,
-        maxRows: args.maxRows, deadline: args.deadlineSeconds ? new Date(Date.now() + args.deadlineSeconds * 1000) : undefined,
+        maxRows: args.maxRows, deadline: new Date(Date.now() + args.deadlineSeconds * 1000),
         onUndrainedRow: released => { undrained = released.catch(() => undefined); },
       });
       process.stdout.write(`${JSON.stringify(summary)}\n`);
