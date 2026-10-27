@@ -778,6 +778,47 @@ describe("issue execution policy routes", () => {
     );
   });
 
+  it("refuses a policy transition when the locked task differs from the row it was computed on", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1009",
+      title: "Stale transition",
+      executionPolicy: null,
+      executionState: null,
+    };
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [
+        {
+          id: "11111111-1111-4111-8111-111111111111",
+          type: "review",
+          participants: [{ type: "agent", agentId: "44444444-4444-4444-8444-444444444444" }],
+        },
+      ],
+    })!;
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.getByIdForUpdate.mockResolvedValue({ ...issue, status: "blocked" });
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "in_review", executionPolicy: policy });
+
+    expect(res.status).toBe(409);
+    expect(res.body).toMatchObject({ details: { code: "execution_policy_transition_stale" } });
+    expect(mockDb.transaction).toHaveBeenCalled();
+    expect(mockIssueService.getByIdForUpdate).toHaveBeenCalled();
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
   it("allows an agent-authored in_review transition with a scheduled monitor", async () => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
