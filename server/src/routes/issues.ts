@@ -19006,8 +19006,6 @@ export function issueRoutes(
         })
       )
         return;
-      const closedExecutionWorkspace =
-        await getClosedIssueExecutionWorkspace(issue);
 
       const actor = getActorInfo(req);
       const commentPresentation =
@@ -19164,6 +19162,10 @@ export function issueRoutes(
           return;
         }
       }
+      // Cross-task candidates are classified above, so a binding the company cannot
+      // see gets their 409 rather than the stored-workspace access 403.
+      const closedExecutionWorkspace =
+        await getClosedIssueExecutionWorkspace(issue);
       // Reopen the closed isolated workspace only after every access, resume-intent,
       // blocker, and run-cap gate passes. A rejected comment must not rebuild and
       // republish the workspace as active, because the issue stays terminal and the
