@@ -802,14 +802,14 @@ describe("releaseIssueExecution review-participant recovery", () => {
     contextSnapshot: { issueId: ISSUE.id, wakeReason: "execution_review_requested" },
   };
 
-  async function release(hasPendingWakeInteraction: boolean, hasExplicitBlockerPath = false, hasPendingFinalizeBlocker = false) {
+  async function release(hasPendingWakeInteraction: boolean, hasExplicitBlockerPath = false, hasPendingFinalizeBlocker = false, issue: IssueSnapshot = reviewIssue) {
     const transaction = createFakeTransaction({
       hasPendingWakeInteraction: vi.fn(async () => hasPendingWakeInteraction),
       hasExplicitBlockerPath: vi.fn(async () => hasExplicitBlockerPath),
       hasPendingFinalizeBlocker: vi.fn(async () => hasPendingFinalizeBlocker),
     });
     const recovery = createFakeRecovery();
-    const issueLock = createFakeIssueLock(createFakeHost(), transaction, reviewIssue, reviewRun);
+    const issueLock = createFakeIssueLock(createFakeHost(), transaction, issue, reviewRun);
     await createReleaseIssueExecution({ issueLock, recovery })({ companyId: "company-1", runId: "run-1", now: new Date() });
     return { transaction, recovery };
   }
@@ -866,6 +866,12 @@ describe("releaseIssueExecution review-participant recovery", () => {
     const issueLock = createFakeIssueLock(createFakeHost(), transaction, reviewIssue, retryRun);
     await createReleaseIssueExecution({ issueLock, recovery })({ companyId: "company-1", runId: "run-1", now: new Date() });
     expect(transaction.queueReviewParticipantRecoveryRun).not.toHaveBeenCalled();
+    expect(recovery.escalateStrandedAssignedIssue).not.toHaveBeenCalled();
+  });
+
+  it("retries the reviewer when the blocker-resolved wake would go to a different assignee", async () => {
+    const { transaction, recovery } = await release(false, true, true, { ...reviewIssue, assigneeAgentId: "executor-agent" });
+    expect(transaction.queueReviewParticipantRecoveryRun).toHaveBeenCalledTimes(1);
     expect(recovery.escalateStrandedAssignedIssue).not.toHaveBeenCalled();
   });
 

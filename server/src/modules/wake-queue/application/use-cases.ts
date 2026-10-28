@@ -594,6 +594,7 @@ async function runReleaseRecoveryTail(
 
   const hasReviewBlockerWait =
     reviewParticipantApplies &&
+    issue.assigneeAgentId === currentParticipant?.agentId &&
     (hasExplicitBlockerPath ||
       (await transaction.hasPendingFinalizeBlocker({
         companyId: issue.companyId,
