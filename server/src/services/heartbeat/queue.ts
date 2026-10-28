@@ -1,4 +1,5 @@
 import { authorizationService } from "../authorization.js";
+import { isAdmittedReconciliation, isGuardedReconciliationDelivery, lockReconciledDeliveryPrefix, recordReconciledDeliveryOutcome, revalidateReconciledDelivery } from "../execution-reconciliation-delivery.js";
 import { assertTaskRetryConversationAllowed, readTaskRetryIntent, retireSupersededTaskRetry } from "../task-retry.js";
 import { insertIssueComment } from "../issue-comment-writes.js";
 import { withExternalAdmissionGuard, assertNoExternalOverlap } from "../../modules/external-agents/index.js";
@@ -2224,10 +2225,17 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
     let agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
+    const guardedDelivery = executionReconciliationWake && issueId
+      ? await isGuardedReconciliationDelivery(db, agent.companyId, issueId, enrichedContextSnapshot.recoveryActionId)
+      : false;
+    let guardedWaitingGate: string | null = null;
     if (issueId) {
       const [pending] = await db.select().from(caseHandoffs).where(and(eq(caseHandoffs.companyId, agent.companyId), eq(caseHandoffs.issueId, issueId),
         inArray(caseHandoffs.state, ["awaiting_release", "pending_dispatch"]))).limit(1);
-      if (pending && opts.durableCaseHandoffRequest?.handoffId !== pending.id) return null;
+      if (pending && opts.durableCaseHandoffRequest?.handoffId !== pending.id) {
+        if (!guardedDelivery) return null;
+        guardedWaitingGate ??= "case_handoff";
+      }
     }
     // Mentions only annotate comments. Ignore legacy callers before creating
     // a run or deferred request; assignment and review have their own wakes.
@@ -2512,6 +2520,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     // run and no path until a person noticed.
     if (
       schedulingSuppression.suppressed &&
+      schedulingSuppression.reason !== "task_drain" &&
+      guardedDelivery
+    ) {
+      guardedWaitingGate ??= "operational_suppression";
+    } else if (
+      schedulingSuppression.suppressed &&
       schedulingSuppression.reason !== "task_drain"
     ) {
       await writeSkippedHeartbeatRequest("heartbeat.scheduling_suppressed", {
@@ -2531,7 +2545,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       .where(eq(companies.id, agent.companyId))
       .then((rows) => rows[0] ?? null);
 
-    if (!company || company.status !== "active") {
+    if ((!company || company.status !== "active") && guardedDelivery) guardedWaitingGate ??= "company_pause";
+    if ((!company || company.status !== "active") && !guardedDelivery) {
       if (outboxRequest) return null;
       const companyStatus = company?.status ?? "missing";
       if (opts.requestedByActorType === "user") {
@@ -2625,6 +2640,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       if (resolvedIssue) {
         if (
           worktreeExecutionCutoff &&
+          resolvedIssue.createdAt < worktreeExecutionCutoff &&
+          guardedDelivery
+        ) {
+          guardedWaitingGate ??= "operational_suppression";
+        } else if (
+          worktreeExecutionCutoff &&
           resolvedIssue.createdAt < worktreeExecutionCutoff
         ) {
           await writeSkippedHeartbeatRequest(
@@ -2709,7 +2730,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         projectId,
       },
     );
-    if (budgetBlock) {
+    if (budgetBlock && guardedDelivery) guardedWaitingGate ??= "budget";
+    if (budgetBlock && !guardedDelivery) {
       await writeSkippedRequest("budget.blocked", { error: budgetBlock.reason }, {
         scopeType: budgetBlock.scopeType, scopeId: budgetBlock.scopeId,
       });
@@ -2722,7 +2744,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
     // Setup delays execution, but must not discard work accepted by a caller.
     const invokability = await getAgentInvokability(isAgentAwaitingSetup(agent) ? { ...agent, status: "idle" } : agent);
-    if (!invokability.invokable) {
+    if (!invokability.invokable && guardedDelivery) guardedWaitingGate ??= "agent_pause";
+    if (!invokability.invokable && !guardedDelivery) {
       if (outboxRequest) return null;
       if (opts.requestedByActorType !== "user" || executionWaitRequestId) {
         await writeSkippedRequest("agent.not_invokable", {
@@ -2743,7 +2766,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       await writeSkippedRequest("heartbeat.disabled", {}, { enabled: false });
       return null;
     }
-    if (source !== "timer" && !policy.wakeOnDemand) {
+    if (source !== "timer" && !policy.wakeOnDemand && guardedDelivery) {
+      guardedWaitingGate ??= "wake_policy";
+    } else if (source !== "timer" && !policy.wakeOnDemand) {
       await writeSkippedRequest("heartbeat.wakeOnDemand.disabled", {}, { wakeOnDemand: false });
       return null;
     }
@@ -2767,7 +2792,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       return null;
     }
 
-    if (issueId) {
+    if (issueId && !guardedDelivery) {
       const activePauseHold = await treeControlSvc.getActivePauseHoldGate(
         agent.companyId,
         issueId,
@@ -2832,8 +2857,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
       const cancelledRunsToEmit: (typeof heartbeatRuns.$inferSelect)[] = [];
 
+      let guardedDeliveryAction: typeof issueRecoveryActions.$inferSelect | null = null;
       const outcome = await db
         .transaction(async (tx) => {
+          guardedDeliveryAction = null;
+          const result = await (async () => {
+          if (executionReconciliationWake) await lockReconciledDeliveryPrefix(tx, agent.companyId, agentId);
           await tx.execute(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );
@@ -3301,6 +3330,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           }
 
           let reconciledSourceRunId: string | null = null;
+          let admittedDeliveryActionId: string | null = null;
           let reconciledRestoreRetryCount: number | null = null;
           if (executionReconciliationWake) {
             const actionId = readNonEmptyString(
@@ -3318,11 +3348,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               enrichedContextSnapshot.source !== "execution.reconciled" ||
               enrichedContextSnapshot.forceFreshSession !== true ||
               payload?.issueId !== issue.id ||
-              payload?.recoveryActionId !== actionId ||
-              issue.assigneeAgentId !== agentId ||
-              ["done", "cancelled"].includes(issue.status)
+              payload?.recoveryActionId !== actionId
             )
               return { kind: "skipped" as const };
+            const ownerOrClosedMismatch =
+              issue.assigneeAgentId !== agentId ||
+              ["done", "cancelled"].includes(issue.status);
 
             // The issue lock serializes all admissions for this source. Validate
             // the durable operator decision, then reconcile a prior queue commit
@@ -3356,10 +3387,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               !readNonEmptyString(decision.outcomeEvidence) ||
               enrichedContextSnapshot.previousRunId !== sourceRunId ||
               enrichedContextSnapshot.retryOfRunId !== sourceRunId ||
-              !["pending", "delivered"].includes(
+              !["pending", "waiting", "delivered"].includes(
                 String(action.evidence.continuationDelivery),
               )
             )
+              return { kind: "skipped" as const };
+            if (ownerOrClosedMismatch && !isAdmittedReconciliation(decision))
               return { kind: "skipped" as const };
 
             const [existingWake] = await tx
@@ -3403,8 +3436,20 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 return { kind: "deferred" as const };
               return { kind: "replayed" as const, run: existingRun };
             }
-            if (action.evidence.continuationDelivery !== "pending")
+            if (!["pending", "waiting"].includes(String(action.evidence.continuationDelivery)))
               return { kind: "skipped" as const };
+            if (isAdmittedReconciliation(decision)) {
+              const revalidated = await revalidateReconciledDelivery(tx, { companyId: issue.companyId, issueId: issue.id, action });
+              const delivery = revalidated.kind !== "invalidated" && guardedWaitingGate
+                ? { kind: "waiting" as const, gate: guardedWaitingGate }
+                : revalidated;
+              if (delivery.kind !== "deliver") {
+                await recordReconciledDeliveryOutcome(tx, action, delivery);
+                return { kind: "skipped" as const };
+              }
+              admittedDeliveryActionId = action.id;
+              guardedDeliveryAction = action;
+            }
             const [reconciledRun] = await tx.select().from(heartbeatRuns).where(and(
               eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, sourceRunId),
             ));
@@ -4460,12 +4505,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             .returning()
             .then((rows) => rows[0]);
 
-          if (ownsReconstructionContinuation) {
+          if (ownsReconstructionContinuation || admittedDeliveryActionId) {
             await tx.update(issueRecoveryActions).set({ evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({
               continuationDelivery: "delivered", continuationRunId: newRun.id,
             })}::jsonb` }).where(and(eq(issueRecoveryActions.companyId, issue.companyId),
               eq(issueRecoveryActions.id, String(enrichedContextSnapshot.recoveryActionId)),
-              sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`));
+              sql`${issueRecoveryActions.evidence}->>'continuationDelivery' in ('pending', 'waiting')`));
           }
 
           await tx
@@ -4512,6 +4557,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // transitions to "running" — Fix A (lazy locking).
 
           return { kind: "queued" as const, run: newRun };
+          })();
+          if (guardedDeliveryAction && result.kind !== "queued") {
+            await recordReconciledDeliveryOutcome(tx, guardedDeliveryAction, {
+              kind: "invalidated", reason: `queue_${result.kind}`,
+            });
+          }
+          return result;
         })
         .catch((error) => {
           if (isExternalChatWaitAuthorizationContention(error))

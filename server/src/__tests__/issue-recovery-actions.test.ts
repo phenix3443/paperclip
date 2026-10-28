@@ -2621,6 +2621,134 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       });
     });
 
+    describe("delivery revalidation in the queue transaction (slice A3b)", () => {
+      const admitted = async (key: string) => {
+        const fixture = await seedAdmission();
+        await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(await admissionBody(fixture, key)).expect(200);
+        const responsibleUserId = randomUUID();
+        await db.insert(authUsers).values({ id: responsibleUserId, name: "Recovery operator",
+          email: `${responsibleUserId}@example.test`, emailVerified: true, createdAt: new Date(), updatedAt: new Date() });
+        await db.update(companies).set({ defaultResponsibleUserId: responsibleUserId }).where(eq(companies.id, fixture.companyId));
+        await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, fixture.coderId));
+        return fixture;
+      };
+      const deliver = () => deliverReconciledExecutions(db, heartbeatService(db, { runtimeEnv: {} }).wakeup);
+      const actionRow = async (actionId: string) =>
+        (await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, actionId)))[0]!;
+      const reconciliationWakes = (actionId: string) => db.select().from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.idempotencyKey, `execution-reconciliation:${actionId}`));
+
+      it("delivers an admitted reconciliation once and marks it delivered in the same commit", async () => {
+        const fixture = await admitted("recon:a3b-deliver-0001");
+        await deliver();
+        await deliver();
+        const wakes = await reconciliationWakes(fixture.actionId);
+        expect(wakes).toHaveLength(1);
+        const action = await actionRow(fixture.actionId);
+        expect(action.evidence).toMatchObject({ continuationDelivery: "delivered", continuationRunId: wakes[0]!.runId });
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, wakes[0]!.runId!));
+        expect(run!.retryOfRunId).toBe(fixture.runId);
+      });
+
+      it("records waiting for a closed gate without a wake or run, then delivers after the gate opens", async () => {
+        const fixture = await admitted("recon:a3b-waiting-00001");
+        const [interaction] = await db.insert(issueThreadInteractions).values({ companyId: fixture.companyId,
+          issueId: fixture.sourceIssueId, kind: "request_confirmation", payload: {} as any }).returning();
+        const runsBefore = await db.select().from(heartbeatRuns);
+        await deliver();
+        const waiting = await actionRow(fixture.actionId);
+        expect(waiting.evidence).toMatchObject({ continuationDelivery: "waiting", continuationWait: { gate: "interaction", attempts: 1 } });
+        expect(new Date((waiting.evidence as any).continuationWait.recheckAt).getTime()).toBeGreaterThan(Date.now());
+        expect(await reconciliationWakes(fixture.actionId)).toHaveLength(0);
+        expect(await db.select().from(heartbeatRuns)).toHaveLength(runsBefore.length);
+
+        await deliver();
+        expect((await actionRow(fixture.actionId)).evidence).toMatchObject({ continuationWait: { attempts: 1 } });
+
+        await db.update(issueThreadInteractions).set({ status: "answered" }).where(eq(issueThreadInteractions.id, interaction!.id));
+        await db.update(issueRecoveryActions).set({
+          evidence: sql`jsonb_set(${issueRecoveryActions.evidence}, '{continuationWait,recheckAt}', to_jsonb(${new Date(Date.now() - 1000).toISOString()}::text))`,
+        }).where(eq(issueRecoveryActions.id, fixture.actionId));
+        await deliver();
+        const delivered = await actionRow(fixture.actionId);
+        expect(delivered.evidence).toMatchObject({ continuationDelivery: "delivered" });
+        expect(await reconciliationWakes(fixture.actionId)).toHaveLength(1);
+      });
+
+      it.each([
+        ["company paused", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.update(companies)
+          .set({ status: "paused" }).where(eq(companies.id, f.companyId)), "company_pause"],
+        ["agent paused", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.update(agents)
+          .set({ status: "paused" }).where(eq(agents.id, f.coderId)), "agent_pause"],
+        ["on-demand wakes off", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.update(agents)
+          .set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1, wakeOnDemand: false } } }).where(eq(agents.id, f.coderId)), "wake_policy"],
+      ])("records waiting instead of dropping the wake before the queue transaction when %s", async (_name, change, gate) => {
+        const fixture = await admitted(`recon:a3b-pretx-${randomUUID().slice(0, 8)}`);
+        await change(fixture);
+        const runsBefore = (await db.select().from(heartbeatRuns)).length;
+        await deliver();
+        expect((await actionRow(fixture.actionId)).evidence).toMatchObject({
+          continuationDelivery: "waiting", continuationWait: { gate },
+        });
+        expect(await reconciliationWakes(fixture.actionId)).toHaveLength(0);
+        expect(await db.select().from(heartbeatRuns)).toHaveLength(runsBefore);
+      });
+
+      it.each([
+        ["a review state", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.update(issues)
+          .set({ executionState: { status: "pending" } as any }).where(eq(issues.id, f.sourceIssueId)), "stage_changed"],
+        ["a newer run", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.insert(heartbeatRuns).values({ id: randomUUID(),
+          companyId: f.companyId, agentId: f.coderId, invocationSource: "manual", status: "failed", issueId: f.sourceIssueId,
+          finishedAt: new Date() } as any), "newer_run"],
+        ["a missing receipt", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.delete(executionReconciliationReceipts)
+          .where(eq(executionReconciliationReceipts.actionId, f.actionId)), "receipt_missing"],
+        ["a receipt that no longer matches the action", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.update(issueRecoveryActions)
+          .set({ evidence: sql`jsonb_set(${issueRecoveryActions.evidence}, '{executionReconciliation,authorizationPayloadDigest}', '"0000"'::jsonb)` })
+          .where(eq(issueRecoveryActions.id, f.actionId)), "receipt_mismatch"],
+        ["an archived company", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.update(companies)
+          .set({ status: "archived" }).where(eq(companies.id, f.companyId)), "company_inactive"],
+        ["a terminated owner", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.update(agents)
+          .set({ status: "terminated" }).where(eq(agents.id, f.coderId)), "owner_not_invokable"],
+      ])("invalidates delivery after %s without a wake or run", async (_name, change, reason) => {
+        const fixture = await admitted(`recon:a3b-inval-${randomUUID().slice(0, 8)}`);
+        await change(fixture);
+        await deliver();
+        expect((await actionRow(fixture.actionId)).evidence).toMatchObject({
+          continuationDelivery: "invalidated", continuationInvalidatedReason: reason,
+        });
+        expect(await reconciliationWakes(fixture.actionId)).toHaveLength(0);
+      });
+
+      it.each([
+        ["the owner is cleared", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.update(issues)
+          .set({ assigneeAgentId: null }).where(eq(issues.id, f.sourceIssueId)), "owner_mismatch"],
+        ["the task is reassigned", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.update(issues)
+          .set({ assigneeAgentId: f.managerId }).where(eq(issues.id, f.sourceIssueId)), "owner_mismatch"],
+        ["the task is done", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.update(issues)
+          .set({ status: "done" }).where(eq(issues.id, f.sourceIssueId)), "issue_closed"],
+        ["the task is cancelled", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.update(issues)
+          .set({ status: "cancelled" }).where(eq(issues.id, f.sourceIssueId)), "issue_closed"],
+        ["the return owner is gone", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.update(issueRecoveryActions)
+          .set({ returnOwnerAgentId: null }).where(eq(issueRecoveryActions.id, f.actionId)), "owner_missing"],
+      ])("persists invalidation when %s instead of leaving delivery pending", async (_name, change, reason) => {
+        const fixture = await admitted(`recon:a3b-exit-${randomUUID().slice(0, 8)}`);
+        await change(fixture);
+        const runsBefore = (await db.select().from(heartbeatRuns)).length;
+        await deliver();
+        const invalidated = await actionRow(fixture.actionId);
+        expect(invalidated.evidence).toMatchObject({
+          continuationDelivery: "invalidated", continuationInvalidatedReason: reason,
+        });
+        expect(await reconciliationWakes(fixture.actionId)).toHaveLength(0);
+        expect(await db.select().from(heartbeatRuns)).toHaveLength(runsBefore);
+
+        await deliver();
+        expect((await actionRow(fixture.actionId)).evidence).toEqual(invalidated.evidence);
+        expect(await reconciliationWakes(fixture.actionId)).toHaveLength(0);
+        expect(await db.select().from(heartbeatRuns)).toHaveLength(runsBefore);
+      });
+    });
+
     describe("gates on locked rows (slice A3a)", () => {
       type Fixture = Awaited<ReturnType<typeof seedAdmission>>;
       type Setup = (fixture: Fixture) => Promise<unknown>;

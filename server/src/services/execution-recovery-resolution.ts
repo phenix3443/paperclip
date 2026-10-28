@@ -294,7 +294,11 @@ export async function deliverReconciledExecutions(
     .where(
       and(
         eq(issueRecoveryActions.status, "resolved"),
-        sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`,
+        or(
+          sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`,
+          sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'waiting'
+            and (${issueRecoveryActions.evidence}#>>'{continuationWait,recheckAt}') <= ${new Date().toISOString()}`,
+        ),
       ),
     )
     .limit(25);
@@ -302,14 +306,26 @@ export async function deliverReconciledExecutions(
     try {
       const decision = action.evidence.executionReconciliation as
         ExecutionReconciliation | undefined;
-      if (!decision || !action.returnOwnerAgentId) continue;
+      if (!decision) continue;
       const pendingDecision = and(
         eq(issueRecoveryActions.companyId, action.companyId),
         eq(issueRecoveryActions.id, action.id),
         eq(issueRecoveryActions.status, "resolved"),
-        sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`,
+        sql`${issueRecoveryActions.evidence}->>'continuationDelivery' in ('pending', 'waiting')`,
         sql`${issueRecoveryActions.evidence}->'executionReconciliation' = ${JSON.stringify(decision)}::jsonb`,
       );
+      const admitted = typeof (decision as { authorizationPayloadDigest?: unknown }).authorizationPayloadDigest === "string";
+      if (!action.returnOwnerAgentId) {
+        if (admitted) {
+          await db
+            .update(issueRecoveryActions)
+            .set({
+              evidence: sql`${issueRecoveryActions.evidence} || '{"continuationDelivery":"invalidated","continuationInvalidatedReason":"owner_missing"}'::jsonb`,
+            })
+            .where(pendingDecision);
+        }
+        continue;
+      }
       const [task] = await db
         .select()
         .from(issues)
@@ -321,8 +337,10 @@ export async function deliverReconciledExecutions(
         );
       if (
         !task ||
-        task.assigneeAgentId !== action.returnOwnerAgentId ||
-        ["done", "cancelled"].includes(task.status)
+        (!admitted && (
+          task.assigneeAgentId !== action.returnOwnerAgentId ||
+          ["done", "cancelled"].includes(task.status)
+        ))
       ) {
         await db
           .update(issueRecoveryActions)

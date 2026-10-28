@@ -335,6 +335,9 @@ only. Separately inspect the underlying execution if it is still stuck.
   pause hold, approval link, policy transition or document decision that races
   admission either commits first and refuses it, or waits for it; see
   [agent access](../agent-access-map/recovery.md#admit-under-gate-locks).
+- A waiting reconciled delivery is not lost or stuck: it is rechecked under
+  lock at its backoff time and is delivered at most once; see
+  [agent access](../agent-access-map/recovery.md#deliver-admitted-reconciliation).
 - Active-run watchdogs, task watchdogs, reviewers, and recovery owners have
   different authority. No recovery card grants board permission by itself.
 - Idle Agent Chat is not stranded work. An intentional operator stop must not

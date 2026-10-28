@@ -74,7 +74,14 @@ export function executionControlSchedule(db: Db) {
         eq(issueRecoveryActions.status, "resolved"),
         sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`,
       )).limit(1);
-      return rows.length ? retry() : null;
+      if (rows.length) return retry();
+      const [waiting] = await db.select({
+        at: sql<string | null>`min(${issueRecoveryActions.evidence}#>>'{continuationWait,recheckAt}')`,
+      }).from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.status, "resolved"),
+        sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'waiting'`,
+      ));
+      return deadline([waiting?.at ? new Date(waiting.at) : null]);
     },
     async status() {
       const rows = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
