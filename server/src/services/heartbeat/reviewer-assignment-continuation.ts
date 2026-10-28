@@ -1,3 +1,5 @@
+import { connectionContinuationPendingResponse } from "../satisfied-connection-intents.js";
+import { authorizationService, type AuthorizationActor, type AuthorizationResource } from "../authorization.js";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { and, asc, eq, inArray, isNull, not, sql } from "drizzle-orm";
@@ -160,6 +162,22 @@ export async function admitReviewerIntent(tx: Db, candidate: Receipt) {
   }
   if (company === "archived") { await retire(tx, row, "Company archived"); return null; }
   if (company !== "active") { await hold(tx, row, intent, "company_inactive"); return null; }
+  const access = authorizationService(tx);
+  const actors: AuthorizationActor[] = [{ type: "agent", agentId: row.agentId, companyId: row.companyId,
+    onBehalfOfUserId: task.responsibleUserId, source: "agent_key" }];
+  if (id.actorType === "agent") actors.push({ type: "agent", agentId: id.actorId, companyId: row.companyId,
+    onBehalfOfUserId: task.responsibleUserId, source: "agent_key" });
+  if (id.actorType === "user") actors.push({ type: "board", userId: id.actorId, source: "session", ignoreInstanceAdmin: true });
+  const resources: AuthorizationResource[] = [{ type: "issue", companyId: row.companyId, issueId: task.id }];
+  if (task.projectId) resources.push({ type: "project", companyId: row.companyId, projectId: task.projectId });
+  for (const actor of actors) {
+    for (const resource of resources) {
+      const decision = await access.decide({ actor, action: resource.type === "project" ? "project:read" : "issue:read", resource });
+      if (!decision.allowed) { await hold(tx, row, intent, decision.code ?? decision.reason); return null; }
+    }
+  }
+  const response = await connectionContinuationPendingResponse(tx, task, task.responsibleUserId, null);
+  if (response) { await hold(tx, row, intent, `pending_${response}`); return null; }
   const [successor] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, row.companyId),
     eq(heartbeatRuns.agentId, row.agentId), inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
     sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${task.id}`,
