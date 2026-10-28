@@ -1,3 +1,6 @@
+import { tmpdir } from "node:os";
+import { createQueuedCommentQueue } from "../modules/wake-queue/index.js";
+import { createQueuedCommentIssueLockWriter } from "../modules/wake-queue/adapters/queued-comment-postgres.js";
 import { createReviewerAssignmentIntent } from "../services/heartbeat/reviewer-assignment-continuation.js";
 import { initializeRunIdentity } from "../services/run-identity.js";
 import { readFile, rm } from "node:fs/promises";
@@ -27,7 +30,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const f = await seedReviewerIntent(db, false);
     await db.update(issues).set({ responsibleUserId: null }).where(eq(issues.id, f.issueId));
     const [busy] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" }).returning();
-    const marker = join(process.env.TMPDIR!, `identity-provider-${randomUUID()}`); markers.push(marker);
+    const marker = join(tmpdir(), `identity-provider-${randomUUID()}`); markers.push(marker);
     await db.update(agents).set({ adapterConfig: { command: process.execPath,
       args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)},'started')`] } }).where(eq(agents.id, f.agentId));
     const service = heartbeatService(db, { runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "false" } });
@@ -166,11 +169,47 @@ const support = await getEmbeddedPostgresTestSupport();
     } finally { await service.drainActiveRunExecutions(); }
   });
 
+  it.each(["reorder", "discard"] as const)("uses the remaining message author after a queued review %s", async mutation => {
+    const f = await seedReviewerIntent(db, false);
+    await db.insert(authUsers).values({ id: "writer", name: "Writer", email: "writer@example.test", createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();
+    await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: "writer", membershipRole: "operator", status: "active" });
+    await db.update(issues).set({ responsibleUserId: null }).where(eq(issues.id, f.issueId));
+    const messages = await db.insert(issueComments).values(["board", "writer"].map(authorUserId => ({
+      companyId: f.companyId, issueId: f.issueId, authorUserId, body: `Instruction from ${authorUserId}`,
+    }))).returning();
+    const [busy] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" }).returning();
+    await db.update(agents).set({ adapterConfig: { command: process.execPath, args: ["-e", "process.exit(0)"] } }).where(eq(agents.id, f.agentId));
+    const service = heartbeatService(db, { runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "false" } });
+    const deps = { syncCommentReferences: async () => {}, deleteCommentReferenceSource: async () => {}, syncCommentExternalObjectsSafely: async () => {} };
+    try {
+      const run = await service.wakeup(f.agentId, { source: "assignment", reason: "execution_review_requested",
+        payload: { issueId: f.issueId }, contextSnapshot: { wakeCommentIds: messages.map(message => message.id) },
+        requestedByActorType: "agent", requestedByActorId: f.source.agentId });
+      expect(run).toMatchObject({ responsibleUserId: "writer" });
+      const [task] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+      const input = { issue: task, actor: { actorType: "user" as const, actorId: "writer", agentId: null, runId: null, agentApiKeyId: null }, queueId: run!.wakeupRequestId! };
+      const queue = await createQueuedCommentIssueLockWriter(db, deps).withLockedQueue(input, async locked => locked.queue);
+      const owner = createQueuedCommentQueue(db, deps);
+      if (mutation === "reorder") await owner.reorderQueuedComments({ ...input, revision: queue.revision!, orderedCommentIds: [messages[1].id, messages[0].id], now: new Date() });
+
+      else await owner.discardQueuedComment({ ...input, revision: queue.revision!, commentId: messages[1].id, now: new Date() });
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, busy.id));
+      await service.resumeQueuedRuns(); await service.drainActiveRunExecutions();
+      const [finished] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run!.id));
+      const [identity] = await db.select().from(runIdentityContexts).where(eq(runIdentityContexts.id, finished.activeIdentityContextId!));
+      const expectedUser = "board";
+      expect(finished).toMatchObject({ status: "succeeded", responsibleUserId: expectedUser });
+      expect(identity.responsibleUserId).toBe(expectedUser);
+      expect(finished.contextSnapshot?.reviewerAssignmentGeneration).toBe(run!.contextSnapshot?.reviewerAssignmentGeneration);
+      expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0].responsibleUserId).toBe(task.responsibleUserId);
+    } finally { await service.drainActiveRunExecutions(); }
+  });
+
   async function identityReview() {
     const f = await seedReviewerIntent(db, false);
     await db.update(issues).set({ responsibleUserId: null,
       executionPolicy: { ...f.issue.executionPolicy!, commentRequired: false } }).where(eq(issues.id, f.issueId));
-    const marker = join(process.env.TMPDIR!, `identity-boundary-${randomUUID()}`); markers.push(marker);
+    const marker = join(tmpdir(), `identity-boundary-${randomUUID()}`); markers.push(marker);
     await db.update(agents).set({ adapterConfig: { command: process.execPath,
       args: ["-e", `require('node:fs').appendFileSync(${JSON.stringify(marker)},process.env.PAPERCLIP_RUN_ID+String.fromCharCode(10));setTimeout(()=>process.exit(0),2000)`] } }).where(eq(agents.id, f.agentId));
     const opts = { source: "assignment" as const, reason: "execution_review_requested", payload: { issueId: f.issueId },
