@@ -159,6 +159,12 @@ own policy and access review.
 Gaps: Task-tree/agent pause and confirmed stop need policy-preserving authority; no
 generic agent management path.
 
+Reviewer intent: Explicit task Stop retires unfinished duty. Temporary tree,
+agent, project, company and budget holds preserve it. Message/session cancellation
+does not gain reviewer authority. The
+[service/PostgreSQL tests](../../server/src/__tests__/heartbeat-reviewer-intent-retirement.test.ts)
+cover lifecycle behavior, not live agent control permission.
+
 ## `drafts`
 
 Capability ID: `steering/drafts`.

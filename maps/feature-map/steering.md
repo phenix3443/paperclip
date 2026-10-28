@@ -168,6 +168,8 @@ gap; do not assume browser queue controls are available in every channel.
   name. A UI row disappearing optimistically does not prove provider receipt.
 - Interrupt, stop, task pause, agent pause, and budget pause have different
   effects. A running indicator disappearing does not prove remote work stopped.
+  Explicit task Stop retires unfinished reviewer intent; temporary pauses retain
+  it. Service/PostgreSQL coverage: [retirement tests](../../server/src/__tests__/heartbeat-reviewer-intent-retirement.test.ts).
 - An interrupted run may need verified cleanup before a saved follow-up can
   start. Preserve and inspect the wait reason; see [recovery](./recovery.md).
 - A healthy idle Agent Chat is waiting for input, not stranded unfinished work.

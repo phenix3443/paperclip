@@ -4,6 +4,7 @@ import { assertOnboardingFirstTaskCreationAllowed } from "./onboarding-first-tas
 
 import { resolveConnectionIntentContinuationSource, resolveItemVerdictContinuationWake } from "./chat-interaction-continuation.js";
 import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
+import { retireReviewerIntents } from "./heartbeat/reviewer-assignment-continuation.js";
 import { insertIssueComment } from "./issue-comment-writes.js";
 import { measureRunTransaction } from "./execution-transaction-timing.js";
 import { readNativeMonitorSource } from "./native-runtime/native-monitor-delivery.js";
@@ -11415,6 +11416,10 @@ export function issueService(db: Db) {
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;
+        if (updated.status === "done" || updated.status === "cancelled") {
+          await retireReviewerIntents(tx, { companyId: updated.companyId, issueId: updated.id,
+            reason: `Task was marked ${updated.status}` });
+        }
         if (updated.status === "done") {
           await completeTerminalCaseHandoffsForIssue(tx, { companyId: updated.companyId, issueId: updated.id,
             publications: activityPublications });

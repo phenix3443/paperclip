@@ -1,6 +1,7 @@
 import { logger } from "../middleware/logger.js";
 import { companies, type Db } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
+import { retireReviewerIntents } from "./heartbeat/reviewer-assignment-continuation.js";
 import * as lifecycle from "../modules/agent-lifecycle/index.js";
 import { withAccountingTransaction } from "./accounting-transaction.js";
 import { budgetServiceInTransaction, policyBlocks, type BudgetServiceHooks } from "./budgets.js";
@@ -45,7 +46,13 @@ export function createAgentLifecycleEffects(_hooks: BudgetServiceHooks = {}): li
         scopeType: "agent", scopeId: agentId, amount, isActive, windowKind: "calendar_month_utc",
       }, userId),
     recordCreation: (db, companyId, agentId) => recordResourceCreationEvent(db, companyId, "agent", agentId),
-    recordStatus: recordAgentStatusEvent,
+    recordStatus: async (db, companyId, agentId, before, after) => {
+      if (after === "terminated") {
+        await retireReviewerIntents(db, { companyId, agentIds: [agentId],
+          reason: "Cancelled because the target agent was permanently removed" });
+      }
+      return recordAgentStatusEvent(db, companyId, agentId, before, after);
+    },
     clearPrimary: clearPrimaryAgent,
     prepareConfiguration: prepareAgentConfiguration,
     completeConfiguration: completeAgentConfiguration,

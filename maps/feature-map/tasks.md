@@ -36,6 +36,10 @@ title bounds, and the first-row origin should remain stable. Test nested expansi
 scrolling to more rows, and detail/back navigation; a collection projection must
 never suppress the full task instruction fetch.
 
+Terminal task updates retire unfinished reviewer assignment intent through the
+common issue service. Reopening does not replay that retired receipt. Service
+coverage: [retirement tests](../../server/src/__tests__/heartbeat-reviewer-intent-retirement.test.ts).
+
 ### `new-task`
 
 Use New task from the global launcher, task list, or project task view.

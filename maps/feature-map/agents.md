@@ -6,6 +6,10 @@ navigation: {"section":"Agents and reusable capabilities","sectionOrder":30,"ord
 
 Operators hire agents, configure their identity and instructions, assign reporting relationships, and manage their lifecycle. Built-in agents have their own setup and lifecycle constraints.
 
+Agent pause preserves unfinished reviewer intent. Permanent termination retires
+it with its original context and reason. Service coverage:
+[retirement tests](../../server/src/__tests__/heartbeat-reviewer-intent-retirement.test.ts).
+
 Feature ID: `agents`.
 
 Implementation: [hiring](../../ui/src/pages/NewAgent.tsx), [configuration](../../ui/src/components/AgentConfigForm.tsx), [organization](../../ui/src/pages/OrgChart.tsx).
