@@ -48,7 +48,7 @@ type Workspace = {
   cwd: string | null; providerRef: string | null; status?: string; metadata: Record<string, unknown> | null;
 };
 
-function managedSourcePaths(workspace: Workspace) {
+export function managedSourcePaths(workspace: Workspace) {
   if (!workspace.projectId || !workspace.repoUrl) return [];
   let repoName: string | null = null;
   try { repoName = new URL(workspace.repoUrl).pathname.replace(/\/+$/, "").split("/").pop()?.replace(/\.git$/i, "") || null; } catch { return []; }
@@ -424,18 +424,26 @@ export function gitCacheExpirationLockLocations(workspace: Workspace): GitExpira
   const state = readGitCacheExpiration(workspace);
   const recipe = readGitCacheRestoration(workspace);
   if (!state || !recipe || !state.lockToken || state.completed) return [];
+  return gitExpirationMarkerLocations({ sourcePath: recipe.sourcePath, worktreePath: recipe.worktreePath, worktreeAdmin: state.worktreeAdmin,
+    branchName: recipe.branchName, checkouts: recipe.contents?.checkouts ?? [] });
+}
+
+export type GitExpirationMarkerAnchor = { sourcePath: string; worktreePath: string; worktreeAdmin: string; branchName: string;
+  checkouts: ReadonlyArray<{ name: string; branchName: string | null }> };
+
+export function gitExpirationMarkerLocations(anchor: GitExpirationMarkerAnchor): GitExpirationLockLocation[] {
   const branchPath = (branch: string) => {
     if (!branch || branch.split("/").some(part => !part || part === "." || part === "..") || branch.includes("\\")) throw new GitCacheRestorationFailure();
     return `refs/heads/${branch}.lock`;
   };
   const locations: GitExpirationLockLocation[] = [
-    ...["index.lock", "HEAD.lock"].map(name => ({ root: recipe.sourcePath,
-      relativePath: path.relative(recipe.sourcePath, path.join(state.worktreeAdmin, name)), checkout: null })),
-    { root: recipe.sourcePath, relativePath: path.join(".git", branchPath(recipe.branchName)), checkout: null },
+    ...["index.lock", "HEAD.lock"].map(name => ({ root: anchor.sourcePath,
+      relativePath: path.relative(anchor.sourcePath, path.join(anchor.worktreeAdmin, name)), checkout: null })),
+    { root: anchor.sourcePath, relativePath: path.join(".git", branchPath(anchor.branchName)), checkout: null },
   ];
-  for (const checkout of recipe.contents?.checkouts ?? []) {
+  for (const checkout of anchor.checkouts) {
     for (const name of ["index.lock", "HEAD.lock", ...(checkout.branchName ? [branchPath(checkout.branchName)] : [])]) {
-      locations.push({ root: recipe.worktreePath, relativePath: path.join(PROJECT_REPOSITORIES_DIR, checkout.name, ".git", name), checkout: checkout.name });
+      locations.push({ root: anchor.worktreePath, relativePath: path.join(PROJECT_REPOSITORIES_DIR, checkout.name, ".git", name), checkout: checkout.name });
     }
   }
   return locations;

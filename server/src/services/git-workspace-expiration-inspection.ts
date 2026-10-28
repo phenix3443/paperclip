@@ -27,6 +27,20 @@ export async function allocatedBytes(target: string, shouldContinue: () => boole
   return bytes;
 }
 
+/** The worktree admin dir must be the source's own `worktrees/<name>` entry, by path and by realpath. */
+export async function verifiedWorktreeAdmin(sourcePath: string, rawAdmin: string) {
+  const worktreeAdmin = path.join(sourcePath, ".git", "worktrees", path.basename(rawAdmin));
+  const canonicalAdmin = path.join(await fs.realpath(sourcePath), ".git", "worktrees", path.basename(rawAdmin));
+  if (await fs.realpath(worktreeAdmin) !== canonicalAdmin || await fs.realpath(rawAdmin) !== canonicalAdmin) {
+    throw new Error("unproven_worktree_admin");
+  }
+  return worktreeAdmin;
+}
+
+export function gitWorktreeTrashPath(worktreePath: string, workspaceId: string, generation: number) {
+  return path.join(path.dirname(worktreePath), `.expired-git-worktree-${workspaceId}-${generation}`);
+}
+
 export async function pathExists(target: string) {
   return fs.lstat(target).then(() => true, (error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return false; throw error; });
 }

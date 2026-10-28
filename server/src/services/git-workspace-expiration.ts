@@ -9,7 +9,7 @@ import { withIsolatedRepositorySourceLock, verifiedRecordedIsolatedRemoteSource 
 import { assertReproducibleGitFiles, assertReproducibleBaseGitStorage, readGitCacheRestoration,
   verifyRemoteGitCommit, gitCacheExpirationLockLocations, recoverGitCacheExpirationLocks, gitCacheCommand, readGitCacheExpiration, finishGitCacheTrash, type GitCacheExpiration, GIT_CACHE_RESTORATION_KEY, GIT_CACHE_EXPIRATION_REASON } from "./git-workspace-restoration.js";
 import { allocatedBytes, pathExists, gitExpirationSkipReason, expirationGitAuth, isGitWorkspaceExpirationEligible, inspectLockedGitExpirationCandidate,
-  GIT_CACHE_EXPIRATION_KEY, type Workspace } from "./git-workspace-expiration-inspection.js";
+  verifiedWorktreeAdmin, gitWorktreeTrashPath, GIT_CACHE_EXPIRATION_KEY, type Workspace } from "./git-workspace-expiration-inspection.js";
 
 export { gitExpirationSkipReason, withAnonymousGitFallback, isGitWorkspaceExpirationEligible, hasPendingGitExpiration } from "./git-workspace-expiration-inspection.js";
 const skipReason = gitExpirationSkipReason;
@@ -84,13 +84,9 @@ export async function expireReconstructableGitWorkspace(db: Db, snapshot: Worksp
         if (!state) {
           const generation = Number(workspace.metadata?.lifecycleGeneration ?? 0) + 1;
           const rawAdmin = (await gitCacheCommand(recipe.worktreePath, ["rev-parse", "--absolute-git-dir"], options.signal)).trim();
-          const worktreeAdmin = path.join(recipe.sourcePath, ".git", "worktrees", path.basename(rawAdmin));
-          const canonicalAdmin = path.join(await fs.realpath(recipe.sourcePath), ".git", "worktrees", path.basename(rawAdmin));
-          if (await fs.realpath(worktreeAdmin) !== canonicalAdmin || await fs.realpath(rawAdmin) !== canonicalAdmin) {
-            throw new Error("unproven_worktree_admin");
-          }
+          const worktreeAdmin = await verifiedWorktreeAdmin(recipe.sourcePath, rawAdmin);
           state = { schema: "paperclip.git-cache-expiration.v1", generation, workspaceRemoved: false,
-            worktreeTrash: path.join(path.dirname(recipe.worktreePath), `.expired-git-worktree-${workspace.id}-${generation}`),
+            worktreeTrash: gitWorktreeTrashPath(recipe.worktreePath, workspace.id, generation),
             worktreeAdmin, baseTrash: null, completed: false, lockToken: randomBytes(32).toString("hex") };
           if (await exists(state.worktreeTrash)) throw new Error("unknown_worktree_trash");
           // Commit the immutable restoration recipe BEFORE touching disk. The separate

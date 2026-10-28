@@ -14,7 +14,7 @@ import { ensureSavedGitCommit, gitCacheCommand, GitCacheRestorationFailure, onGi
 
 export const CLAUDE_SETTINGS_PATH = ".claude/settings.local.json";
 const SETTINGS_LIMIT = 64 * 1024;
-const CHECKOUT_LIMIT = 50;
+export const CHECKOUT_LIMIT = 50;
 type Identity = { companyId: string; workspaceId: string };
 type Settings = { material: StoredSecretVersionMaterial } | null;
 export type ManagedCheckoutSource = { id: string; repoUrl: string; repoRef: string | null; cwd: string | null };
