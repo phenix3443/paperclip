@@ -15278,7 +15278,8 @@ export function issueRoutes(
       try {
         if (shouldUseTransactionalIssueUpdate) {
           issue = await db.transaction(async (tx) => {
-            await tx.select({ id: companies.id }).from(companies).where(eq(companies.id, existing.companyId)).for("share");
+            if (updateFields.executionState !== undefined)
+              await tx.select({ id: companies.id }).from(companies).where(eq(companies.id, existing.companyId)).for("share");
             if (
               reviewPolicySensitiveMutationRequested &&
               !(await assertLockedReviewPolicyAllowsMutation(tx))
@@ -19414,7 +19415,8 @@ export function issueRoutes(
         const postCommitIssueActions: IssuePostCommitAction[] = [];
         try {
           txResult = await db.transaction(async (tx) => {
-            await tx.select({ id: companies.id }).from(companies).where(eq(companies.id, currentIssue.companyId)).for("share");
+            if (updatePatch.executionState !== undefined)
+              await tx.select({ id: companies.id }).from(companies).where(eq(companies.id, currentIssue.companyId)).for("share");
             const insertedComment = await svc.addComment(
               id,
               req.body.body,
