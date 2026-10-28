@@ -644,9 +644,6 @@ function clearExecutionStatePatch(input: {
   }
 }
 
-// A board status change on a pending review either holds it (`blocked` keeps the
-// whole cycle for the guarded `in_review` restore), ends it (`done`/`cancelled`),
-// or is refused: any other status would silently dissolve the review gate.
 function boardPendingStatusOverride(patch: Record<string, unknown>, requestedStatus: string): TransitionResult {
   if (requestedStatus === "blocked") return { patch };
   if (requestedStatus === "done" || requestedStatus === "cancelled") {
@@ -813,8 +810,6 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
       };
     }
 
-    // A blocked hold keeps the cycle as-is until a status or assignee change;
-    // unrelated edits must not revive the review through the drift repair.
     const holdUntouched =
       input.issue.status === "blocked" &&
       (requestedStatus === undefined || requestedStatus === "blocked") &&
