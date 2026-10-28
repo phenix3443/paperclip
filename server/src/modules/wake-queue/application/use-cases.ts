@@ -585,7 +585,7 @@ async function runReleaseRecoveryTail(
     : false;
 
   const hasExplicitBlockerPath =
-    immediateApplies && !reviewParticipantApplies
+    reviewParticipantApplies || immediateApplies
       ? await transaction.hasExplicitBlockerPath({
           companyId: issue.companyId,
           issueId: issue.id,
@@ -624,6 +624,7 @@ async function runReleaseRecoveryTail(
       isExecutionReviewParticipantRecoveryRun:
         isExecutionReviewParticipantRecoveryRun(run),
       hasPendingWakeInteraction,
+      hasExplicitBlockerPath,
     },
     immediate: {
       applies: immediateApplies,
