@@ -306,7 +306,7 @@ export async function deliverReconciledExecutions(
     try {
       const decision = action.evidence.executionReconciliation as
         ExecutionReconciliation | undefined;
-      if (!decision || !action.returnOwnerAgentId) continue;
+      if (!decision) continue;
       const pendingDecision = and(
         eq(issueRecoveryActions.companyId, action.companyId),
         eq(issueRecoveryActions.id, action.id),
@@ -314,6 +314,18 @@ export async function deliverReconciledExecutions(
         sql`${issueRecoveryActions.evidence}->>'continuationDelivery' in ('pending', 'waiting')`,
         sql`${issueRecoveryActions.evidence}->'executionReconciliation' = ${JSON.stringify(decision)}::jsonb`,
       );
+      const admitted = typeof (decision as { authorizationPayloadDigest?: unknown }).authorizationPayloadDigest === "string";
+      if (!action.returnOwnerAgentId) {
+        if (admitted) {
+          await db
+            .update(issueRecoveryActions)
+            .set({
+              evidence: sql`${issueRecoveryActions.evidence} || '{"continuationDelivery":"invalidated","continuationInvalidatedReason":"owner_missing"}'::jsonb`,
+            })
+            .where(pendingDecision);
+        }
+        continue;
+      }
       const [task] = await db
         .select()
         .from(issues)
@@ -323,7 +335,6 @@ export async function deliverReconciledExecutions(
             eq(issues.id, action.sourceIssueId),
           ),
         );
-      const admitted = typeof (decision as { authorizationPayloadDigest?: unknown }).authorizationPayloadDigest === "string";
       if (
         !task ||
         (!admitted && (

@@ -3348,11 +3348,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               enrichedContextSnapshot.source !== "execution.reconciled" ||
               enrichedContextSnapshot.forceFreshSession !== true ||
               payload?.issueId !== issue.id ||
-              payload?.recoveryActionId !== actionId ||
-              issue.assigneeAgentId !== agentId ||
-              ["done", "cancelled"].includes(issue.status)
+              payload?.recoveryActionId !== actionId
             )
               return { kind: "skipped" as const };
+            const ownerOrClosedMismatch =
+              issue.assigneeAgentId !== agentId ||
+              ["done", "cancelled"].includes(issue.status);
 
             // The issue lock serializes all admissions for this source. Validate
             // the durable operator decision, then reconcile a prior queue commit
@@ -3390,6 +3391,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 String(action.evidence.continuationDelivery),
               )
             )
+              return { kind: "skipped" as const };
+            if (ownerOrClosedMismatch && !isAdmittedReconciliation(decision))
               return { kind: "skipped" as const };
 
             const [existingWake] = await tx

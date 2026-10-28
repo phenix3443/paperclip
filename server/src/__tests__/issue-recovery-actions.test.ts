@@ -2718,6 +2718,35 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         });
         expect(await reconciliationWakes(fixture.actionId)).toHaveLength(0);
       });
+
+      it.each([
+        ["the owner is cleared", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.update(issues)
+          .set({ assigneeAgentId: null }).where(eq(issues.id, f.sourceIssueId)), "owner_mismatch"],
+        ["the task is reassigned", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.update(issues)
+          .set({ assigneeAgentId: f.managerId }).where(eq(issues.id, f.sourceIssueId)), "owner_mismatch"],
+        ["the task is done", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.update(issues)
+          .set({ status: "done" }).where(eq(issues.id, f.sourceIssueId)), "issue_closed"],
+        ["the task is cancelled", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.update(issues)
+          .set({ status: "cancelled" }).where(eq(issues.id, f.sourceIssueId)), "issue_closed"],
+        ["the return owner is gone", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.update(issueRecoveryActions)
+          .set({ returnOwnerAgentId: null }).where(eq(issueRecoveryActions.id, f.actionId)), "owner_missing"],
+      ])("persists invalidation when %s instead of leaving delivery pending", async (_name, change, reason) => {
+        const fixture = await admitted(`recon:a3b-exit-${randomUUID().slice(0, 8)}`);
+        await change(fixture);
+        const runsBefore = (await db.select().from(heartbeatRuns)).length;
+        await deliver();
+        const invalidated = await actionRow(fixture.actionId);
+        expect(invalidated.evidence).toMatchObject({
+          continuationDelivery: "invalidated", continuationInvalidatedReason: reason,
+        });
+        expect(await reconciliationWakes(fixture.actionId)).toHaveLength(0);
+        expect(await db.select().from(heartbeatRuns)).toHaveLength(runsBefore);
+
+        await deliver();
+        expect((await actionRow(fixture.actionId)).evidence).toEqual(invalidated.evidence);
+        expect(await reconciliationWakes(fixture.actionId)).toHaveLength(0);
+        expect(await db.select().from(heartbeatRuns)).toHaveLength(runsBefore);
+      });
     });
 
     describe("gates on locked rows (slice A3a)", () => {
