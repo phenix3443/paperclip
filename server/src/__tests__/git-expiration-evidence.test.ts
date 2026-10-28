@@ -486,4 +486,104 @@ describeEmbeddedPostgres("native Git expiration row evidence", () => {
     expect(summary).toMatchObject({ status: "partial", stopReason: "protected_state_changed" });
     expect(rowOf(journal).evidence.drift).toMatchObject({ state: "changed", fields: expect.arrayContaining(["paths.locationSet", "paths.checkout_head"]) });
   });
+
+  it("stops evidence_unavailable for a live row whose worktree is gone, naming its admin roles location_unresolved", async () => {
+    const f = await reconstructable();
+    await fs.rm(f.cwd, { recursive: true, force: true });
+    const journal = memoryJournal();
+    expect(await round(journal, { companyId: f.companyId })).toMatchObject({ status: "partial", stopReason: "evidence_unavailable" });
+    const before = rowOf(journal).evidence.before;
+    const value = before.state === "observed" ? before.value : null;
+    expect(value?.head).toEqual({ state: "unavailable", reason: "worktree_absent" });
+    for (const role of ["worktree_admin", "gitdir_head", "gitdir_index", "expiration_lock_marker", "expiration_lock_marker_dir"]) {
+      expect(value?.paths.find(entry => entry.role === role)?.observation, role).toEqual({ state: "unavailable", reason: "location_unresolved" });
+    }
+    expect(value?.locationSet).toEqual({ state: "unavailable", reason: "location_unresolved" });
+  });
+
+  it("stops evidence_unavailable with invalid_metadata for a live row whose restoration metadata fails validation", async () => {
+    const f = await reconstructable();
+    await db.execute(sql`update execution_workspaces set metadata = metadata || '{"gitCacheRestoration":{"schema":"other"}}'::jsonb where id = ${f.workspaceId}`);
+    const journal = memoryJournal();
+    expect(await round(journal, { companyId: f.companyId })).toMatchObject({ status: "partial", stopReason: "evidence_unavailable" });
+    const before = rowOf(journal).evidence.before;
+    expect(before.state === "observed" && before.value.paths.filter(entry => entry.role === "source").map(entry => entry.observation))
+      .toEqual([{ state: "unavailable", reason: "invalid_metadata" }]);
+  });
+
+  async function withNestedCheckout() {
+    const f = await reconstructable();
+    const container = path.join(f.cwd, ".paperclip-repositories");
+    const checkout = path.join(container, "nested");
+    await fs.mkdir(checkout, { recursive: true });
+    git(checkout, "init", "--initial-branch=topic");
+    await fs.writeFile(path.join(checkout, "file.txt"), "x\n");
+    git(checkout, "add", "."); git(checkout, "commit", "-m", "nested");
+    return { ...f, container, checkout };
+  }
+
+  function identityLog(f: { cwd: string; checkout: string }, replace: (kind: "worktree" | "checkout", call: number, args: readonly string[]) => string[] | null) {
+    const log: Array<{ kind: "worktree" | "checkout"; at: number }> = [];
+    faults.spawn = args => {
+      if (!args.includes("--absolute-git-dir") || !args.includes("--symbolic-full-name")) return null;
+      const kind = args.includes(f.checkout) ? "checkout" : args.includes(f.cwd) ? "worktree" : null;
+      if (!kind) return null;
+      log.push({ kind, at: Date.now() });
+      return replace(kind, log.filter(entry => entry.kind === kind).length, args);
+    };
+    return log;
+  }
+  const thenRun = (args: readonly string[], action: string) => ["sh", "-c", `git "$@"; status=$?; ${action} >/dev/null 2>&1; exit $status`, "sh", ...args];
+
+  it("sees a nested checkout branch switch and a container change made after the phase A reads and before drain", async () => {
+    for (const variant of ["branch", "container"] as const) {
+      const f = await withNestedCheckout();
+      const action = variant === "branch" ? `git -C '${f.checkout}' checkout -q -b switched` : `mkdir '${path.join(f.container, "added")}'`;
+      const log = identityLog(f, (kind, call, args) => kind === "checkout" && call === 2 ? thenRun(args, `sleep 0.05; ${action}`) : null);
+      const reads: string[] = [];
+      const journal = memoryJournal();
+      const summary = await round(journal, { companyId: f.companyId, budgetHooks: { beforeDirectoryRead: async directory => { reads.push(directory); } } });
+      expect(summary, variant).toMatchObject({ status: "partial", stopReason: "protected_state_changed" });
+      const drift = rowOf(journal).evidence.drift;
+      expect(drift, variant).toMatchObject({ state: "changed", fields: expect.arrayContaining([variant === "branch" ? "paths.checkout_head" : "paths.checkout_container"]) });
+      expect(drift.state === "changed" && drift.fields, variant).not.toContain("paths.locationSet");
+      expect(log.map(entry => entry.kind), variant).toEqual(["worktree", "checkout", "worktree", "checkout"]);
+      expect(reads.filter(directory => directory === f.container), variant).toHaveLength(2);
+      faults.spawn = null;
+    }
+  });
+
+  it("stops phase A at the Git output cap of the after HEAD read and starts no checkout child or directory read after it", async () => {
+    const f = await withNestedCheckout();
+    const log = identityLog(f, (kind, call) => kind === "worktree" && call === 2 ? ["sh", "-c", "head -c 17000000 /dev/zero"] : null);
+    const reads: string[] = [];
+    const journal = memoryJournal();
+    const summary = await round(journal, { companyId: f.companyId, budgetHooks: { beforeDirectoryRead: async directory => { reads.push(directory); } } });
+    expect(summary).toMatchObject({ status: "partial", stopReason: "resource_limit", budgetHit: { budget: "git_output" } });
+    const row = rowOf(journal);
+    expect(row.outcome).toBe("resource_limit");
+    expect(log.map(entry => entry.kind)).toEqual(["worktree", "checkout", "worktree"]);
+    expect(reads.filter(directory => directory === f.container)).toHaveLength(1);
+    const after = row.evidence.after.state === "observed" ? row.evidence.after.value : null;
+    expect(after?.head).toEqual({ state: "unavailable", reason: "row_stopped" });
+    expect(after?.locationSet).toEqual({ state: "unavailable", reason: "row_stopped" });
+    expect(after?.row.state).toBe("observed");
+    expect(after?.paths.every(entry => entry.observation.state === "observed")).toBe(true);
+    await waitFor(async () => await advisoryLocks() === 0);
+  });
+
+  it("starts no checkout child after the round aborts between the phase A HEAD child and the checkout child", async () => {
+    const f = await withNestedCheckout();
+    const controller = new AbortController();
+    let abortedAt = Number.POSITIVE_INFINITY;
+    const log = identityLog(f, (kind, call, args) => {
+      if (kind !== "worktree" || call !== 2) return null;
+      setTimeout(() => { abortedAt = Date.now(); controller.abort(); }, 0);
+      return thenRun(args, "sleep 0.2");
+    });
+    expect(await round(memoryJournal(), { companyId: f.companyId, signal: controller.signal })).toMatchObject({ status: "partial", stopReason: "aborted" });
+    expect(log.map(entry => entry.kind)).toEqual(["worktree", "checkout", "worktree"]);
+    expect(log.every(entry => entry.at <= abortedAt)).toBe(true);
+    await waitFor(async () => await advisoryLocks() === 0);
+  });
 });
