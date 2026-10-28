@@ -173,7 +173,7 @@ A round is `complete` only when the selection is exhausted, the round recorded e
 These stop reasons make the round `partial`: `lock_busy`, `resource_limit`, `aborted`, `deadline`, `row_budget`, `evidence_lost`, `database_error`, `protected_state_changed` and `evidence_unavailable`.
 
 - `protected_state_changed`: a row's `drift` is `changed`. The row keeps its native outcome; a `candidate` with drift stays `candidate`, and the round is partial.
-- `evidence_unavailable`: a row that took both locks and was not stopped has a `before` or `after` part that is not `observed`, other than `worktree_absent`. A partial round does not continue later. Start a new round with a new round identifier.
+- `evidence_unavailable`: a row that took both locks and was not stopped has a `before` or `after` part that is not `observed`, or a `drift` of `unknown`. The only exception is the HEAD of a pending row whose worktree is gone (`worktree_absent`); its other roles come from the recorded metadata and must be observed. A live row without its worktree stops the round, because its admin dir cannot be verified. A partial round does not continue later. Start a new round with a new round identifier.
 
 ## Limits
 

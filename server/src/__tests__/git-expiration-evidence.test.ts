@@ -8,7 +8,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { eq, sql } from "drizzle-orm";
 import { companies, issues, executionWorkspaces, createDb, terminateDbConnections, withDedicatedDbConnection, type Db } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { materializeIsolatedRemoteWorkspaceSource } from "../services/isolated-remote-workspace-source.js";
+import { isolatedRemoteSourcePath, materializeIsolatedRemoteWorkspaceSource } from "../services/isolated-remote-workspace-source.js";
 import { realizeExecutionWorkspace } from "../services/workspace-runtime.js";
 import { inspectGitExpirationRound, assertGitExpirationRoundMode, GIT_EXPIRATION_ROUND_MODE, GIT_EXPIRATION_ROUND_APPLICATION_NAME,
   GitExpirationRoundInvariantError, gitExpirationRoundFailure, readOnlyInspectionGitAuth, GIT_EXPIRATION_ROUND_SESSION_PARAMETERS,
@@ -114,11 +114,17 @@ describeEmbeddedPostgres("native Git expiration row evidence", () => {
     await db.insert(companies).values({ id: companyId, name: "Round fixture", issuePrefix: `GR${companyId.slice(0, 6)}` });
     await db.insert(issues).values({ id: issueId, companyId, title: "Finished", status: "done", completedAt: new Date(Date.now() - 48 * 3_600_000) });
     const ids: string[] = [];
+    const source = isolatedRemoteSourcePath(companyId, issueId);
+    await fs.mkdir(source, { recursive: true });
+    git(source, "init", "--initial-branch=main");
+    git(source, "commit", "--allow-empty", "-m", "base");
     for (let index = 0; index < count; index += 1) {
       const id = randomUUID();
       ids.push(id);
+      const cwd = path.join(root, companyId, "worktrees", id);
+      git(source, "worktree", "add", "-q", "-b", `fixture-${index}`, cwd);
       await db.insert(executionWorkspaces).values({ id, companyId, sourceIssueId: issueId, mode: "isolated_workspace", strategyType: "git_worktree",
-        name: `Fixture ${index}`, status: "active", providerType: "local_fs", cwd: path.join(os.tmpdir(), `paperclip-round-missing-${id}`),
+        name: `Fixture ${index}`, status: "active", providerType: "local_fs", cwd, branchName: `fixture-${index}`,
         repoUrl: "https://example.test/fixture.git", metadata: { isolatedRemoteSource: { schema: "paperclip.isolated-remote-source.v1",
           companyId, issueId, repoUrl: "https://example.test/fixture.git" } },
         updatedAt: new Date(Date.now() - (count - index) * 1000), ...row });

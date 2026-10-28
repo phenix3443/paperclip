@@ -153,7 +153,7 @@ function liveSourcePaths(workspace: Workspace): string[] | null {
   try { recorded = recordedIsolatedRemoteSource(workspace); } catch { return null; }
   const sources = recorded ? [recorded] : managedSourcePaths(workspace);
   let restoration: ReturnType<typeof readGitCacheRestoration> = null;
-  try { restoration = readGitCacheRestoration(workspace); } catch { restoration = null; }
+  try { restoration = readGitCacheRestoration(workspace); } catch { return null; }
   if (restoration?.sourcePath && !sources.includes(restoration.sourcePath)) sources.push(restoration.sourcePath);
   return sources;
 }
@@ -185,8 +185,7 @@ function liveAnchor(workspace: Workspace, identity: LiveIdentity): Anchor {
   return {
     sourcePaths: liveSourcePaths(workspace),
     worktreePath: worktree ? observed(worktree) : unavailable("location_unresolved"),
-    markerSource: identity.sourcePath ? observed(identity.sourcePath)
-      : identity.worktreeAdmin.state === "unavailable" && identity.worktreeAdmin.reason === "worktree_absent" ? identity.worktreeAdmin : unavailable("location_unresolved"),
+    markerSource: identity.sourcePath ? observed(identity.sourcePath) : unavailable("location_unresolved"),
     worktreeAdmin: identity.worktreeAdmin,
     branchName: workspace.branchName,
     checkouts: identity.checkouts,
@@ -202,7 +201,6 @@ export async function captureLiveIdentity(workspace: Workspace, signal?: AbortSi
   const stop = (): LiveIdentity => ({ head: head.observation, sourcePath: null, worktreeAdmin: unavailable("row_stopped"), checkouts: unavailable("row_stopped") });
   let sourcePath: string | null = null;
   let worktreeAdmin: Observation<string> = unavailable("location_unresolved");
-  if (head.observation.state === "unavailable" && head.observation.reason === "worktree_absent") worktreeAdmin = unavailable("worktree_absent");
   if (head.gitDir) {
     for (const candidate of liveSourcePaths(workspace) ?? []) {
       if (signal?.aborted) return stop();

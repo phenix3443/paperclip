@@ -457,7 +457,7 @@ export async function inspectGitExpirationRound(options: GitExpirationRoundOptio
           }
           if (summary.drainIncomplete) { summary.stopReason = "resource_limit"; break scan; }
           if (row.evidence.drift.state === "changed") { summary.stopReason = "protected_state_changed"; break scan; }
-          if (row.evidence.before.state !== "unavailable" && missingEvidence(row.evidence).length) {
+          if (row.evidence.before.state !== "unavailable" && (row.evidence.drift.state === "unknown" || missingEvidence(row.evidence).length)) {
             summary.stopReason = "evidence_unavailable";
             break scan;
           }
