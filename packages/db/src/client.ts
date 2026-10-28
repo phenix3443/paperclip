@@ -559,9 +559,6 @@ const MIGRATIONS_WITH_TOP_LEVEL_STATEMENTS = new Set([
   "0332_little_night_nurse.sql",
   "0345_luxuriant_carmella_unuscione.sql",
   "0369_late_logan.sql",
-  "0372_aromatic_loki.sql",
-  "0375_young_garia.sql",
-  "0376_messy_chimera.sql",
   "0381_mean_scream.sql",
   "0382_narrow_the_executioner.sql",
   "0385_open_madame_web.sql",
@@ -577,6 +574,9 @@ const MIGRATIONS_WITH_TOP_LEVEL_STATEMENTS = new Set([
 
   "0384_funny_adam_warlock.sql",
   "0383_tool_review_company_expiry.sql",
+  "0395_aromatic_loki.sql",
+  "0398_young_garia.sql",
+  "0399_messy_chimera.sql",
 ]);
 
 async function applyPendingMigrationsManually(
