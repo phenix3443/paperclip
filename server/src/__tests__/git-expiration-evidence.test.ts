@@ -14,7 +14,7 @@ import { inspectGitExpirationRound, assertGitExpirationRoundMode, GIT_EXPIRATION
   GitExpirationRoundInvariantError, gitExpirationRoundFailure, readOnlyInspectionGitAuth, GIT_EXPIRATION_ROUND_SESSION_PARAMETERS,
   type GitExpirationRoundEvent, type GitExpirationRoundJournal, type GitExpirationRoundOptions } from "../services/git-expiration-round.js";
 import { GitCacheRestorationFailure } from "../services/git-workspace-restoration.js";
-import { GIT_EXPIRATION_BUDGETS, probeGitProcessGroup, ROW_DRAIN_BOUND_MS } from "../services/git-expiration-budget.js";
+import { currentInspectionBudget, GIT_EXPIRATION_BUDGETS, probeGitProcessGroup, ROW_DRAIN_BOUND_MS } from "../services/git-expiration-budget.js";
 import { createGitRemoteAuthProvider } from "../services/git-credentials.js";
 import { parseGitExpirationRoundArgs, runGitExpirationRoundCli, GitExpirationRoundUsageError, fileGitExpirationRoundJournal,
   readGitExpirationRoundJournal, gitExpirationRoundExitCode } from "../git-expiration-round-cli.js";
@@ -22,7 +22,9 @@ import { gitExpirationEvidenceContract } from "../services/git-expiration-eviden
 import { CHECKOUT_LIMIT } from "../services/git-workspace-contents.js";
 
 const faults = vi.hoisted(() => ({ git: null as ((args: readonly string[]) => Error | null) | null,
-  spawn: null as ((args: readonly string[]) => string[] | null) | null, seamWrite: false, secretServices: 0 }));
+  spawn: null as ((args: readonly string[]) => string[] | null) | null, seamWrite: false, secretServices: 0,
+  events: [] as Array<{ type: "spawn" | "read" | "trigger" | "drain_returned"; detail: string }>,
+  beforeDrain: null as (() => Promise<void>) | null, afterAdmin: null as ((call: number) => void) | null, adminCalls: 0 }));
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:child_process")>();
   const { promisify: promisifyActual } = await import("node:util");
@@ -34,6 +36,7 @@ vi.mock("node:child_process", async (importOriginal) => {
     },
   });
   const spawn = ((file: string, args: readonly string[] = [], options?: object) => {
+    if (file === "git") faults.events.push({ type: "spawn", detail: args.join(" ") });
     const replacement = file === "git" ? faults.spawn?.(args) : null;
     return replacement ? actual.spawn(replacement[0]!, replacement.slice(1), options as never) : actual.spawn(file, args as string[], options as never);
   }) as typeof actual.spawn;
@@ -47,10 +50,29 @@ vi.mock("../services/git-workspace-expiration-inspection.js", async (importOrigi
   const actual = await importOriginal<typeof import("../services/git-workspace-expiration-inspection.js")>();
   const { executionWorkspaces: table } = await import("@paperclipai/db");
   const { eq: equals } = await import("drizzle-orm");
-  return { ...actual, inspectLockedGitExpirationCandidate: async (...args: Parameters<typeof actual.inspectLockedGitExpirationCandidate>) => {
+  const verifiedWorktreeAdmin = async (...args: Parameters<typeof actual.verifiedWorktreeAdmin>) => {
+    const admin = await actual.verifiedWorktreeAdmin(...args);
+    faults.adminCalls += 1;
+    faults.afterAdmin?.(faults.adminCalls);
+    return admin;
+  };
+  return { ...actual, verifiedWorktreeAdmin, inspectLockedGitExpirationCandidate: async (...args: Parameters<typeof actual.inspectLockedGitExpirationCandidate>) => {
     if (faults.seamWrite) await args[0].update(table).set({ name: "mutated" }).where(equals(table.id, args[1].id));
     return actual.inspectLockedGitExpirationCandidate(...args);
   } };
+});
+vi.mock("../services/git-expiration-budget.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/git-expiration-budget.js")>();
+  class LoggedInspectionBudget extends actual.InspectionBudget {
+    override async drain() {
+      const before = faults.beforeDrain;
+      faults.beforeDrain = null;
+      await before?.();
+      await super.drain();
+      faults.events.push({ type: "drain_returned", detail: "" });
+    }
+  }
+  return { ...actual, InspectionBudget: LoggedInspectionBudget };
 });
 const sqlState = (error: unknown) => {
   for (let current = error; current instanceof Error; current = current.cause) {
@@ -102,7 +124,8 @@ describeEmbeddedPostgres("native Git expiration row evidence", () => {
     process.env.PAPERCLIP_HOME = path.join(root, "home");
     process.env.PAPERCLIP_INSTANCE_ID = "default";
   });
-  afterEach(async () => { faults.git = null; faults.spawn = null; faults.seamWrite = false; await db.execute(sql`TRUNCATE TABLE companies CASCADE`); });
+  afterEach(async () => { faults.git = null; faults.spawn = null; faults.seamWrite = false; faults.events = []; faults.beforeDrain = null;
+    faults.afterAdmin = null; faults.adminCalls = 0; await db.execute(sql`TRUNCATE TABLE companies CASCADE`); });
   afterAll(async () => {
     if (previousHome === undefined) delete process.env.PAPERCLIP_HOME; else process.env.PAPERCLIP_HOME = previousHome;
     if (previousInstance === undefined) delete process.env.PAPERCLIP_INSTANCE_ID; else process.env.PAPERCLIP_INSTANCE_ID = previousInstance;
@@ -522,68 +545,114 @@ describeEmbeddedPostgres("native Git expiration row evidence", () => {
     return { ...f, container, checkout };
   }
 
-  function identityLog(f: { cwd: string; checkout: string }, replace: (kind: "worktree" | "checkout", call: number, args: readonly string[]) => string[] | null) {
-    const log: Array<{ kind: "worktree" | "checkout"; at: number }> = [];
-    faults.spawn = args => {
-      if (!args.includes("--absolute-git-dir") || !args.includes("--symbolic-full-name")) return null;
-      const kind = args.includes(f.checkout) ? "checkout" : args.includes(f.cwd) ? "worktree" : null;
-      if (!kind) return null;
-      log.push({ kind, at: Date.now() });
-      return replace(kind, log.filter(entry => entry.kind === kind).length, args);
-    };
-    return log;
-  }
-  const thenRun = (args: readonly string[], action: string) => ["sh", "-c", `git "$@"; status=$?; ${action} >/dev/null 2>&1; exit $status`, "sh", ...args];
+  const isIdentity = (detail: string) => detail.includes("--absolute-git-dir") && detail.includes("--symbolic-full-name");
+  const identityKinds = (f: { checkout: string }) => faults.events.filter(event => event.type === "spawn" && isIdentity(event.detail))
+    .map(event => event.detail.includes(f.checkout) ? "checkout" : "worktree");
+  const containerReads = (f: { container: string }) => faults.events.filter(event => event.type === "read" && event.detail === f.container).length;
+  const logReads = { beforeDirectoryRead: async (directory: string) => { faults.events.push({ type: "read", detail: directory }); } };
+  const nothingAfter = (type: "trigger" | "drain_returned") => {
+    const index = faults.events.findIndex(event => event.type === type);
+    expect(index, type).toBeGreaterThanOrEqual(0);
+    expect(faults.events.slice(index + 1).filter(event => event.type === "spawn" || event.type === "read"), `after ${type}`).toEqual([]);
+  };
 
-  it("sees a nested checkout branch switch and a container change made after the phase A reads and before drain", async () => {
-    for (const variant of ["branch", "container"] as const) {
-      const f = await withNestedCheckout();
-      const action = variant === "branch" ? `git -C '${f.checkout}' checkout -q -b switched` : `mkdir '${path.join(f.container, "added")}'`;
-      const log = identityLog(f, (kind, call, args) => kind === "checkout" && call === 2 ? thenRun(args, `sleep 0.05; ${action}`) : null);
-      const reads: string[] = [];
+  it("sees protected changes made after phase A and before drain in the phase B lstat only", async () => {
+    const variants = [
+      { name: "branch switch", container: "nested", field: "paths.checkout_head", act: (c: string, k: string) => git(k, "checkout", "-q", "-b", "switched") },
+      { name: "checkout added", container: "nested", field: "paths.checkout_container", act: (c: string) => fs.mkdir(path.join(c, "added")) },
+      { name: "checkout added and removed", container: "nested", field: "paths.checkout_container",
+        act: async (c: string) => { await fs.mkdir(path.join(c, "added")); await fs.rm(path.join(c, "added"), { recursive: true }); } },
+      { name: "empty container, checkout added", container: "empty", field: "paths.checkout_container", act: (c: string) => fs.mkdir(path.join(c, "added")) },
+      { name: "empty container, checkout added and removed", container: "empty", field: "paths.checkout_container",
+        act: async (c: string) => { await fs.mkdir(path.join(c, "added")); await fs.rm(path.join(c, "added"), { recursive: true }); } },
+      { name: "no container, created with a checkout", container: "none", field: "paths.checkout_container",
+        act: (c: string) => fs.mkdir(path.join(c, "added"), { recursive: true }) },
+    ] as const;
+    for (const variant of variants) {
+      const f = variant.container === "nested" ? await withNestedCheckout() : { ...await reconstructable(), checkout: "", container: "" };
+      const container = path.join(f.cwd, ".paperclip-repositories");
+      if (variant.container === "empty") await fs.mkdir(container);
+      const baseline = memoryJournal();
+      expect(await round(baseline, { companyId: f.companyId }), variant.name).toMatchObject({ stopReason: null });
+      faults.events = [];
+      faults.beforeDrain = async () => { await coarseTick(); await variant.act(container, f.checkout); };
       const journal = memoryJournal();
-      const summary = await round(journal, { companyId: f.companyId, budgetHooks: { beforeDirectoryRead: async directory => { reads.push(directory); } } });
-      expect(summary, variant).toMatchObject({ status: "partial", stopReason: "protected_state_changed" });
-      const drift = rowOf(journal).evidence.drift;
-      expect(drift, variant).toMatchObject({ state: "changed", fields: expect.arrayContaining([variant === "branch" ? "paths.checkout_head" : "paths.checkout_container"]) });
-      expect(drift.state === "changed" && drift.fields, variant).not.toContain("paths.locationSet");
-      expect(log.map(entry => entry.kind), variant).toEqual(["worktree", "checkout", "worktree", "checkout"]);
-      expect(reads.filter(directory => directory === f.container), variant).toHaveLength(2);
-      faults.spawn = null;
+      const summary = await round(journal, { companyId: f.companyId, budgetHooks: logReads });
+      expect(summary, variant.name).toMatchObject({ status: "partial", stopReason: "protected_state_changed", drainIncomplete: false });
+      const row = rowOf(journal);
+      expect(row.outcome, variant.name).toBe(rowOf(baseline).outcome);
+      expect(row.evidence.drift, variant.name).toMatchObject({ state: "changed", fields: expect.arrayContaining([variant.field]) });
+      expect(row.evidence.drift.state === "changed" && row.evidence.drift.fields, variant.name).not.toContain("paths.locationSet");
+      nothingAfter("drain_returned");
+      expect(await advisoryLocks(), variant.name).toBe(0);
     }
   });
 
-  it("stops phase A at the Git output cap of the after HEAD read and starts no checkout child or directory read after it", async () => {
+  it("starts no child or directory read after an abort or a budget stop between the phase A HEAD child and the checkout read", async () => {
+    for (const trigger of ["abort", "walker_entries", "git_children"] as const) {
+      const f = await withNestedCheckout();
+      const controller = new AbortController();
+      faults.events = [];
+      faults.adminCalls = 0;
+      faults.afterAdmin = call => {
+        if (call !== 2) return;
+        faults.events.push({ type: "trigger", detail: trigger });
+        if (trigger === "abort") { controller.abort(); return; }
+        const budget = currentInspectionBudget()!;
+        if (trigger === "walker_entries") { try { for (;;) budget.countEntry(); } catch {} return; }
+        budget.takeGitSlot();
+        try { budget.takeGitSlot(); } catch {} finally { budget.releaseGitSlot(); }
+      };
+      const journal = memoryJournal();
+      const summary = await round(journal, { companyId: f.companyId, signal: controller.signal, budgetHooks: logReads });
+      expect(identityKinds(f), trigger).toEqual(["worktree", "checkout", "worktree"]);
+      expect(containerReads(f), trigger).toBe(1);
+      nothingAfter("trigger");
+      nothingAfter("drain_returned");
+      expect(summary.drainIncomplete, trigger).toBe(false);
+      expect(await advisoryLocks(), trigger).toBe(0);
+      if (trigger === "abort") {
+        expect(summary, trigger).toMatchObject({ status: "partial", stopReason: "aborted" });
+        continue;
+      }
+      expect(summary, trigger).toMatchObject({ status: "partial", stopReason: "resource_limit", budgetHit: { budget: trigger } });
+      const row = rowOf(journal);
+      expect(row.outcome, trigger).toBe("resource_limit");
+      const before = row.evidence.before.state === "observed" ? row.evidence.before.value : null;
+      const after = row.evidence.after.state === "observed" ? row.evidence.after.value : null;
+      expect(after?.locationSet, trigger).toEqual({ state: "unavailable", reason: "row_stopped" });
+      expect(after?.locationSet, trigger).not.toEqual(before?.locationSet);
+      expect(after?.row.state, trigger).toBe("observed");
+      expect(after?.paths.map(entry => entry.role), trigger).toEqual(before?.paths.map(entry => entry.role));
+      expect(after?.paths.every(entry => entry.observation.state === "observed"), trigger).toBe(true);
+    }
+  });
+
+  it("stops phase A at the Git output cap of the after HEAD read and starts no child or directory read after it", async () => {
     const f = await withNestedCheckout();
-    const log = identityLog(f, (kind, call) => kind === "worktree" && call === 2 ? ["sh", "-c", "head -c 17000000 /dev/zero"] : null);
-    const reads: string[] = [];
+    let worktreeIdentity = 0;
+    faults.spawn = args => {
+      if (!isIdentity(args.join(" ")) || args.includes(f.checkout)) return null;
+      worktreeIdentity += 1;
+      if (worktreeIdentity !== 2) return null;
+      faults.events.push({ type: "trigger", detail: "git_output" });
+      return ["sh", "-c", "head -c 17000000 /dev/zero"];
+    };
     const journal = memoryJournal();
-    const summary = await round(journal, { companyId: f.companyId, budgetHooks: { beforeDirectoryRead: async directory => { reads.push(directory); } } });
-    expect(summary).toMatchObject({ status: "partial", stopReason: "resource_limit", budgetHit: { budget: "git_output" } });
+    const summary = await round(journal, { companyId: f.companyId, budgetHooks: logReads });
+    expect(summary).toMatchObject({ status: "partial", stopReason: "resource_limit", budgetHit: { budget: "git_output" }, drainIncomplete: false });
+    expect(identityKinds(f)).toEqual(["worktree", "checkout", "worktree"]);
+    expect(containerReads(f)).toBe(1);
+    expect(faults.events.slice(faults.events.findIndex(event => event.type === "trigger") + 2)
+      .filter(event => event.type === "spawn" || event.type === "read")).toEqual([]);
+    nothingAfter("drain_returned");
     const row = rowOf(journal);
     expect(row.outcome).toBe("resource_limit");
-    expect(log.map(entry => entry.kind)).toEqual(["worktree", "checkout", "worktree"]);
-    expect(reads.filter(directory => directory === f.container)).toHaveLength(1);
     const after = row.evidence.after.state === "observed" ? row.evidence.after.value : null;
     expect(after?.head).toEqual({ state: "unavailable", reason: "row_stopped" });
     expect(after?.locationSet).toEqual({ state: "unavailable", reason: "row_stopped" });
     expect(after?.row.state).toBe("observed");
     expect(after?.paths.every(entry => entry.observation.state === "observed")).toBe(true);
-    await waitFor(async () => await advisoryLocks() === 0);
-  });
-
-  it("starts no checkout child after the round aborts between the phase A HEAD child and the checkout child", async () => {
-    const f = await withNestedCheckout();
-    const controller = new AbortController();
-    let abortedAt = Number.POSITIVE_INFINITY;
-    const log = identityLog(f, (kind, call, args) => {
-      if (kind !== "worktree" || call !== 2) return null;
-      setTimeout(() => { abortedAt = Date.now(); controller.abort(); }, 0);
-      return thenRun(args, "sleep 0.2");
-    });
-    expect(await round(memoryJournal(), { companyId: f.companyId, signal: controller.signal })).toMatchObject({ status: "partial", stopReason: "aborted" });
-    expect(log.map(entry => entry.kind)).toEqual(["worktree", "checkout", "worktree"]);
-    expect(log.every(entry => entry.at <= abortedAt)).toBe(true);
-    await waitFor(async () => await advisoryLocks() === 0);
+    expect(await advisoryLocks()).toBe(0);
   });
 });
