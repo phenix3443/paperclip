@@ -199,6 +199,17 @@ describeEmbeddedPostgres("heartbeat task-drain admission release", () => {
     expect(await db.select().from(heartbeatRuns)).toEqual([]);
   });
 
+  it.each([null, "invalid", { version: 99 }])("rejects reserved context that retry writers could copy into a receipt (%j)", async namespace => {
+    const { agentId, issueId } = await seedAgentAndIssue();
+    const heartbeat = heartbeatService(db);
+    await expect(heartbeat.wakeup(agentId, {
+      source: "on_demand", requestedByActorType: "user", requestedByActorId: "responsible-user",
+      contextSnapshot: { issueId, _paperclipReviewerAssignmentContinuation: namespace },
+    })).rejects.toMatchObject({ status: 400 });
+    expect(await db.select().from(agentWakeupRequests)).toEqual([]);
+    expect(await db.select().from(heartbeatRuns)).toEqual([]);
+  });
+
   it("releases the run, wakeup, and issue lock when a task drain trips right after the run is claimed", async () => {
     const { companyId, issueId, runId, wakeupRequestId } = await seedQueuedRun();
     const heartbeat = heartbeatService(db);

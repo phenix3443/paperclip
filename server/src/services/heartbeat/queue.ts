@@ -2173,7 +2173,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
   }
 
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string) {
-    if (hasReviewerAssignmentContinuation(opts.payload)) {
+    if (hasReviewerAssignmentContinuation(opts.payload) || hasReviewerAssignmentContinuation(opts.contextSnapshot)) {
       throw new HttpError(400, "Reviewer assignment continuation payload is reserved");
     }
     const source = opts.source ?? "on_demand";

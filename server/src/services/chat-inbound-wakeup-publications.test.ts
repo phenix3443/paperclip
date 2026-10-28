@@ -72,6 +72,15 @@ function fixture() {
 }
 
 describe("durable inbound queue notice", () => {
+  it.each([null, "invalid", { version: 99 }])("does not publish a reserved receipt or coalesced owner (%j)", namespace => {
+    const { action, receipt } = fixture();
+    const reserved = { ...receipt, payload: { ...receipt.payload, _paperclipReviewerAssignmentContinuation: namespace } };
+    expect(resolveInboundWakeReceipt(action, reserved, reserved)).toBeNull();
+    const owner = { ...reserved, id: randomUUID() };
+    const child = { ...receipt, status: "coalesced", payload: { ...receipt.payload, coalescedIntoWakeupRequestId: owner.id } };
+    expect(resolveInboundWakeReceipt(action, child, owner)).toBeNull();
+    expect(resolveInboundWakeReceipt(action, receipt, receipt)?.state).toBe("queued");
+  });
   it("projects only a committed deferred receipt and closed text", () => {
     const { action, receipt } = fixture();
     expect(resolveInboundWakeReceipt(action, receipt, receipt)).toEqual({
