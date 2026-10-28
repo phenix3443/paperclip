@@ -113,8 +113,8 @@ type Observation<T> =
 | --- | --- | --- | --- | --- |
 | E1 keys | Page row key (`page_selected`) and reread key under the lifecycle lock | `row_inspected.key`, `.current` (unchanged) | `row_keys.v1`; every key of `page_selected` has at most one `row_inspected` | Unchanged: key change gives rejection `workspace_changed` |
 | E2 row state | Locked reread in the lifecycle transaction, before and after the row work; page snapshot as `selected` | `row_inspected.evidence.{selected,before,after}.row` | `row_state.v1` | Before/after change: stop `protected_state_changed`. Missing after for a locked, unstopped row: stop `evidence_unavailable` |
-| E2 paths | `lstat` with `bigint: true` of the roles named by the native location seam `resolveProtectedLocations` for every row state, fixed at before and reused for after, inside the lock chain | `evidence.{before,after}.paths`, `evidence.before.locationSet` | `row_paths.v1`; every required role present | Same as row state. An unresolved required role is `unavailable` and stops `evidence_unavailable`; an empty list is never an observed absence |
-| E2 HEAD | One bounded Git child per side: `rev-parse --absolute-git-dir HEAD --symbolic-full-name HEAD` in the worktree | `evidence.{before,after}.head` | `row_head.v1` | Same as row state. Skipped after a row stop: `unavailable` `row_stopped` |
+| E2 paths | `lstat` with `bigint: true` of the roles named by the native location seam `resolveProtectedLocations` for every row state, fixed at before and reused for after, inside the lock chain; after `lstat` in phase B (after drain), after location set from phase B row + phase A identity | `evidence.{before,after}.paths`, `evidence.{before,after}.locationSet` | `row_paths.v1`; every required role present | Same as row state. An unresolved required role is `unavailable` and stops `evidence_unavailable`; an empty list is never an observed absence |
+| E2 HEAD | One bounded Git child per side: `rev-parse --absolute-git-dir HEAD --symbolic-full-name HEAD` in the worktree; the after child runs in phase A, before drain | `evidence.{before,after}.head` | `row_head.v1` | Same as row state. Not started after a row stop: `unavailable` `row_stopped` |
 | E3 row bytes | One extended walk of the candidate worktree (the existing walk, same entry budget) | `evidence.bytes`; `candidateBytes` unchanged | `row_bytes.v1` | Walk error keeps today's rejection, reports `error` and stops `evidence_unavailable`. Never zero for an unwalked tree |
 | E3 round bytes | Sum of row values plus a round hardlink index | `round_finished.bytes`, stdout `bytes` | `round_bytes.v1`; `state` must be `observed` and `failedRows` 0 for full reconciliation | Index cap: stop `resource_limit` `hardlink_index`. A failed walk makes `state` `incomplete` and totals `unavailable` |
 | E4 counters | Entry mutation sentinel at every native mutation site | `round_finished.entryMutations`, stdout `entryMutations` | `entry_mutations.v1`; all counts 0 and `reclaimedBytes` 0 | Any attempt: trap throws, stop `mutation_detected`, overrides every other reason |
@@ -134,14 +134,51 @@ withIsolatedRepositorySourceLock                         source lock (try-only)
       try {
         pg_try_advisory_xact_lock(lifecycle)              unchanged
         reread row                                        unchanged
-  +     before = observe(tx, row, paths, head)            new hook, before eligibility
+  +     before = observeBefore(tx, row)                   new hook, before eligibility
         eligibility, proof, walk (+ extended byte tally)  unchanged order
       } finally {
-  +     afterHead = rowStopped ? unavailable : observeHead()
-        await budget.drain()                              unchanged
-  +     afterRow, afterPaths = observe(tx, row, paths)    after drain, before lock release
+  +     afterIdentity = signal.aborted ? unavailable      phase A: children and reads that
+                      : captureIdentity(row)              need the budget, before drain
+        await budget.drain()                              unchanged (git-expiration-round.ts:208)
+  +     afterRow, afterPaths, afterLocationSet            phase B: DB select + lstat only,
+                      = observeAfter(tx, before, afterIdentity)  after drain, before lock release
       }
 ```
+
+The after side has two phases with a hard split.
+
+**Phase A, identity capture (before drain).** `captureIdentity` does every after step
+that needs a Git child, a directory read through the shared budget, or a `realpath`:
+
+1. The after HEAD read (one `runBoundedGit` child).
+2. For a live row, the after anchor inputs: `verifiedWorktreeAdmin` of the absolute
+   Git dir from step 1 (`realpath`), the checkout directory entries through
+   `readBoundedDirectory`, and one bounded Git child per checkout for its branch and
+   Git dir.
+
+It runs only when `signal` is not aborted, and it checks `signal` again before each
+child and each directory read. Every child goes through `runBoundedGit`, so the budget
+`track`s it and the final `drain()` waits for it; `readBoundedDirectory` counts
+entries in the same row budget. If the row stops before or during phase A (abort,
+row deadline, entry budget, Git child or output cap), phase A starts nothing more and
+its result is `unavailable` `row_stopped` for each part it did not finish. The row
+keeps its native `resource_limit` or abort result. Phase A never reuses before values
+as an after observation.
+
+**Phase B, fixed reads (after drain).** `observeAfter` starts no child, reads no
+directory and uses no budget:
+
+1. Reread the row with one select in the lifecycle transaction.
+2. `lstat` each role of the list fixed at `before` (same paths, same order).
+3. Build the after location set (see Protected paths) only from the phase B row,
+   pure native validators over its metadata, and the phase A identity. When the
+   location set needs phase A identity that is `unavailable`, the after location set
+   is `unavailable` `row_stopped`; it is not copied from before.
+
+Because phase A ends before drain, a change to HEAD or a checkout after phase A is
+still seen in phase B: the fixed roles include the admin `HEAD` and `index`, each
+checkout's `.git/HEAD` and `.git/index`, and the marker directories, and phase B
+`lstat`s them after drain.
 
 - `inspectLockedGitExpirationCandidate` gets an optional async `onLocked(current)`
   hook. It replaces the synchronous `observeCurrent` and runs at the same place,
@@ -149,11 +186,13 @@ withIsolatedRepositorySourceLock                         source lock (try-only)
   path does not pass it and is unchanged.
 - The before observation runs for every row that gets both locks, also when the row
   is then rejected. Rejection paths run proof steps, so they need the same check.
-- The after HEAD read needs a Git child. It runs before drain and only when the row
-  signal is not aborted, so a stopped row starts no new child.
-- The after row and path reads run after drain, while both locks are still held.
-  They use the lifecycle transaction (no new connection) and `lstat` (no child).
-  They run also for a stopped row, so a stopped row still proves its paths.
+- The before observation does the same reads in one pass (row reread, HEAD read,
+  anchor, `lstat`; see Protected paths), right after the lock. The row signal is live at that point;
+  if it is already aborted, `before` is `unavailable` `row_stopped`.
+- Phase B runs also for a stopped row, while both locks are still held. It uses the
+  lifecycle transaction (no new connection) and `lstat` (no child), so a stopped row
+  still proves its fixed paths and row state; only its phase A parts are
+  `unavailable` `row_stopped`.
   `statement_timeout` bounds the select. If the chain is not released within the
   existing 5 s drain bound, the round records the row with
   `after: unavailable "undrained"`, as it already records `drainIncomplete`.
@@ -217,19 +256,32 @@ stands for an observed absence.
 | `sourcePath` | `gitCacheRestoration.sourcePath` | `recordedIsolatedRemoteSource(workspace)` when recorded; else every path of `managedSourcePaths(workspace)` (two candidates), each as its own role |
 | `worktreeAdmin` | `gitCacheExpiration.worktreeAdmin` (recorded and validated; independent of the worktree) | `verifiedWorktreeAdmin` of the absolute Git dir from the before HEAD read, which must resolve under one source candidate |
 | `branchName` | `gitCacheRestoration.branchName` | `branchName` column |
-| `checkouts` | `gitCacheRestoration.contents.checkouts` | Directory entries of `<worktree>/<PROJECT_REPOSITORIES_DIR>`, read with `readBoundedDirectory` (shared entry budget), at most `CHECKOUT_LIMIT` (50, `git-workspace-contents.ts:17`, exported with no change); branch of each from one bounded Git child (`rev-parse --absolute-git-dir --symbolic-full-name HEAD`) under the child gate |
+| `checkouts` | `gitCacheRestoration.contents.checkouts` | Directory entries of `<worktree>/<PROJECT_REPOSITORIES_DIR>`, read with `readBoundedDirectory` (shared entry budget), at most `CHECKOUT_LIMIT` (50, `git-workspace-contents.ts:17`, exported with no change); branch and Git dir of each from one bounded Git child (`rev-parse --absolute-git-dir --symbolic-full-name HEAD`) under the child gate |
+| Anchor inputs needing a child, a budgeted directory read or `realpath` | None: `readGitCacheRestoration`, `readGitCacheExpiration` and the trash rule are synchronous parsers of the row metadata | `worktreeAdmin` (HEAD read + `realpath`), `checkouts` (directory read + Git children); captured in phase A only |
 
 A row that has an existing `gitCacheRestoration` but no expiration state uses the
 live-row column. Its recorded `sourcePath` is added as one more `source` role.
 
 The before observation runs in this order: row reread, HEAD read, anchor, then
-`lstat` of every role. After runs the same order, with the HEAD read before drain
-and the rest after drain (see capture points).
+`lstat` of every role. After splits the same steps into phase A (HEAD read and the
+live anchor inputs, before drain) and phase B (row reread, `lstat` of the fixed
+roles, location set, after drain); see capture points.
 
 **Roles.** All roles are required. The list is fixed at `before` and reused for
-`after`, and `after` also recomputes the anchor and compares its digest
-(`paths.locationSet`), so a changed admin path or source is drift, not a silent
-new list.
+`after`; phase B never adds or removes a role. The location set is the digest of the
+anchor (`sourcePath` candidates, `worktreePath`, `worktreeAdmin`, `branchName`,
+checkout names, branches and Git dirs). `before.locationSet` comes from the before
+anchor. `after.locationSet` is built in phase B from:
+
+- a pending row: the phase B row metadata only, through the same synchronous
+  validators (no filesystem read);
+- a live row: the phase B row columns (`cwd`, `providerRef`, `branchName`, recorded
+  isolated source) plus the phase A identity (`worktreeAdmin`, checkout list with
+  branches and Git dirs).
+
+A different digest is drift `paths.locationSet`, so a changed admin path, source or
+checkout branch is reported, not a silent new list. When phase A did not finish,
+`after.locationSet` is `unavailable` `row_stopped`.
 
 | Role | Path |
 | --- | --- |
@@ -240,6 +292,7 @@ new list.
 | `expiration_lock_marker` | Each location of `gitExpirationMarkerLocations(anchor)` |
 | `expiration_lock_marker_dir` | The parent directory of each marker, so a marker that appears and goes again inside the window still changes `mtimeNs`/`ctimeNs` |
 | `checkout_root` | Each `<worktree>/<PROJECT_REPOSITORIES_DIR>/<name>` |
+| `checkout_head`, `checkout_index` | `HEAD` and `index` under each checkout's Git dir from the before anchor (for a pending row `<checkout_root>/.git`, as in the lock locations), so a branch switch after phase A is still seen by phase B |
 
 Each entry reports `role`, `pathDigest` and an observation whose value is
 `{ present: false }` on `ENOENT` or `{ present: true, statDigest, type }`, where
@@ -459,9 +512,11 @@ New stop reasons. All give `partial` and exit 3.
   `bytes` and `entryMutations` so the authoritative partial result has them.
 - **Locks.** Source then lifecycle, try-only. No new lock, no new connection. All
   after observations finish before the lock chain unwinds.
-- **Abort and drain.** No new Git child starts after the row signal aborts. The
-  `lstat` and the one select after drain are bounded by the drain bound and
-  `statement_timeout`. The undrained hold is unchanged.
+- **Abort and drain.** No new Git child or budgeted directory read starts after the
+  row signal aborts. All after work that needs one runs in phase A, before the final
+  `drain()`, and is tracked by the row budget; after drain only the one select and
+  `lstat` of fixed roles run, bounded by the drain bound and `statement_timeout`.
+  The undrained hold is unchanged.
 - **Budgets.** Before and after HEAD reads use the Git child gate, the output cap and
   the row deadline. The byte tally uses the same walk and entry counter. No budget
   value changes. The only addition is `hardlink_index`.
@@ -526,7 +581,9 @@ uninstall the ledger in a dedicated test file.
 | Unresolved paths | Live row whose Git dir is outside every source candidate; pending row with invalid `gitCacheExpiration`; more than `CHECKOUT_LIMIT` checkout entries | Roles listed with `unavailable` `location_unresolved` / `invalid_metadata` / `checkout_budget`; stop `evidence_unavailable`, exit 3; never an empty role list |
 | Lock location parity | Existing lock acquire and recover tests | `gitCacheExpirationLockLocations` returns the same list as before the extraction |
 | Budget | Entry budget hit, row deadline and Git output cap during the walk and during the after HEAD read | Existing `resource_limit` reasons; `after.head` `unavailable row_stopped`; after row and paths still observed after drain |
-| Abort | Abort during proof and during the before HEAD read; abort with undrained row | No new child after abort; locks held until drain; `after` `undrained` when the bound is passed; round `aborted` |
+| Nested checkout, stop before after anchor | Live row with one nested checkout; separately: (a) abort the round, (b) exhaust the entry budget, (c) hit the Git child cap, each after the walk and before phase A; and (d) abort inside phase A between the HEAD child and the checkout child. A spawn hook records every child start with a timestamp | No child and no `readBoundedDirectory` call after the abort or budget hit, and none after the final `drain()` returns (spawn log vs drain timestamp); `after.head`, the live anchor inputs and `after.locationSet` `unavailable row_stopped`, never equal to the before values; phase B row and fixed-role paths observed; row keeps native `resource_limit` or abort and round `partial`/`aborted`, exit 3; locks released within the drain bound, or `after` `undrained` with the existing hold when a child is held past it |
+| Nested checkout change | Successful live row with one nested checkout: (a) switch the checkout branch from a proof-step hook (before phase A); (b) replace the checkout `.git` with one that points at another Git dir (before phase A); (c) switch the checkout branch from a hook that runs after phase A and before drain | (a) `drift.changed` names `paths.locationSet` and `paths.checkout_head`; (b) names `paths.locationSet`; (c) names `paths.checkout_head` from the phase B `lstat`; all stop `protected_state_changed`, `partial`, exit 3; row outcome unchanged; no child after drain |
+| Abort | Abort during proof and during the before HEAD read; abort with undrained row | No new child after abort; locks held until drain; phase A parts `unavailable row_stopped`; `after` `undrained` when the bound is passed; round `aborted` |
 | Lock | Busy source lock; busy lifecycle lock | `lock_busy` with `unavailable lock_busy` evidence; no observation taken without both locks |
 | Mutation traps | Install sentinel, then call each instrumented site from a test seam inside a row; also from a detached promise whose error is swallowed | Trap thrown before any filesystem or DB effect (checked by `lstat` and row select); `attempts[kind]` 1; round `mutation_detected`, overriding an earlier `lock_busy` or `resource_limit`, with `supersededStopReason` set |
 | Live paths | Existing `git-workspace-expiration*.test.ts`, compaction tests, terminal sweep tests, `git-expiration-auth-fallback.test.ts`, without sentinel | Pass unchanged; `allocatedBytes` returns the same values |
