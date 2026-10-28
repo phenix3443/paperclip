@@ -12,3 +12,10 @@ export function ordinaryWakeRequestSql(alias: string): string {
   if (!/^[a-z_][a-z0-9_]*$/.test(alias)) throw new Error("Invalid wake request SQL alias");
   return `NOT COALESCE(${alias}.payload ? '${REVIEWER_ASSIGNMENT_CONTINUATION_KEY}', false)`;
 }
+
+export function ordinaryWakeRunPredicate(wakeupRequestId: SQLWrapper, companyId: SQLWrapper) {
+  return sql`NOT EXISTS (SELECT 1 FROM ${agentWakeupRequests}
+    WHERE ${agentWakeupRequests.id} = ${wakeupRequestId}
+      AND ${agentWakeupRequests.companyId} = ${companyId}
+      AND NOT (${ordinaryWakeRequestPredicate()}))`;
+}

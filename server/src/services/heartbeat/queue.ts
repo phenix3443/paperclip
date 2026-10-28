@@ -1,4 +1,4 @@
-import { hasReviewerAssignmentContinuation, ordinaryWakeRequestPredicate } from "../../modules/wake-queue/index.js";
+import { hasReviewerAssignmentContinuation, ordinaryWakeRequestPredicate, ordinaryWakeRunPredicate } from "../../modules/wake-queue/index.js";
 import { authorizationService } from "../authorization.js";
 import { isAdmittedReconciliation, isGuardedReconciliationDelivery, lockReconciledDeliveryPrefix, recordReconciledDeliveryOutcome, revalidateReconciledDelivery } from "../execution-reconciliation-delivery.js";
 import { assertTaskRetryConversationAllowed, readTaskRetryIntent, retireSupersededTaskRetry } from "../task-retry.js";
@@ -778,8 +778,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           .for("update", { noWait: true })
           .limit(1);
         if (!issue) return null;
-        if (run.wakeupRequestId)
-          await tx
+        if (run.wakeupRequestId) {
+          const [wake] = await tx
             .select({ id: agentWakeupRequests.id })
             .from(agentWakeupRequests)
             .where(
@@ -791,6 +791,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             )
             .for("update", { noWait: true })
             .limit(1);
+          if (!wake) return null;
+        }
         const [current] = await tx
           .select()
           .from(heartbeatRuns)
@@ -970,6 +972,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     companyAgents?: AgentOrgRow[],
     deferredPostCommitEffects?: WakeQueuePostCommitEffect[],
   ) {
+    if (run.wakeupRequestId) {
+      const [wake] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+        ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, run.wakeupRequestId),
+        eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
+      ));
+      if (!wake) return null;
+    }
     if (run.status !== "queued") return run;
     const [caseHandoffReceipt] = run.wakeupRequestId ? await db.select().from(caseHandoffs).where(and(
       eq(caseHandoffs.wakeupRequestId, run.wakeupRequestId), eq(caseHandoffs.companyId, run.companyId),
@@ -1607,9 +1616,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           return tx.transaction(async (claimTx) => {
             const issueClaim = await lockIssueExecutionClaim(claimTx as unknown as Db);
             if (issueClaim.blocked) return null;
-            if (run.wakeupRequestId) await claimTx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
-              ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, run.wakeupRequestId), eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
-            )).for("update");
+            if (run.wakeupRequestId) {
+              const [wake] = await claimTx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+                ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, run.wakeupRequestId), eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
+              )).for("update");
+              if (!wake) return null;
+            }
             const [lockedRun] = await claimTx.select().from(heartbeatRuns).where(and(
               eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.agentId, run.agentId),
             )).for("update");
@@ -1917,6 +1929,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       .where(
         and(
           eq(heartbeatRuns.status, "queued"),
+          ordinaryWakeRunPredicate(heartbeatRuns.wakeupRequestId, heartbeatRuns.companyId),
           eq(companies.status, "active"),
           cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
         ),
@@ -2001,6 +2014,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           and(
             eq(heartbeatRuns.agentId, agentId),
             eq(heartbeatRuns.status, "queued"),
+            ordinaryWakeRunPredicate(heartbeatRuns.wakeupRequestId, heartbeatRuns.companyId),
             cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
           ),
         )
