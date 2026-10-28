@@ -495,8 +495,7 @@ describePostgres("already available connection requests", () => {
 
   it.each(["missing", "revoked", "blocked", "weaker", "changed_version", "inactive_tool", "other_connection", "wrong_requester", "wrong_user", "other_company", "ambiguous"] as const)("keeps an access request pending for %s", async (reason) => {
     const f = await seed();
-    let intent = await requestAccess(f, reason === "weaker" ? "allowed" : "allowed",
-      reason === "wrong_requester" ? { requestingAgentId: randomUUID() } : {});
+    let intent = await requestAccess(f, "allowed", reason === "wrong_requester" ? { requestingAgentId: randomUUID() } : {});
     if (reason !== "missing") await db.update(toolProfiles).set({ defaultAction: "allow" });
     if (reason === "revoked") await db.update(connectionGrants).set({ status: "revoked" });
     if (reason === "blocked") await db.insert(toolPolicies).values({ companyId: f.companyId, name: "Block", policyType: "block", selectors: { issueId: f.issueId } });
