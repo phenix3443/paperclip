@@ -198,7 +198,8 @@ export async function admitReviewerIntent(tx: Db, candidate: Receipt, adoptingRu
   const response = await connectionContinuationPendingResponse(tx, task, task.responsibleUserId, null);
   if (response) { await hold(tx, row, intent, `pending_${response}`); return null; }
   const [successor] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, row.companyId),
-    eq(heartbeatRuns.agentId, row.agentId), inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+    eq(heartbeatRuns.agentId, row.agentId),
+    inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry", "succeeded", "failed", "cancelled", "interrupted", "timed_out"]),
     sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${task.id}`,
     sql`${heartbeatRuns.contextSnapshot}->>'reviewerAssignmentGeneration' = ${id.generation}`,
     adoptingRunId ? eq(heartbeatRuns.id, adoptingRunId) : undefined,

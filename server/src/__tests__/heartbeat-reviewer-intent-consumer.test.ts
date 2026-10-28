@@ -531,6 +531,36 @@ const support = await getEmbeddedPostgresTestSupport();
     } finally { await c.stop(); }
   });
 
+  it("adopts a finished ordinary turn after the original actor regains project access", async () => {
+    vi.stubEnv("PAPERCLIP_ISSUE_PRIVACY_MODE", "enforce");
+    const f = await seed(false);
+    const project = await projectService(db).create(f.companyId, { name: "Restricted adoption", visibility: "private" });
+    await issueService(db).update(f.issueId, { projectId: project.id });
+    for (const principal of [{ subjectType: "user" as const, subjectId: "board" },
+      { subjectType: "agent" as const, subjectId: f.agentId }]) {
+      await ensureProjectAccessMember(db, { companyId: f.companyId, projectId: project.id, ...principal });
+    }
+    const receipt = await db.transaction(tx => createReviewerAssignmentIntent(tx, { companyId: f.companyId, issueId: f.issueId,
+      sourceRunId: f.source.id, requestedByActorType: "agent", requestedByActorId: f.source.agentId }));
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+    const service = heartbeatService(db);
+    const run = await service.wakeup(f.agentId, { source: "on_demand", reason: "issue_commented",
+      payload: { issueId: f.issueId }, requestedByActorType: "user", requestedByActorId: "board" });
+    expect(run).toBeTruthy();
+    const read = async () => (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt!.id)))[0];
+    expect(await read()).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    await db.update(heartbeatRuns).set({ status: "succeeded", startedAt: new Date(), finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, run!.id));
+    await ensureProjectAccessMember(db, { companyId: f.companyId, projectId: project.id,
+      subjectType: "agent", subjectId: f.source.agentId });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 300_000);
+    await service.reconcileReviewerAssignments();
+    expect(await read()).toMatchObject({ status: "coalesced", runId: run!.id });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(2);
+    expect(await executionControlSchedule(db).continuation()).toBeNull();
+  });
+
   it("retains a first producer notification arriving during the startup sweep", async () => {
     vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"], shouldAdvanceTime: true });
     let scanned!: () => void, release!: () => void;
