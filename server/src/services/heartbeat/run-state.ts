@@ -1161,8 +1161,9 @@ export function createHeartbeatRunState(db: Db) {
     agentId: string,
     adapterType: string,
     taskKey: string,
+    reader: Pick<Db, "select"> = db,
   ) {
-    return db
+    return reader
       .select()
       .from(agentTaskSessions)
       .where(
@@ -1429,14 +1430,17 @@ export function createHeartbeatRunState(db: Db) {
       .catch(() => false);
   }
 
-  async function hasResolvablePriorSessionWorkspaceForWake(input: {
-    agent: typeof agents.$inferSelect;
-    contextSnapshot: Record<string, unknown>;
-    taskKey: string | null;
-    explicitResumeSession: Awaited<
-      ReturnType<typeof resolveExplicitResumeSessionOverride>
-    > | null;
-  }) {
+  async function hasResolvablePriorSessionWorkspaceForWake(
+    input: {
+      agent: typeof agents.$inferSelect;
+      contextSnapshot: Record<string, unknown>;
+      taskKey: string | null;
+      explicitResumeSession: Awaited<
+        ReturnType<typeof resolveExplicitResumeSessionOverride>
+      > | null;
+    },
+    reader: Pick<Db, "select"> = db,
+  ) {
     if (
       await hasResolvableSessionWorkspaceCwd(
         input.explicitResumeSession?.sessionParams,
@@ -1452,6 +1456,7 @@ export function createHeartbeatRunState(db: Db) {
       input.agent.id,
       input.agent.adapterType,
       input.taskKey,
+      reader,
     );
     const taskSessionParams = normalizeResumeParamsForAdapter(
       input.agent.adapterType,

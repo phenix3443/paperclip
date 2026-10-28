@@ -2613,20 +2613,6 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     const sessionBefore =
       explicitResumeSession?.sessionDisplayId ??
       (await resolveSessionBeforeForWakeup(agent, effectiveTaskKey));
-    let hasResolvablePriorSessionWorkspace: boolean | null = null;
-    const resolveHasResolvablePriorSessionWorkspace = async () => {
-      if (hasResolvablePriorSessionWorkspace !== null)
-        return hasResolvablePriorSessionWorkspace;
-      hasResolvablePriorSessionWorkspace = issueId
-        ? await hasResolvablePriorSessionWorkspaceForWake({
-            agent,
-            contextSnapshot: enrichedContextSnapshot,
-            taskKey: effectiveTaskKey,
-            explicitResumeSession,
-          })
-        : false;
-      return hasResolvablePriorSessionWorkspace;
-    };
     const continuationAttempt = readContinuationAttempt(
       enrichedContextSnapshot.livenessContinuationAttempt,
     );
@@ -3951,7 +3937,15 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               existingExecutionWorkspaceStatus,
             });
             const hasResolvablePriorSessionWorkspace =
-              await resolveHasResolvablePriorSessionWorkspace();
+              await hasResolvablePriorSessionWorkspaceForWake(
+                {
+                  agent,
+                  contextSnapshot: enrichedContextSnapshot,
+                  taskKey: effectiveTaskKey,
+                  explicitResumeSession,
+                },
+                tx,
+              );
 
             if (
               isUnrunnableWorktreeCombo({
