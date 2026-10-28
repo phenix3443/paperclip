@@ -2635,8 +2635,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await heartbeat.drainActiveRunExecutions();
   });
 
-  it("delivers the reviewer after actual native finalization and verified local workspace cleanup", async () => {
+  it.each([false, true])("delivers the reviewer after actual native finalization and verified local workspace cleanup (late stop=%s)", async lateStop => {
     const f = await seedPendingNativeFinalization();
+    const child = lateStop ? spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore" }) : null;
+    const childExit = child ? new Promise<void>(resolve => child.once("exit", () => resolve())) : Promise.resolve();
+    const pid = child?.pid ?? 2_000_000_000;
     const reviewerId = randomUUID(), stageId = randomUUID();
     await db.insert(agents).values({ id: reviewerId, companyId: f.companyId, name: "Reviewer", role: "engineer",
       adapterType: "process", status: "idle", runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } });
@@ -2659,16 +2662,21 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         sql`${agentWakeupRequests.payload} ? '_paperclipReviewerAssignmentContinuation'`));
       expect(receipt).toMatchObject({ status: "deferred_issue_execution", runId: null });
       const started = new Date(0);
-      await db.update(heartbeatRuns).set({ processStartedAt: started, runnerProfileJson: {} }).where(eq(heartbeatRuns.id, f.runId));
+      await db.update(heartbeatRuns).set({ processPid: pid, processStartedAt: started, runnerProfileJson: {} }).where(eq(heartbeatRuns.id, f.runId));
       await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, agentId: f.agentId, runId: f.runId,
         seq: 100, eventType: "native.process_identity_recorded", payload: { targetKind: "local", hostname: os.hostname(),
-          processPid: 2_000_000_000, processGroupId: null, processStartedAt: started.toISOString() } });
+          processPid: pid, processGroupId: null, processStartedAt: started.toISOString() } });
       await db.update(heartbeatRuns).set({ nextEventSeq: 101 }).where(eq(heartbeatRuns.id, f.runId));
       await db.insert(workspaceOperations).values({ companyId: f.companyId, issueId: f.issueId,
         heartbeatRunId: f.runId, phase: "workspace_finalize", status: "succeeded" });
       vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"], shouldAdvanceTime: true });
       await heartbeat.reapOrphanedRuns();
       expect(await heartbeat.getRun(f.runId)).toMatchObject({ runtimeMode: "native", nativePhase: "committed" });
+      if (lateStop) {
+        expect((await heartbeat.getRun(f.runId))?.resultJson?.executionReleased).toBeUndefined();
+        child!.kill("SIGKILL"); await childExit;
+        await heartbeat.reapOrphanedRuns();
+      }
       expect((await heartbeat.getRun(f.runId))?.resultJson?.executionReleased).toMatchObject({ runId: f.runId, issueId: f.issueId });
       await vi.advanceTimersByTimeAsync(60_000);
       await vi.waitFor(async () => expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt.id)))[0])
@@ -2679,7 +2687,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect(after.responsibleUserId).toEqual(before.responsibleUserId);
       expect(mockExecutePaperclipNativeSession).not.toHaveBeenCalled();
       expect(mockAdapterExecute).not.toHaveBeenCalled();
-    } finally { vi.useRealTimers(); await c.stop(); await heartbeat.drainActiveRunExecutions(); }
+    } finally {
+      vi.useRealTimers(); child?.kill("SIGKILL"); await childExit;
+      await c.stop(); await heartbeat.drainActiveRunExecutions();
+    }
   }, 30_000);
 
   it("rejects foreign result, company, and issue bindings for native finalization", async () => {

@@ -3701,7 +3701,12 @@ not rewritten by delivery.
 See `heartbeat-reviewer-assignment-continuation.test.ts` for the original symptom,
 `heartbeat-reviewer-handoff.test.ts` for real local executor cancellation/cleanup
 and transactional handoff tests, and `heartbeat-native-cleanup-admission.test.ts`
-for the native terminal-before-cleanup boundary. The intent consumer, transaction,
+for the native terminal-before-cleanup boundary. The focused reviewer case in
+`heartbeat-process-recovery.test.ts` exercises accepted PRP results, actual
+native finalization and process-stop/workspace settlement in either order.
+The native process owner settles its release callback in the same transaction as
+stop evidence and identity clearing; callback failure rolls back both.
+The intent consumer, transaction,
 retirement and namespace suites cover the remaining assembled-service contracts.
 An unfenced binary must never consume storage containing unfinished reviewer
 intents; deployment and compatible rollback remain separate operator work.
