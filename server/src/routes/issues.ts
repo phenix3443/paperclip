@@ -19415,7 +19415,7 @@ export function issueRoutes(
         const postCommitIssueActions: IssuePostCommitAction[] = [];
         try {
           txResult = await db.transaction(async (tx) => {
-            if (updatePatch.executionState !== undefined)
+            if (transition.patch.executionState !== undefined)
               await tx.select({ id: companies.id }).from(companies).where(eq(companies.id, currentIssue.companyId)).for("share");
             const insertedComment = await svc.addComment(
               id,

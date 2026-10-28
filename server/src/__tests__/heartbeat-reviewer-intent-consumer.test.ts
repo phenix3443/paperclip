@@ -1,3 +1,4 @@
+import { idleWorkSnapshot } from "../services/task-admission.js";
 import { seedReviewerIntent } from "./helpers/reviewer-intent.js";
 import express from "express";
 import request from "supertest";
@@ -199,6 +200,7 @@ const support = await getEmbeddedPostgresTestSupport();
         expect(completedSweeps).toBeGreaterThan(beforeProduction);
         expect(databaseWorkPending(db, DELIVERY_QUEUES.executionContinuation)).toBe(false);
         expect(c.nextWakeAt()).toBeNull();
+        expect(idleWorkSnapshot().active).toBe(0);
       }, { timeout: 5000 });
       const settled = reads;
       await vi.advanceTimersByTimeAsync(90_000);
