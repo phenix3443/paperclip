@@ -527,13 +527,30 @@ describePostgres("already available connection requests", () => {
   it("replays a retired access request after restart without a second wake", async () => {
     const f = await seed(); const intent = await requestAccess(f);
     await grantRequested(f, intent);
-    const first = vi.fn().mockResolvedValue(null);
+    const first = vi.fn(async () => {
+      await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "automation",
+        status: "queued", idempotencyKey: `connection-intent:${intent.id}:expired` });
+      return null;
+    });
     await connectionIntentDeliveryService(db, { wakeup: first }).sweepPending();
     const restarted = vi.fn().mockResolvedValue(null);
     await connectionIntentDeliveryService(db, { wakeup: restarted }).sweepPending();
     expect(first).toHaveBeenCalledOnce();
     expect(restarted).not.toHaveBeenCalled();
-    expect(await db.select().from(connectionIntentDeliveries)).toHaveLength(1);
+    const receipts = await db.select().from(connectionIntentDeliveries);
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0].deliveredAt).not.toBeNull();
+  });
+
+  it("keeps a waiting access request on the delivery worker until its grant commits", async () => {
+    const f = await seed(); const intent = await requestAccess(f);
+    const worker = connectionIntentDeliveryService(db, { wakeup: vi.fn().mockResolvedValue(null) });
+    expect(await worker.hasPending()).toBe(true);
+    await worker.sweepPending();
+    expect((await db.select().from(issueThreadInteractions))[0].status).toBe("pending");
+    await grantRequested(f, intent);
+    await worker.sweepPending();
+    expect((await db.select().from(issueThreadInteractions))[0].status).toBe("expired");
   });
 
   it("rejects a delayed human reply to a retired access request without recording consent", async () => {
