@@ -30,7 +30,7 @@ function canonical(value: unknown): string {
 
 export { issueExecutionGeneration as reviewerAssignmentGeneration } from "../issue-execution-policy.js";
 
-const identitySchema = z.object({ companyId: z.uuid(), issueId: z.uuid(), reviewerId: z.uuid(), sourceRunId: z.uuid(),
+const identitySchema = z.object({ companyId: z.uuid(), issueId: z.uuid(), reviewerId: z.uuid(), sourceRunId: z.uuid(), sourceAgentId: z.uuid().optional(),
   contextSnapshot: z.record(z.string(), z.unknown()),
   generation: z.string().regex(/^[a-f0-9]{64}$/), actorType: z.enum(["agent", "user", "system"]), actorId: z.string().min(1) });
 const recordSchema = z.object({ version: z.literal(1), immutable: identitySchema,
@@ -60,16 +60,17 @@ function stageContext(task: Task) {
     lastDecisionOutcome: state.lastDecisionOutcome, allowedActions: ["approve", "request_changes"] };
 }
 
-function sourceMatches(source: typeof heartbeatRuns.$inferSelect, task: typeof issues.$inferSelect) {
+function sourceMatches(source: typeof heartbeatRuns.$inferSelect, task: typeof issues.$inferSelect, sourceAgentId?: string) {
   const state = pending(task);
-  return state?.returnAssignee?.type === "agent" && source.agentId === state.returnAssignee.agentId &&
+  const expectedAgentId = sourceAgentId ?? (state?.returnAssignee?.type === "agent" ? state.returnAssignee.agentId : null);
+  return expectedAgentId !== null && source.agentId === expectedAgentId &&
     (source.nativeIssueId === task.id || source.contextSnapshot?.issueId === task.id) &&
     (source.nativeIssueId === null || source.nativeIssueId === task.id) &&
     (source.contextSnapshot?.issueId === undefined || source.contextSnapshot.issueId === task.id);
 }
 
 export async function createReviewerAssignmentIntent(tx: IntentDb, input: {
-  companyId: string; issueId: string; sourceRunId: string;
+  companyId: string; issueId: string; sourceRunId: string; predecessorAgentId?: string;
   requestedByActorType: "agent" | "user" | "system"; requestedByActorId: string;
 }) {
   const company = await lockReviewerIntentCompany(tx, input.companyId);
@@ -78,7 +79,7 @@ export async function createReviewerAssignmentIntent(tx: IntentDb, input: {
   const state = task && pending(task);
   const [source] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.sourceRunId)));
   if (!task || task.status !== "in_review" || !state || !source ||
-      !sourceMatches(source, task) ||
+      !sourceMatches(source, task, input.predecessorAgentId) ||
       (input.requestedByActorType === "agent" && input.requestedByActorId !== source.agentId) ||
       (input.requestedByActorType === "user" && input.requestedByActorId !== task.responsibleUserId)) return null;
   const generation = reviewerAssignmentGeneration(task);
@@ -90,7 +91,7 @@ export async function createReviewerAssignmentIntent(tx: IntentDb, input: {
   if (existing && readIntent(existing)) return existing;
   const now = new Date();
   const intent: Intent = { version: 1, immutable: { companyId: task.companyId, issueId: task.id,
-    reviewerId: task.assigneeAgentId!, sourceRunId: source.id, generation,
+    reviewerId: task.assigneeAgentId!, sourceRunId: source.id, sourceAgentId: source.agentId, generation,
     actorType: input.requestedByActorType, actorId: input.requestedByActorId,
     contextSnapshot: { issueId: task.id, taskId: task.id, wakeReason: "execution_review_requested", source: "issue.execution_stage",
       executionStage: stageContext(task), interruptedRunId: source.id } }, attempt: 0, nextAttemptAt: now.getTime() };
@@ -105,10 +106,11 @@ export async function createReviewerAssignmentIntent(tx: IntentDb, input: {
 export async function produceReviewerAssignmentTransition(tx: IntentDb, before: Task, after: typeof issues.$inferSelect,
   input: { sourceRunId: string | null; actorType: "agent" | "user" | "system"; actorId: string }) {
   const next = pending(after), previous = pending(before);
-  if (!next || !input.sourceRunId || (previous?.currentStageId === next.currentStageId &&
+  if (!next || !input.sourceRunId || !before.assigneeAgentId || before.assigneeUserId || (previous?.currentStageId === next.currentStageId &&
       canonical(previous.currentParticipant) === canonical(next.currentParticipant))) return null;
   return createReviewerAssignmentIntent(tx, { companyId: after.companyId, issueId: after.id,
-    sourceRunId: input.sourceRunId, requestedByActorType: input.actorType, requestedByActorId: input.actorId });
+    sourceRunId: input.sourceRunId, predecessorAgentId: before.assigneeAgentId,
+    requestedByActorType: input.actorType, requestedByActorId: input.actorId });
 }
 
 export async function hasPendingReviewerAssignment(tx: IntentDb, task: typeof issues.$inferSelect) {
@@ -170,7 +172,7 @@ export async function admitReviewerIntent(tx: Db, candidate: Receipt) {
   const [task] = await tx.select().from(issues).where(and(eq(issues.companyId, row.companyId), eq(issues.id, id.issueId)));
   const [source] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, row.companyId), eq(heartbeatRuns.id, id.sourceRunId)));
   if (!task || !pending(task) || ["done", "cancelled"].includes(task.status) || reviewerAssignmentGeneration(task) !== id.generation ||
-      !source || !sourceMatches(source, task) ||
+      !source || !sourceMatches(source, task, id.sourceAgentId) ||
       canonical(id.contextSnapshot.executionStage) !== canonical(stageContext(task)) ||
       (id.actorType === "agent" && source.agentId !== id.actorId) ||
       (id.actorType === "user" && task.responsibleUserId !== id.actorId)) {

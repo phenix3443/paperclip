@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { agents, agentWakeupRequests, authUsers, createDb, heartbeatRuns, issues, type Db } from "@paperclipai/db";
@@ -120,6 +121,42 @@ const support = await getEmbeddedPostgresTestSupport();
       await service.drainActiveRunExecutions(); await c.stop();
     }
   }, 60_000);
+
+  it("continues from a reviewer to the next review stage while preserving the author's return assignment", async () => {
+    const f = await seedReviewerIntent(db, false);
+    const nextId = randomUUID(), nextStageId = randomUUID();
+    await db.insert(agents).values({ id: nextId, companyId: f.companyId, name: "Second reviewer", role: "engineer",
+      adapterType: "process", status: "idle", runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } });
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: nextId, status: "running" });
+    const [reviewSource] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      status: "cancelled", finishedAt: new Date(), contextSnapshot: { issueId: f.issueId },
+      resultJson: { reassignmentStopConfirmed: true, executionCancellation: { state: "acknowledged" } } }).returning();
+    const policy = { ...f.issue.executionPolicy!, stages: [...f.issue.executionPolicy!.stages,
+      { id: nextStageId, type: "review" as const, approvalsNeeded: 1,
+        participants: [{ id: randomUUID(), type: "agent" as const, agentId: nextId }] }] };
+    await db.update(issues).set({ executionPolicy: policy }).where(eq(issues.id, f.issueId));
+    const after = await issueService(db).update(f.issueId, { status: "in_review", assigneeAgentId: nextId,
+      executionState: { ...f.issue.executionState!, currentStageId: nextStageId, currentStageIndex: 1,
+        currentParticipant: { type: "agent", agentId: nextId }, completedStageIds: [f.issue.executionState!.currentStageId!] },
+      actorAgentId: f.agentId, executionHandoffRunId: reviewSource.id });
+    const [receipt] = await receipts(f);
+    expect(receipt).toMatchObject({ agentId: nextId, status: "deferred_issue_execution", runId: null });
+    const { recordRunExecutionReleased } = await import("../services/heartbeat/case-handoff-lifecycle.js");
+    await recordRunExecutionReleased(db, reviewSource.id, f.issueId);
+    const service = heartbeatService(db), { c, start } = coordinator(service);
+    try {
+      await start();
+      const [delivered] = await receipts(f);
+      expect(delivered).toMatchObject({ status: "coalesced", runId: expect.any(String) });
+      const current = await issueService(db).getById(f.issueId);
+      expect(current?.executionState).toEqual(after?.executionState);
+      expect(current?.executionState?.returnAssignee?.agentId).toBe(f.source.agentId);
+      expect(current?.executionPolicy).toEqual(policy);
+      expect(current?.responsibleUserId).toBe("board");
+      expect(await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.agentId, nextId),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${f.issueId}`))).toHaveLength(1);
+    } finally { await c.stop(); await service.drainActiveRunExecutions(); }
+  });
 
   it("serializes archive with the real producer and never replays on unarchive", async () => {
     const f = await seed();

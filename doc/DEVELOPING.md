@@ -3685,7 +3685,11 @@ verify broken-pipe handling, normal input delivery and process cleanup.
 The issue service persists a future pending agent-review handoff as an unfinished
 reviewer intent in the same transaction as the stage/assignment update. Only
 server-owned transition inputs identify the interrupted source run; public wake
-payloads cannot create the intent. Repeated handoff wakes leave delivery to the
+payloads cannot create the intent. The immutable source agent comes from the
+locked predecessor assignment; a later review stage may depart from a reviewer
+while returnAssignee still names the original author. Delivery validates that
+saved source instead of treating returnAssignee as the outgoing executor.
+Repeated handoff wakes leave delivery to the
 existing execution-continuation consumer. Ordinary matching reviewer turns still
 satisfy the intent through generation-based adoption.
 
