@@ -246,6 +246,7 @@ export async function markExecutionReconciliation(
   }
   await db.transaction(async tx => {
     await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionContinuation);
+    await notifyDeliveryWork(tx, DELIVERY_QUEUES.crossTaskContinuations);
     await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionReplacement);
     await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionDisposition);
     await tx

@@ -84,6 +84,7 @@ export const instanceExperimentalSettingsSchema = z.object({
   autoRestartDevServerWhenIdle: z.boolean().default(false),
   enableWorkspaceBranchReconcileForward: z.boolean().default(true),
   enableWorkspaceDirtyQuarantineRepair: z.boolean().default(true),
+  enableCrossTaskDeferredContinuation: z.boolean().default(false),
   enableOwnerInstanceAdmin: z.boolean().default(false),
   // Kill switch for the sandbox duplex command-stream bridge. Default off. When
   // off the host keeps the file bridge for every run with no manifest change and

@@ -120,6 +120,7 @@ function defaultExperimentalSettings(): InstanceExperimentalSettingsPayload {
     enableSandboxDuplexBridge: false,
     enableRunnerPreviewIngress: false,
     enableWorktreeRunExecution: false,
+    enableCrossTaskDeferredContinuation: false,
     worktreeRunExecutionActivatedAt: null,
     worktreeRunExecutionActivationInstanceId: null,
   };

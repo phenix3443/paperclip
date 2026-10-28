@@ -193,6 +193,17 @@ import {
 import { trackAgentTaskCompleted } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { isUniqueViolation } from "../db-errors.js";
+import {
+  CROSS_TASK_CONTINUATION_MESSAGES,
+  CrossTaskContinuationRefusal,
+  type CrossTaskContinuationCommitDeps,
+  classifyIssueExecutionWorkspaceBinding,
+  isSuccessorReopenableWorkspace,
+  commitCrossTaskContinuation,
+  crossTaskContinuationRequestDigest,
+  findCrossTaskContinuationReplay,
+} from "../services/cross-task-continuation.js";
+import { runBindsIssueForWorkspaceExecution } from "../services/task-workspace-access.js";
 import type { StorageService } from "../storage/types.js";
 import { validate, validateIssueMutationBody } from "../middleware/validate.js";
 import * as serviceIndex from "../services/index.js";
@@ -3043,6 +3054,11 @@ type IssueListInflightEntry = {
 const issueListResponseCache = new Map<string, IssueListCacheEntry>();
 const issueListInflight = new Map<string, IssueListInflightEntry>();
 const issueListActorClientInflight = new Map<string, number>();
+
+export const crossTaskContinuationTestHooks: {
+  beforeTransaction?: () => Promise<void>;
+  beforeCommit?: (tx: Parameters<Parameters<Db["transaction"]>[0]>[0]) => Promise<void>;
+} = {};
 
 export function __getIssueListResponseCacheSizeForTests() {
   return issueListResponseCache.size;
@@ -6866,6 +6882,35 @@ export function issueRoutes(
     return false;
   }
 
+  async function reauthorizeCrossTaskContinuation(
+    req: Request,
+    lockedIssue: Parameters<CrossTaskContinuationCommitDeps["reauthorize"]>[0],
+    resumeRequested: boolean,
+  ): Promise<{ status: number; body: { error?: string; details?: Record<string, unknown> } } | null> {
+    const refusal = { status: 500, body: {} as { error?: string; details?: Record<string, unknown> } };
+    const capture = {
+      status(code: number) { refusal.status = code; return capture; },
+      json(body: { error?: string; details?: Record<string, unknown> }) { refusal.body = body; return capture; },
+    } as unknown as Response;
+    const commentDecision = await assertAgentIssueCommentAllowed(req, capture, lockedIssue);
+    if (!commentDecision) return refusal;
+    const nonAssignee = req.actor.type === "agent"
+      && lockedIssue.assigneeAgentId !== null
+      && lockedIssue.assigneeAgentId !== req.actor.agentId;
+    if (isClosedIssueStatus(lockedIssue.status) && nonAssignee
+      && (isDirectParentReportDecision(commentDecision) || isIssueMentionGrantDecision(commentDecision))) {
+      return { status: 409, body: { error: "Issue access changed; retry the follow-up" } };
+    }
+    if (isClosedIssueStatus(lockedIssue.status) && nonAssignee
+      && !(await assertAgentIssueMutationAllowed(req, capture, lockedIssue, { allowVisibleIssueWrite: true }))) {
+      return refusal;
+    }
+    if (!(await assertExplicitResumeIntentAllowed(req, capture, lockedIssue, resumeRequested ? { resumeIntent: true } : {}))) {
+      return refusal;
+    }
+    return null;
+  }
+
   async function assertExplicitResumeIntentAllowed(
     req: Request,
     res: Response,
@@ -7776,6 +7821,184 @@ export function issueRoutes(
       res.status(409).json({ error: result.message });
     }
     return null;
+  }
+
+  async function respondWithCrossTaskContinuationReplay(
+    req: Request,
+    res: Response,
+    issue: { id: string; companyId: string },
+    requestDigest: string,
+  ): Promise<boolean> {
+    const replay = await findCrossTaskContinuationReplay(db, {
+      companyId: issue.companyId,
+      issueId: issue.id,
+      agentId: req.actor.agentId!,
+      clientRequestId: req.body.clientRequestId,
+      requestDigest,
+    });
+    if (replay.kind === "fresh") return false;
+    if (replay.kind === "digest_mismatch") {
+      res.status(409).json({ error: CROSS_TASK_CONTINUATION_MESSAGES.digestMismatch });
+      return true;
+    }
+    if (replay.kind === "invariant_breach") {
+      logger.error(
+        { issueId: issue.id, commentId: replay.commentId },
+        "cross-task continuation comment has no continuation intent",
+      );
+      res.status(500).json({ error: "Cross-task continuation receipt is incomplete" });
+      return true;
+    }
+    const comment = await svc.getComment(replay.commentId);
+    res.status(201).json({ ...comment, replayed: true, continuation: replay.continuation });
+    return true;
+  }
+
+  async function commitDeferredCrossTaskContinuationOrRespond(input: {
+    req: Request;
+    res: Response;
+    issue: Awaited<ReturnType<typeof svc.getById>> & {};
+    binding: { workspaceId: string; generation: number };
+    requestDigest: string | null;
+    resumeRequested: boolean;
+    interruptRequested: boolean;
+    commentPresentation: unknown;
+    commentAuthorizationReason: ReturnType<typeof issueWriteAuthorizationReason>;
+    commentAccessDecision: unknown;
+  }): Promise<void> {
+    const { req, res, issue, binding } = input;
+    if (!req.body.clientRequestId || !input.requestDigest) {
+      res.status(422).json({ error: CROSS_TASK_CONTINUATION_MESSAGES.clientRequestIdRequired });
+      return;
+    }
+    if (input.interruptRequested) {
+      res.status(403).json({ error: "Only board users can interrupt active runs from issue comments" });
+      return;
+    }
+    const actor = getActorInfo(req);
+    const publications: ActivityPublication[] = [];
+    const postCommitIssueActions: IssuePostCommitAction[] = [];
+    const sourceTrust = await sourceTrustForActorWrite(issue, actor);
+    let result: Awaited<ReturnType<typeof commitCrossTaskContinuation>>;
+    try {
+      await crossTaskContinuationTestHooks.beforeTransaction?.();
+      result = await commitCrossTaskContinuation(db, {
+        companyId: issue.companyId,
+        issueId: issue.id,
+        actorAgentId: req.actor.agentId!,
+        sourceRunId: req.actor.runId!,
+        clientRequestId: req.body.clientRequestId,
+        requestDigest: input.requestDigest,
+        binding,
+        admitted: {
+          assigneeAgentId: issue.assigneeAgentId ?? null,
+          responsibleUserId: issue.responsibleUserId ?? null,
+        },
+        resumeRequested: input.resumeRequested,
+      }, {
+        addComment: (tx) => svc.addComment(
+          issue.id,
+          req.body.body,
+          {
+            agentId: actor.agentId ?? undefined,
+            runId: actor.runId,
+            onBehalfOfUserId: authenticatedActorResponsibleUserId(req),
+          },
+          {
+            authorType: req.body.authorType ?? "agent",
+            presentation: input.commentPresentation as never,
+            metadata: req.body.metadata ?? null,
+            attachmentIds: req.body.attachmentIds,
+            clientRequestId: req.body.clientRequestId,
+            mirrorToSlack: false,
+            authorizationReason: input.commentAuthorizationReason,
+            sourceTrust,
+          },
+          tx,
+        ),
+        setIssueTodo: (tx) => svc.update(
+          issue.id,
+          { status: "todo" },
+          tx as unknown as Db,
+          undefined,
+          postCommitIssueActions,
+        ),
+        logIssueReopened: async (tx, { reopenedFrom }) => {
+          await logActivity(tx as unknown as Db, {
+            companyId: issue.companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
+            action: "issue.updated",
+            entityType: "issue",
+            entityId: issue.id,
+            details: {
+              status: "todo",
+              reopened: true,
+              reopenedFrom,
+              source: "comment",
+              ...(input.resumeRequested ? { resumeIntent: true, followUpRequested: true } : {}),
+              crossTaskContinuation: true,
+              identifier: issue.identifier,
+            },
+          }, publications);
+        },
+        getActivePauseHold: (companyId, issueId) => treeControlSvc.getActivePauseHoldGate(companyId, issueId),
+        getUnresolvedBlockerCount: async (issueId, tx) =>
+          (await svc.getDependencyReadiness(issueId, tx)).unresolvedBlockerCount,
+        reauthorize: (lockedIssue) => reauthorizeCrossTaskContinuation(req, lockedIssue, input.resumeRequested),
+        beforeCommit: crossTaskContinuationTestHooks.beforeCommit,
+      });
+    } catch (error) {
+      if (error instanceof CrossTaskContinuationRefusal) {
+        res.status(error.status).json({ error: error.message, ...(error.details ? { details: error.details } : {}) });
+        return;
+      }
+      throw error;
+    }
+    if (result.kind === "replay") {
+      if (!(await respondWithCrossTaskContinuationReplay(req, res, issue, input.requestDigest))) {
+        res.status(409).json({ error: CROSS_TASK_CONTINUATION_MESSAGES.deadlock });
+      }
+      return;
+    }
+    for (const publication of publications) publishActivity(publication);
+    await flushIssuePostCommitActions(postCommitIssueActions);
+    const comment = await svc.getComment(result.commentId);
+    await issueReferencesSvc.syncComment(result.commentId);
+    await externalObjectsSvc.syncCommentSafely(result.commentId);
+    if (actor.runId) {
+      await heartbeat.reportRunActivity(actor.runId).catch((err) =>
+        logger.warn({ err, runId: actor.runId }, "failed to clear detached run warning after issue comment"));
+    }
+    await logActivity(db, {
+      companyId: issue.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
+      responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
+      action: "issue.comment_added",
+      entityType: "issue",
+      entityId: issue.id,
+      details: {
+        commentId: result.commentId,
+        bodySnippet: req.body.body.slice(0, 120),
+        identifier: issue.identifier,
+        issueTitle: issue.title,
+        authorizationReason: input.commentAuthorizationReason,
+        ...(input.resumeRequested ? { resumeIntent: true, followUpRequested: true } : {}),
+        ...(result.reopenedFrom ? { reopened: true, reopenedFrom: result.reopenedFrom, source: "comment" } : {}),
+        crossTaskContinuation: true,
+        wakeupRequestId: result.continuation.wakeupRequestId,
+      },
+    });
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: issue.companyId }).catch((err) =>
+      logger.warn({ err, issueId: issue.id }, "failed to dispatch cross-task continuation intent"));
+    res.status(201).json({ ...comment, replayed: false, continuation: result.continuation });
   }
 
   // The keepalive re-stamps the reopen-pending flag on this interval while a
@@ -18582,6 +18805,21 @@ export function issueRoutes(
         );
         return;
       }
+      const crossTaskRequestDigest =
+        req.actor.type === "agent" && req.actor.agentId && req.body.clientRequestId
+          ? crossTaskContinuationRequestDigest({
+              issueId: issue.id,
+              body: req.body.body,
+              resume: req.body.resume,
+              reopen: req.body.reopen,
+              interrupt: req.body.interrupt,
+              attachmentIds: req.body.attachmentIds,
+            })
+          : null;
+      if (crossTaskRequestDigest && !(await assertIssueReadAllowed(req, res, issue))) return;
+      if (crossTaskRequestDigest && (await respondWithCrossTaskContinuationReplay(
+        req, res, issue, crossTaskRequestDigest,
+      ))) return;
       const commentAccessDecision = await assertAgentIssueCommentAllowed(
         req,
         res,
@@ -18721,6 +18959,43 @@ export function issueRoutes(
         ))
       )
         return;
+      const crossTaskBinding =
+        req.actor.type === "agent" &&
+        req.actor.agentId &&
+        req.actor.runId &&
+        (effectiveResumeRequested === true || effectiveReopenRequested === true)
+          ? await classifyIssueExecutionWorkspaceBinding(db, issue)
+          : null;
+      const crossTaskCandidate =
+        (crossTaskBinding?.kind === "missing" || crossTaskBinding?.kind === "closed_isolated") &&
+        (await instanceSettings.getExperimental()).enableCrossTaskDeferredContinuation === true &&
+        !(await runBindsIssueForWorkspaceExecution(db, req.actor, issue.companyId, issue.id));
+      if (crossTaskCandidate && crossTaskBinding) {
+        const binding = crossTaskBinding;
+        if (binding.kind === "missing") {
+          res.status(409).json({ error: CROSS_TASK_CONTINUATION_MESSAGES.notReopenable });
+          return;
+        }
+        if (binding.kind === "closed_isolated") {
+          if (!isSuccessorReopenableWorkspace(binding)) {
+            res.status(409).json({ error: CROSS_TASK_CONTINUATION_MESSAGES.notReopenable });
+            return;
+          }
+          await commitDeferredCrossTaskContinuationOrRespond({
+            req,
+            res,
+            issue,
+            binding,
+            requestDigest: crossTaskRequestDigest,
+            resumeRequested: effectiveResumeRequested === true,
+            interruptRequested,
+            commentPresentation,
+            commentAuthorizationReason,
+            commentAccessDecision,
+          });
+          return;
+        }
+      }
       // Reopen the closed isolated workspace only after every access, resume-intent,
       // blocker, and run-cap gate passes. A rejected comment must not rebuild and
       // republish the workspace as active, because the issue stays terminal and the

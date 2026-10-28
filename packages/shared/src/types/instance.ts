@@ -123,6 +123,7 @@ export interface InstanceExperimentalSettings {
   autoRestartDevServerWhenIdle: boolean;
   enableWorkspaceBranchReconcileForward: boolean;
   enableWorkspaceDirtyQuarantineRepair: boolean;
+  enableCrossTaskDeferredContinuation: boolean;
   /**
    * On cloud-managed instances, grant the stack owner instance-admin access
    * to their own dedicated instance. Elevation is computed per request at the

@@ -15,6 +15,7 @@ import { bindHeartbeatRunnerHomeMode, prepareHeartbeatExecutionConfiguration } f
 import { createHeartbeatRunOutput } from "./heartbeat/run-output.js";
 import { prepareHeartbeatSession, resolveHeartbeatAdapterSession } from "./heartbeat/session-preparation.js";
 import { prepareHeartbeatTaskContext } from "./heartbeat/task-context.js";
+import { reopenTargetBoundSuccessorWorkspace } from "./heartbeat/target-bound-successor-reopen.js";
 import { selectHeartbeatEnvironment } from "./heartbeat/environment-selection.js";
 import { reconcileMuseNativeTerminalRun } from "./native-runtime/muse-terminal-reconciliation.js";
 import { prepareHeartbeatWorkspace } from "./heartbeat/workspace-preparation.js";
@@ -2372,6 +2373,20 @@ export function heartbeatService(
             ),
           );
         issueContext = { ...issueContext, responsibleUserId };
+      }
+      if (issueId) {
+        await reopenTargetBoundSuccessorWorkspace(db, {
+          run: {
+            id: run.id, companyId: run.companyId, agentId: run.agentId, wakeupRequestId: run.wakeupRequestId,
+            issueId: run.issueId, nativeIssueId: run.nativeIssueId,
+            contextSnapshot: parseObject(run.contextSnapshot),
+          },
+          responsibleUserId,
+          externalProvider: Boolean(externalProvider),
+          hasPersistedNativeExecutionInput: run.runtimeMode === "native" && parseObject(run.runnerProfileJson).nativeExecutionInput !== undefined,
+          freshIsolatedWorkspaceRequested: freshWorkspace?.mode === "fresh_isolated_workspace",
+          executionWorkspacesSvc,
+        });
       }
       const workspacePolicyContext = workspaceProjectContext ?? (
         !boundSourceWorkspace && !taskWorkspaceIntentRow?.intent && !issueContext?.projectWorkspaceId

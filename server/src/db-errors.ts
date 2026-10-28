@@ -50,3 +50,13 @@ export function isForeignKeyViolation(error: unknown): boolean {
   }
   return false;
 }
+
+export function isDeadlockDetected(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < MAX_CAUSE_DEPTH && current && typeof current === "object"; depth += 1) {
+    const candidate = current as { code?: unknown; cause?: unknown };
+    if (candidate.code === "40P01") return true;
+    current = candidate.cause;
+  }
+  return false;
+}
