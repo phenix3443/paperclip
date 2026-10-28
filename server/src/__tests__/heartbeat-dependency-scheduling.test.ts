@@ -5,6 +5,7 @@ import {
   costEvents,
   budgetPolicies,
   budgetIncidents,
+  approvals,
   activityLog,
   agents,
   agentRuntimeState,
@@ -42,6 +43,7 @@ import {
 import { heartbeatService } from "../services/heartbeat.ts";
 import { runningProcesses } from "../adapters/index.ts";
 import { budgetService } from "../services/budgets.js";
+import { configureAgentLifecycle, createAgentLifecycle } from "../services/agent-lifecycle.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -164,6 +166,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     await db.delete(activityLog);
     await db.delete(costEvents);
     await db.delete(budgetIncidents);
+    await db.delete(approvals);
     await db.delete(budgetPolicies);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
@@ -201,45 +204,58 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     await db.insert(companyMemberships).values({ companyId, principalType: "user",
       principalId: "responsible-user", status: "active", membershipRole: "member" });
     await db.insert(agents).values({ id: agentId, companyId, name: "Held worker", role: "engineer",
-      status: hold === "manual pause" ? "paused" : "idle", adapterType: "codex_local",
+      status: "idle", adapterType: "codex_local",
       adapterConfig: {}, permissions: {}, runtimeConfig: { heartbeat: { wakeOnDemand: true } } });
     await db.insert(issues).values({ id: issueId, companyId, title: "Dependency finished during hold",
       status: "blocked", assigneeAgentId: agentId, responsibleUserId: "responsible-user" });
-    if (hold === "budget policy") {
-      await db.insert(budgetPolicies).values({ companyId, scopeType: "agent", scopeId: agentId,
-        metric: "billed_cents", windowKind: "lifetime", amount: 100, reservationCents: "0", notifyEnabled: false });
-      await db.insert(costEvents).values({ companyId, agentId, provider: "test", model: "test-model",
-        costCents: 100, occurredAt: new Date() });
-      expect(await budgetService(db).getInvocationBlock(companyId, agentId, { issueId })).not.toBeNull();
-    }
-    const [intent] = await db.insert(agentWakeupRequests).values({ companyId, agentId,
-      source: "automation", triggerDetail: "system", reason: "issue_blockers_resolved",
-      requestedByActorType: "system", requestedByActorId: "native-status-committer",
-      idempotencyKey: `native-dependency:${issueId}`,
-      payload: { issueId, taskId: issueId, _paperclipWakeContext: { issueId, taskId: issueId,
-        source: "native_status_decision" } } }).returning();
+    const lifecycle = configureAgentLifecycle(db, { requiredPluginIds: async () => [],
+      runHost: async () => "complete", runPlugin: async () => "complete" });
+    try {
+      if (hold === "manual pause") {
+        await createAgentLifecycle(db).pauseAgent(agentId);
+        await lifecycle.process(agentId);
+      } else {
+        await db.insert(budgetPolicies).values({ companyId, scopeType: "agent", scopeId: agentId,
+          metric: "billed_cents", windowKind: "lifetime", amount: 100, reservationCents: "0", notifyEnabled: false });
+        await db.insert(costEvents).values({ companyId, agentId, provider: "test", model: "test-model",
+          costCents: 100, occurredAt: new Date() });
+        expect(await budgetService(db).getInvocationBlock(companyId, agentId, { issueId })).not.toBeNull();
+        await lifecycle.process(agentId);
+      }
+      const [intent] = await db.insert(agentWakeupRequests).values({ companyId, agentId,
+        source: "automation", triggerDetail: "system", reason: "issue_blockers_resolved",
+        requestedByActorType: "system", requestedByActorId: "native-status-committer",
+        idempotencyKey: `native-dependency:${issueId}`,
+        payload: { issueId, taskId: issueId, _paperclipWakeContext: { issueId, taskId: issueId,
+          source: "native_status_decision" } } }).returning();
 
-    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
-    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
-    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(0);
-    expect(mockAdapterExecute).not.toHaveBeenCalled();
+      await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
+      await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(0);
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
 
-    if (hold === "budget policy") {
-      await db.update(budgetPolicies).set({ amount: 200 }).where(eq(budgetPolicies.companyId, companyId));
-      expect(await budgetService(db).getInvocationBlock(companyId, agentId, { issueId })).toBeNull();
+      if (hold === "budget policy") {
+        await db.update(budgetPolicies).set({ amount: 200 }).where(eq(budgetPolicies.companyId, companyId));
+        expect(await budgetService(db).getInvocationBlock(companyId, agentId, { issueId })).toBeNull();
+      } else {
+        await createAgentLifecycle(db).resumeAgent(agentId);
+      }
+      await lifecycle.process(agentId);
+      expect((await db.select().from(agents).where(eq(agents.id, agentId)))[0]!.lifecycleState).toBe("ready");
+      await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
+      await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
+      await heartbeat.drainActiveRunExecutions();
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+      const requests = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+      console.info("Dependency hold regression", { hold, runs: runs.map(({ id, status }) => ({ id, status })),
+        requests: requests.map(({ id, reason, status, runId }) => ({ id, reason, status, runId })),
+        adapterCalls: mockAdapterExecute.mock.calls.length });
+      expect(runs).toHaveLength(1);
+      expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+      expect(requests.find(({ id }) => id === intent!.id)?.runId).toBe(runs[0]!.id);
+    } finally {
+      await lifecycle.stop();
     }
-    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, agentId));
-    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
-    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
-    await heartbeat.drainActiveRunExecutions();
-    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
-    const requests = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
-    console.info("Dependency hold regression", { hold, runs: runs.map(({ id, status }) => ({ id, status })),
-      requests: requests.map(({ id, reason, status, runId }) => ({ id, reason, status, runId })),
-      adapterCalls: mockAdapterExecute.mock.calls.length });
-    expect(runs).toHaveLength(1);
-    expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
-    expect(requests.find(({ id }) => id === intent!.id)?.runId).toBe(runs[0]!.id);
   });
 
   it("delivers a revised native child completion after the running parent blocks", async () => {
