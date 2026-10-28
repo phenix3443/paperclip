@@ -19162,8 +19162,6 @@ export function issueRoutes(
           return;
         }
       }
-      // Cross-task candidates are classified above, so a binding the company cannot
-      // see gets their 409 rather than the stored-workspace access 403.
       const closedExecutionWorkspace =
         await getClosedIssueExecutionWorkspace(issue);
       // Reopen the closed isolated workspace only after every access, resume-intent,

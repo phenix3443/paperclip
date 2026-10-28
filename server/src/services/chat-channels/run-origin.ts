@@ -101,7 +101,6 @@ async function reentryContext(db: Db, run: Run, from: Context, visited: Readonly
     const [owner] = await db.select({ issueId: boundRunIssueIdSql(), agentId: heartbeatRuns.agentId }).from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.id, current.runId), eq(heartbeatRuns.companyId, run.companyId))).limit(1);
     if (!owner) return undefined;
-    // Only the same agent re-enters this task; another agent's run here is not a return trip.
     if (owner.issueId === issueId) return owner.agentId === run.agentId ? current : undefined;
     if (!current.parentContextId) return null;
     [current] = await db.select().from(runIdentityContexts).where(and(

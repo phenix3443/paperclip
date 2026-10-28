@@ -6520,7 +6520,6 @@ describe("native startup restart detachment", () => {
     }));
     const snapshotDb = { select: () => ({ from: () => ({
       innerJoin: () => ({ where: async () => snapshotRows }),
-      // Develop's detachment re-reads each run's status before detaching it.
       where: async () => [{ status: "running" }],
     }) }) } as unknown as Db;
     const { logger } = await import("../../middleware/logger.js");

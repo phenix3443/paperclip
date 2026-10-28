@@ -176,7 +176,6 @@ export async function readBoundedDirectory(directory: string, signal?: AbortSign
   try {
     dir = await fs.opendir(directory);
   } catch (error) {
-    // fs.opendir rejects without JS stack frames; keep the failure location for expiration diagnostics.
     if (error instanceof Error) Error.captureStackTrace(error);
     throw error;
   }
