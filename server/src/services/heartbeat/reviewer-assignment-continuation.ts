@@ -162,6 +162,7 @@ export async function admitReviewerIntent(tx: Db, candidate: Receipt) {
   }
   if (company === "archived") { await retire(tx, row, "Company archived"); return null; }
   if (company !== "active") { await hold(tx, row, intent, "company_inactive"); return null; }
+  if (task.responsibleUserId === null) { await hold(tx, row, intent, "identity_initialization_pending"); return null; }
   const access = authorizationService(tx);
   const actors: AuthorizationActor[] = [{ type: "agent", agentId: row.agentId, companyId: row.companyId,
     onBehalfOfUserId: task.responsibleUserId, source: "agent_key" }];

@@ -2014,6 +2014,27 @@ their original generation. Refused admission rolls back without consuming the
 monitor. Queue dispatch begins after the admission transaction commits. Other
 monitor paths retain their existing handling.
 
+For legacy tasks with no responsible user, the identity owner initializes the
+NEW review run through the same operator/origin/message selection as dispatch.
+It applies the original null-only task backfill before the queue captures the
+complete generation in that admission transaction. Non-null task ownership is
+preserved. An immutable null-generation intent waits for lawful initialization;
+then the existing generation check retires it instead of re-signing it.
+
+A stamped reviewer quota retry also needs installation evidence. The issue
+mutation owner verifies the source's complete generation before installing the
+quota monitor, rejects any simultaneous non-monitor generation change, and
+records both the source and installed generations in the same transaction's
+`issue.review_quota_monitor_installed` activity. This is a company-scoped,
+server-owned installation proof, not a wake receipt. At retry admission, the
+monitor owner checks that proof against the exact source and current installed
+generation under issue-before-run locks. Only a NEW scheduled retry consumes the
+matching claim and captures the complete post-consumption generation in that
+commit. A missing/foreign proof or any intervening generation change refuses
+admission and retains the monitor duty. Existing retries and immutable receipts
+keep their original generation; provider dispatch still follows outer commit.
+
+
 Held receipts retain per-receipt 15-to-300-second backoff in existing JSON.
 `nextAttemptAt` is an integer Unix time in milliseconds. SQL selects at most 50
 due candidates before decoding payloads; the deadline query returns one aggregate.
