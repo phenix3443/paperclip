@@ -1,7 +1,7 @@
 import { settleNewReviewRunIdentity, settleReviewRunClaimIdentity } from "../run-identity.js";
 import type { IssueMonitorAdmission } from "./scheduling.js";
 import { parseIssueExecutionState } from "../issue-execution-policy.js";
-import { hasPendingReviewerAssignment, admitReviewerIntent, consumeReviewerIntent, reconcileReviewerAssignments, reviewerAssignmentGeneration } from "./reviewer-assignment-continuation.js";
+import { hasPendingReviewerAssignment, admitReviewerIntent, consumeReviewerIntent, adoptReviewerAssignmentIntents, reconcileReviewerAssignments, reviewerAssignmentGeneration } from "./reviewer-assignment-continuation.js";
 import { hasReviewerAssignmentContinuation, ordinaryWakeRequestPredicate, ordinaryWakeRunPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { isAdmittedReconciliation, isGuardedReconciliationDelivery, lockReconciledDeliveryPrefix, recordReconciledDeliveryOutcome, revalidateReconciledDelivery } from "../execution-reconciliation-delivery.js";
 import { assertTaskRetryConversationAllowed, readTaskRetryIntent, readTaskRetryBoardMessageOrigin, retireSupersededTaskRetry, taskRetryMutationAllowed } from "../task-retry.js";
@@ -2941,7 +2941,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           if (!reviewerIntent && enrichedContextSnapshot.source === "issue.execution_stage" && !wakeCommentId) {
             const [pendingReviewIssue] = await tx.select().from(issues).where(and(eq(issues.companyId, agent.companyId), eq(issues.id, issueId!)));
             if (pendingReviewIssue && source === "assignment" && reason === "execution_review_requested" &&
-                await hasPendingReviewerAssignment(tx, pendingReviewIssue)) return { kind: "deferred" as const };
+                await hasPendingReviewerAssignment(tx, pendingReviewIssue) &&
+                !await getExecutionBlocker(tx as unknown as Db, agent.companyId, issueId!)) return { kind: "deferred" as const };
           }
 
           let reusedDispatchReceipt: typeof agentWakeupRequests.$inferSelect | null = null;
@@ -4589,9 +4590,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           }
           const admittedIssue = monitorAdmission ? await monitorAdmission.consume(tx as unknown as Db, issue, agentId) : issue;
           const reviewState = parseIssueExecutionState(admittedIssue.executionState);
-          const pendingReview = admittedIssue.status === "in_review" && reviewState?.status === "pending" &&
+          const pendingReview = reviewState?.status === "pending" &&
             reviewState.currentStageType === "review" && reviewState.currentParticipant?.type === "agent" &&
-            reviewState.currentParticipant.agentId === agentId;
+            reviewState.currentParticipant.agentId === agentId && admittedIssue.assigneeAgentId === agentId &&
+            admittedIssue.assigneeUserId === null;
 
           let newRun = await tx
             .insert(heartbeatRuns)
@@ -4679,6 +4681,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             [newRun] = await tx.update(heartbeatRuns).set({ contextSnapshot: {
               ...newRun.contextSnapshot, reviewerAssignmentGeneration: reviewerAssignmentGeneration(settledIssue),
             } }).where(and(eq(heartbeatRuns.companyId, agent.companyId), eq(heartbeatRuns.id, newRun.id))).returning();
+            await adoptReviewerAssignmentIntents(tx as unknown as Db, settledIssue, newRun);
           }
 
           // executionRunId is NOT stamped here (enqueueWakeup queues the run but

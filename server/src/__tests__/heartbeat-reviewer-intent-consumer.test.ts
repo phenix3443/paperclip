@@ -108,13 +108,19 @@ const support = await getEmbeddedPostgresTestSupport();
   });
 
 
-  it.each(["queued", "running", "scheduled_retry"])("adopts a matching %s ordinary turn", async status => {
+  it.each(["queued", "running", "scheduled_retry", "succeeded"])("adopts a matching %s ordinary turn", async status => {
     const f = await seed();
+    const intent = f.receipt.payload!._paperclipReviewerAssignmentContinuation as Record<string, unknown>;
+    await db.update(agentWakeupRequests).set({ payload: { ...f.receipt.payload,
+      _paperclipReviewerAssignmentContinuation: { ...intent, nextAttemptAt: Date.now() + 300_000 },
+    } }).where(eq(agentWakeupRequests.id, f.receipt.id));
     await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
     const service = heartbeatService(db);
     const run = await service.wakeup(f.agentId, { source: "assignment", reason: "execution_review_requested",
       payload: { issueId: f.issueId }, requestedByActorType: "agent", requestedByActorId: f.source.agentId });
     expect(run).toBeTruthy();
+    const [adopted] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.receipt.id));
+    expect(adopted).toMatchObject({ status: "coalesced", runId: run!.id });
     if (status !== "queued") await db.update(heartbeatRuns).set({ status }).where(eq(heartbeatRuns.id, run!.id));
     await service.reconcileReviewerAssignments();
     const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.receipt.id));

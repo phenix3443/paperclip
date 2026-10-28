@@ -162,12 +162,12 @@ async function lockIntent(tx: IntentDb, candidate: Receipt) {
   return { company, row };
 }
 
-export async function admitReviewerIntent(tx: Db, candidate: Receipt) {
+export async function admitReviewerIntent(tx: Db, candidate: Receipt, adoptingRunId?: string) {
   const { company, row } = await lockIntent(tx, candidate);
   if (!row) return null;
   const intent = readIntent(row);
   if (!intent) { await retire(tx, row, "invalid reviewer intent"); return null; }
-  if (intent.nextAttemptAt > Date.now()) return null;
+  if (!adoptingRunId && intent.nextAttemptAt > Date.now()) return null;
   const id = intent.immutable;
   const [task] = await tx.select().from(issues).where(and(eq(issues.companyId, row.companyId), eq(issues.id, id.issueId)));
   const [source] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, row.companyId), eq(heartbeatRuns.id, id.sourceRunId)));
@@ -201,8 +201,10 @@ export async function admitReviewerIntent(tx: Db, candidate: Receipt) {
     eq(heartbeatRuns.agentId, row.agentId), inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
     sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${task.id}`,
     sql`${heartbeatRuns.contextSnapshot}->>'reviewerAssignmentGeneration' = ${id.generation}`,
+    adoptingRunId ? eq(heartbeatRuns.id, adoptingRunId) : undefined,
   )).orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id)).limit(1);
   if (successor) return { row, intent, task, successor };
+  if (adoptingRunId) return null;
   if (!await hasRecordedRunExecutionRelease(tx, source, task.id) ||
       await getExecutionBlocker(tx, row.companyId, task.id)) {
     await hold(tx, row, intent, "execution_not_released"); return null;
@@ -214,6 +216,18 @@ export async function consumeReviewerIntent(tx: Db, candidate: Receipt, run: typ
   await tx.update(agentWakeupRequests).set({ status: "coalesced", runId: run.id,
     finishedAt: new Date(), updatedAt: new Date(), error: null }).where(and(
       eq(agentWakeupRequests.companyId, candidate.companyId), eq(agentWakeupRequests.id, candidate.id), unfinished()));
+}
+
+export async function adoptReviewerAssignmentIntents(tx: Db, task: typeof issues.$inferSelect, run: typeof heartbeatRuns.$inferSelect) {
+  const generation = reviewerAssignmentGeneration(task);
+  const rows = await tx.select().from(agentWakeupRequests).where(and(unfinished(),
+    eq(agentWakeupRequests.companyId, task.companyId), eq(agentWakeupRequests.agentId, run.agentId),
+    sql`${agentWakeupRequests.payload}->>'issueId' = ${task.id}`,
+    sql`${agentWakeupRequests.payload}->${KEY}->'immutable'->>'generation' = ${generation}`));
+  for (const row of rows) {
+    const selected = await admitReviewerIntent(tx, row, run.id);
+    if (selected?.successor?.id === run.id) await consumeReviewerIntent(tx, row, run);
+  }
 }
 
 export async function reconcileReviewerAssignments(db: Db, admit: (row: Receipt, opts: WakeupOptions) => Promise<unknown>) {

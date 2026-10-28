@@ -321,6 +321,7 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
   async function pass() { return continueDecidedReviewReassignments(db, heartbeat.wakeup); }
 
   async function drain(f: Fixture) {
+    await heartbeat.reconcileReviewerAssignments();
     await waitFor(async () => {
       const live = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
         sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${f.issueId}`,
@@ -1081,6 +1082,9 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     const response = await request(app({ type: "agent", source: "agent_key", companyId: f.companyId, agentId: f.authorId, runId: authorRunId }))
       .patch(`/api/issues/${f.issueId}`).send({ status: "done", comment: "Handled the null case too." });
     expect(response.status, JSON.stringify(response.body)).toBe(200);
+    await waitFor(async () => Boolean((await heartbeat.getRun(authorRunId))?.resultJson?.executionReleased),
+      10_000, "the author's execution release");
+    await heartbeat.reconcileReviewerAssignments();
     return { resubmittedAt, authorRunId };
   }
 
