@@ -57,6 +57,7 @@ export function companyService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
   type CompanyTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
   async function applyArchiveCascadeInTx(tx: CompanyTx, id: string) {
+    await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionContinuation, id);
     await retireReviewerIntents(tx as unknown as Db, { companyId: id,
       reason: "Cancelled because the company was archived" });
     const [agentCount] = await tx.select({ value: count() }).from(agents).where(and(eq(agents.companyId, id), notInArray(agents.status, ["paused", "terminated", "pending_approval"])));

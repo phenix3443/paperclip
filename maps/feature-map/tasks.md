@@ -23,6 +23,10 @@ Agent access: [companion](../agent-access-map/tasks.md).
 
 ## How to get to it (user POV)
 
+Terminal task updates retire unfinished reviewer assignment intent through the
+common issue service. Reopening does not replay that retired receipt. Service
+coverage: [retirement tests](../../server/src/__tests__/heartbeat-reviewer-intent-retirement.test.ts).
+
 ### `new-task`
 
 Use New task from the global launcher, task list, or project task view.

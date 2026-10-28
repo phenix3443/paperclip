@@ -181,6 +181,12 @@ consent; some controls require a board actor.
 Permanent deletion is board-only. Retained case handoff references return
 `409 agent_case_history_retained` before dependency cleanup; keep the agent terminated.
 
+Reviewer intent: Pause preserves unfinished duty; termination retires it through
+the lifecycle effect in the same company transaction. Existing destructive
+purge retention rules remain separate. The
+[service/PostgreSQL tests](../../server/src/__tests__/heartbeat-reviewer-intent-retirement.test.ts)
+cover this behavior without qualifying live agent permission.
+
 Evidence: `source-only` — [implementation](../../server/src/routes/agents.ts#L1395) at
 the reviewed commit above.
 

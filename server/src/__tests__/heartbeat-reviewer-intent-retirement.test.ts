@@ -10,6 +10,7 @@ import { createAgentLifecycle } from "../services/agent-lifecycle.js";
 import { issueTreeControlService } from "../services/issue-tree-control.js";
 import { budgetService, deliverBudgetEnforcement } from "../services/budgets.js";
 import { lockReviewerIntentCompany } from "../services/heartbeat/reviewer-assignment-continuation.js";
+import { DELIVERY_QUEUES, subscribeDeliveryWork } from "../services/delivery-work-notifications.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const suite = support.supported ? describe : describe.skip;
@@ -185,8 +186,18 @@ suite("reviewer intent retirement through owning services", () => {
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toEqual([]);
   });
 
-  it("archive serializes with a synthetic creation transaction and retires its committed receipt", async () => {
-    const { companyId, agentId, issueId } = await seed();
+  function lockBoundedDatabase() {
+    return new Proxy(db, { get(target, key, receiver) {
+      if (key === "transaction") return (work: Parameters<Db["transaction"]>[0]) => target.transaction(async tx => {
+        await tx.execute(sql`set local lock_timeout = '100ms'`);
+        return work(tx);
+      });
+      return Reflect.get(target, key, receiver);
+    } });
+  }
+
+  it.each(["creation", "adoption"])("archive serializes with synthetic %s and settles its committed work", async operation => {
+    const { companyId, agentId, issueId, receipt: original } = await seed();
     const entered = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
     const creation = db.transaction(async transaction => {
@@ -195,24 +206,30 @@ suite("reviewer intent retirement through owning services", () => {
       await tx.select().from(issues).where(eq(issues.id, issueId)).for("update");
       const [created] = await tx.insert(agentWakeupRequests).values({ companyId, agentId, source: "assignment",
         status: "deferred_issue_execution", payload: { issueId, _paperclipReviewerAssignmentContinuation: { version: 1 } } }).returning();
+      if (operation === "adoption") {
+        const [run] = await tx.insert(heartbeatRuns).values({ companyId, agentId, status: "queued", runtimeMode: "legacy",
+          runtimeModeResolvedAt: new Date(), contextSnapshot: { issueId } }).returning();
+        await tx.update(agentWakeupRequests).set({ status: "coalesced", runId: run.id, finishedAt: new Date() })
+          .where(eq(agentWakeupRequests.id, original.id));
+      }
       entered.resolve();
       await release.promise;
       return created;
     });
     await entered.promise;
     try {
-      const boundedDb = new Proxy(db, { get(target, key, receiver) {
-        if (key === "transaction") return (work: Parameters<Db["transaction"]>[0]) => target.transaction(async tx => {
-          await tx.execute(sql`set local lock_timeout = '100ms'`);
-          return work(tx);
-        });
-        return Reflect.get(target, key, receiver);
-      } });
-      await expect(companyService(boundedDb).archive(companyId)).rejects.toMatchObject({ cause: { code: "55P03" } });
+      await expect(companyService(lockBoundedDatabase()).archive(companyId)).rejects.toMatchObject({ cause: { code: "55P03" } });
     } finally { release.resolve(); }
     const receipt = await creation;
     await companyService(db).archive(companyId);
+    await heartbeatService(db).stopInvocationsForAgents([agentId], "Cancelled because the company was archived");
     expect(await readReceipt(receipt.id)).toMatchObject({ status: "cancelled", payload: receipt.payload });
+    if (operation === "adoption") {
+      const adopted = await readReceipt(original.id);
+      expect(adopted).toMatchObject({ status: "coalesced", payload: original.payload });
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, adopted.runId!)))[0])
+        .toMatchObject({ status: "cancelled", startedAt: null });
+    }
   });
 
   it("an adoption that wins commits one linked ordinary run, which archive cancels without starting a provider", async () => {
@@ -239,5 +256,69 @@ suite("reviewer intent retirement through owning services", () => {
       .toMatchObject({ status: "cancelled", startedAt: null });
     expect(await readReceipt(receipt.id)).toEqual(adoptedReceipt);
     expect(await contract(issueId)).toEqual(before);
+  });
+
+  it.each(["creation", "adoption"])("Stop serializes with synthetic %s under the issue lock", async operation => {
+    const { companyId, agentId, issueId, receipt } = await seed();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "queued", runtimeMode: "legacy",
+      runtimeModeResolvedAt: new Date(), contextSnapshot: { issueId } }).returning();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const mutation = db.transaction(async transaction => {
+      const tx = transaction as unknown as Db;
+      expect(await lockReviewerIntentCompany(tx, companyId)).toBe("active");
+      await tx.select().from(issues).where(eq(issues.id, issueId)).for("update");
+      if (operation === "creation") {
+        await tx.insert(agentWakeupRequests).values({ companyId, agentId, source: "assignment", status: "deferred_issue_execution",
+          payload: { issueId, _paperclipReviewerAssignmentContinuation: { version: 1 } } });
+      } else {
+        await tx.update(agentWakeupRequests).set({ status: "coalesced", runId: run.id, finishedAt: new Date() })
+          .where(eq(agentWakeupRequests.id, receipt.id));
+      }
+      entered.resolve();
+      await release.promise;
+    });
+    await entered.promise;
+    const stopOptions = { reviewerIntentDisposition: "retire" as const, resultJson: { cancelledByActorType: "user" } };
+    try {
+      await expect(heartbeatService(lockBoundedDatabase()).cancelRun(run.id, "Explicit Stop", stopOptions))
+        .rejects.toMatchObject({ status: 409, message: "Native retry cancellation is busy; retry the same request" });
+    } finally { release.resolve(); }
+    await mutation;
+    await heartbeatService(db).cancelRun(run.id, "Explicit Stop", stopOptions);
+    const all = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+    expect(all.filter(row => row.status === "deferred_issue_execution")).toEqual([]);
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0])
+      .toMatchObject({ status: "cancelled", startedAt: null });
+    if (operation === "adoption") expect(await readReceipt(receipt.id)).toMatchObject({ status: "coalesced", runId: run.id, payload: receipt.payload });
+  });
+
+  it("archive notification settles only with its transaction and rollback preserves intent", async () => {
+    const { companyId, receipt } = await seed();
+    const snapshots: string[] = [];
+    const unsubscribe = subscribeDeliveryWork(db, DELIVERY_QUEUES.executionContinuation, () => { snapshots.push("settled"); });
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const rollbackDb = new Proxy(db, { get(target, key, receiver) {
+      if (key === "transaction") return (work: Parameters<Db["transaction"]>[0]) => target.transaction(async tx => {
+        await work(tx);
+        entered.resolve();
+        await release.promise;
+        throw new Error("Injected archive rollback");
+      });
+      return Reflect.get(target, key, receiver);
+    } });
+    const archive = companyService(rollbackDb).archive(companyId);
+    const rejected = expect(archive).rejects.toThrow("Injected archive rollback");
+    await entered.promise;
+    expect(snapshots).toEqual([]);
+    release.resolve();
+    await rejected;
+    expect(await readReceipt(receipt.id)).toEqual(receipt);
+    snapshots.length = 0;
+    await companyService(db).archive(companyId);
+    expect(snapshots).toEqual(["settled"]);
+    expect(await readReceipt(receipt.id)).toMatchObject({ status: "cancelled" });
+    unsubscribe();
   });
 });
