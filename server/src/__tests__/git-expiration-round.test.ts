@@ -1027,6 +1027,92 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
       expect(rowOf(journal).evidence.drift).toMatchObject({ state: "changed", fields: expect.arrayContaining(["paths.expiration_lock_marker_dir"]) });
     });
 
+    async function pendingWithoutWorktree() {
+      const f = await reconstructable();
+      const [row] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, f.workspaceId));
+      const admin = git(f.cwd, "rev-parse", "--absolute-git-dir");
+      const recipe = { schema: "paperclip.git-cache-restoration.v1", companyId: f.companyId, workspaceId: f.workspaceId, sourceIssueId: row!.sourceIssueId,
+        repoUrl: row!.repoUrl, commit: git(f.cwd, "rev-parse", "HEAD"), branchName: row!.branchName, sourceKind: "isolated_remote", projectId: null,
+        sourcePath: f.baseCwd, worktreePath: f.cwd, gitBranchOwnershipVersion: 1, verifiedAt: new Date().toISOString() };
+      const state = { schema: "paperclip.git-cache-expiration.v1", generation: 1, workspaceRemoved: true,
+        worktreeTrash: path.join(path.dirname(f.cwd), `.expired-git-worktree-${f.workspaceId}-1`),
+        worktreeAdmin: path.join(f.baseCwd, ".git", "worktrees", path.basename(admin)), baseTrash: null, completed: false };
+      await db.update(executionWorkspaces).set({ status: "archived", closedAt: new Date(),
+        metadata: { ...row!.metadata, lifecycleGeneration: 1, gitCacheRestoration: recipe, gitCacheExpiration: state } })
+        .where(eq(executionWorkspaces.id, f.workspaceId));
+      await fs.rm(f.cwd, { recursive: true, force: true });
+      return { ...f, admin: state.worktreeAdmin };
+    }
+
+    it("observes a pending row whose worktree is gone from its recorded metadata, without an evidence stop", async () => {
+      const f = await pendingWithoutWorktree();
+      const journal = memoryJournal();
+      const summary = await round(journal, { companyId: f.companyId });
+      expect(summary.stopReason).not.toBe("evidence_unavailable");
+      const evidence = rowOf(journal).evidence;
+      expect(evidence.drift).toEqual({ state: "none" });
+      const before = evidence.before.state === "observed" ? evidence.before.value : null;
+      expect(before?.head).toEqual({ state: "unavailable", reason: "worktree_absent" });
+      const role = (name: string) => before?.paths.find(entry => entry.role === name)?.observation;
+      expect(role("worktree")).toEqual({ state: "observed", value: { present: false } });
+      expect(role("checkout_container")).toEqual({ state: "observed", value: { present: false } });
+      for (const name of ["worktree_admin", "source", "gitdir_head", "expiration_lock_marker_dir"]) {
+        expect(role(name), name).toMatchObject({ state: "observed", value: { present: true } });
+      }
+    });
+
+    it("stops protected_state_changed when a pending row's admin dir is removed inside the window", async () => {
+      const f = await pendingWithoutWorktree();
+      const journal = memoryJournal();
+      // A pending row with no worktree reads no directory; the window is held open by blocking the eligibility query.
+      let running!: ReturnType<typeof round>;
+      await holdingTableLock("issue_recovery_actions", async () => {
+        running = round(journal, { companyId: f.companyId });
+        await waitFor(async () => await lockWaiters() > 0);
+        await fs.rm(f.admin, { recursive: true, force: true });
+      });
+      expect(await running).toMatchObject({ status: "partial", stopReason: "protected_state_changed" });
+      expect(rowOf(journal).evidence.drift).toMatchObject({ state: "changed", fields: expect.arrayContaining(["paths.worktree_admin"]) });
+    });
+
+    it("keeps the native resource_limit on a proof timeout: after HEAD is row_stopped, after row and paths are read after drain", async () => {
+      const f = await reconstructable();
+      const identity: number[] = [];
+      faults.spawn = args => {
+        if (args.includes("--absolute-git-dir") && args.includes("--symbolic-full-name")) identity.push(Date.now());
+        return args.includes("ORIG_HEAD") ? ["sleep", "30"] : null;
+      };
+      const journal = memoryJournal();
+      expect(await round(journal, { companyId: f.companyId, budgetHooks: { gitTimeoutMs: 300 } }))
+        .toMatchObject({ status: "partial", stopReason: "resource_limit", resourceLimited: 1 });
+      const evidence = rowOf(journal).evidence;
+      expect(identity).toHaveLength(1);
+      expect(evidence.before).toMatchObject({ state: "observed" });
+      const after = evidence.after.state === "observed" ? evidence.after.value : null;
+      expect(after?.head).toEqual({ state: "unavailable", reason: "row_stopped" });
+      expect(after?.locationSet).toEqual({ state: "unavailable", reason: "row_stopped" });
+      expect(after?.row).toMatchObject({ state: "observed" });
+      expect(after?.paths.length).toBeGreaterThan(0);
+      expect(after?.paths.every(entry => entry.observation.state === "observed")).toBe(true);
+      expect(after?.head).not.toEqual(evidence.before.state === "observed" ? evidence.before.value.head : null);
+    });
+
+    it("starts no identity child after the round aborts during proof", async () => {
+      const f = await reconstructable();
+      const controller = new AbortController();
+      const identity: number[] = [];
+      let abortedAt = Number.POSITIVE_INFINITY;
+      faults.spawn = args => {
+        if (args.includes("--absolute-git-dir") && args.includes("--symbolic-full-name")) identity.push(Date.now());
+        if (args.includes("ORIG_HEAD")) { setTimeout(() => { abortedAt = Date.now(); controller.abort(); }, 100); return ["sleep", "30"]; }
+        return null;
+      };
+      expect(await round(memoryJournal(), { companyId: f.companyId, signal: controller.signal })).toMatchObject({ status: "partial", stopReason: "aborted" });
+      expect(identity).toHaveLength(1);
+      expect(identity.every(at => at < abortedAt)).toBe(true);
+      await waitFor(async () => await advisoryLocks() === 0);
+    });
+
     it("stops protected_state_changed when a checkout container appears", async () => {
       const f = await reconstructable();
       const journal = memoryJournal();

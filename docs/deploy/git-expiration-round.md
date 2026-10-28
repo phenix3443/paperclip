@@ -73,11 +73,11 @@ The round writes `events.jsonl` in the evidence directory. Each line is one even
 
 | Event | Content |
 | --- | --- |
-| `round_started` | Round identifier, `upperBound`, mode, page size, limits, the fixed `budgets` and `scratchDir` |
+| `round_started` | Round identifier, `upperBound`, mode, page size, limits, the fixed `budgets`, `scratchDir` and `evidenceContract` |
 | `page_selected` | Page number and selected keys |
 | `selection_exhaustion_checked` | `more`: whether a row is left after the cap. No key is recorded. |
-| `row_inspected` | Selected key, current row, workspace, outcome, reason and candidate bytes |
-| `round_finished` | Summary. `status` is `partial` or `pending_commit`. It includes `fullPages`, `exhaustionChecked`, `budgetHit` (`budget`, `scope` `row` or `round`, `limit`, `observed`, or `null`), `peaks` (`rowMs`, `rowEntries`, `childOutputBytes`, `dbClients`, `gitChildren`, `journalBytes`), `drainIncomplete`, `undrainedRow` and `budgets`. When a row does not drain within 5 s and no other budget is named, `budgetHit.budget` is `row_drain`. `peaks.dbClients` counts the configured pool of 2 plus the dedicated connections open at that moment, including dedicated connections opened from a dedicated connection. `peaks.journalBytes` is the size of the journal before its first `round_finished` record, so the journal and the stdout summary report the same value. The stdout summary has the same fields. |
+| `row_inspected` | Selected key, current row, workspace, outcome, reason, candidate bytes and `evidence` (see [Row evidence](#row-evidence)) |
+| `round_finished` | Summary. `status` is `partial` or `pending_commit`. It includes `fullPages`, `exhaustionChecked`, `budgetHit` (`budget`, `scope` `row` or `round`, `limit`, `observed`, or `null`), `peaks` (`rowMs`, `rowEntries`, `childOutputBytes`, `dbClients`, `gitChildren`, `journalBytes`), `drainIncomplete`, `undrainedRow`, `budgets` and `evidenceContract`. When a row does not drain within 5 s and no other budget is named, `budgetHit.budget` is `row_drain`. `peaks.dbClients` counts the configured pool of 2 plus the dedicated connections open at that moment, including dedicated connections opened from a dedicated connection. `peaks.journalBytes` is the size of the journal before its first `round_finished` record, so the journal and the stdout summary report the same value. The stdout summary has the same fields. |
 | `round_committed` | Round identifier and status `complete` |
 
 `current` in `row_inspected` is the row that the round read again under the lifecycle lock:
@@ -87,6 +87,48 @@ The round writes `events.jsonl` in the evidence directory. Each line is one even
 | `read` | `current.key` and `current.status` are the values read under the lock. A key that is not the selected key gives `rejected` with `workspace_changed`. |
 | `missing` | The row no longer exists. |
 | `not_read` | The round did not read the row again, for example because the row is not a candidate or a lock is busy. |
+
+### Evidence contract
+
+`round_started`, `round_finished` and the stdout summary carry the same `evidenceContract`:
+
+```json
+{ "name": "paperclip.git-expiration-evidence", "version": 1,
+  "capabilities": ["row_keys.v1", "row_state.v1", "row_paths.v1", "row_head.v1", "drift_stop.v1"] }
+```
+
+`node server/dist/git-expiration-round-cli.js --print-evidence-contract` prints this object and exits `0`. It reads no environment, opens no
+database, starts no child process and writes no file. A consumer accepts only this `name`, `version` 1 and every capability it needs. A
+missing contract, another version or a missing capability means the evidence is unavailable; it is never read as zero.
+
+### Row evidence
+
+Every new value is an observation with one of three forms:
+
+| `state` | Fields | Meaning |
+| --- | --- | --- |
+| `observed` | `value` | Read by the native round. |
+| `unavailable` | `reason` | Not attempted for a known reason: `row_not_locked`, `not_candidate`, `lock_busy`, `row_stopped`, `undrained`, `worktree_absent`, `location_unresolved`, `invalid_metadata` or `checkout_budget`. |
+| `error` | `code` | Attempted and failed. `code` is an errno name (`EACCES`), a Git exit (`git_exit_128`), `git_output`, `statement_timeout` or `invalid_output`. Messages, arguments, URLs and environment never enter evidence. |
+
+`evidence` in `row_inspected` has:
+
+- `selected`: the row state of the selected page row.
+- `before` and `after`: one side each, read inside the source lock and the lifecycle lock. `before` is read right after the lifecycle lock and
+  before eligibility. `after` is read in two phases: the HEAD read and every live-row input that needs a Git child or a directory read run
+  before the row drains; after the drain, only one select of the row and `lstat` of the paths fixed at `before` run. A side has `row`, `head`,
+  `locationSet` and `paths`. Rows that never take both locks have `before` and `after` `unavailable` with the matching reason.
+- `drift`: `none`, `changed` with `fields` (for example `row.metadata`, `head.commit`, `paths.gitdir_index`), or `unknown` with `missing`.
+- `selectionDrift`: `none` or `changed` between `selected` and `before`. It is a recorded signal, not a stop; a changed key still gives the
+  native `workspace_changed` rejection.
+
+The row state value has the key, status, `closedAtPresent`, `lifecycleGeneration` and SHA-256 digests of the status, the protected columns,
+the metadata and the `gitCacheExpiration` and `gitCacheRestoration` keys. The HEAD value has the commit and digests of the ref and the Git
+dir. Each path entry has a `role`, a `pathDigest` and an observation whose value is `{ present: false }` or `{ present: true, type,
+statDigest }`. Raw paths are not written. The roles are the worktree and its `.git`, each source and its `.git`, the worktree admin dir and
+its `HEAD` and `index`, the trash paths, every expiration lock marker and its directory, the checkout container (listed also when it does
+not exist) and each nested checkout with its `HEAD` and `index`. A role that the native seam cannot name is listed as `unavailable`; an
+empty list is never an observed absence.
 
 ### Read the result
 
@@ -128,7 +170,10 @@ Row outcomes:
 
 A round is `complete` only when the selection is exhausted, the round recorded every selected row and nothing stopped the round.
 
-These stop reasons make the round `partial`: `lock_busy`, `resource_limit`, `aborted`, `deadline`, `row_budget`, `evidence_lost` and `database_error`. A partial round does not continue later. Start a new round with a new round identifier.
+These stop reasons make the round `partial`: `lock_busy`, `resource_limit`, `aborted`, `deadline`, `row_budget`, `evidence_lost`, `database_error`, `protected_state_changed` and `evidence_unavailable`.
+
+- `protected_state_changed`: a row's `drift` is `changed`. The row keeps its native outcome; a `candidate` with drift stays `candidate`, and the round is partial.
+- `evidence_unavailable`: a row that took both locks and was not stopped has a `before` or `after` part that is not `observed`, other than `worktree_absent`. A partial round does not continue later. Start a new round with a new round identifier.
 
 ## Limits
 
