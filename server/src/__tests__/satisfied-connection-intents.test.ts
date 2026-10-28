@@ -477,14 +477,18 @@ describePostgres("already available connection requests", () => {
     return (await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, f.intent.id)))[0]!;
   }
 
+  async function grantRequested(f: Awaited<ReturnType<typeof seed>>, intent: Awaited<ReturnType<typeof requestAccess>>) {
+    await db.transaction(async (tx) => grantConnectionAgentTools(tx as unknown as typeof db, { connection: f.connection, agentId: f.agentId,
+      userId: "connection-owner", tools: intent.payload.accessRequest!.tools, context: { issueId: f.issueId, projectId: null } }));
+  }
+
   it.each(["allowed", "ask_first"] as const)("retires an exact %s access request once its grant commits", async (permission) => {
     const f = await seed(); const intent = await requestAccess(f, permission);
     const wakeup = vi.fn().mockResolvedValue(null);
     const worker = connectionIntentDeliveryService(db, { wakeup });
     await worker.sweepPending();
     expect((await db.select().from(issueThreadInteractions))[0].status).toBe("pending");
-    await db.transaction(async (tx) => grantConnectionAgentTools(tx as unknown as typeof db, { connection: f.connection, agentId: f.agentId,
-      userId: "connection-owner", tools: intent.payload.accessRequest!.tools, context: { issueId: f.issueId, projectId: null } }));
+    await grantRequested(f, intent);
     await worker.sweepPending();
     await worker.sweepPending();
     const [retired] = await db.select().from(issueThreadInteractions);
@@ -507,11 +511,6 @@ describePostgres("already available connection requests", () => {
     const [task] = await db.select().from(issues);
     expect(await connectionContinuationPendingResponse(db, task, "connection-owner")).toBeNull();
   });
-
-  async function grantRequested(f: Awaited<ReturnType<typeof seed>>, intent: Awaited<ReturnType<typeof requestAccess>>) {
-    await db.transaction(async (tx) => grantConnectionAgentTools(tx as unknown as typeof db, { connection: f.connection, agentId: f.agentId,
-      userId: "connection-owner", tools: intent.payload.accessRequest!.tools, context: { issueId: f.issueId, projectId: null } }));
-  }
 
   it("keeps an access request pending when its grant transaction rolls back", async () => {
     const f = await seed(); const intent = await requestAccess(f);
@@ -568,8 +567,7 @@ describePostgres("already available connection requests", () => {
 
   it("does not strand the task when a retired access request's exact tool version later changes", async () => {
     const f = await seed(); const intent = await requestAccess(f);
-    await db.transaction(async (tx) => grantConnectionAgentTools(tx as unknown as typeof db, { connection: f.connection, agentId: f.agentId,
-      userId: "connection-owner", tools: intent.payload.accessRequest!.tools, context: { issueId: f.issueId, projectId: null } }));
+    await grantRequested(f, intent);
     await connectionIntentDeliveryService(db, { wakeup: vi.fn().mockResolvedValue(null) }).sweepPending();
     expect((await db.select().from(issueThreadInteractions))[0].status).toBe("expired");
     await db.update(toolCatalogEntries).set({ versionHash: "v2" });

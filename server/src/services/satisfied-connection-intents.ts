@@ -34,7 +34,6 @@ async function findAvailableToolConnection(db: Db, task: Task, intent: Intent, p
   const lookup = { companyId: task.companyId, agentId: payload.requestingAgentId,
     responsibleUserId: intent.addresseeUserId, serviceSlug: payload.serviceSlug };
   const exact = () => service.usableConnectionForAgent({ ...lookup, connectionId: accessRequest!.connectionId });
-  // The gateway authorizes an exact request on its named connection without an install.
   const connection = accessRequest && !retired ? await exact()
     : await service.usableConnectionForAgent(lookup) ?? (accessRequest ? await exact() : null);
   if (!connection) return null;
