@@ -1,4 +1,4 @@
-import { settleNewReviewRunIdentity } from "../run-identity.js";
+import { settleNewReviewRunIdentity, settleReviewRunClaimIdentity } from "../run-identity.js";
 import type { IssueMonitorAdmission } from "./scheduling.js";
 import { parseIssueExecutionState } from "../issue-execution-policy.js";
 import { admitReviewerIntent, consumeReviewerIntent, reconcileReviewerAssignments, reviewerAssignmentGeneration } from "./reviewer-assignment-continuation.js";
@@ -774,6 +774,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     try {
       const attempt = () => db.transaction(async (tx) => {
         terminal = null;
+        if (stage === "claim") await tx.select({ id: companies.id }).from(companies).where(eq(companies.id, run.companyId)).for("share");
         // Same queue-edit lock order, then the close committer's conversation
         // row. NOWAIT releases partial locks on contention. Claim defers to the
         // queue; dispatch retries this transaction before considering failure.
@@ -1215,6 +1216,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     // All ordinary and comment claims use the same company-scoped issue
     // lock. A batch may claim several runs before executeRun tracks any owner.
     async function lockIssueExecutionClaim(tx: Db) {
+      await tx.select({ id: companies.id }).from(companies).where(eq(companies.id, run.companyId)).for("share");
       const [owner] = issueId ? await tx.select({
         assigneeAgentId: issues.assigneeAgentId,
         statusVersion: issues.statusVersion,
@@ -1269,14 +1271,16 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       }
       return { ownsIssue, blocked: false };
     }
-    async function bindClaimedIssueExecution(tx: Db, ownsIssue: boolean, claimedRun: typeof heartbeatRuns.$inferSelect | null | undefined) {
-      if (!claimedRun || !issueId || !ownsIssue) return;
-      await tx.update(issues).set({
-        executionRunId: claimedRun.id,
+    async function bindClaimedIssueExecution(tx: Db, ownsIssue: boolean, claimedRun: typeof heartbeatRuns.$inferSelect | null | undefined, previousStartedAt: Date | null) {
+      if (!claimedRun) return null;
+      const settled = await settleReviewRunClaimIdentity(tx, claimedRun, previousStartedAt);
+      if (issueId && ownsIssue) await tx.update(issues).set({
+        executionRunId: settled.id,
         executionAgentNameKey: normalizeAgentNameKey(agent.name),
         executionLockedAt: claimedAt,
         updatedAt: claimedAt,
       }).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)));
+      return settled;
     }
     const nativeReviewContext = readNativeReviewAssignmentContext(context);
     const queuedCommentIds = queuedCommentIdsFromRunContext(context);
@@ -1451,9 +1455,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                     ),
                   )
                   .returning();
-                await bindClaimedIssueExecution(tx as unknown as Db, issueClaim.ownsIssue, claimedRun);
-                return claimedRun
-                  ? { kind: "claimed" as const, run: claimedRun }
+                const settledRun = await bindClaimedIssueExecution(tx as unknown as Db, issueClaim.ownsIssue, claimedRun, lockedRun.startedAt);
+                return settledRun
+                  ? { kind: "claimed" as const, run: settledRun }
                   : { kind: "stale" as const, run: null };
               }
               const commentRows = await tx
@@ -1555,9 +1559,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   ),
                 )
                 .returning();
-              await bindClaimedIssueExecution(tx as unknown as Db, issueClaim.ownsIssue, claimedRun);
-              return claimedRun
-                ? { kind: "claimed" as const, run: claimedRun }
+              const settledRun = await bindClaimedIssueExecution(tx as unknown as Db, issueClaim.ownsIssue, claimedRun, lockedRun.startedAt);
+              return settledRun
+                ? { kind: "claimed" as const, run: settledRun }
                 : { kind: "stale" as const, run: null };
             })
             .catch((error) => {
@@ -1638,8 +1642,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             const claimedRun = await claimTx.update(heartbeatRuns).set(claimValues).where(and(
               eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued"),
             )).returning().then((rows) => rows[0] ?? null);
-            await bindClaimedIssueExecution(claimTx as unknown as Db, issueClaim.ownsIssue, claimedRun);
-            return claimedRun;
+            return bindClaimedIssueExecution(claimTx as unknown as Db, issueClaim.ownsIssue, claimedRun, lockedRun.startedAt);
           });
         });
     if (!claimed) return null;
