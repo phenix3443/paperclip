@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../receipt-namespace.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../../services/delivery-work-notifications.js";
 import { isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop } from "../../../services/acknowledged-native-stop.js";
 import { readRunCancellation } from "../../../services/run-cancellation.js";
@@ -227,7 +228,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           .from(agentWakeupRequests)
           .where(
             and(
-              eq(agentWakeupRequests.companyId, companyId),
+              ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, companyId),
               eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
               excludedWakeIds?.length ? notInArray(agentWakeupRequests.id, excludedWakeIds) : undefined,
               sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
@@ -279,7 +280,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
             })
             .where(
               and(
-                eq(agentWakeupRequests.companyId, companyId),
+                ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, companyId),
                 eq(agentWakeupRequests.id, row.id),
                 eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
               ),
@@ -318,7 +319,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         .set({ status: "cancelled", finishedAt: now, error: reason, updatedAt: now })
         .where(
           and(
-            eq(agentWakeupRequests.id, wakeId),
+            ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, wakeId),
             eq(agentWakeupRequests.companyId, companyId),
             eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
           ),
@@ -333,7 +334,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         .set({ payload: withQueuedCommentIdsInWakePayload(payload, liveCommentIds), updatedAt: now })
         .where(
           and(
-            eq(agentWakeupRequests.id, wakeId),
+            ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, wakeId),
             eq(agentWakeupRequests.companyId, companyId),
             eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
           ),
@@ -354,7 +355,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         })
         .where(
           and(
-            eq(agentWakeupRequests.id, wakeId),
+            ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, wakeId),
             eq(agentWakeupRequests.companyId, companyId),
             eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
           ),
@@ -467,7 +468,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         })
         .where(
           and(
-            eq(agentWakeupRequests.id, wakeId),
+            ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, wakeId),
             eq(agentWakeupRequests.companyId, companyId),
             eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
           ),
@@ -506,7 +507,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         .set({ runId: newRun.id, updatedAt: input.now })
         .where(
           and(
-            eq(agentWakeupRequests.id, input.wakeId),
+            ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, input.wakeId),
             eq(agentWakeupRequests.companyId, input.companyId),
             isNull(agentWakeupRequests.runId),
           ),
@@ -692,7 +693,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       await tx
         .update(agentWakeupRequests)
         .set({ runId: queuedRun.id, updatedAt: now })
-        .where(and(eq(agentWakeupRequests.id, wakeupRequest.id), eq(agentWakeupRequests.companyId, companyId)));
+        .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, wakeupRequest.id), eq(agentWakeupRequests.companyId, companyId)));
 
       await tx
         .update(issues)
@@ -756,7 +757,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       await tx
         .update(agentWakeupRequests)
         .set({ runId: queuedRun.id, updatedAt: now })
-        .where(and(eq(agentWakeupRequests.id, wakeupRequest.id), eq(agentWakeupRequests.companyId, companyId)));
+        .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, wakeupRequest.id), eq(agentWakeupRequests.companyId, companyId)));
 
       await tx
         .update(issues)
@@ -881,7 +882,7 @@ export function createWakeAdmissionReader(): WakeAdmissionReader {
         .from(agentWakeupRequests)
         .where(
           and(
-            eq(agentWakeupRequests.companyId, input.companyId),
+            ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, input.companyId),
             eq(agentWakeupRequests.id, input.wakeupRequestId),
           ),
         )
@@ -931,7 +932,7 @@ export function createWakeAdmissionReader(): WakeAdmissionReader {
         .from(agentWakeupRequests)
         .where(
           and(
-            eq(agentWakeupRequests.companyId, companyId),
+            ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, companyId),
             eq(agentWakeupRequests.agentId, agentId),
             eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
             sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
@@ -1032,7 +1033,7 @@ export function createWakeAdmissionWriter(): WakeAdmissionWriter {
         })
         .where(
           and(
-            eq(agentWakeupRequests.id, input.existingDeferredWakeId),
+            ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, input.existingDeferredWakeId),
             eq(agentWakeupRequests.companyId, input.companyId),
             eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
           ),
@@ -1167,7 +1168,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           : null;
         const [interruptedQueue] = interruptQueueId && issueRow
           ? await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
-              eq(agentWakeupRequests.id, interruptQueueId),
+              ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, interruptQueueId),
               eq(agentWakeupRequests.companyId, run.companyId),
               eq(agentWakeupRequests.agentId, run.agentId),
               eq(agentWakeupRequests.status, "deferred_issue_execution"),

@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { imessageProgressSupersessionReason } from "./imessage-photon/publications.js";
 import { fastResponseRequests } from "@paperclipai/db";
 
@@ -521,7 +522,7 @@ export function createChatPublicationReplacement(db: Db, options: ChatPublicatio
         .from(heartbeatRuns)
         .innerJoin(
           agentWakeupRequests,
-          and(
+          and(ordinaryWakeRequestPredicate(), and(
             eq(agentWakeupRequests.id, heartbeatRuns.wakeupRequestId),
             eq(agentWakeupRequests.runId, heartbeatRuns.id),
             eq(agentWakeupRequests.companyId, heartbeatRuns.companyId),
@@ -530,7 +531,7 @@ export function createChatPublicationReplacement(db: Db, options: ChatPublicatio
             // its original admission. Its terminal milestone still owns
             // this exact lane even if no working update was sent first.
             ne(agentWakeupRequests.status, "skipped"),
-          ),
+          )),
         )
         .where(
           and(

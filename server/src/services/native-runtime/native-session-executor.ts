@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { DELIVERY_QUEUES } from "../delivery-work-notifications.js";
 import { writeExecutionControl } from "../execution-control-notifications.js";
 import { notifyExecutionRunWork } from "../execution-control-notifications.js";
@@ -8778,7 +8779,7 @@ async function executePaperclipNativeSessionWithinScope(
       .from(agentWakeupRequests)
       .where(
         and(
-          eq(agentWakeupRequests.companyId, input.execution.binding.companyId),
+          ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, input.execution.binding.companyId),
           eq(agentWakeupRequests.agentId, input.execution.binding.agentId),
           like(
             agentWakeupRequests.idempotencyKey,

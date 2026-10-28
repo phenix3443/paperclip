@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { agentWakeupRequests, heartbeatRuns, type Db } from "@paperclipai/db";
 import { and, desc, eq, inArray, ne, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
@@ -16,7 +17,7 @@ export async function readNativeMonitorSource(
 ): Promise<string | null> {
   const source = alias(heartbeatRuns, "monitor_source");
   const sources = await db.select({ runId: source.id }).from(heartbeatRuns)
-    .innerJoin(agentWakeupRequests, and(
+    .innerJoin(agentWakeupRequests, and(ordinaryWakeRequestPredicate(), and(
       eq(agentWakeupRequests.companyId, binding.companyId),
       eq(agentWakeupRequests.runId, heartbeatRuns.id),
       eq(agentWakeupRequests.agentId, heartbeatRuns.agentId),
@@ -24,7 +25,7 @@ export async function readNativeMonitorSource(
       ne(agentWakeupRequests.status, "skipped"),
       sql`${agentWakeupRequests.payload}->>'issueId' = ${binding.issueId}`,
       sql`${agentWakeupRequests.idempotencyKey} = 'issue-monitor:' || ${binding.issueId} || ':' || (${agentWakeupRequests.payload}->>'nextCheckAt')`,
-    ))
+    )))
     .innerJoin(source, and(
       eq(source.companyId, binding.companyId), eq(source.agentId, heartbeatRuns.agentId),
       eq(source.nativeIssueId, binding.issueId), eq(source.runtimeMode, "native"),
@@ -79,7 +80,7 @@ export async function readNativeMonitorDelivery(
     sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId',
       ${heartbeatRuns.contextSnapshot}->>'taskId') = ${binding.issueId}`,
   )).where(and(
-    eq(agentWakeupRequests.companyId, binding.companyId),
+    ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, binding.companyId),
     eq(agentWakeupRequests.agentId, run.agentId),
     eq(agentWakeupRequests.reason, "issue_monitor_due"),
     sql`${agentWakeupRequests.payload}->>'issueId' = ${binding.issueId}`,

@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { and, eq, inArray } from "drizzle-orm";
 import { createHash } from "node:crypto";
 import type { Db } from "@paperclipai/db";
@@ -254,7 +255,7 @@ export async function findExistingIssueBlockersResolvedWakeForReadyState(
     .from(agentWakeupRequests)
     .where(
       and(
-        eq(agentWakeupRequests.companyId, input.companyId),
+        ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, input.companyId),
         inArray(agentWakeupRequests.idempotencyKey, lookupKeys),
       ),
     );

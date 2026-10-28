@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { and, eq, sql } from "drizzle-orm";
 import { agentWakeupRequests, environmentLeases, heartbeatRuns, issueRecoveryActions, type Db } from "@paperclipai/db";
 import { verifiedWorkspaceRepairReceipt } from "./workspace-recovery-receipt.js";
@@ -26,7 +27,7 @@ export async function canSelectFreshWorkspace(input: {
   if (!requestId || !system || system.sourceRunId !== input.sourceRunId || system.freshAttemptRunId) return null;
   if (system.providerCooldownAt !== null && system.providerCooldownAt > Date.now()) return null;
   const [wake] = await input.db.select().from(agentWakeupRequests).where(and(
-    eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.id, requestId),
+    ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.id, requestId),
     eq(agentWakeupRequests.agentId, input.agentId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
     sql`${agentWakeupRequests.payload}->>'issueId' = ${input.issueId}`,
   ));
@@ -64,7 +65,7 @@ export async function readFreshWorkspaceReadiness(db: Db, run: Pick<typeof heart
     // independent directory: falling back to the agent's configured cwd would
     // reopen the original source after a failed fresh attempt.
     const [wake] = await db.select().from(agentWakeupRequests).where(and(
-      eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
+      ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
       eq(agentWakeupRequests.runId, run.id), eq(agentWakeupRequests.reason, "task_retry"),
       eq(agentWakeupRequests.status, "coalesced"), eq(agentWakeupRequests.requestedByActorType, "user"),
       sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
@@ -76,7 +77,7 @@ export async function readFreshWorkspaceReadiness(db: Db, run: Pick<typeof heart
         !["evaluate", "continue", "fresh_isolated_workspace"].includes(intent.strategy)) return null;
     if (intent.chatActionId) {
       const [chatWake] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
-        eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
+        ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
         eq(agentWakeupRequests.id, intent.chatActionId), eq(agentWakeupRequests.runId, run.id),
         sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
       ));
@@ -101,7 +102,7 @@ export async function readFreshWorkspaceReadiness(db: Db, run: Pick<typeof heart
     await db.transaction(async tx => {
       const changed = await tx.update(agentWakeupRequests).set({
         payload: sql`jsonb_set(${agentWakeupRequests.payload}, '{taskRetry,strategy}', '"fresh_isolated_workspace"'::jsonb)`,
-      }).where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.runId, run.id),
+      }).where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.runId, run.id),
         sql`${agentWakeupRequests.payload}#>>'{taskRetry,strategy}' in ('evaluate', 'continue')`)).returning({ id: agentWakeupRequests.id });
       if (changed.length) await persistActivity(tx as unknown as Db, { companyId: run.companyId,
         actorType: "system", actorId: "task-recovery", action: "issue.fresh_workspace_selected",
@@ -116,7 +117,7 @@ export async function readFreshWorkspaceReadiness(db: Db, run: Pick<typeof heart
   if (action?.evidence.runId !== readiness.sourceRunId ||
       readSystemRecovery(action.evidence)?.freshAttemptRunId !== run.id) return null;
   const [wake] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
-    eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.id, readiness.retryIntentId),
+    ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.id, readiness.retryIntentId),
     eq(agentWakeupRequests.agentId, run.agentId), eq(agentWakeupRequests.runId, run.id),
     sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
   )).limit(1);
