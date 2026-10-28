@@ -1888,8 +1888,19 @@ only for an explicit task Stop. Omission or `"preserve"` leaves this duty alone;
 generic cancellation strings and user attribution do not establish permanent
 invalidation. Budget, subtree, agent, project and company pause paths keep
 unfinished intent. Comment/session cancellation keeps its source-specific
-authority and cannot retire reviewer intent. No real producer, consumer,
-deadline or operational replay is enabled by these retirement seams.
+authority and cannot retire reviewer intent.
+
+The queue owner's `reconcileReviewerAssignments` consumes synthetic v1 receipts
+through ordinary admission, with company-to-issue serialization and atomic
+successor association. It reads recorded executor-release proof; it does not run
+fallback cleanup or create that proof. Full policy/state, assignment and
+responsibility form the canonical generation. Ordinary runs record their admitted
+generation so the consumer can adopt matching queued/running/scheduled-retry work.
+Held receipts retain per-receipt 15-to-300-second backoff in existing JSON.
+The existing `executionContinuation` worker includes their earliest due time;
+empty or terminal-only history adds no deadline. No native producer or cleanup
+notification hook is enabled here. Production integration and operational replay
+remain separate work.
 
 Run lifecycle handling is in `server/src/services/heartbeat/run-lifecycle.ts`.
 It owns status transitions, run events and progress, liveness classification,

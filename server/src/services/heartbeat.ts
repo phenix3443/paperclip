@@ -4081,6 +4081,7 @@ export function heartbeatService(
       }),
 
     wakeup: trackWakeup,
+    reconcileReviewerAssignments: heartbeatQueue.reconcileReviewerAssignments,
     dispatchPendingNativeStatusWakeups,
     triggerIssueMonitor,
 

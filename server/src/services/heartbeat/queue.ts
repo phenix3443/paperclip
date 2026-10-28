@@ -1,3 +1,4 @@
+import { admitReviewerIntent, consumeReviewerIntent, reconcileReviewerAssignments, reviewerAssignmentGeneration } from "./reviewer-assignment-continuation.js";
 import { hasReviewerAssignmentContinuation, ordinaryWakeRequestPredicate, ordinaryWakeRunPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { authorizationService } from "../authorization.js";
 import { isAdmittedReconciliation, isGuardedReconciliationDelivery, lockReconciledDeliveryPrefix, recordReconciledDeliveryOutcome, revalidateReconciledDelivery } from "../execution-reconciliation-delivery.js";
@@ -2172,7 +2173,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     return promise;
   }
 
-  async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string) {
+  async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string, reviewerIntent?: typeof agentWakeupRequests.$inferSelect) {
     if (hasReviewerAssignmentContinuation(opts.payload) || hasReviewerAssignmentContinuation(opts.contextSnapshot)) {
       throw new HttpError(400, "Reviewer assignment continuation payload is reserved");
     }
@@ -2181,6 +2182,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     const contextSnapshot: Record<string, unknown> = {
       ...(opts.contextSnapshot ?? {}),
     };
+    delete contextSnapshot.reviewerAssignmentGeneration;
     const reason = opts.reason ?? null;
     let payload = opts.payload ? { ...opts.payload } : null;
     // Only the board queue route can record interruption authority on an
@@ -2472,7 +2474,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     ) => {
       // A temporary refusal must leave the handoff retryable, without burning
       // its one durable receipt ID on a skipped wake.
-      if (outboxRequest) return { created: false };
+      if (outboxRequest || reviewerIntent) return { created: false };
       if (executionWaitRequestId) {
         await db.update(agentWakeupRequests).set({
           payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), '{executionWait}',
@@ -2865,7 +2867,18 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const outcome = await db
         .transaction(async (tx) => {
           guardedDeliveryAction = null;
+          let reviewerAdmitted = false;
           const result = await (async () => {
+          if (reviewerIntent) {
+            const selected = await admitReviewerIntent(tx as unknown as Db, reviewerIntent);
+            if (!selected) return { kind: "deferred" as const };
+            if (selected.successor) {
+              await consumeReviewerIntent(tx as unknown as Db, selected.row, selected.successor);
+              return { kind: "replayed" as const, run: selected.successor };
+            }
+            reviewerAdmitted = true;
+          }
+
           if (executionReconciliationWake) await lockReconciledDeliveryPrefix(tx, agent.companyId, agentId);
           await tx.execute(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
@@ -3161,6 +3174,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               lastStatusDecisionId: issues.lastStatusDecisionId,
               workspaceBindingRevision: issues.workspaceBindingRevision,
               executionState: issues.executionState,
+              executionPolicy: issues.executionPolicy,
               createdAt: issues.createdAt,
             })
             .from(issues)
@@ -3191,6 +3205,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             });
             return { kind: "skipped" as const };
           }
+
+          const reviewerGeneration = reviewerAssignmentGeneration(issue);
 
           if (taskRetryActorId) {
             await assertTaskRetryConversationAllowed(tx as unknown as Db, issue, taskRetryActorId);
@@ -4497,13 +4513,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               retryOfRunId: failedChatRetry
                 ? durableRequest!.failedRunRetry!.failedRunId
                 : opts.failedRunId ?? automaticParentRunId,
-              contextSnapshot: adoptedComments.length
-                ? withQueuedCommentIdsInRunContext(
-                    enrichedContextSnapshot,
-                    adoptedCommentIds,
-                    adoptedComments.map((wake) => wake.id),
-                  )
-                : enrichedContextSnapshot,
+              contextSnapshot: {
+                ...(adoptedComments.length ? withQueuedCommentIdsInRunContext(
+                  enrichedContextSnapshot, adoptedCommentIds, adoptedComments.map(wake => wake.id),
+                ) : enrichedContextSnapshot), reviewerAssignmentGeneration: reviewerGeneration,
+              },
               sessionIdBefore: explicitContinuation || decidedReviewAdmitted ? null : sessionBefore,
               continuationAttempt,
               ...(reconciledSourceRunId
@@ -4570,6 +4584,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
           return { kind: "queued" as const, run: newRun };
           })();
+          if (reviewerIntent && reviewerAdmitted) {
+            if (!("run" in result) || !result.run || result.run.contextSnapshot?.reviewerAssignmentGeneration !== reviewerAssignmentGeneration(
+              (await tx.select().from(issues).where(and(eq(issues.companyId, agent.companyId), eq(issues.id, issueId!))))[0]!,
+            )) throw new Error("Reviewer admission held");
+            await consumeReviewerIntent(tx as unknown as Db, reviewerIntent, result.run);
+          }
           if (guardedDeliveryAction && result.kind !== "queued") {
             await recordReconciledDeliveryOutcome(tx, guardedDeliveryAction, {
               kind: "invalidated", reason: `queue_${result.kind}`,
@@ -5269,6 +5289,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
   }
 
   return {
+    reconcileReviewerAssignments: () => reconcileReviewerAssignments(db, (row, opts) => enqueueWakeup(row.agentId, opts, undefined, row)),
     enqueueWakeup,
     dispatchPendingNativeStatusWakeups,
     startNextQueuedRunForAgent,

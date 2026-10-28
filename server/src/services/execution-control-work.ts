@@ -1,3 +1,4 @@
+import { reviewerAssignmentNext } from "./heartbeat/reviewer-assignment-continuation.js";
 import { and, asc, eq, isNotNull, sql } from "drizzle-orm";
 import { adapterAuthSessions, heartbeatRuns, issueRecoveryActions, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import type { createDeliveryWorkCoordinator } from "./delivery-work-coordinator.js";
@@ -74,14 +75,16 @@ export function executionControlSchedule(db: Db) {
         eq(issueRecoveryActions.status, "resolved"),
         sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`,
       )).limit(1);
-      if (rows.length) return retry();
+      const reviewer = await reviewerAssignmentNext(db);
+      if (rows.length) return reviewer === null ? retry() : Math.min(reviewer, retry());
       const [waiting] = await db.select({
         at: sql<string | null>`min(${issueRecoveryActions.evidence}#>>'{continuationWait,recheckAt}')`,
       }).from(issueRecoveryActions).where(and(
         eq(issueRecoveryActions.status, "resolved"),
         sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'waiting'`,
       ));
-      return deadline([waiting?.at ? new Date(waiting.at) : null]);
+      const recovery = deadline([waiting?.at ? new Date(waiting.at) : null]);
+      return recovery === null ? reviewer : reviewer === null ? recovery : Math.min(recovery, reviewer);
     },
     async status() {
       const rows = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
