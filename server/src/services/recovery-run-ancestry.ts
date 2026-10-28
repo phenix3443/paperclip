@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/index.js";
 import { sql } from "drizzle-orm";
 import { agentWakeupRequests, heartbeatRuns, issueRecoveryActions, type Db } from "@paperclipai/db";
 import { canonicalExecutionUuid } from "./execution-identity.js";
@@ -22,7 +23,7 @@ export async function recoveryRunAncestry(input: {
         select current_run.retry_of_run_id::text as id
         union
         select w.payload#>>'{taskRetry,sourceRunId}' from ${agentWakeupRequests} w
-        where w.company_id = ${input.companyId} and w.run_id = s.id
+        where ${ordinaryWakeRequestPredicate(sql.raw('w.payload'))} and w.company_id = ${input.companyId} and w.run_id = s.id
           and w.reason = 'task_retry' and w.status = 'coalesced'
           and w.requested_by_actor_type = 'user' and w.payload->>'issueId' = ${input.issueId}
           and w.payload#>>'{taskRetry,schema}' = 'paperclip.task-retry.v1'

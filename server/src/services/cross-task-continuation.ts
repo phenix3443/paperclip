@@ -1,3 +1,4 @@
+import { hasReviewerAssignmentContinuation, ordinaryWakeRequestPredicate } from "../modules/wake-queue/index.js";
 import { createHash } from "node:crypto";
 import {
   agentWakeupRequests,
@@ -171,7 +172,7 @@ export async function findCrossTaskContinuationReplay(
   ));
   if (!comment) return { kind: "fresh" };
   const [intent] = await db.select().from(agentWakeupRequests).where(and(
-    eq(agentWakeupRequests.companyId, input.companyId),
+    ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, input.companyId),
     eq(agentWakeupRequests.idempotencyKey, crossTaskContinuationIntentKey(input.issueId, comment.id)),
   ));
   if (!intent) return { kind: "invariant_breach", commentId: comment.id };
@@ -205,7 +206,7 @@ async function findPendingContinuationIntent(
     .from(agentWakeupRequests)
     .leftJoin(heartbeatRuns, eq(heartbeatRuns.id, agentWakeupRequests.runId))
     .where(and(
-      eq(agentWakeupRequests.companyId, input.companyId),
+      ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, input.companyId),
       eq(agentWakeupRequests.agentId, input.agentId),
       eq(agentWakeupRequests.requestedByActorType, "system"),
       eq(agentWakeupRequests.requestedByActorId, CROSS_TASK_CONTINUATION_COMMITTER_ID),
@@ -447,10 +448,12 @@ export const NATIVE_STATUS_DISPATCH_ACTOR_PREFIX = "native-status-wake-dispatch:
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function deferredDispatchReceiptIntentId(receipt: {
+  payload?: unknown;
   requestedByActorType: string | null;
   requestedByActorId: string | null;
   idempotencyKey: string | null;
 }) {
+  if (hasReviewerAssignmentContinuation(receipt.payload)) return null;
   if (receipt.requestedByActorType !== "system" || !receipt.requestedByActorId) return null;
   if (isCrossTaskContinuationDispatchKey(receipt.idempotencyKey) && receipt.requestedByActorId === receipt.idempotencyKey) {
     const intentId = receipt.idempotencyKey!.slice(DISPATCH_KEY_PREFIX.length);
@@ -474,7 +477,7 @@ export async function isTrustedDeferredDispatchReceipt(
     return false;
   }
   const [intent] = await db.select().from(agentWakeupRequests).where(and(
-    eq(agentWakeupRequests.id, identity.intentId), eq(agentWakeupRequests.companyId, scope.companyId),
+    ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, identity.intentId), eq(agentWakeupRequests.companyId, scope.companyId),
   ));
   if (!intent || intent.requestedByActorType !== "system" || intent.agentId !== scope.agentId
     || (intent.payload as Record<string, unknown> | null)?.issueId !== scope.issueId) {
@@ -497,7 +500,7 @@ export async function listPromotableDeferredDispatchReceipts(
       sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
     ))
     .where(and(
-      input.companyId ? eq(agentWakeupRequests.companyId, input.companyId) : undefined,
+      ordinaryWakeRequestPredicate(), input.companyId ? eq(agentWakeupRequests.companyId, input.companyId) : undefined,
       eq(agentWakeupRequests.status, "deferred_issue_execution"),
       eq(agentWakeupRequests.requestedByActorType, "system"),
       isNull(agentWakeupRequests.runId),

@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/index.js";
 import { scheduledIssueMonitorWait } from "../issue-monitors.js";
 import { readNativeMonitorDelivery, type NativeMonitorDelivery } from "./native-monitor-delivery.js";
 import { readNativePlanWait, type NativePlanWaitSource } from "./native-plan-wait.js";
@@ -195,7 +196,7 @@ async function assertPendingEffectTarget(
       .from(agentWakeupRequests)
       .where(
         and(
-          eq(agentWakeupRequests.id, input.targetId),
+          ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, input.targetId),
           eq(agentWakeupRequests.companyId, input.companyId),
         ),
       )
@@ -422,7 +423,7 @@ async function enqueueWake(input: {
     .from(agentWakeupRequests)
     .where(
       and(
-        eq(agentWakeupRequests.companyId, input.companyId),
+        ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, input.companyId),
         eq(agentWakeupRequests.idempotencyKey, input.idempotencyKey),
         inArray(agentWakeupRequests.status, [
           "queued",
@@ -713,7 +714,7 @@ async function materializeDecisionEffect(input: {
         .from(agentWakeupRequests)
         .where(
           and(
-            eq(agentWakeupRequests.companyId, input.companyId),
+            ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, input.companyId),
             eq(agentWakeupRequests.agentId, effect.agentId),
             eq(agentWakeupRequests.idempotencyKey, effect.idempotencyKey),
             notInArray(agentWakeupRequests.status, [
@@ -1002,7 +1003,7 @@ async function materializeDecisionEffect(input: {
       .from(agentWakeupRequests)
       .where(
         and(
-          eq(agentWakeupRequests.companyId, input.companyId),
+          ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, input.companyId),
           inArray(agentWakeupRequests.status, [
             "queued",
             "deferred_issue_execution",
@@ -1026,10 +1027,10 @@ async function materializeDecisionEffect(input: {
           updatedAt: new Date(),
         })
         .where(
-          inArray(
+          and(ordinaryWakeRequestPredicate(), inArray(
             agentWakeupRequests.id,
             wakeRows.map((row) => row.id),
-          ),
+          )),
         );
     }
     const interactionRows = await input.tx

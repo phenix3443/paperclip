@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/index.js";
 import { resumePreservedResultFinalization } from "./preserved-result-finalization.js";
 import { and, asc, eq, gt, inArray, ne, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, environmentLeases, heartbeatRuns, issues, issueRecoveryActions, workspaceOperations, type Db } from "@paperclipai/db";
@@ -310,7 +311,7 @@ export function retainedWorkspaceCandidates(db: Db, cursor?: string) {
           and ${environmentLeases.id}::text = ${heartbeatRuns.runnerProfileJson}#>>'{nativeWorkspaceSync,leaseId}'
           and ${environmentLeases.status} = 'released' and ${environmentLeases.cleanupStatus} = 'success'
           and ${environmentLeases.metadata}->'workspaceRecoveryCleanup' is null)) or exists (
-        select 1 from ${agentWakeupRequests} where ${agentWakeupRequests.companyId} = ${issueRecoveryActions.companyId}
+        select 1 from ${agentWakeupRequests} where ${ordinaryWakeRequestPredicate()} and ${agentWakeupRequests.companyId} = ${issueRecoveryActions.companyId}
         and ${agentWakeupRequests.status} = 'deferred_issue_execution' and ${agentWakeupRequests.requestedByActorType} = 'user'
         and ${agentWakeupRequests.payload}->>'issueId' = ${issueRecoveryActions.sourceIssueId}::text))`,
       cursor ? gt(issueRecoveryActions.id, cursor) : undefined,

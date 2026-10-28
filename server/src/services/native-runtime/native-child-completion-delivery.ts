@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/index.js";
 import { and, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, type Db } from "@paperclipai/db";
 
@@ -12,7 +13,7 @@ export interface NativeChildCompletionRecipient {
 /** New child results belong to a fresh parent turn, including across a Done claim. */
 export async function hasPendingNativeChildCompletion(db: Db, input: NativeChildCompletionRecipient) {
   const [pending] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
-    eq(agentWakeupRequests.companyId, input.companyId),
+    ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, input.companyId),
     eq(agentWakeupRequests.agentId, input.agentId),
     or(eq(agentWakeupRequests.reason, "issue_children_completed"),
       and(eq(agentWakeupRequests.reason, "issue_execution_deferred"),

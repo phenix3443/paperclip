@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/index.js";
 import { withExternalAdmissionGuard, assertNoExternalOverlap } from "../../modules/external-agents/index.js";
 import { agentWakeupRequests, heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import { and, eq } from "drizzle-orm";
@@ -22,7 +23,7 @@ export async function claimQueuedNativeReviewRun(db: Db, input: {
     if (!issue) return null;
     if (input.run.wakeupRequestId) {
       const [wake] = await tx.select().from(agentWakeupRequests).where(and(
-        eq(agentWakeupRequests.id, input.run.wakeupRequestId),
+        ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, input.run.wakeupRequestId),
         eq(agentWakeupRequests.companyId, input.run.companyId),
         eq(agentWakeupRequests.agentId, input.run.agentId),
       )).for("update");
@@ -46,7 +47,7 @@ export async function claimQueuedNativeReviewRun(db: Db, input: {
     }).where(eq(heartbeatRuns.id, run.id)).returning();
     if (run.wakeupRequestId) await tx.update(agentWakeupRequests).set({
       status: "claimed", claimedAt: input.claimedAt, updatedAt: input.claimedAt,
-    }).where(eq(agentWakeupRequests.id, run.wakeupRequestId));
+    }).where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, run.wakeupRequestId)));
     return claimed ?? null;
   });
 }

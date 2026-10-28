@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/index.js";
 import { and, asc, desc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -711,7 +712,7 @@ export function questionResponseDeliveryService(
       .from(agentWakeupRequests)
       .where(
         and(
-          eq(agentWakeupRequests.companyId, input.companyId),
+          ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, input.companyId),
           eq(agentWakeupRequests.idempotencyKey, input.idempotencyKey),
           inArray(agentWakeupRequests.status, [
             ...DURABLE_WAKE_REQUEST_STATUSES,

@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/index.js";
 import { notifyDeliveryWork, DELIVERY_QUEUES } from "./delivery-work-notifications.js";
 import { and, asc, eq, inArray, lte, sql } from "drizzle-orm";
 import { agents, agentWakeupRequests, chatCompletionDeliveries as deliveries, chatTaskHandoffs as handoffs,
@@ -176,7 +177,7 @@ export function chatCompletionDeliveryService(db: Db, heartbeat: { wakeup(agentI
       const [agent] = await db.select().from(agents).where(and(eq(agents.id, row.handoff.agentId), eq(agents.companyId, claimed.companyId)));
       if (!agent || ["paused", "terminated"].includes(agent.status)) return;
       const key = `chat-completion:${id}:${claimed.attempts}`;
-      const wakes = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, claimed.companyId), eq(agentWakeupRequests.idempotencyKey, key)));
+      const wakes = await db.select().from(agentWakeupRequests).where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, claimed.companyId), eq(agentWakeupRequests.idempotencyKey, key)));
       const runId = claimed.targetRunId ?? wakes.find(w => w.runId)?.runId;
       if (runId) {
         const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
@@ -226,14 +227,14 @@ export function chatCompletionDeliveryService(db: Db, heartbeat: { wakeup(agentI
       });
       if (!run) {
         const receipts = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
-          .where(and(eq(agentWakeupRequests.companyId, claimed.companyId), eq(agentWakeupRequests.idempotencyKey, key)));
+          .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, claimed.companyId), eq(agentWakeupRequests.idempotencyKey, key)));
         if (!receipts.length) throw new Error("Completion wake returned no run or durable receipt");
       }
       if (run) await db.update(deliveries).set({ targetRunId: run.id, status: "queued" })
         .where(and(eq(deliveries.id, id), inArray(deliveries.status, [...pending]), sql`${deliveries.targetRunId} is null`));
     } catch (error) {
       const receipts = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
-        .where(and(eq(agentWakeupRequests.companyId, claimed.companyId), eq(agentWakeupRequests.idempotencyKey, `chat-completion:${id}:${claimed.attempts}`)));
+        .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, claimed.companyId), eq(agentWakeupRequests.idempotencyKey, `chat-completion:${id}:${claimed.attempts}`)));
       await db.update(deliveries).set({ error: error instanceof Error ? error.message : String(error),
         ...(receipts.length ? {} : { attempts: claimed.attempts + 1,
           status: claimed.attempts + 1 >= MAX_ATTEMPTS ? "exhausted" as const : "pending" as const }) })

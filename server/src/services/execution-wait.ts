@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/index.js";
 import { createHash } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { agentWakeupRequests, type Db } from "@paperclipai/db";
@@ -29,7 +30,7 @@ export async function recordExecutionWait(
     const [existing] = await tx.select({ id: agentWakeupRequests.id })
       .from(agentWakeupRequests)
       .where(and(
-        eq(agentWakeupRequests.companyId, request.companyId),
+        ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, request.companyId),
         eq(agentWakeupRequests.agentId, request.agentId),
         eq(agentWakeupRequests.status, "skipped"),
         eq(agentWakeupRequests.idempotencyKey, key),
@@ -40,7 +41,7 @@ export async function recordExecutionWait(
         coalescedCount: sql`${agentWakeupRequests.coalescedCount} + 1`,
         updatedAt: new Date(),
       }).where(and(
-        eq(agentWakeupRequests.companyId, request.companyId),
+        ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, request.companyId),
         eq(agentWakeupRequests.id, existing.id),
       ));
       return { created: false };

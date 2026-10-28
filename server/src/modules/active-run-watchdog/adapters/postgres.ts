@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../../wake-queue/index.js";
 import { and, asc, desc, eq, gt, gte, inArray, ne, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -366,7 +367,7 @@ export function createPostgresWatchdogAdapter(db: Db): WatchdogRunReader & Watch
             updatedAt: input.now,
           })
           .where(and(
-            eq(agentWakeupRequests.id, input.run.wakeupRequestId),
+            ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, input.run.wakeupRequestId),
             eq(agentWakeupRequests.companyId, companyId),
             // A late success fold cannot restore cancelled assignment authority.
             ne(agentWakeupRequests.status, "cancelled"),

@@ -15,6 +15,7 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issues,
+  issueComments,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -156,6 +157,47 @@ describeEmbeddedPostgres("heartbeat task-drain admission release", () => {
 
     return { companyId, agentId, issueId, runId, wakeupRequestId };
   }
+
+  it("startup drains ordinary messages behind a reserved receipt without adopting it", async () => {
+    const { companyId, agentId, issueId } = await seedAgentAndIssue();
+    const heartbeat = heartbeatService(db);
+    const [source] = await db.insert(heartbeatRuns).values({ companyId, agentId, invocationSource: "assignment",
+      status: "succeeded", runtimeMode: "legacy", finishedAt: new Date(), contextSnapshot: { issueId } }).returning();
+    await db.insert(heartbeatRuns).values({ companyId, agentId, invocationSource: "on_demand",
+      status: "running", contextSnapshot: {} });
+    const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user",
+      authorUserId: "responsible-user", body: "An ordinary message must still progress" }).returning();
+    const payload = { issueId, _paperclipWakeContext: { issueId, wakeReason: "issue_commented", wakeCommentIds: [comment.id] } };
+    const [reserved] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "assignment",
+      reason: "issue_commented", status: "deferred_issue_execution", requestedByActorType: "user",
+      requestedByActorId: "responsible-user", requestedAt: new Date(0), updatedAt: new Date(0),
+      payload: { ...payload, _paperclipReviewerAssignmentContinuation: null } }).returning();
+    const [ordinary] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation",
+      reason: "issue_commented", status: "deferred_issue_execution", requestedByActorType: "user",
+      requestedByActorId: "responsible-user", payload }).returning();
+    await heartbeat.resumeQueuedRuns();
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, reserved.id)))[0]).toEqual(reserved);
+    const [delivered] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, ordinary.id));
+    expect(delivered).toMatchObject({ runId: expect.any(String) });
+    expect(delivered.status).not.toBe("deferred_issue_execution");
+    const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, delivered.runId!));
+    expect(successor.id).not.toBe(source.id);
+    expect(successor.contextSnapshot).toMatchObject({ issueId, wakeCommentIds: [comment.id] });
+    await heartbeat.drainActiveRunExecutions();
+    await heartbeat.resumeQueuedRuns();
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, reserved.id)))[0]).toEqual(reserved);
+    await heartbeat.drainActiveRunExecutions();
+  });
+
+  it.each([null, "invalid", { version: 99 }])("rejects caller-supplied reviewer namespace before admission (%j)", async namespace => {
+    const { agentId } = await seedAgentAndIssue();
+    const heartbeat = heartbeatService(db);
+    await expect(heartbeat.wakeup(agentId, {
+      source: "on_demand", payload: { _paperclipReviewerAssignmentContinuation: namespace },
+    })).rejects.toMatchObject({ status: 400 });
+    expect(await db.select().from(agentWakeupRequests)).toEqual([]);
+    expect(await db.select().from(heartbeatRuns)).toEqual([]);
+  });
 
   it("releases the run, wakeup, and issue lock when a task drain trips right after the run is claimed", async () => {
     const { companyId, issueId, runId, wakeupRequestId } = await seedQueuedRun();

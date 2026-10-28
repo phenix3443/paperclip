@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/index.js";
 import { priorRecoveryApiReceipt } from "../recovery-effect-receipts.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
 import { caseHandoffService } from "../case-handoffs.js";
@@ -471,7 +472,7 @@ export class PaperclipRunnerToolAuthority {
         if (current.digest !== this.binding.pinnedMcpDigest) {
           const idempotencyKey = `connection-intent:tools:${this.binding.runId}:${current.digest}`;
           const delivered = () => this.db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
-            eq(agentWakeupRequests.companyId, this.binding.companyId), eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+            ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, this.binding.companyId), eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
             notInArray(agentWakeupRequests.status, ["skipped", "failed", "cancelled"]),
           )).limit(1);
           if (!(await delivered()).length) try { await this.binding.enqueueWakeup(this.binding.agentId, {

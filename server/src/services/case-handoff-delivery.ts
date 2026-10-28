@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/index.js";
 import { and, asc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, caseHandoffs, cases, heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import { caseHandoffService, recordCaseHandoffEvent, type CaseHandoffRow } from "./case-handoffs.js";
@@ -65,7 +66,7 @@ export function caseHandoffDeliveryService(db: Db, options: { heartbeat: Heartbe
   async function accepted(row: CaseHandoffRow) {
     if (row.destinationKind !== "agent" || !row.toAgentId) return false;
     const [receipt] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
-      eq(agentWakeupRequests.id, row.wakeupRequestId), eq(agentWakeupRequests.companyId, row.companyId),
+      ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, row.wakeupRequestId), eq(agentWakeupRequests.companyId, row.companyId),
       eq(agentWakeupRequests.agentId, row.toAgentId),
       or(inArray(agentWakeupRequests.status, ACCEPTED), sql`exists (
         select 1 from ${heartbeatRuns} admitted where admitted.id = ${agentWakeupRequests.runId}

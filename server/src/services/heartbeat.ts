@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/index.js";
 import { DELIVERY_QUEUES } from "./delivery-work-notifications.js";
 import { writeExecutionControl } from "./execution-control-notifications.js";
 import { readFreshWorkspaceReadiness } from "./fresh-workspace-continuation.js";
@@ -3931,7 +3932,7 @@ export function heartbeatService(
       }
       if (latestRun?.runtimeMode === "legacy" && isHeartbeatRunTerminalStatus(latestRun.status)) {
         const [pending] = await db.select({ id: agentWakeupRequests.id, payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
-          eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
+          ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
           eq(agentWakeupRequests.status, "deferred_issue_execution"),
           sql`${agentWakeupRequests.payload}->>'issueId' = ${String(latestRun.contextSnapshot?.issueId)}`,
         )).limit(1);

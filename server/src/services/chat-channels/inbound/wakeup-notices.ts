@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../../../modules/wake-queue/index.js";
 import type { DbOrTransaction } from "../runtime-types.js";
 import { notifyChatPublicationWork } from "../../chat-work-notifications.js";
 import { and, asc, eq, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
@@ -83,7 +84,7 @@ export function createInboundWakeNotices(db: Db, options: NoticeOptions) {
     const [receipt] = await tx
       .select()
       .from(agentWakeupRequests)
-      .where(eq(agentWakeupRequests.id, action.id))
+      .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, action.id)))
       .for("update", { noWait: true });
     const ownerId =
       receipt?.payload?.coalescedIntoWakeupRequestId ?? receipt?.id;
@@ -94,7 +95,7 @@ export function createInboundWakeNotices(db: Db, options: NoticeOptions) {
         : await tx
           .select()
           .from(agentWakeupRequests)
-          .where(eq(agentWakeupRequests.id, ownerId))
+          .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, ownerId)))
           .for("update", { noWait: true })
           .then((rows) => rows[0]);
     const resolved = resolveInboundWakeReceipt(
@@ -166,11 +167,11 @@ export function createInboundWakeNotices(db: Db, options: NoticeOptions) {
       .from(chatActions)
       .innerJoin(
         agentWakeupRequests,
-        eq(agentWakeupRequests.id, chatActions.id),
+        and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, chatActions.id)),
       )
       .innerJoin(
         owner,
-        sql`${owner.id} = case when ${coalescedOwnerId} is null then ${agentWakeupRequests.id} else ${payloadUuid(coalescedOwnerId)} end`,
+        and(ordinaryWakeRequestPredicate(owner.payload), sql`${owner.id} = case when ${coalescedOwnerId} is null then ${agentWakeupRequests.id} else ${payloadUuid(coalescedOwnerId)} end`),
       )
       .where(
         and(
@@ -218,7 +219,7 @@ export function createInboundWakeNotices(db: Db, options: NoticeOptions) {
           const [receipt] = await tx
             .select()
             .from(agentWakeupRequests)
-            .where(eq(agentWakeupRequests.id, action.id));
+            .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, action.id)));
           const ownerId =
             receipt?.payload?.coalescedIntoWakeupRequestId ?? receipt?.id;
           if (

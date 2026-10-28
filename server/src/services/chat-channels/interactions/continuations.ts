@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../../../modules/wake-queue/index.js";
 import {
   and,
   asc,
@@ -231,7 +232,7 @@ export function createChatInteractionContinuations(db: Db, options: InteractionC
           .from(agentWakeupRequests)
           .where(
             and(
-              eq(agentWakeupRequests.companyId, claimed.companyId),
+              ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, claimed.companyId),
               eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
               notInArray(agentWakeupRequests.status, [
                 "skipped",
@@ -313,7 +314,7 @@ export function createChatInteractionContinuations(db: Db, options: InteractionC
             .from(agentWakeupRequests)
             .where(
               and(
-                eq(agentWakeupRequests.companyId, claimed.companyId),
+                ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, claimed.companyId),
                 eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
                 notInArray(agentWakeupRequests.status, [
                   "skipped",
@@ -370,7 +371,7 @@ export function createChatInteractionContinuations(db: Db, options: InteractionC
               .from(agentWakeupRequests)
               .where(
                 and(
-                  eq(agentWakeupRequests.companyId, claimed.companyId),
+                  ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, claimed.companyId),
                   eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
                   notInArray(agentWakeupRequests.status, [
                     "skipped",

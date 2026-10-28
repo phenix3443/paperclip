@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/index.js";
 import { notifyExecutionRunWork } from "../execution-control-notifications.js";
 import { logger } from "../../middleware/logger.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -428,7 +429,7 @@ export async function reconcileSafeNativeReplacements(
         await tx
           .update(agentWakeupRequests)
           .set({ runId: successorRunId })
-          .where(eq(agentWakeupRequests.id, wake!.id));
+          .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, wake!.id)));
         await tx
           .update(nativeRunFinalizations)
           .set({

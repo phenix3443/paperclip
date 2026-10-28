@@ -1,3 +1,4 @@
+import { hasReviewerAssignmentContinuation } from "../modules/wake-queue/index.js";
 import type { agentWakeupRequests, chatActions } from "@paperclipai/db";
 import {
   assertDurableChatWakeupReceipt,
@@ -70,6 +71,7 @@ export function resolveInboundWakeReceipt(
   owner: Receipt | null,
   sourceRemoved = false,
 ) {
+  if (hasReviewerAssignmentContinuation(receipt?.payload) || hasReviewerAssignmentContinuation(owner?.payload)) return null;
   const payload = action.payload;
   if (
     action.kind !== "inbound_wakeup" ||

@@ -1,3 +1,4 @@
+import { hasReviewerAssignmentContinuation, ordinaryWakeRequestPredicate } from "../modules/wake-queue/index.js";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { agentWakeupRequests, issueThreadInteractions, type Db } from "@paperclipai/db";
 import type { IssueComment, IssueQueuedCommentEntry } from "@paperclipai/shared";
@@ -8,6 +9,7 @@ function record(value: unknown): Record<string, unknown> {
 
 /** Interaction receipts keep their typed payload; they never become editable comments. */
 export function queuedInteractionId(payload: unknown): string | null {
+  if (hasReviewerAssignmentContinuation(payload)) return null;
   const p = record(payload);
   return p.mutation === "interaction" && typeof p.interactionId === "string"
     && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(p.interactionId)
@@ -58,7 +60,7 @@ export async function hasQueuedInteractionResponse(db: Db, companyId: string, is
       eq(issueThreadInteractions.issueId, issueId),
       inArray(issueThreadInteractions.status, ["accepted", "answered", "rejected"]),
     )).where(and(
-      eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId),
+      ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId),
       inArray(agentWakeupRequests.status, ["deferred_issue_execution", "queued"]),
       sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
       sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`,

@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../../../modules/wake-queue/index.js";
 import type { EndpointRow, DbTransaction, DbOrTransaction, RuntimeContext, LifecycleRuntimeFence } from "../runtime-types.js";
 
 import { dueChatAction, PROVIDER_EFFECT_STALE_MS } from "../../chat-action-work.js";
@@ -245,7 +246,7 @@ export function createSlackSessionStop(db: Db, options: SlackSessionStopOptions)
           .from(agentWakeupRequests)
           .where(
             and(
-              eq(agentWakeupRequests.companyId, currentEndpoint.companyId),
+              ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, currentEndpoint.companyId),
               eq(agentWakeupRequests.agentId, currentEndpoint.assignedAgentId),
               inArray(agentWakeupRequests.status, [
                 "queued",
@@ -564,7 +565,7 @@ export function createSlackSessionStop(db: Db, options: SlackSessionStopOptions)
           .from(agentWakeupRequests)
           .where(
             and(
-              eq(agentWakeupRequests.id, payload.target.id),
+              ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, payload.target.id),
               eq(agentWakeupRequests.companyId, current.companyId),
               eq(agentWakeupRequests.agentId, payload.assignedAgentId),
               lte(agentWakeupRequests.requestedAt, eventCutoff),
@@ -594,7 +595,7 @@ export function createSlackSessionStop(db: Db, options: SlackSessionStopOptions)
             })
             .where(
               and(
-                eq(agentWakeupRequests.id, wakeup.id),
+                ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, wakeup.id),
                 inArray(agentWakeupRequests.status, [
                   "queued",
                   "deferred_issue_execution",

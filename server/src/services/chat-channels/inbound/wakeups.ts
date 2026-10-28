@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../../../modules/wake-queue/index.js";
 import { DELIVERY_PROCESSING_STALE_MS } from "./delivery-ledger.js";
 import type { EndpointRow, DbOrTransaction } from "../runtime-types.js";
 import { notifyChatDeliveryWork } from "../../chat-work-notifications.js";
@@ -88,7 +89,7 @@ export function createInboundWakeups(db: Db, options: WakeupOptions) {
           const existingReceipt = await tx
             .select()
             .from(agentWakeupRequests)
-            .where(eq(agentWakeupRequests.id, action.id))
+            .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, action.id)))
             .limit(1)
             .then((rows) => rows[0] ?? null);
           if (!existingReceipt)
@@ -296,7 +297,7 @@ export function createInboundWakeups(db: Db, options: WakeupOptions) {
       const row = await db
         .select()
         .from(agentWakeupRequests)
-        .where(eq(agentWakeupRequests.id, claimed.id))
+        .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, claimed.id)))
         .limit(1)
         .then((rows) => rows[0] ?? null);
       if (row && request) assertDurableChatWakeupReceipt(request, row);

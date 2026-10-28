@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../../../modules/wake-queue/index.js";
 import type { EndpointRow, DbTransaction, DbOrTransaction, RuntimeContext, LifecycleRuntimeFence } from "../../chat-channels/runtime-types.js";
 import { createChatFailedRunRetry, type ChatFailedRetrySource as FailedChatRetrySource } from "../../chat-channels/failed-run-retry.js";
 
@@ -566,7 +567,7 @@ export function createTeamsFileAuthority(options: TeamsFileAuthorityOptions) {
       .from(agentWakeupRequests)
       .where(
         and(
-          eq(agentWakeupRequests.companyId, endpoint.companyId),
+          ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, endpoint.companyId),
           eq(agentWakeupRequests.id, action.id),
           eq(agentWakeupRequests.agentId, endpoint.assignedAgentId),
         ),

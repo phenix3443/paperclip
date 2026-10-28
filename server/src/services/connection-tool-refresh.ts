@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/index.js";
 import { and, eq, notInArray } from "drizzle-orm";
 import { agentWakeupRequests, heartbeatRuns, toolMcpGateways, toolMcpGatewayTokens, type Db } from "@paperclipai/db";
 import type { RuntimeToolsTokenClaims } from "../runtime-tools-token.js";
@@ -36,7 +37,7 @@ export async function refreshReadyConnectionTools<T extends ReadyCandidate>(
   }
   const idempotencyKey = `connection-intent:tools:${claims.run_id}:${current.digest}`;
   const queued = async () => (await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
-    eq(agentWakeupRequests.companyId, claims.company_id),
+    ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, claims.company_id),
     eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
     notInArray(agentWakeupRequests.status, ["skipped", "failed", "cancelled"]),
   )).limit(1)).length > 0;

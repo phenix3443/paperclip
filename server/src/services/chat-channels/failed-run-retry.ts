@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/index.js";
 import { continuingTeamsFilePublication, type ContinuingTeamsFileTransfer } from "./microsoft-teams/file-transfer-source.js";
 import { readTaskChatRetryIntent, taskChatRetryExecutionStopped } from "./task-retry-authority.js";
 import { notifyChatActionWork, notifyChatPublicationWork } from "../chat-work-notifications.js";
@@ -889,7 +890,7 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
         .from(agentWakeupRequests)
         .where(
           and(
-            eq(agentWakeupRequests.id, failedRun.wakeupRequestId),
+            ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, failedRun.wakeupRequestId),
             eq(agentWakeupRequests.companyId, input.companyId),
           ),
         )
@@ -964,7 +965,7 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
     const admittedBatch =
       await tx.execute(sql`select source.id, source.payload->>'commentId' as comment_id
       from agent_wakeup_requests receipt join chat_actions source on source.id = receipt.id
-      where receipt.company_id = ${input.companyId}::uuid and receipt.agent_id = ${input.agentId}::uuid
+      where ${ordinaryWakeRequestPredicate(sql.raw('receipt.payload'))} and receipt.company_id = ${input.companyId}::uuid and receipt.agent_id = ${input.agentId}::uuid
         and (receipt.run_id = ${failedRun.id}::uuid or receipt.id = ${failedRun.wakeupRequestId}::uuid
           or receipt.payload->>'coalescedIntoWakeupRequestId' = ${failedRun.wakeupRequestId})
         and source.company_id = ${input.companyId}::uuid and source.kind = 'inbound_wakeup' limit 51`);
@@ -1092,7 +1093,7 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
       const [receipt] = await tx
         .select()
         .from(agentWakeupRequests)
-        .where(eq(agentWakeupRequests.id, action.id))
+        .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, action.id)))
         .for("share", { noWait: true });
       if (!receipt) throw failedChatRetryDenied();
       assertFailedRetryReceipt(
@@ -1135,7 +1136,7 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
           .from(agentWakeupRequests)
           .where(
             and(
-              eq(agentWakeupRequests.id, ownerId),
+              ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, ownerId),
               eq(agentWakeupRequests.companyId, input.companyId),
             ),
           )
@@ -1184,7 +1185,7 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
             ordered.map((action) => action.id),
           ),
           gte(chatActions.createdAt, newestSource),
-          sql`exists (select 1 from agent_wakeup_requests newer_admission where newer_admission.id = ${chatActions.id}
+          sql`exists (select 1 from agent_wakeup_requests newer_admission where ${ordinaryWakeRequestPredicate(sql.raw('newer_admission.payload'))} and newer_admission.id = ${chatActions.id}
         and newer_admission.company_id = ${input.companyId}::uuid and newer_admission.status <> 'skipped')`,
         ),
       )
@@ -1383,7 +1384,7 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
     const [receipt] = await tx
       .select()
       .from(agentWakeupRequests)
-      .where(eq(agentWakeupRequests.id, intent.id))
+      .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, intent.id)))
       .for("share", { noWait: true });
     if (receipt) {
       assertFailedRetryReceipt(
@@ -1481,7 +1482,7 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
       .from(agentWakeupRequests)
       .where(
         and(
-          eq(agentWakeupRequests.id, action.id),
+          ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, action.id),
           eq(agentWakeupRequests.companyId, action.companyId),
         ),
       );
@@ -1589,7 +1590,7 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
       const existing = await db
         .select({ id: agentWakeupRequests.id })
         .from(agentWakeupRequests)
-        .where(eq(agentWakeupRequests.id, claimed.id));
+        .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, claimed.id)));
       if (!existing.length) {
         const context = {
           issueId: source.issueId,
@@ -1649,7 +1650,7 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
       const [receipt] = await db
         .select()
         .from(agentWakeupRequests)
-        .where(eq(agentWakeupRequests.id, claimed.id));
+        .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, claimed.id)));
       if (!receipt) throw new Error("chat_retry_receipt_not_committed");
       return settle(
         ["skipped", "failed", "cancelled"].includes(receipt.status)
@@ -1661,7 +1662,7 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
       const [receipt] = await db
         .select()
         .from(agentWakeupRequests)
-        .where(eq(agentWakeupRequests.id, claimed.id));
+        .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, claimed.id)));
       if (receipt)
         return settle("processed", {
           code: "failed_chat_retry_durable",
@@ -1735,10 +1736,10 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
       .from(chatActions)
       .innerJoin(
         agentWakeupRequests,
-        and(
+        and(ordinaryWakeRequestPredicate(), and(
           eq(agentWakeupRequests.id, chatActions.id),
           eq(agentWakeupRequests.companyId, chatActions.companyId),
-        ),
+        )),
       )
       .where(
         and(
@@ -1780,7 +1781,7 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
           const [current] = await tx
             .select()
             .from(agentWakeupRequests)
-            .where(eq(agentWakeupRequests.id, receipt.id))
+            .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, receipt.id)))
             .for("update", { noWait: true });
           if (!current || current.runId || current.status !== receipt.status)
             return 0;

@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/index.js";
 import { and, eq, gt, inArray, ne, notInArray, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, assets, environmentLeases, heartbeatRuns, issueAttachments, issueRecoveryActions, issues, nativeRunFinalizations, nativeRunResults, type Db } from "@paperclipai/db";
 import { reconstructWorkspaceSchema, type ExecutionReconciliation } from "@paperclipai/shared";
@@ -128,7 +129,7 @@ export async function validateReconstructedWorkspaceDispatch(db: Db, run: typeof
     if (!root.retryOfRunId || predecessorRunIds.length >= 64 || predecessorRunIds.includes(root.retryOfRunId)
       || root.invocationSource !== "automation" || root.triggerDetail !== "system" || !root.scheduledRetryReason
       || object(root.contextSnapshot).retryOfRunId !== root.retryOfRunId) throw changed();
-    const [wake] = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, run.companyId),
+    const [wake] = await db.select().from(agentWakeupRequests).where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, run.companyId),
       eq(agentWakeupRequests.agentId, run.agentId), eq(agentWakeupRequests.id, root.wakeupRequestId ?? "00000000-0000-0000-0000-000000000000"))).for("share");
     if (!wake || wake.runId !== root.id || wake.source !== "automation" || wake.triggerDetail !== "system"
       || wake.requestedByActorType !== "system" || wake.payload?.retryOfRunId !== root.retryOfRunId

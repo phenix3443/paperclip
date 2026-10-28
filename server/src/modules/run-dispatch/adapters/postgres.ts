@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../../wake-queue/index.js";
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { validateReconstructedWorkspaceDispatch } from "../../../services/native-runtime/native-workspace-reconstruction.js";
@@ -759,7 +760,7 @@ export function createPostgresRunDispatchAdapter(
         .set({ status: "cancelled", finishedAt: input.now, error: input.reason, updatedAt: input.now })
         .where(
           and(
-            eq(agentWakeupRequests.id, row.wakeupRequestId),
+            ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, row.wakeupRequestId),
             eq(agentWakeupRequests.companyId, row.companyId),
           ),
         );
@@ -981,7 +982,7 @@ export function createPostgresRunDispatchAdapter(
           .set({ status: "skipped", finishedAt: now, error: decision.reason, updatedAt: now })
           .where(
             and(
-              eq(agentWakeupRequests.id, row.wakeupRequestId),
+              ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, row.wakeupRequestId),
               eq(agentWakeupRequests.companyId, row.companyId),
             ),
           );

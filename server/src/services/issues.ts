@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/index.js";
 import { insertIssueComment } from "./issue-comment-writes.js";
 import { measureRunTransaction } from "./execution-transaction-timing.js";
 import { readNativeMonitorSource } from "./native-runtime/native-monitor-delivery.js";
@@ -797,7 +798,7 @@ async function freshChatSourceAfterPublishedControl(
     .from(agentWakeupRequests)
     .where(
       and(
-        eq(agentWakeupRequests.id, run.wakeupRequestId),
+        ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, run.wakeupRequestId),
         eq(agentWakeupRequests.companyId, companyId),
         eq(agentWakeupRequests.agentId, run.agentId),
         eq(agentWakeupRequests.runId, run.id),
@@ -810,10 +811,10 @@ async function freshChatSourceAfterPublishedControl(
     .from(chatActions)
     .innerJoin(
       agentWakeupRequests,
-      and(
+      and(ordinaryWakeRequestPredicate(), and(
         eq(agentWakeupRequests.id, chatActions.id),
         eq(agentWakeupRequests.companyId, chatActions.companyId),
-      ),
+      )),
     )
     .where(
       and(
@@ -864,10 +865,10 @@ async function freshChatSourceAfterPublishedControl(
     .from(chatActions)
     .innerJoin(
       agentWakeupRequests,
-      and(
+      and(ordinaryWakeRequestPredicate(), and(
         eq(agentWakeupRequests.id, chatActions.id),
         eq(agentWakeupRequests.companyId, chatActions.companyId),
-      ),
+      )),
     )
     .innerJoin(
       chatMessageLinks,
@@ -1352,7 +1353,7 @@ export async function resolveChatOriginPublicationBindings(
       const [wake] = await dbOrTx.select({ payload: agentWakeupRequests.payload,
         idempotencyKey: agentWakeupRequests.idempotencyKey })
         .from(agentWakeupRequests).where(and(
-          eq(agentWakeupRequests.companyId, companyId),
+          ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, companyId),
           eq(agentWakeupRequests.agentId, lineageAgentId!),
           eq(agentWakeupRequests.runId, originRunId),
           like(agentWakeupRequests.idempotencyKey, "tool-action-response:%"),
@@ -1504,7 +1505,7 @@ export async function resolveChatOriginPublicationBindings(
           .from(agentWakeupRequests)
           .where(
             and(
-              eq(agentWakeupRequests.companyId, companyId),
+              ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, companyId),
               eq(
                 agentWakeupRequests.idempotencyKey,
                 continuationIdempotencyKey,
@@ -3940,7 +3941,7 @@ async function listIssueBlockerAttentionMap(
         .from(agentWakeupRequests)
         .where(
           and(
-            eq(agentWakeupRequests.companyId, companyId),
+            ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, companyId),
             inArray(
               agentWakeupRequests.status,
               BLOCKER_ATTENTION_ACTIVE_WAKE_STATUSES,
@@ -4086,7 +4087,7 @@ async function listIssueBlockerAttentionMap(
           .from(agentWakeupRequests)
           .where(
             and(
-              eq(agentWakeupRequests.companyId, companyId),
+              ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, companyId),
               inArray(
                 agentWakeupRequests.status,
                 BLOCKER_ATTENTION_ACTIVE_WAKE_STATUSES,
@@ -4590,7 +4591,7 @@ async function listIssueReviewAttentionMap(
       .from(agentWakeupRequests)
       .where(
         and(
-          eq(agentWakeupRequests.companyId, companyId),
+          ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, companyId),
           inArray(agentWakeupRequests.status, [
             "queued",
             "deferred_issue_execution",
@@ -5706,7 +5707,7 @@ async function listIssueBlockedInboxAttentionMap(
           .from(agentWakeupRequests)
           .where(
             and(
-              eq(agentWakeupRequests.companyId, companyId),
+              ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, companyId),
               inArray(agentWakeupRequests.status, [
                 ...BLOCKED_INBOX_ACTIVE_WAKE_STATUSES,
               ]),
@@ -11277,7 +11278,7 @@ export function issueService(db: Db) {
           // plugin/service writes that do not go through HTTP run cancellation.
           // Keep the requester attribution for audit; cancellation revokes its use.
           await tx.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: new Date(), updatedAt: new Date() })
-            .where(and(eq(agentWakeupRequests.companyId, receiptExisting.companyId),
+            .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, receiptExisting.companyId),
               eq(agentWakeupRequests.requestedByActorType, "user"),
               sql`coalesce(${agentWakeupRequests.payload}->>'issueId', ${agentWakeupRequests.payload}->>'taskId',
                 ${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'issueId',

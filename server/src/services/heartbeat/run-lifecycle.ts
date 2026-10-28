@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/index.js";
 import { notifyExecutionRunWork } from "../execution-control-notifications.js";
 import os from "node:os";
 import {
@@ -1391,7 +1392,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
       .set({ status, ...patch, updatedAt: new Date() })
       // Reassignment revokes requests transactionally. Late execution settlement
       // must not turn a revoked request back into authority for a later retry.
-      .where(and(eq(agentWakeupRequests.id, wakeupRequestId), ne(agentWakeupRequests.status, "cancelled")));
+      .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, wakeupRequestId), ne(agentWakeupRequests.status, "cancelled")));
   }
 
   async function addContinuationExhaustedCommentOnce(input: {
@@ -1733,7 +1734,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
             .from(agentWakeupRequests)
             .where(
               and(
-                eq(agentWakeupRequests.companyId, issue.companyId),
+                ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, issue.companyId),
                 eq(agentWakeupRequests.agentId, run.agentId),
                 inArray(agentWakeupRequests.status, [
                   "queued",
@@ -1998,7 +1999,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
       .from(agentWakeupRequests)
       .where(
         and(
-          eq(agentWakeupRequests.companyId, issue.companyId),
+          ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, issue.companyId),
           eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
           notInArray(agentWakeupRequests.status, ["skipped"]),
         ),
@@ -2434,7 +2435,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
           runId: queuedRun.id,
           updatedAt: now,
         })
-        .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+        .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, wakeupRequest.id)));
 
       await tx
         .update(issues)
@@ -2485,7 +2486,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
       .from(agentWakeupRequests)
       .where(
         and(
-          eq(agentWakeupRequests.companyId, companyId),
+          ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, companyId),
           eq(agentWakeupRequests.agentId, agentId),
           eq(agentWakeupRequests.status, "deferred_issue_execution"),
           sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,

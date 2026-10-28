@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/index.js";
 import { and, desc, eq, gte, ne, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, nativeRunResults, type Db } from "@paperclipai/db";
 import { readSystemRecovery } from "./system-recovery-state.js";
@@ -37,7 +38,7 @@ export async function resumePreservedResultFinalization(db: Db, companyId: strin
     const recovery = readSystemRecovery(action?.evidence);
     if (!result || recovery?.state !== "complete" || !recovery.preservationOperationIds.length) return false;
     const [intent] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
-      eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, run.agentId),
+      ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, run.agentId),
       eq(agentWakeupRequests.status, "deferred_issue_execution"), eq(agentWakeupRequests.reason, "task_retry"),
       sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
       sql`${agentWakeupRequests.payload}#>>'{taskRetry,sourceRunId}' = ${runId}`,
@@ -57,7 +58,7 @@ export async function resumePreservedResultFinalization(db: Db, companyId: strin
     if (intent) await tx.update(agentWakeupRequests).set({
       status: "coalesced", runId, finishedAt: new Date(), updatedAt: new Date(),
       payload: sql`jsonb_set(${agentWakeupRequests.payload}, '{taskRetry,strategy}', '"finalize_result"'::jsonb)`,
-    }).where(eq(agentWakeupRequests.id, intent.id));
+    }).where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, intent.id)));
     return true;
   });
 }

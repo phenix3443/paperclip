@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/index.js";
 import { withExternalAdmissionGuard } from "../modules/external-agents/index.js";
 import { and, eq, gt, gte, inArray, isNull, sql } from "drizzle-orm";
 import { museAgentBindings, museMailboxItems, museRunnerAssignments, museRunnerOperations, agentWakeupRequests, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
@@ -62,7 +63,7 @@ export async function consumeMuseHistoryReceipt(db: Db, operation: typeof museRu
     // Match queue ownership order before touching any binding or deferred wake.
     await tx.select({id:issues.id}).from(issues).where(and(eq(issues.id,run.issueId),eq(issues.companyId,source.companyId))).for("update");
     const wakes = await tx.select().from(agentWakeupRequests).where(and(
-      eq(agentWakeupRequests.companyId, source.companyId), eq(agentWakeupRequests.agentId, source.agentId),
+      ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, source.companyId), eq(agentWakeupRequests.agentId, source.agentId),
       isNull(agentWakeupRequests.runId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
       sql`${agentWakeupRequests.payload}->>'museAssignmentFollowUp' = ${source.id}`)).orderBy(agentWakeupRequests.createdAt,agentWakeupRequests.id).for("update");
     await tx.select({id:heartbeatRuns.id}).from(heartbeatRuns).where(eq(heartbeatRuns.id,source.runId)).for("update");
@@ -103,7 +104,7 @@ export async function consumeMuseHistoryReceipt(db: Db, operation: typeof museRu
         ...(remaining.length ? { payload: withQueuedCommentIdsInWakePayload(wake.payload, remaining) }
           : { status: "coalesced", runId: source.runId, finishedAt: now }),
         updatedAt: now,
-      }).where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, source.companyId),
+      }).where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, source.companyId),
         eq(agentWakeupRequests.status, "deferred_issue_execution")));
     }
     });

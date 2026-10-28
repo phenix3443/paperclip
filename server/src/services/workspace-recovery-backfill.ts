@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/index.js";
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { agentWakeupRequests, environmentLeases, heartbeatRuns, issues, issueRecoveryActions, type Db } from "@paperclipai/db";
 import { adoptSystemRecovery } from "./system-recovery.js";
@@ -91,14 +92,14 @@ export async function historicalRecoveryCounts(db: Db, companyId: string) {
     classified: sql<number>`count(*)::int`,
     repaired: sql<number>`count(*) filter (where ${issueRecoveryActions.evidence}#>>'{systemRecovery,state}' = 'complete')::int`,
     waitingInputDelivered: sql<number>`count(*) filter (where exists (
-      select 1 from ${agentWakeupRequests} w where w.company_id = ${issueRecoveryActions.companyId}
+      select 1 from ${agentWakeupRequests} w where ${ordinaryWakeRequestPredicate(sql.raw('w.payload'))} and w.company_id = ${issueRecoveryActions.companyId}
       and w.run_id::text = ${issueRecoveryActions.evidence}#>>'{explicitUserContinuation,runId}'
       and w.status in ('coalesced', 'completed') and w.requested_by_actor_type = 'user'))::int`,
     awaitingRetry: sql<number>`count(*) filter (where ${issueRecoveryActions.evidence}#>>'{systemRecovery,state}' = 'complete'
       and exists (select 1 from ${issues} i where i.id = ${issueRecoveryActions.sourceIssueId}
         and i.company_id = ${issueRecoveryActions.companyId} and i.status not in ('done', 'cancelled')
         and i.execution_run_id is null)
-      and not exists (select 1 from ${agentWakeupRequests} w where w.company_id = ${issueRecoveryActions.companyId}
+      and not exists (select 1 from ${agentWakeupRequests} w where ${ordinaryWakeRequestPredicate(sql.raw('w.payload'))} and w.company_id = ${issueRecoveryActions.companyId}
         and w.payload->>'issueId' = ${issueRecoveryActions.sourceIssueId}::text and w.status = 'deferred_issue_execution')
       and ${issueRecoveryActions.evidence}#>>'{explicitUserContinuation,runId}' is null)::int`,
     unresolvedSources: sql<number>`count(*) filter (where ${issueRecoveryActions.evidence}#>>'{systemRecovery,state}' <> 'complete')::int`,

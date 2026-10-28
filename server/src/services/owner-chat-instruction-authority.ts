@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/index.js";
 import { sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 
@@ -65,7 +66,7 @@ export async function hasOwnerChatInstructionAuthority(
         AND (message.id::text = coalesce(w.payload->>'commentId', w.payload->'_paperclipWakeContext'->>'wakeCommentId')
           OR (jsonb_typeof(w.payload #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'
             AND (w.payload #> '{_paperclipWakeContext,wakeCommentIds}') ? message.id::text))
-      WHERE w.run_id IN (SELECT id FROM task_runs)
+      WHERE ${ordinaryWakeRequestPredicate(sql.raw('w.payload'))} AND w.run_id IN (SELECT id FROM task_runs)
         AND w.company_id = ${input.companyId}::uuid AND w.agent_id = ${input.agentId}::uuid
         AND w.requested_by_actor_type = 'user' AND w.requested_by_actor_id = ${input.userId}
         AND w.status NOT IN ('skipped', 'cancelled')

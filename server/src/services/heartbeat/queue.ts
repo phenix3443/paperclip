@@ -1,3 +1,4 @@
+import { hasReviewerAssignmentContinuation, ordinaryWakeRequestPredicate } from "../../modules/wake-queue/index.js";
 import { authorizationService } from "../authorization.js";
 import { isAdmittedReconciliation, isGuardedReconciliationDelivery, lockReconciledDeliveryPrefix, recordReconciledDeliveryOutcome, revalidateReconciledDelivery } from "../execution-reconciliation-delivery.js";
 import { assertTaskRetryConversationAllowed, readTaskRetryIntent, retireSupersededTaskRetry } from "../task-retry.js";
@@ -783,7 +784,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             .from(agentWakeupRequests)
             .where(
               and(
-                eq(agentWakeupRequests.id, run.wakeupRequestId),
+                ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, run.wakeupRequestId),
                 eq(agentWakeupRequests.companyId, run.companyId),
                 eq(agentWakeupRequests.agentId, run.agentId),
               ),
@@ -908,7 +909,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             })
             .where(
               and(
-                eq(agentWakeupRequests.id, current.wakeupRequestId),
+                ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, current.wakeupRequestId),
                 eq(agentWakeupRequests.companyId, current.companyId),
                 eq(agentWakeupRequests.agentId, current.agentId),
                 eq(agentWakeupRequests.runId, current.id),
@@ -1287,7 +1288,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 .from(agentWakeupRequests)
                 .where(
                   and(
-                    eq(agentWakeupRequests.id, run.wakeupRequestId!),
+                    ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, run.wakeupRequestId!),
                     eq(agentWakeupRequests.companyId, run.companyId),
                     eq(agentWakeupRequests.agentId, run.agentId),
                   ),
@@ -1373,7 +1374,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                       finishedAt: claimedAt,
                       updatedAt: claimedAt,
                     })
-                    .where(eq(agentWakeupRequests.id, wake.id));
+                    .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, wake.id)));
                   await tx
                     .update(issues)
                     .set({
@@ -1481,7 +1482,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                     error: reason,
                     updatedAt: claimedAt,
                   })
-                  .where(eq(agentWakeupRequests.id, wake.id));
+                  .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, wake.id)));
                 await tx
                   .update(issues)
                   .set({
@@ -1515,7 +1516,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   ),
                   updatedAt: claimedAt,
                 })
-                .where(eq(agentWakeupRequests.id, wake.id));
+                .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, wake.id)));
               const [claimedRun] = await tx
                 .update(heartbeatRuns)
                 .set({
@@ -1607,7 +1608,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             const issueClaim = await lockIssueExecutionClaim(claimTx as unknown as Db);
             if (issueClaim.blocked) return null;
             if (run.wakeupRequestId) await claimTx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
-              eq(agentWakeupRequests.id, run.wakeupRequestId), eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
+              ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, run.wakeupRequestId), eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
             )).for("update");
             const [lockedRun] = await claimTx.select().from(heartbeatRuns).where(and(
               eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.agentId, run.agentId),
@@ -1730,7 +1731,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         await tx
           .update(agentWakeupRequests)
           .set({ status: "queued", claimedAt: null, updatedAt: now })
-          .where(and(eq(agentWakeupRequests.id, released.wakeupRequestId), ne(agentWakeupRequests.status, "cancelled")));
+          .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, released.wakeupRequestId), ne(agentWakeupRequests.status, "cancelled")));
       }
 
       const context = parseObject(released.contextSnapshot);
@@ -1819,7 +1820,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     const cutoff = await getWorktreeExecutionCutoff();
     const pendingInterrupts = await db.select({ id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId })
       .from(agentWakeupRequests).innerJoin(companies, eq(companies.id, agentWakeupRequests.companyId))
-      .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.status, "deferred_issue_execution"),
         eq(companies.status, "active"),
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is not null`,
         lte(agentWakeupRequests.updatedAt, new Date(Date.now() - 30_000)),
@@ -1827,7 +1828,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
     for (const wake of pendingInterrupts) {
       await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
-        eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "deferred_issue_execution"),
       ));
       await resumeQueuedCommentInterrupt(wake.companyId, wake.id).catch(err => {
         logger.warn({ err, queueId: wake.id }, "failed to resume interrupted comment queue");
@@ -1843,7 +1844,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         or(eq(issues.assigneeAgentId, agentWakeupRequests.agentId),
           sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,wakeReason}' = 'issue_comment_mentioned'`)))
       .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
-      .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.status, "deferred_issue_execution"),
         isNull(issues.executionRunId),
         or(and(
           sql`jsonb_typeof(${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'`,
@@ -1866,7 +1867,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         or(isNull(heartbeatRuns.nativeIssueId), sql`${heartbeatRuns.nativeIssueId}::text = ${String(wake.payload?.issueId)}`),
       )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
       await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
-        eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "deferred_issue_execution"),
       ));
       if (!latest || !latest.finishedAt || !isHeartbeatRunTerminalStatus(latest.status)) continue;
       if (latest.runtimeMode !== "legacy" && latest.runtimeMode !== "native") continue;
@@ -1897,7 +1898,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       ))
       .innerJoin(companies, eq(companies.id, heartbeatRuns.companyId))
       .where(and(
-        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.status, "deferred_issue_execution"),
         eq(heartbeatRuns.status, "cancelled"),
         eq(heartbeatRuns.runtimeMode, "legacy"),
         eq(companies.status, "active"),
@@ -2158,6 +2159,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
   }
 
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string) {
+    if (hasReviewerAssignmentContinuation(opts.payload)) {
+      throw new HttpError(400, "Reviewer assignment continuation payload is reserved");
+    }
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
     const contextSnapshot: Record<string, unknown> = {
@@ -2204,7 +2208,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     let taskRetryActorId: string | null = null;
     if (opts.taskRetryRequestId) {
       const [receipt] = await db.select().from(agentWakeupRequests).where(and(
-        eq(agentWakeupRequests.id, opts.taskRetryRequestId), eq(agentWakeupRequests.agentId, agentId),
+        ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, opts.taskRetryRequestId), eq(agentWakeupRequests.agentId, agentId),
         eq(agentWakeupRequests.status, "deferred_issue_execution"),
         eq(agentWakeupRequests.requestedByActorType, "user"),
         sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId ?? ""}`,
@@ -2389,7 +2393,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const receipt = await queryDb
         .select()
         .from(agentWakeupRequests)
-        .where(eq(agentWakeupRequests.id, receiptRequest.id))
+        .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, receiptRequest.id)))
         .limit(1)
         .then((rows) => rows[0] ?? null);
       if (receipt && durableRequest) assertDurableChatWakeupReceipt(durableRequest, receipt);
@@ -2464,7 +2468,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 : "Waiting for task execution to be enabled. Your message is saved."),
             })}::jsonb)`,
           updatedAt: new Date(),
-        }).where(and(eq(agentWakeupRequests.id, executionWaitRequestId),
+        }).where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, executionWaitRequestId),
           eq(agentWakeupRequests.companyId, agent.companyId), eq(agentWakeupRequests.agentId, agentId),
           eq(agentWakeupRequests.status, "deferred_issue_execution")));
         return { created: false };
@@ -2872,7 +2876,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             && opts.dispatchReceiptReadmissionId === executionWaitRequestId;
           if (executionWaitRequestId) {
             const [pending] = await tx.select().from(agentWakeupRequests).where(and(
-              eq(agentWakeupRequests.id, executionWaitRequestId), eq(agentWakeupRequests.companyId, agent.companyId),
+              ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, executionWaitRequestId), eq(agentWakeupRequests.companyId, agent.companyId),
               eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
               // A user message can join a queue originally created by a
               // system wake. Admission validates the saved user comment or board click.
@@ -2913,7 +2917,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               if (!wakeCommentId || !ids.includes(wakeCommentId)) return { kind: "deferred" as const };
               pending.payload = withQueuedCommentIdsInWakePayload(parseObject(pending.payload), ids);
               await tx.update(agentWakeupRequests).set({ payload: pending.payload }).where(and(
-                eq(agentWakeupRequests.id, pending.id), eq(agentWakeupRequests.companyId, agent.companyId),
+                ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, pending.id), eq(agentWakeupRequests.companyId, agent.companyId),
               ));
             }
             if (!opts.queuedCommentInterruptId && !opts.queuedCommentRequestId && pending.payload?.manualUserWake === true) {
@@ -3072,7 +3076,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             await durableRequest.authorize(tx as unknown as Db);
             if (opts.taskRetryRequestId) {
               const [retryWake] = await tx.select().from(agentWakeupRequests).where(and(
-                eq(agentWakeupRequests.companyId, agent.companyId), eq(agentWakeupRequests.id, opts.taskRetryRequestId),
+                ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, agent.companyId), eq(agentWakeupRequests.id, opts.taskRetryRequestId),
                 eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
               )).for("update");
               const retry = readTaskRetryIntent(retryWake?.payload);
@@ -3400,7 +3404,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               .from(agentWakeupRequests)
               .where(
                 and(
-                  eq(agentWakeupRequests.companyId, issue.companyId),
+                  ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, issue.companyId),
                   eq(agentWakeupRequests.agentId, agentId),
                   eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey),
                   ne(agentWakeupRequests.status, "skipped"),
@@ -3480,7 +3484,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               await tx.update(agentWakeupRequests).set({
                 payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), '{executionWait}', ${JSON.stringify(condition)}::jsonb)`,
                 updatedAt: new Date(),
-              }).where(eq(agentWakeupRequests.id, executionWaitRequestId));
+              }).where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, executionWaitRequestId)));
               return { kind: "deferred" as const };
             }
             if (durableRequest || wakeCommentId ||
@@ -3622,7 +3626,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   updatedAt: now,
                 })
                 .where(
-                  eq(agentWakeupRequests.id, scheduledRun.wakeupRequestId),
+                  and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, scheduledRun.wakeupRequestId)),
                 );
             }
 
@@ -3756,10 +3760,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                     updatedAt: new Date(),
                   })
                   .where(
-                    eq(
+                    and(ordinaryWakeRequestPredicate(), eq(
                       agentWakeupRequests.id,
                       activeExecutionRun.wakeupRequestId,
-                    ),
+                    )),
                   );
               }
               activeExecutionRun = null;
@@ -4056,7 +4060,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               // Receipt consumption uses the same issue -> wake -> run -> guard ->
               // binding order. Lock before publishing, then reuse these wake rows.
               pendingFollowUps = await tx.select().from(agentWakeupRequests).where(and(
-                eq(agentWakeupRequests.companyId, agent.companyId), eq(agentWakeupRequests.agentId, agentId),
+                ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, agent.companyId), eq(agentWakeupRequests.agentId, agentId),
                 isNull(agentWakeupRequests.runId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
                 sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
                 sql`${agentWakeupRequests.payload}->>${followUpPayloadKey} is not null`,
@@ -4082,7 +4086,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 payload: withQueuedCommentIdsInWakePayload(pending.payload,
                   [...new Set([...queuedCommentIdsFromWakePayload(pending.payload), wakeCommentId!])]),
                 coalescedCount: pending.coalescedCount + 1, updatedAt: new Date(),
-              }).where(and(eq(agentWakeupRequests.id, pending.id), eq(agentWakeupRequests.companyId, agent.companyId),
+              }).where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, pending.id), eq(agentWakeupRequests.companyId, agent.companyId),
                 eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "deferred_issue_execution")));
               else await tx.insert(agentWakeupRequests).values({ companyId: agent.companyId, agentId, source, triggerDetail,
                 reason, payload: withQueuedCommentIdsInWakePayload({ ...payload, issueId: issue.id,
@@ -4374,7 +4378,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           const wakeupRequest = reusedDispatchReceipt
             ? await tx.update(agentWakeupRequests)
               .set({ status: "queued", error: null, updatedAt: new Date() })
-              .where(and(eq(agentWakeupRequests.id, reusedDispatchReceipt.id),
+              .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, reusedDispatchReceipt.id),
                 eq(agentWakeupRequests.status, "deferred_issue_execution")))
               .returning()
               .then((rows) => rows[0])
@@ -4427,7 +4431,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   .from(agentWakeupRequests)
                   .where(
                     and(
-                      eq(agentWakeupRequests.companyId, issue.companyId),
+                      ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, issue.companyId),
                       inArray(agentWakeupRequests.agentId, handoffSource ? [agentId, handoffSource.agentId] : [agentId]),
                       eq(agentWakeupRequests.status, "deferred_issue_execution"),
                       sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
@@ -4519,12 +4523,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               runId: newRun.id,
               updatedAt: new Date(),
             })
-            .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+            .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, wakeupRequest.id)));
 
           if (failedChatRetry && opts.taskRetryRequestId) {
             await tx.update(agentWakeupRequests).set({
               status: "coalesced", runId: newRun.id, finishedAt: new Date(), updatedAt: new Date(),
-            }).where(and(eq(agentWakeupRequests.companyId, issue.companyId),
+            }).where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, issue.companyId),
               eq(agentWakeupRequests.id, opts.taskRetryRequestId),
               eq(agentWakeupRequests.status, "deferred_issue_execution")));
           }
@@ -4539,17 +4543,17 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 updatedAt: new Date(),
               })
               .where(
-                inArray(
+                and(ordinaryWakeRequestPredicate(), inArray(
                   agentWakeupRequests.id,
                   adoptedComments.map((wake) => wake.id),
-                ),
+                )),
               );
             await tx
               .update(agentWakeupRequests)
               .set({
                 payload: withQueuedCommentIdsInWakePayload(payload, adoptedCommentIds),
               })
-              .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+              .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, wakeupRequest.id)));
           }
 
           // executionRunId is NOT stamped here (enqueueWakeup queues the run but
@@ -4795,7 +4799,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           runId: newRun.id,
           updatedAt: new Date(),
         })
-        .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+        .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, wakeupRequest.id)));
 
       return { kind: "queued" as const, run: newRun };
     });
@@ -4847,7 +4851,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       .from(agentWakeupRequests)
       .where(
         and(
-          input.companyId
+          ordinaryWakeRequestPredicate(), input.companyId
             ? eq(agentWakeupRequests.companyId, input.companyId)
             : undefined,
           eq(agentWakeupRequests.requestedByActorType, "system"),
@@ -4882,7 +4886,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           .select()
           .from(agentWakeupRequests)
           .where(
-            dispatchKey
+            and(ordinaryWakeRequestPredicate(), dispatchKey
               ? and(
                   eq(agentWakeupRequests.companyId, candidate.companyId),
                   eq(agentWakeupRequests.idempotencyKey, dispatchKey),
@@ -4891,7 +4895,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   eq(agentWakeupRequests.companyId, candidate.companyId),
                   eq(agentWakeupRequests.requestedByActorType, "system"),
                   eq(agentWakeupRequests.requestedByActorId, dispatchActorId),
-                ),
+                )),
           )
           .orderBy(desc(agentWakeupRequests.requestedAt))
           .limit(1)
@@ -4919,7 +4923,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           })
           .where(
             and(
-              eq(agentWakeupRequests.id, candidate.id),
+              ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, candidate.id),
               isNull(agentWakeupRequests.runId),
             ),
           );
@@ -4951,7 +4955,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         })
         .where(
           and(
-            eq(agentWakeupRequests.id, candidate.id),
+            ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, candidate.id),
             isNull(agentWakeupRequests.runId),
             candidate.status === "claimed"
               ? eq(agentWakeupRequests.status, "claimed")
@@ -4987,7 +4991,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             error: null,
             updatedAt: new Date(),
           })
-          .where(eq(agentWakeupRequests.id, candidate.id));
+          .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, candidate.id)));
         recovered += 1;
         continue;
       }
@@ -5040,7 +5044,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   : "Native status wake target has a different assignee",
               updatedAt: new Date(),
             })
-            .where(eq(agentWakeupRequests.id, candidate.id));
+            .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, candidate.id)));
           recovered += 1;
           continue;
         }
@@ -5063,7 +5067,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 error: gateError,
                 updatedAt: new Date(),
               })
-              .where(eq(agentWakeupRequests.id, candidate.id));
+              .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, candidate.id)));
             recovered += 1;
             continue;
           }
@@ -5122,7 +5126,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             error: delivered?.error ?? null,
             updatedAt: new Date(),
           })
-          .where(eq(agentWakeupRequests.id, candidate.id));
+          .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, candidate.id)));
 
         if (scopeKey) {
           deliveredByIssueScope.set(scopeKey, {
@@ -5155,7 +5159,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           })
           .where(
             and(
-              eq(agentWakeupRequests.id, candidate.id),
+              ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, candidate.id),
               eq(agentWakeupRequests.status, "claimed"),
               isNull(agentWakeupRequests.runId),
             ),
@@ -5204,7 +5208,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       if (!identity || !issueId) continue;
       if (await getExecutionBlocker(db, receipt.companyId, issueId)) continue;
       const [intent] = await db.select().from(agentWakeupRequests).where(and(
-        eq(agentWakeupRequests.id, identity.intentId), eq(agentWakeupRequests.companyId, receipt.companyId),
+        ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, identity.intentId), eq(agentWakeupRequests.companyId, receipt.companyId),
       ));
       const [target] = await db.select({
         status: issues.status, assigneeAgentId: issues.assigneeAgentId,
@@ -5228,7 +5232,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       }
       if (gateError) {
         await db.update(agentWakeupRequests).set({ status: "skipped", error: gateError, finishedAt: new Date(), updatedAt: new Date() })
-          .where(and(eq(agentWakeupRequests.id, receipt.id), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+          .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, receipt.id), eq(agentWakeupRequests.status, "deferred_issue_execution")));
         continue;
       }
       try {
@@ -5247,7 +5251,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         if (run) {
           promoted += 1;
           await db.update(agentWakeupRequests).set({ runId: run.id, updatedAt: new Date() })
-            .where(and(eq(agentWakeupRequests.id, intent.id), isNull(agentWakeupRequests.runId)));
+            .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, intent.id), isNull(agentWakeupRequests.runId)));
         }
       } catch (error) {
         logger.warn({ err: error, wakeupRequestId: receipt.id }, "failed to re-admit a deferred dispatch receipt");

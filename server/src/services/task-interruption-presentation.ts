@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/index.js";
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { agents, agentWakeupRequests, approvals, companies, heartbeatRuns, issueApprovals, issueRecoveryActions,
   issues, issueTreeHoldMembers, issueTreeHolds, projects, type Db } from "@paperclipai/db";
@@ -66,7 +67,7 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
     }).from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), inArray(runIssue, ids)))
       .orderBy(runIssue, desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)),
     db.selectDistinctOn([wakeIssue], { issueId: wakeIssue, id: agentWakeupRequests.id, requestedAt: agentWakeupRequests.requestedAt })
-      .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId), inArray(wakeIssue, ids),
+      .from(agentWakeupRequests).where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, companyId), inArray(wakeIssue, ids),
         eq(agentWakeupRequests.status, "deferred_issue_execution"), eq(agentWakeupRequests.requestedByActorType, "user")))
       .orderBy(wakeIssue, desc(agentWakeupRequests.requestedAt)),
     agentIds.length ? db.select({ id: agents.id, status: agents.status, pauseReason: agents.pauseReason }).from(agents)

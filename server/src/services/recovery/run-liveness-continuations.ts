@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/index.js";
 import { and, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentWakeupRequests, agents, heartbeatRuns, issues } from "@paperclipai/db";
@@ -73,7 +74,7 @@ export async function findExistingRunLivenessContinuationWake(
     .from(agentWakeupRequests)
     .where(
       and(
-        eq(agentWakeupRequests.companyId, input.companyId),
+        ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, input.companyId),
         eq(agentWakeupRequests.idempotencyKey, input.idempotencyKey),
         inArray(agentWakeupRequests.status, IDEMPOTENT_WAKE_STATUSES),
       ),
