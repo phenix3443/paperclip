@@ -1,4 +1,4 @@
-import { assertReviewQuotaMonitorInstallation } from "./reviewer-quota-monitor.js";
+import { assertReviewQuotaMonitorInstallation, ReviewQuotaMonitorHeld } from "./reviewer-quota-monitor.js";
 import { insertIssueComment } from "../issue-comment-writes.js";
 import {
   issues,
@@ -166,9 +166,9 @@ export class IssueMonitorAdmission {
 
   async consume(tx: Db, current: Pick<typeof issues.$inferSelect, "id" | "companyId" | "status" | "assigneeAgentId" | "assigneeUserId" | "responsibleUserId" | "executionPolicy" | "executionState">, agentId: string, source?: typeof heartbeatRuns.$inferSelect) {
     if (this.quotaSourceRunId) {
-      if (!source || source.id !== this.quotaSourceRunId) throw conflict("The quota source changed before admission");
+      if (!source || source.id !== this.quotaSourceRunId) throw new ReviewQuotaMonitorHeld("The quota source changed before admission");
       const [task] = await tx.select().from(issues).where(and(eq(issues.id, current.id), eq(issues.companyId, current.companyId)));
-      if (!task) throw conflict("The monitored task is unavailable");
+      if (!task) throw new ReviewQuotaMonitorHeld("The monitored task is unavailable");
       await assertReviewQuotaMonitorInstallation(tx, task, source);
     }
     if (current.id !== this.claimed.id || current.companyId !== this.claimed.companyId || agentId !== this.claimed.assigneeAgentId
@@ -736,7 +736,7 @@ export function createHeartbeatScheduling(
         if (isProviderQuotaReviewMonitor) {
           const [task] = await db.select().from(issues).where(and(eq(issues.id, claimed.id), eq(issues.companyId, claimed.companyId)));
           if (!task || issueExecutionGeneration(task) !== issueExecutionGeneration(claimed))
-            throw conflict("The quota monitor generation changed before recovery");
+            throw new ReviewQuotaMonitorHeld("The quota monitor generation changed before recovery");
           await assertReviewQuotaMonitorInstallation(db, task, sourceRun);
         }
         if (sourceRun.runtimeMode === "native") {
@@ -863,7 +863,7 @@ export function createHeartbeatScheduling(
 
       return { outcome: "triggered" as const };
     } catch (err) {
-      if (err instanceof HttpError && err.status >= 400 && err.status < 500) {
+      if (!(err instanceof ReviewQuotaMonitorHeld) && err instanceof HttpError && err.status >= 400 && err.status < 500) {
         if (input.clearOnClientError) {
           await db
             .update(issues)

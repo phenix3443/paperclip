@@ -1,3 +1,4 @@
+import { ReviewQuotaMonitorHeld } from "./reviewer-quota-monitor.js";
 import type { IssueMonitorAdmission } from "./scheduling.js";
 import { issueExecutionGeneration } from "../issue-execution-policy.js";
 import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
@@ -45,7 +46,6 @@ import {
 import {
   HttpError,
   notFound,
-  conflict,
 } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { parseObject } from "../../adapters/utils.js";
@@ -737,7 +737,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
               ),
             )
             .limit(1);
-          if (existing && monitorAdmission) throw conflict("An existing retry cannot consume a new review monitor");
+          if (existing && monitorAdmission) throw new ReviewQuotaMonitorHeld("An existing retry cannot consume a new review monitor");
           if (existing)
             return {
               outcome: "scheduled",
@@ -1052,7 +1052,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
         if (monitorAdmission) {
           const [task] = issueId ? await tx.select().from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId))) : [];
           const [source] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId)));
-          if (!task || !source) throw conflict("The quota retry source is unavailable");
+          if (!task || !source) throw new ReviewQuotaMonitorHeld("The quota retry source is unavailable");
           const consumed = await monitorAdmission.consume(tx as unknown as Db, task, agent.id, source);
           admittedContext = { ...retryContextSnapshot, reviewerAssignmentGeneration: issueExecutionGeneration(consumed) };
         }

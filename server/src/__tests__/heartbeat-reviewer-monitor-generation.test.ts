@@ -392,4 +392,36 @@ const support = await getEmbeddedPostgresTestSupport();
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, source.id)))[0].contextSnapshot).toEqual(source.contextSnapshot);
   });
 
+  it.each(["missing", "changed"] as const)("retains quota duty on real deadline delivery with %s proof", async fault => {
+    const { f, source, service, install } = await quotaReady(); await install();
+    const [before] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    if (fault === "missing") await db.delete(activityLog).where(eq(activityLog.companyId, f.companyId));
+    else await issueService(db).update(f.issueId, { executionState: { ...before.executionState!, reviewRequest: { instructions: "new submission" } } });
+    await service.tickTimers(new Date(before.monitorNextCheckAt!.getTime() + 1));
+    expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0].monitorNextCheckAt).toEqual(before.monitorNextCheckAt);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, source.id))).toHaveLength(0);
+  });
+
+  it.each(["native", "reconciliation"] as const)("rechecks a quota source becoming %s inside retry admission", async fault => {
+    const { f, source, install } = await quotaReady(); await install();
+    let claimed = false, mutated = false;
+    const racing = new Proxy(db, { get(target, key) {
+      if (key !== "transaction") return Reflect.get(target, key);
+      return async (...args: Parameters<typeof db.transaction>) => {
+        if (claimed && !mutated) {
+          mutated = true;
+          await db.update(heartbeatRuns).set(fault === "native" ? { runtimeMode: "native" } :
+            { resultJson: { executionRecovery: { kind: "interrupted", providerWorkStarted: true } } }).where(eq(heartbeatRuns.id, source.id));
+        }
+        const value = await Reflect.apply(target.transaction, target, args);
+        if (value?.id === f.issueId && value.monitorWakeRequestedAt) claimed = true;
+        return value;
+      };
+    } });
+    await expect(heartbeatService(racing).triggerIssueMonitor(f.issueId)).rejects.toThrow();
+    expect(mutated).toBe(true);
+    expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0].monitorNextCheckAt).not.toBeNull();
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, source.id))).toHaveLength(0);
+  });
+
 });
