@@ -1992,8 +1992,65 @@ only for an explicit task Stop. Omission or `"preserve"` leaves this duty alone;
 generic cancellation strings and user attribution do not establish permanent
 invalidation. Budget, subtree, agent, project and company pause paths keep
 unfinished intent. Comment/session cancellation keeps its source-specific
-authority and cannot retire reviewer intent. No real producer, consumer,
-deadline or operational replay is enabled by these retirement seams.
+authority and cannot retire reviewer intent.
+
+The queue owner's `reconcileReviewerAssignments` consumes synthetic v1 receipts
+through ordinary admission, with company-to-issue serialization and atomic
+successor association. It reads recorded executor-release proof; it does not run
+fallback cleanup or create that proof. Full policy/state, assignment and
+responsibility form the canonical generation. Ordinary runs record their admitted
+generation so the consumer can adopt matching queued/running/scheduled-retry work.
+The existing run-dispatch owner compares this generation under issue/run locks
+at queue claim and both provider admission phases, including ordinary review
+turns that the consumer adopts. At both provider phases, stamped review turns
+also re-read current response, dependency, tree, access, invokability and recovery
+gates through their existing owners. Accounting still commits before the final
+read-only ownership gate. Other task turns do not receive this stamp.
+For a pending review, the monitor owner supplies a scoped admission object to
+the queue. After ordinary admission succeeds, the same company-scoped issue
+transaction consumes the exact claimed monitor and creates the new run with the
+complete post-consumption generation. Existing runs and immutable intents keep
+their original generation. Refused admission rolls back without consuming the
+monitor. Queue dispatch begins after the admission transaction commits. Other
+monitor paths retain their existing handling.
+
+For legacy tasks with no responsible user, the identity owner initializes the
+NEW review run through the same operator/origin/message selection as dispatch.
+It applies the original null-only task backfill before the queue captures the
+complete generation in that admission transaction. Non-null task ownership is
+preserved. An immutable null-generation intent waits for lawful initialization;
+then the existing generation check retires it instead of re-signing it.
+When an ordinary comment coalesces into that queued review, the identity owner
+accepts previously unseen message identities inside the first claim transaction,
+after the queue holds company, issue/wake and run locks. It preserves explicit
+operator priority and existing accepted steering, and returns a run whose user
+matches its active identity. Reclaims do not replay messages or rewind identity.
+This changes run attribution without re-signing the review generation or
+reassigning the task's now non-null responsible user.
+
+
+A stamped reviewer quota retry also needs installation evidence. The issue
+mutation owner verifies the source's complete generation before installing the
+quota monitor, rejects any simultaneous non-monitor generation change, and
+records both the source and installed generations in the same transaction's
+`issue.review_quota_monitor_installed` activity. This is a company-scoped,
+server-owned installation proof, not a wake receipt. At retry admission, the
+monitor owner checks that proof against the exact source and current installed
+generation under issue-before-run locks. Only a NEW scheduled retry consumes the
+matching claim and captures the complete post-consumption generation in that
+commit. A missing/foreign proof or any intervening generation change refuses
+admission and retains the monitor duty. Existing retries and immutable receipts
+keep their original generation; provider dispatch still follows outer commit.
+
+
+Held receipts retain per-receipt 15-to-300-second backoff in existing JSON.
+`nextAttemptAt` is an integer Unix time in milliseconds. SQL selects at most 50
+due candidates before decoding payloads; the deadline query returns one aggregate.
+Each validated receipt associates individually with its successor.
+The existing `executionContinuation` worker includes their earliest due time;
+empty or terminal-only history adds no deadline. No native producer or cleanup
+notification hook is enabled here. Production integration and operational replay
+remain separate work.
 
 Run lifecycle handling is in `server/src/services/heartbeat/run-lifecycle.ts`.
 It owns status transitions, run events and progress, liveness classification,

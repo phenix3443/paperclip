@@ -99,6 +99,12 @@ credentials/run context; inspect its result and applicable persistence/attributi
 Assert the relevant denied actor, owner, company or mode from Policy. Review the
 remaining operations before qualifying the whole capability.
 
+The reserved reviewer-intent creation seam is server-internal and has no new
+agent endpoint. The [service/PostgreSQL suite](../../server/src/__tests__/heartbeat-reviewer-intent-consumer.test.ts)
+checks original actor, reviewer, responsible-user and project authority, with
+current access rechecked at provider dispatch. This does not qualify the REST
+operations above or prove live native producer integration.
+
 Gaps: Review policy determines final completion; formal board approval is a different
 boundary.
 

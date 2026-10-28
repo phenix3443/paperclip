@@ -1410,7 +1410,7 @@ async function startServerWithDatabaseTeardown(
       { queue: DELIVERY_QUEUES.executionReplacement, run: () => reconcileSafeNativeReplacements(db, new Date(), { verifyStoppedSession: run => verifyStoppedNativeSessionForReplacement(db, run) }), next: executionSchedule.replacement },
       { queue: DELIVERY_QUEUES.executionContinuation, run: async () => {
         const settled = await Promise.allSettled([deliverReconciledExecutions(db, heartbeat.wakeup),
-          continueDecidedReviewReassignments(db, heartbeat.wakeup)]);
+          continueDecidedReviewReassignments(db, heartbeat.wakeup), heartbeat.reconcileReviewerAssignments()]);
         for (const result of settled) if (result.status === "rejected") throw result.reason;
       }, next: async () => {
         const deadline = await executionSchedule.continuation();
