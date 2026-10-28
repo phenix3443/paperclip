@@ -11,7 +11,7 @@ type Task = Pick<typeof issues.$inferSelect, "id" | "companyId" | "projectId" | 
 type Intent = Pick<typeof issueThreadInteractions.$inferSelect, "id" | "companyId" | "issueId" | "kind" | "status" | "payload" | "addresseeUserId"> & Partial<Pick<typeof issueThreadInteractions.$inferSelect, "sourceRunId">>;
 
 /** Verify existing access only. This never installs tools, grants access, or adopts an identity. */
-async function findAvailableToolConnection(db: Db, task: Task, intent: Intent, policyRunId?: string | null) {
+async function findAvailableToolConnection(db: Db, task: Task, intent: Intent, policyRunId?: string | null, retired = false) {
   if (intent.kind !== "connection_intent" || intent.status !== "pending"
     || intent.companyId !== task.companyId || intent.issueId !== task.id
     || task.assigneeUserId) return null;
@@ -29,11 +29,15 @@ async function findAvailableToolConnection(db: Db, task: Task, intent: Intent, p
     ));
     if (membership?.status !== "active" || !membership.membershipRole || membership.membershipRole === "viewer") return null;
   }
-  const connection = await connectionIntentService(db).usableConnectionForAgent({ companyId: task.companyId,
-    agentId: payload.requestingAgentId, responsibleUserId: intent.addresseeUserId, serviceSlug: payload.serviceSlug });
-  if (!connection) return null;
   const accessRequest = payload.accessRequest;
-  if (accessRequest && connection.id !== accessRequest.connectionId) return null;
+  const service = connectionIntentService(db);
+  const lookup = { companyId: task.companyId, agentId: payload.requestingAgentId,
+    responsibleUserId: intent.addresseeUserId, serviceSlug: payload.serviceSlug };
+  const exact = () => service.usableConnectionForAgent({ ...lookup, connectionId: accessRequest!.connectionId });
+  // The gateway authorizes an exact request on its named connection without an install.
+  const connection = accessRequest && !retired ? await exact()
+    : await service.usableConnectionForAgent(lookup) ?? (accessRequest ? await exact() : null);
+  if (!connection) return null;
   // Use the gateway's exact descriptors and listing policy, including task,
   // project and routine context. Per-invocation approvals remain enforced.
   const access = await createToolGatewayService(db).summarizeConnectionAccessForAgent({
@@ -41,7 +45,7 @@ async function findAvailableToolConnection(db: Db, task: Task, intent: Intent, p
     heartbeatRunId: policyRunId === undefined ? intent.sourceRunId ?? null : policyRunId,
     issueId: task.id, projectId: task.projectId,
   });
-  if (!accessRequest) return access.allowedCount + access.askFirstCount > 0 ? connection : null;
+  if (!accessRequest || retired) return access.allowedCount + access.askFirstCount > 0 ? connection : null;
   const catalog = await db.select().from(toolCatalogEntries).where(and(
     eq(toolCatalogEntries.companyId, task.companyId), eq(toolCatalogEntries.connectionId, connection.id),
     inArray(toolCatalogEntries.id, accessRequest.tools.map(tool => tool.catalogEntryId)),
@@ -74,8 +78,7 @@ export async function connectionContinuationPendingResponse(db: Db, task: Task, 
     if (interaction.status !== "pending" && !retired) continue;
     if (retired && (interaction.payload as { requestingAgentId?: string }).requestingAgentId !== task.assigneeAgentId) continue;
     if (interaction.addresseeUserId !== responsibleUserId) return "interaction";
-    const payload = retired ? { ...interaction.payload, accessRequest: undefined } as Intent["payload"] : interaction.payload;
-    const connection = await findAvailableToolConnection(db, task, { ...interaction, payload, status: "pending" }, policyRunId);
+    const connection = await findAvailableToolConnection(db, task, { ...interaction, status: "pending" }, policyRunId, retired);
     // Historical system retirements describe a service need, not a permanent
     // binding to an account the user may later replace. Delivery and native
     // response projection still validate their own exact recorded connection.

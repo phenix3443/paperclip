@@ -270,6 +270,7 @@ export function connectionIntentService(db: Db) {
     purpose?: "ai" | "channel";
     sourceRunId?: string | null;
     inventory?: Awaited<ReturnType<typeof connectionInventory>>;
+    connectionId?: string;
   }) {
     const managed = input.purpose === "ai" ? await managedAgent(input.companyId, input.agentId, input.serviceSlug, { sourceRunId: input.sourceRunId }) : null;
     if (managed) {
@@ -294,7 +295,7 @@ export function connectionIntentService(db: Db) {
     const installedIds = new Set(effective.installedConnections.map((connection) => connection.id));
     const permittedIds = new Set(effective.allowedTools.map((tool) => tool.connectionId));
     const usable = (connection: ToolConnection | undefined) => connection
-      && installedIds.has(connection.id) && permittedIds.has(connection.id)
+      && (input.connectionId ? connection.id === input.connectionId : installedIds.has(connection.id) && permittedIds.has(connection.id))
       && connection.status === "active" && connection.enabled
       && ["mcp_remote", "local_stdio"].includes(connection.transport)
       && !isToolConnectionAttentionHealth(connection.healthStatus) ? connection : null;
@@ -304,7 +305,7 @@ export function connectionIntentService(db: Db) {
       });
       return usable(matching.find((connection) => connection.id === selection.grant?.connectionId));
     }
-    const installed = matching.filter((connection) => installedIds.has(connection.id));
+    const installed = input.connectionId ? matching : matching.filter((connection) => installedIds.has(connection.id));
     const grantsByConnection = await Promise.all(installed.map(async (connection) => ({
       connection,
       grants: (await access.listConnectionGrants(connection.id, input.companyId)).grants,

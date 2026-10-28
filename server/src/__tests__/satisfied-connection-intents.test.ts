@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { activityLog, agentWakeupRequests, agents, approvals, authUsers, companies, companyMemberships, connectionGrants, connectionGrantDelegations,
-  connectionIntentDeliveries, createDb, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueApprovals, issueRecoveryActions, issueThreadInteractions, issues, projects, toolApplications,
+  connectionIntentDeliveries, createDb, principalPermissionGrants, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueApprovals, issueRecoveryActions, issueThreadInteractions, issues, projects, toolApplications,
   toolCatalogEntries, toolConnectionInstalls, toolConnections, toolProfileBindings, toolProfiles, toolPolicies,
 } from "@paperclipai/db";
 import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapters/postgres.js";
@@ -491,6 +491,20 @@ describePostgres("already available connection requests", () => {
     expect(await db.select().from(connectionIntentDeliveries)).toHaveLength(1);
     expect(await db.select().from(approvals)).toHaveLength(0);
     expect(wakeup).toHaveBeenCalledOnce();
+  });
+
+  it("retires an access request when an uninstalled seat already holds an explicit tools:use grant", async () => {
+    const f = await seed(); await requestAccess(f);
+    await db.delete(toolConnectionInstalls);
+    await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "agent", principalId: f.agentId,
+      permissionKey: "tools:use", scope: { allow: [`connection:${f.connection.id}`] } });
+    const wakeup = vi.fn().mockResolvedValue(null);
+    await connectionIntentDeliveryService(db, { wakeup }).sweepPending();
+    const [retired] = await db.select().from(issueThreadInteractions);
+    expect(retired).toMatchObject({ status: "expired", result: expect.objectContaining({ connectionId: f.connection.id }) });
+    expect(wakeup).toHaveBeenCalledOnce();
+    const [task] = await db.select().from(issues);
+    expect(await connectionContinuationPendingResponse(db, task, "connection-owner")).toBeNull();
   });
 
   it("does not strand the task when a retired access request's exact tool version later changes", async () => {
