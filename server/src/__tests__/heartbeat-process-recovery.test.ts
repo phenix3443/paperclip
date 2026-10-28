@@ -2637,9 +2637,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
   it.each([false, true])("delivers the reviewer after actual native finalization and verified local workspace cleanup (late stop=%s)", async lateStop => {
     const f = await seedPendingNativeFinalization();
-    const child = lateStop ? spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore" }) : null;
-    const childExit = child ? new Promise<void>(resolve => child.once("exit", () => resolve())) : Promise.resolve();
-    const pid = child?.pid ?? 2_000_000_000;
+    let child: ChildProcess | null = null;
+    let childExit = Promise.resolve();
     const reviewerId = randomUUID(), stageId = randomUUID();
     await db.insert(agents).values({ id: reviewerId, companyId: f.companyId, name: "Reviewer", role: "engineer",
       adapterType: "process", status: "idle", runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } });
@@ -2656,6 +2655,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const heartbeat = heartbeatService(db);
     const c = createDeliveryWorkCoordinator({ owner: db, canRun: () => true });
     try {
+      child = lateStop ? spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { stdio: "ignore" }) : null;
+      const ownedChild = child;
+      childExit = ownedChild ? new Promise<void>(resolve => ownedChild.once("exit", () => resolve())) : Promise.resolve();
+      const pid = child?.pid ?? 2_000_000_000;
       await registerExecutionControlWork(c, [{ queue: DELIVERY_QUEUES.executionContinuation,
         run: heartbeat.reconcileReviewerAssignments, next: executionControlSchedule(db).continuation }]).ready;
       const [receipt] = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
