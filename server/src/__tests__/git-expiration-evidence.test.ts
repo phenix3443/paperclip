@@ -414,4 +414,35 @@ describeEmbeddedPostgres("native Git expiration row evidence", () => {
     expect(before.state === "observed" && before.value.paths.filter(entry => entry.role.startsWith("checkout_") && entry.role !== "checkout_container")
       .map(entry => entry.observation)).toEqual(Array(3).fill({ state: "unavailable", reason: "checkout_budget" }));
   });
+
+  it("records lock_busy evidence and takes no observation when the source or lifecycle lock is held", async () => {
+    for (const key of ["source", "lifecycle"] as const) {
+      const f = await seed(1);
+      const lock = key === "source" ? `isolated_repository_source:${f.companyId}:${f.issueId}` : `execution_workspace_lifecycle:${f.ids[0]}`;
+      const journal = memoryJournal();
+      await db.transaction(async tx => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lock}, 0))`);
+        expect(await round(journal, { companyId: f.companyId }), key).toMatchObject({ status: "partial", stopReason: "lock_busy" });
+      });
+      expect(rowOf(journal).evidence, key).toMatchObject({ selected: { state: "observed" }, before: { state: "unavailable", reason: "lock_busy" },
+        after: { state: "unavailable", reason: "lock_busy" } });
+    }
+  });
+
+  it("lists and observes the roles of a nested checkout of a live row", async () => {
+    const f = await reconstructable();
+    const checkout = path.join(f.cwd, ".paperclip-repositories", "nested");
+    await fs.mkdir(checkout, { recursive: true });
+    git(checkout, "init", "--initial-branch=topic");
+    await fs.writeFile(path.join(checkout, "file.txt"), "x\n");
+    git(checkout, "add", "."); git(checkout, "commit", "-m", "nested");
+    const journal = memoryJournal();
+    await round(journal, { companyId: f.companyId });
+    const before = rowOf(journal).evidence.before;
+    const value = before.state === "observed" ? before.value : null;
+    for (const role of ["checkout_container", "checkout_root", "checkout_head", "checkout_index"]) {
+      expect(value?.paths.find(entry => entry.role === role)?.observation, role).toMatchObject({ state: "observed", value: { present: true } });
+    }
+    expect(value?.paths.filter(entry => entry.role === "expiration_lock_marker")).toHaveLength(6);
+  });
 });
