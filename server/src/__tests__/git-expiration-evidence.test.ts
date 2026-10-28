@@ -19,6 +19,7 @@ import { createGitRemoteAuthProvider } from "../services/git-credentials.js";
 import { parseGitExpirationRoundArgs, runGitExpirationRoundCli, GitExpirationRoundUsageError, fileGitExpirationRoundJournal,
   readGitExpirationRoundJournal, gitExpirationRoundExitCode } from "../git-expiration-round-cli.js";
 import { gitExpirationEvidenceContract } from "../services/git-expiration-evidence.js";
+import { CHECKOUT_LIMIT } from "../services/git-workspace-contents.js";
 
 const faults = vi.hoisted(() => ({ git: null as ((args: readonly string[]) => Error | null) | null,
   spawn: null as ((args: readonly string[]) => string[] | null) | null, seamWrite: false, secretServices: 0 }));
@@ -363,5 +364,54 @@ describeEmbeddedPostgres("native Git expiration row evidence", () => {
     }) } });
     expect(summary).toMatchObject({ status: "partial", stopReason: "protected_state_changed" });
     expect(rowOf(journal).evidence.drift).toMatchObject({ state: "changed", fields: expect.arrayContaining(["paths.checkout_container"]) });
+  });
+
+  it("records selection drift without a stop when metadata changes after selection with the same key", async () => {
+    const f = await reconstructable();
+    const journal = memoryJournal(async event => {
+      if (event.type === "page_selected" && event.keys.length) {
+        await db.execute(sql`update execution_workspaces set metadata = metadata || '{"touched":true}'::jsonb, updated_at = updated_at where id = ${f.workspaceId}`);
+      }
+    });
+    const summary = await round(journal, { companyId: f.companyId });
+    expect(summary.stopReason).not.toBe("protected_state_changed");
+    const evidence = rowOf(journal).evidence;
+    expect(evidence.selectionDrift).toMatchObject({ state: "changed", fields: expect.arrayContaining(["row.metadata"]) });
+    expect(evidence.drift).toEqual({ state: "none" });
+  });
+
+  it("stops evidence_unavailable with invalid_metadata for a pending row whose expiration state fails validation", async () => {
+    const f = await pendingWithoutWorktree();
+    await db.execute(sql`update execution_workspaces set metadata = jsonb_set(metadata, '{gitCacheExpiration,worktreeTrash}', '"/elsewhere"') where id = ${f.workspaceId}`);
+    const journal = memoryJournal();
+    expect(await round(journal, { companyId: f.companyId })).toMatchObject({ status: "partial", stopReason: "evidence_unavailable" });
+    const before = rowOf(journal).evidence.before;
+    const reasons = before.state === "observed" ? new Set(before.value.paths.map(entry => entry.observation.state === "unavailable" ? entry.observation.reason : null)) : null;
+    expect(reasons).toEqual(new Set(["invalid_metadata"]));
+  });
+
+  it.skipIf(process.getuid?.() === 0)("records an errno code for a denied after lstat and stops on the admin change that denied it", async () => {
+    const f = await reconstructable();
+    const admin = git(f.cwd, "rev-parse", "--absolute-git-dir");
+    const journal = memoryJournal();
+    try {
+      const summary = await round(journal, { companyId: f.companyId, budgetHooks: { beforeDirectoryRead: async (directory: string) => {
+        if (directory === path.join(f.cwd, ".paperclip-repositories")) await fs.chmod(admin, 0o000);
+      } } });
+      expect(summary).toMatchObject({ status: "partial", stopReason: "protected_state_changed" });
+    } finally { await fs.chmod(admin, 0o755); }
+    expect(rowOf(journal).evidence.drift).toMatchObject({ state: "changed", fields: expect.arrayContaining(["paths.worktree_admin"]) });
+    const after = rowOf(journal).evidence.after;
+    expect(after.state === "observed" && after.value.paths.find(entry => entry.role === "gitdir_head")?.observation).toEqual({ state: "error", code: "EACCES" });
+  });
+
+  it("lists checkout roles as checkout_budget when the container has more entries than the native limit", async () => {
+    const f = await reconstructable();
+    for (let index = 0; index <= CHECKOUT_LIMIT; index += 1) await fs.mkdir(path.join(f.cwd, ".paperclip-repositories", `c${index}`), { recursive: true });
+    const journal = memoryJournal();
+    expect(await round(journal, { companyId: f.companyId })).toMatchObject({ status: "partial", stopReason: "evidence_unavailable" });
+    const before = rowOf(journal).evidence.before;
+    expect(before.state === "observed" && before.value.paths.filter(entry => entry.role.startsWith("checkout_") && entry.role !== "checkout_container")
+      .map(entry => entry.observation)).toEqual(Array(3).fill({ state: "unavailable", reason: "checkout_budget" }));
   });
 });
