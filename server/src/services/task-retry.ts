@@ -1,5 +1,6 @@
 import { writeExecutionControl } from "./execution-control-notifications.js";
 import { DELIVERY_QUEUES } from "./delivery-work-notifications.js";
+import { hasReviewerAssignmentContinuation, ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, inArray, or, sql } from "drizzle-orm";
@@ -48,6 +49,7 @@ const taskRetryIntentSchema = z.object({
 });
 export type TaskRetryIntent = z.infer<typeof taskRetryIntentSchema>;
 export function readTaskRetryIntent(payload: Record<string, unknown> | null | undefined): TaskRetryIntent | null {
+  if (hasReviewerAssignmentContinuation(payload)) return null;
   const result = taskRetryIntentSchema.safeParse(payload?.taskRetry);
   return result.success ? result.data : null;
 }
@@ -186,7 +188,7 @@ export async function retireSupersededTaskRetry(db: Db, input: {
   if (latest?.id === input.sourceRunId) return false;
   const retired = await db.update(agentWakeupRequests).set({ status: "skipped", error: "task_retry_superseded",
     finishedAt: new Date(), updatedAt: new Date() }).where(and(
-    eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.id, input.requestId),
+    ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.id, input.requestId),
     eq(agentWakeupRequests.reason, "task_retry"), sql`${agentWakeupRequests.runId} is null`,
     sql`${agentWakeupRequests.payload}->>'issueId' = ${input.issueId}`,
     inArray(agentWakeupRequests.status, ["deferred_issue_execution", "queued", "claimed"]),
@@ -210,7 +212,7 @@ export async function requestTaskRetry(input: {
     await assertTaskRetryConversationAllowed(db, issue, input.actorId);
     const key = `task-retry:${input.idempotencyKey}`;
     const [sameRequest] = await tx.select().from(agentWakeupRequests).where(and(
-      eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.idempotencyKey, key)));
+      ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.idempotencyKey, key)));
     if (sameRequest) {
       if (sameRequest.payload?.issueId !== issue.id || sameRequest.requestedByActorId !== input.actorId)
         throw conflict("This retry request belongs to a different task or user.");
@@ -227,7 +229,7 @@ export async function requestTaskRetry(input: {
       return { requestId: null, accepted: false, stale: true, observedRunId: latest?.id ?? null };
     }
     let active = (await tx.select().from(agentWakeupRequests).where(and(
-      eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, issue.assigneeAgentId),
+      ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, issue.assigneeAgentId),
       sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
       sql`${agentWakeupRequests.payload}->'taskRetry'->>'schema' = 'paperclip.task-retry.v1'`,
       inArray(agentWakeupRequests.status, ["deferred_issue_execution", "queued", "claimed"]),
@@ -239,7 +241,7 @@ export async function requestTaskRetry(input: {
     if (active && !active.runId && issue.conversationAgentId && active.requestedByActorId !== issue.conversationUserId) {
       // A former owner's unadmitted receipt cannot own the new owner's Retry.
       await tx.update(agentWakeupRequests).set({ status: "failed", finishedAt: new Date(), updatedAt: new Date() })
-        .where(eq(agentWakeupRequests.id, active.id));
+        .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, active.id)));
       active = undefined;
     }
     const busy = ["queued", "running", "scheduled_retry"].includes(latest.status);
@@ -264,7 +266,7 @@ export async function requestTaskRetry(input: {
     if (active && !busy && !active.runId && records.some(action =>
       readSystemRecovery(action.evidence)?.state === "exhausted")) {
       await tx.update(agentWakeupRequests).set({ status: "failed", finishedAt: new Date(), updatedAt: new Date() })
-        .where(eq(agentWakeupRequests.id, active.id));
+        .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, active.id)));
       active = undefined;
     }
     const id = randomUUID();
@@ -299,7 +301,7 @@ export async function requestTaskRetry(input: {
       intent.chatActionId = (await input.prepareChatRetry(db, { companyId: issue.companyId, issueId: issue.id,
         agentId: issue.assigneeAgentId, failedRunId: latest.id, initiatedByUserId: input.actorId, retryIntentId: id })).actionId;
       await tx.update(agentWakeupRequests).set({ payload: { issueId: issue.id, taskRetry: intent } })
-        .where(eq(agentWakeupRequests.id, id));
+        .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, id)));
     }
     if (!busy) {
       for (const action of records) {
@@ -341,7 +343,7 @@ export async function requestTaskRetry(input: {
  * durable outcome; it never launches a parallel generic board execution. */
 export async function reconcileTaskChatRetryReceipts(db: Db) {
   const pending = await db.select().from(agentWakeupRequests).where(and(
-    eq(agentWakeupRequests.reason, "task_retry"), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+    ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.reason, "task_retry"), eq(agentWakeupRequests.status, "deferred_issue_execution"),
     sql`${agentWakeupRequests.payload}#>>'{taskRetry,chatActionId}' is not null`,
   )).orderBy(agentWakeupRequests.updatedAt).limit(50);
   for (const wake of pending) {
@@ -351,7 +353,7 @@ export async function reconcileTaskChatRetryReceipts(db: Db) {
       eq(chatActions.id, intent.chatActionId), eq(chatActions.kind, "failed_run_retry"),
       sql`${chatActions.payload}->>'issueId' = ${String(wake.payload?.issueId)}`));
     const [receipt] = chat ? await db.select().from(agentWakeupRequests).where(and(
-      eq(agentWakeupRequests.companyId, wake.companyId), eq(agentWakeupRequests.id, chat.id),
+      ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, wake.companyId), eq(agentWakeupRequests.id, chat.id),
       eq(agentWakeupRequests.agentId, wake.agentId))) : [];
     // A deferred chat receipt is admitted input, not a completed dispatch.
     // Re-stage that exact action through chat's owner; it rechecks authority
@@ -371,6 +373,6 @@ export async function reconcileTaskChatRetryReceipts(db: Db) {
       ...(receipt?.runId ? { status: "coalesced", runId: receipt.runId, finishedAt: new Date() }
         : failed ? { status: "failed", finishedAt: new Date() } : {}),
       updatedAt: new Date(),
-    }).where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+    }).where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "deferred_issue_execution")));
   }
 }

@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { createHash } from "node:crypto";
 import { agentWakeupRequests, chatActions, chatDeliveries, chatEndpoints, type Db } from "@paperclipai/db";
 import { and, eq, inArray, or, sql, type SQLWrapper } from "drizzle-orm";
@@ -176,7 +177,7 @@ export function unadmittedChatWakeupCondition(
       and chat_unadmitted.status in ('preparing', 'issued', 'processing', 'failed')
       and not exists (
         select 1 from agent_wakeup_requests chat_admission
-        where chat_admission.id = chat_unadmitted.id
+        where ${ordinaryWakeRequestPredicate(sql.raw('chat_admission.payload'))} and chat_admission.id = chat_unadmitted.id
           and chat_admission.company_id = chat_unadmitted.company_id
           and chat_admission.agent_id::text = chat_unadmitted.payload->>'agentId'
           and chat_admission.status <> 'skipped'
@@ -204,7 +205,8 @@ export function unadmittedChatWakeupCondition(
           and chat_later.payload->>'issueId' = chat_unadmitted.payload->>'issueId'
           and chat_later.kind = 'inbound_wakeup'
           and (chat_later.created_at, chat_later.id) > (chat_unadmitted.created_at, chat_unadmitted.id)
-          and chat_later_admission.company_id = chat_later.company_id
+          and ${ordinaryWakeRequestPredicate(sql.raw('chat_later_admission.payload'))}
+           and chat_later_admission.company_id = chat_later.company_id
           and chat_later_admission.agent_id::text = chat_later.payload->>'agentId'
           and chat_later_admission.status <> 'skipped'
       ))
@@ -369,7 +371,7 @@ export async function slackMentionAllowsRunStart(
       eq(chatDeliveries.companyId, run.companyId),
     ))
     .where(and(
-      eq(agentWakeupRequests.companyId, run.companyId),
+      ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, run.companyId),
       eq(agentWakeupRequests.agentId, run.agentId),
       or(
         eq(agentWakeupRequests.runId, run.id),

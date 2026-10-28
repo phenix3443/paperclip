@@ -1,4 +1,5 @@
 import { chatWakeAuthorityDenied } from "./wakeup-authorization-error.js";
+import { ordinaryWakeRequestPredicate } from "../../../modules/wake-queue/receipt-namespace.js";
 import { nonDirectDestinationAllowed } from "./surfaces.js";
 import { lifecycleRuntimeFence } from "./delivery-ledger.js";
 import type { DbTransaction, DbOrTransaction } from "../runtime-types.js";
@@ -236,7 +237,7 @@ export function createInboundWakeAuthority(db: Db, options: WakeAuthorityOptions
     if (normalized.principal?.isBot || isGitHubAutomaticDelivery(current.delivery) || current.delivery.state !== "processed") throw forbidden();
     if ((action.payload.requestedByActorType === "user" ? action.payload.requestedByActorId : null) !== request.responsibleUserId) throw forbidden();
     const [agent] = await tx.select({ name: agents.name }).from(agents).where(and(eq(agents.id, request.agentId!), eq(agents.companyId, request.companyId)));
-    const [receipt] = await tx.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, action.id));
+    const [receipt] = await tx.select().from(agentWakeupRequests).where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, action.id)));
     if (receipt && ["skipped", "cancelled", "failed"].includes(receipt.status)) throw forbidden();
     return {
       agentName: agent?.name ?? "Assistant", message: normalized.message?.text ?? "Shared an attachment.", queued: !receipt?.runId || await fastResponseTurnQueued(tx, request),

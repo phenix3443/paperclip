@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../wake-queue/receipt-namespace.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../services/delivery-work-notifications.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { and, asc, desc, eq, gt, inArray, isNull, sql } from "drizzle-orm";
@@ -572,7 +573,7 @@ function createMuseBroker(db:Db, publicOrigin?:string) {
       const result=await idleMutation(s,{version:1,command:"task.create",requestId:c.requestId,title:c.prompt.slice(0,500),description:c.prompt},true);
       issueId=String(result.issueId);
     } else issueId=c.issueId;
-    const receipt=async()=>(await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId,s.companyId),eq(agentWakeupRequests.agentId,s.agentId),eq(agentWakeupRequests.idempotencyKey,requestKey))).limit(1))[0];
+    const receipt=async()=>(await db.select().from(agentWakeupRequests).where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId,s.companyId),eq(agentWakeupRequests.agentId,s.agentId),eq(agentWakeupRequests.idempotencyKey,requestKey))).limit(1))[0];
     const replay=async(row:typeof agentWakeupRequests.$inferSelect)=>{
       if(row.source!=="assignment"||row.requestedByActorType!=="agent"||row.requestedByActorId!==s.agentId||row.payload?.issueId!==issueId||row.payload?.museRequestId!==c.requestId||row.payload?.museBindingId!==b.id||row.payload?.museBindingGeneration!==b.generation||row.payload?.museRequestDigest!==requestDigest)throw conflict("Request ID reused with changed input.");
       await assertIssue(s,issueId);

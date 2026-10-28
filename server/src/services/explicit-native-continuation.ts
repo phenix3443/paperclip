@@ -1,4 +1,5 @@
 import { assertDurableChatWakeupRequest, assertDurableChatWakeupReceipt, type DurableChatWakeupRequest } from "./durable-chat-wakeup.js";
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { notifyExecutionRunWork } from "./execution-control-notifications.js";
 import { canSelectFreshWorkspace, type ContinuationReadiness } from "./fresh-workspace-continuation.js";
 import { readTaskRetryIntent } from "./task-retry.js";
@@ -143,7 +144,7 @@ export async function admitExplicitNativeContinuation(input: {
   ));
   if (!task || task.assigneeAgentId !== agentId || ["done", "cancelled"].includes(task.status)) return null;
   const [retryWake] = input.taskRetryRequestId ? await db.select().from(agentWakeupRequests).where(and(
-    eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.id, input.taskRetryRequestId),
+    ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.id, input.taskRetryRequestId),
     eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
     eq(agentWakeupRequests.requestedByActorType, "user"), eq(agentWakeupRequests.requestedByActorId, actorId),
     sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
@@ -151,7 +152,7 @@ export async function admitExplicitNativeContinuation(input: {
   const taskRetry = readTaskRetryIntent(retryWake?.payload);
   if (input.taskRetryRequestId && (!taskRetry || taskRetry.generationId !== retryWake?.id || taskRetry.actorId !== actorId)) return null;
   const [interruptQueue] = input.queuedCommentInterruptId ? await db.select().from(agentWakeupRequests).where(and(
-    eq(agentWakeupRequests.id, input.queuedCommentInterruptId),
+    ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, input.queuedCommentInterruptId),
     eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId),
     eq(agentWakeupRequests.status, "deferred_issue_execution"),
     sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
@@ -163,7 +164,7 @@ export async function admitExplicitNativeContinuation(input: {
     queuedCommentIdsFromWakePayload(interruptQueue.payload).includes(commentId))));
   if (input.queuedCommentInterruptId && !queuedInterrupt) return null;
   const [savedQueue] = input.queuedCommentRequestId ? await db.select().from(agentWakeupRequests).where(and(
-    eq(agentWakeupRequests.id, input.queuedCommentRequestId),
+    ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, input.queuedCommentRequestId),
     eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId),
     eq(agentWakeupRequests.status, "deferred_issue_execution"),
     sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
@@ -518,7 +519,7 @@ export async function admitExplicitNativeContinuation(input: {
   if (input.taskRetryRequestId) await db.update(agentWakeupRequests).set({
     payload: sql`jsonb_set(${agentWakeupRequests.payload}, '{taskRetry,strategy}',
       ${JSON.stringify(readiness?.mode === "fresh_isolated_workspace" ? "fresh_isolated_workspace" : "continue")}::jsonb)`,
-  }).where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.id, input.taskRetryRequestId)));
+  }).where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.id, input.taskRetryRequestId)));
   return continuation;
 }
 

@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { and, eq, sql } from "drizzle-orm";
 import { agentWakeupRequests, environmentLeases, heartbeatRuns, issueRecoveryActions, nativeRunFinalizations, nativeRunResults, issues, type Db } from "@paperclipai/db";
 import { buildExecutionContinuation } from "../execution-continuation.js";
@@ -15,7 +16,7 @@ export async function readTaskChatRetryIntent(db: Db, input: {
   intentId: string; chatActionId?: string;
 }) {
   const [wake] = await db.select().from(agentWakeupRequests).where(and(
-    eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.id, input.intentId),
+    ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.id, input.intentId),
     eq(agentWakeupRequests.agentId, input.agentId), eq(agentWakeupRequests.reason, "task_retry"),
     eq(agentWakeupRequests.requestedByActorType, "user"),
     sql`${agentWakeupRequests.payload}->>'issueId' = ${input.issueId}`,

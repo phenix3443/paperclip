@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { lockExecutionReconciliationAuthority } from "./execution-reconciliation-authority-lock.js";
 import { notifyCompanyRetentionWork } from "./retention-work-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
@@ -75,7 +76,7 @@ export function companyService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
         updatedAt: new Date(),
       })
       .where(and(
-        eq(agentWakeupRequests.companyId, id),
+        ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, id),
         inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution", "claimed"]),
         isNull(agentWakeupRequests.runId),
       ));

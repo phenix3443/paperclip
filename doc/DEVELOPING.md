@@ -1956,6 +1956,20 @@ its process-wide execution and wakeup promise sets. Forwarding callbacks preserv
 construction order for retry and recovery services. Keep queue policy changes
 separate from this extraction and from adapter execution changes.
 
+Wake receipt classification belongs to `server/src/modules/wake-queue/`.
+The presence of `_paperclipReviewerAssignmentContinuation` reserves a receipt,
+including null, malformed and unknown-version values. Generic readers exclude
+it in SQL before ordering/limits; generic writers repeat that classification
+in their mutation predicates, including writes by a previously selected ID.
+Import the SQL/in-memory classification contract from the public
+`modules/wake-queue/receipt-namespace.ts` entry point, which does not compose
+queue adapters, rather than interpreting the reserved value in another service.
+Public wake admission rejects this key
+in both payload and context, since retry paths can copy context into a receipt.
+Authorized diagnostics retain visibility, and unfinished receipts still block
+instance sleep. This fence does not enable a reviewer producer or implement its
+owner-specific retirement/delivery lifecycle.
+
 Run lifecycle handling is in `server/src/services/heartbeat/run-lifecycle.ts`.
 It owns status transitions, run events and progress, liveness classification,
 completion handoffs, issue-comment finalization, and runtime/cost settlement.

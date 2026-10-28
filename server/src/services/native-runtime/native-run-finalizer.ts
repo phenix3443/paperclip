@@ -1,5 +1,6 @@
 import { pendingNativeGovernance } from "./native-governance.js";
 import { onboardingFirstTaskCompletionAllowed } from "../onboarding-first-task-admission.js";
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { notifyExecutionRunWork } from "../execution-control-notifications.js";
 import { reconcileMuseNativeTerminalRun } from "./muse-terminal-reconciliation.js";
 import { assertNativeCaseHandoffResult } from "./native-case-handoff.js";
@@ -1298,7 +1299,7 @@ export async function finalizeNativeRun(input: {
 
   await dismissAutomaticCompletionReviews(input.db, coordinator.issueId);
   const sourceWake = run.wakeupRequestId ? await input.db.select({ payload: agentWakeupRequests.payload })
-    .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.id, run.wakeupRequestId),
+    .from(agentWakeupRequests).where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, run.wakeupRequestId),
       eq(agentWakeupRequests.companyId, run.companyId))).then((rows) => rows[0]) : null;
   // One follow-up may repair an incomplete report. Repeated incomplete results
   // require a visible recovery action instead of an unbounded wake loop.

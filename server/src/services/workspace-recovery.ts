@@ -1,6 +1,7 @@
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { beginIdleTrackedWork } from "./task-admission.js";
 import { writeEnvironmentCleanup } from "./environment-cleanup-notifications.js";
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { resumePreservedResultFinalization } from "./preserved-result-finalization.js";
 import { and, asc, eq, gt, inArray, ne, notInArray, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, environmentLeases, heartbeatRuns, issues, issueRecoveryActions, workspaceOperations, type Db } from "@paperclipai/db";
@@ -321,7 +322,7 @@ export function retainedWorkspaceCandidates(db: Db, cursor?: string, unfinishedO
     and ${environmentLeases.status} = 'released' and ${environmentLeases.cleanupStatus} = 'success'
     and ${environmentLeases.metadata}->'workspaceRecoveryCleanup' is null))`;
   const waitingInput = sql`exists (select 1 from ${agentWakeupRequests}
-    where ${agentWakeupRequests.companyId} = ${issueRecoveryActions.companyId}
+    where ${ordinaryWakeRequestPredicate()} and ${agentWakeupRequests.companyId} = ${issueRecoveryActions.companyId}
     and ${agentWakeupRequests.status} = 'deferred_issue_execution' and ${agentWakeupRequests.requestedByActorType} = 'user'
     and ${agentWakeupRequests.payload}->>'issueId' = ${issueRecoveryActions.sourceIssueId}::text)`;
   return db.select({ action: issueRecoveryActions, run: heartbeatRuns }).from(issueRecoveryActions)

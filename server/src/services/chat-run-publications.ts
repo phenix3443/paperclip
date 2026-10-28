@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { notifyChatPublicationWork } from "./chat-work-notifications.js";
 import {
   and,
@@ -729,7 +730,8 @@ export async function enqueueChatRunMilestones(
       and interaction_prompt.idempotency_key = 'interaction:' || interaction.id::text || ':' || interaction_prompt.endpoint_id::text
       and interaction_prompt.state = 'published'
     inner join agent_wakeup_requests continuation_wake
-      on continuation_wake.company_id = interaction.company_id
+      on ${ordinaryWakeRequestPredicate(sql.raw('continuation_wake.payload'))}
+      and continuation_wake.company_id = interaction.company_id
       and continuation_wake.run_id = ${heartbeatRuns.id}
       and continuation_wake.agent_id = ${heartbeatRuns.agentId}
       and continuation_wake.status <> 'skipped'
@@ -780,7 +782,8 @@ export async function enqueueChatRunMilestones(
   const hasMonitorContinuation = sql<boolean>`(
     ${heartbeatRuns.contextSnapshot}->>'source' = 'issue.monitor' and exists (
       select 1 from agent_wakeup_requests monitor_wake
-      where monitor_wake.company_id = ${heartbeatRuns.companyId}
+      where ${ordinaryWakeRequestPredicate(sql.raw('monitor_wake.payload'))}
+        and monitor_wake.company_id = ${heartbeatRuns.companyId}
         and monitor_wake.run_id = ${heartbeatRuns.id}
         and monitor_wake.agent_id = ${heartbeatRuns.agentId}
         and monitor_wake.reason = 'issue_monitor_due'
@@ -793,7 +796,8 @@ export async function enqueueChatRunMilestones(
   const hasTaskContinuation = sql<boolean>`(
     ${heartbeatRuns.contextSnapshot}->>'source' = 'native_status_decision' and exists (
       select 1 from agent_wakeup_requests continuation_wake
-      where continuation_wake.company_id = ${heartbeatRuns.companyId}
+      where ${ordinaryWakeRequestPredicate(sql.raw('continuation_wake.payload'))}
+        and continuation_wake.company_id = ${heartbeatRuns.companyId}
         and continuation_wake.run_id = ${heartbeatRuns.id}
         and continuation_wake.agent_id = ${heartbeatRuns.agentId}
         and continuation_wake.reason = 'issue_status_changed'

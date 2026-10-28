@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { and, eq, sql } from "drizzle-orm";
 import { agentWakeupRequests, issues } from "@paperclipai/db";
 import type { Db } from "@paperclipai/db";
@@ -44,6 +45,7 @@ export async function withHumanDirectedWork(
         SELECT 1 FROM agent_wakeup_requests w
         WHERE (w.run_id IN (SELECT id FROM task_runs) OR
             (w.run_id IS NULL AND w.reason = 'issue_human_assignment' AND w.status = 'completed'))
+        AND ${ordinaryWakeRequestPredicate(sql.raw('w.payload'))}
         AND w.company_id = ${input.companyId}::uuid AND w.agent_id = ${input.agentId}::uuid
           AND w.requested_by_actor_type = 'user' AND nullif(trim(w.requested_by_actor_id), '') IS NOT NULL
           AND w.status NOT IN ('skipped', 'cancelled')

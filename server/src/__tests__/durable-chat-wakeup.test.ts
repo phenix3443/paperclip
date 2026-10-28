@@ -1043,6 +1043,24 @@ describe("durable inbound chat scheduler receipts", () => {
     expect(f.authorize).toHaveBeenCalledTimes(1);
   });
 
+  it.each([null, "invalid", { version: 99 }])("coalesces ordinary inbound chat behind a reserved receipt (%j)", async namespace => {
+    const f = await fixture(true);
+    const first = f.request(), second = f.request();
+    const [reserved] = await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+      source: "assignment", reason: "issue_commented", status: "deferred_issue_execution", requestedAt: new Date(0),
+      requestedByActorType: "user", requestedByActorId: "board-user",
+      payload: { issueId: f.issueId, _paperclipReviewerAssignmentContinuation: namespace,
+        _paperclipWakeContext: { issueId: f.issueId, source: "chat:slack", wakeCommentIds: [first.commentId] } } }).returning();
+    await f.wake(first);
+    await f.wake(second);
+    await f.wake(second);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, reserved.id)))[0]).toEqual(reserved);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, first.id)))[0])
+      .toMatchObject({ status: "deferred_issue_execution", coalescedCount: 1 });
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, second.id)))[0])
+      .toMatchObject({ status: "coalesced", payload: { coalescedIntoWakeupRequestId: first.id } });
+  });
+
   it("records a stable receipt when merging into a deferred wake and never merges the replay twice", async () => {
     const f = await fixture(true);
     const first = f.request(),

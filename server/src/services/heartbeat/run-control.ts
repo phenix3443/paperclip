@@ -1,6 +1,7 @@
 import { resumeDeferredChatWake } from "../durable-chat-wakeup.js";
 import { notifyEnvironmentCleanup } from "../environment-cleanup-notifications.js";
 import { readNativeStopExecutionEvidence } from "./native-stop-evidence-read.js";
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { readTaskRetryIntent, reconcileTaskChatRetryReceipts } from "../task-retry.js";
 import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED, readNativeLocalProcessStop, recordedLocalExecutionStopped } from "../native-local-process-stop.js";
 import { isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";
@@ -549,7 +550,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       !(await getExecutionBlocker(db, run.companyId, issueId));
     if (run.runtimeMode !== "native" && run.runtimeMode !== "legacy") return;
     const pending = await db.select().from(agentWakeupRequests).where(and(
-      eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
+      ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
       eq(agentWakeupRequests.status, "deferred_issue_execution"),
       inArray(agentWakeupRequests.requestedByActorType, ["user", "system"]),
       requestId ? eq(agentWakeupRequests.id, requestId) : undefined,
@@ -612,7 +613,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
             payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), '{executionWait}',
               coalesce(${agentWakeupRequests.payload}->'executionWait', '{}'::jsonb) || ${JSON.stringify(wait)}::jsonb)`,
             updatedAt: new Date(),
-          }).where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, run.companyId),
+          }).where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, run.companyId),
             eq(agentWakeupRequests.status, "deferred_issue_execution")));
           continue;
         }
@@ -634,7 +635,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
 
   async function resumeSavedComments(companyId: string, queueId: string, interrupted = false, opts?: { retryCleanup?: boolean }) {
     const [wake] = await db.select().from(agentWakeupRequests).where(and(
-      eq(agentWakeupRequests.id, queueId), eq(agentWakeupRequests.companyId, companyId),
+      ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, queueId), eq(agentWakeupRequests.companyId, companyId),
       eq(agentWakeupRequests.status, "deferred_issue_execution"),
     ));
     if (!wake) return;
@@ -680,7 +681,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
           eq(issues.companyId, companyId), eq(issues.id, issueId),
         )).for("update");
         const [current] = await tx.select().from(agentWakeupRequests).where(and(
-          eq(agentWakeupRequests.id, queueId), eq(agentWakeupRequests.companyId, companyId),
+          ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, queueId), eq(agentWakeupRequests.companyId, companyId),
           eq(agentWakeupRequests.agentId, wake.agentId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
           sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
           sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt'->>'actorId' = ${actorId}`,
@@ -752,7 +753,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
   async function resumeTaskRetry(companyId: string, requestId: string) {
     if ((await getSchedulingSuppression()).suppressed) return;
     const [wake] = await db.select().from(agentWakeupRequests).where(and(
-      eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.id, requestId),
+      ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.id, requestId),
       eq(agentWakeupRequests.status, "deferred_issue_execution"), eq(agentWakeupRequests.reason, "task_retry"),
       eq(agentWakeupRequests.requestedByActorType, "user"),
     ));
@@ -777,12 +778,12 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
         eq(issues.assigneeAgentId, agentWakeupRequests.agentId)))
       .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
-      .where(and(eq(agentWakeupRequests.reason, "task_retry"), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.reason, "task_retry"), eq(agentWakeupRequests.status, "deferred_issue_execution"),
         sql`${agentWakeupRequests.payload}->'taskRetry'->>'chatActionId' is null`,
         notInArray(issues.status, ["done", "cancelled"])))
       .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
     for (const retry of retries) {
-      await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(eq(agentWakeupRequests.id, retry.id));
+      await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, retry.id)));
       await resumeTaskRetry(retry.companyId, retry.id).catch(err => logger.warn({ err, requestId: retry.id }, "Task retry dispatch deferred"));
     }
     const waits = await db.select({ wake: agentWakeupRequests })
@@ -791,7 +792,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
         eq(issues.assigneeAgentId, agentWakeupRequests.agentId)))
       .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
-      .where(and(exists(db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+      .where(and(ordinaryWakeRequestPredicate(), exists(db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
         eq(issueRecoveryActions.companyId, issues.companyId), eq(issueRecoveryActions.sourceIssueId, issues.id),
         executionBlockerPredicate(),
       ))), eq(agentWakeupRequests.status, "deferred_issue_execution"),
@@ -809,7 +810,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       // Advance the cursor even for invalid evidence so one damaged task cannot
       // starve later requests in this bounded scan. Preserve concurrent edits.
       const [claimed] = await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
-        eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, wake.companyId),
+        ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, wake.companyId),
         eq(agentWakeupRequests.status, "deferred_issue_execution"),
         lte(agentWakeupRequests.updatedAt, new Date(Date.now() - 30_000)),
       )).returning({ id: agentWakeupRequests.id });
@@ -955,7 +956,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       )
       .where(
         and(
-          eq(agentWakeupRequests.companyId, companyId),
+          ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, companyId),
           inArray(agentWakeupRequests.status, [
             "queued",
             "deferred_issue_execution",
@@ -981,7 +982,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         .from(agentWakeupRequests)
         .where(
           and(
-            eq(agentWakeupRequests.companyId, scope.companyId),
+            ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, scope.companyId),
             inArray(agentWakeupRequests.status, [
               "queued",
               "deferred_issue_execution",
@@ -996,7 +997,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         .from(agentWakeupRequests)
         .where(
           and(
-            eq(agentWakeupRequests.companyId, scope.companyId),
+            ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, scope.companyId),
             eq(agentWakeupRequests.agentId, scope.scopeId),
             inArray(agentWakeupRequests.status, [
               "queued",
@@ -1025,7 +1026,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         updatedAt: now,
       })
       .where(and(
-        inArray(agentWakeupRequests.id, wakeupIds),
+        ordinaryWakeRequestPredicate(), inArray(agentWakeupRequests.id, wakeupIds),
         inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
         isNull(agentWakeupRequests.runId),
         scope.createdBefore ? lt(agentWakeupRequests.createdAt, scope.createdBefore) : undefined,
@@ -1562,7 +1563,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       .from(agentWakeupRequests)
       .where(
         and(
-          inArray(agentWakeupRequests.agentId, uniqueAgentIds),
+          ordinaryWakeRequestPredicate(), inArray(agentWakeupRequests.agentId, uniqueAgentIds),
           inArray(agentWakeupRequests.status, [
             "queued",
             "deferred_issue_execution",
@@ -1582,7 +1583,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         error: reason,
         updatedAt: now,
       })
-      .where(inArray(agentWakeupRequests.id, wakeupIds));
+      .where(and(ordinaryWakeRequestPredicate(), inArray(agentWakeupRequests.id, wakeupIds)));
 
     return wakeupIds.length;
   }

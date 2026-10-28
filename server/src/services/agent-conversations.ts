@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { FAST_RESPONSE_AGENT_GUIDANCE, fastResponseHistoryBody } from "@paperclipai/shared";
 import {
   persistActivity,
@@ -511,7 +512,7 @@ export async function undeliveredConversationComments(
         eq(issueComments.issueId, issueId),
         isNull(issueComments.deletedAt),
         sql`${issueComments.clientRequestId} is not null`,
-        sql`not exists (select 1 from ${agentWakeupRequests} where ${agentWakeupRequests.companyId} = ${companyId}
+        sql`not exists (select 1 from ${agentWakeupRequests} where ${ordinaryWakeRequestPredicate()} and ${agentWakeupRequests.companyId} = ${companyId}
       and ${agentWakeupRequests.idempotencyKey} = 'conversation-comment:' || ${issueComments.id}::text)`,
       ),
     )
