@@ -55,6 +55,11 @@ const mockTxInsert = vi.hoisted(() =>
 );
 const mockTx = vi.hoisted(() => ({
   insert: mockTxInsert,
+  select: vi.fn(() => ({
+    from: vi.fn(() => ({
+      where: vi.fn(() => ({ for: vi.fn(async () => []) })),
+    })),
+  })),
 }));
 const mockDbSelectOrderBy = vi.hoisted(() => vi.fn(async () => []));
 const mockDbSelectWhere = vi.hoisted(() =>
@@ -291,7 +296,7 @@ function makeIssueUpdateReceipt(
 ) {
   const fields = Object.fromEntries(
     Object.entries(patch).filter(
-      ([key]) => key !== "actorAgentId" && key !== "actorUserId",
+      ([key]) => key !== "actorAgentId" && key !== "actorUserId" && key !== "executionHandoffRunId",
     ),
   );
   const changes = Object.fromEntries(

@@ -149,11 +149,15 @@ function createEmptyRelationReadDb() {
   };
 }
 
-async function createApp(db: unknown = createEmptyRelationReadDb()) {
-  const [{ issueRoutes }, { errorHandler }] = await Promise.all([
+function loadAppModules() {
+  return Promise.all([
     vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
   ]);
+}
+
+async function createApp(db: unknown = createEmptyRelationReadDb()) {
+  const [{ issueRoutes }, { errorHandler }] = await loadAppModules();
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -194,6 +198,7 @@ function issueUpdateWithReceipt(issue: ReturnType<typeof makeIssue>, patch: Reco
     actorAgentId: _actorAgentId,
     actorRunId: _actorRunId,
     actorRunStopId: _actorRunStopId,
+    executionHandoffRunId: _executionHandoffRunId,
     actorUserId: _actorUserId,
     workspaceSelectionActor: _workspaceSelectionActor,
     blockedByIssueIds: _blockedByIssueIds,
@@ -212,7 +217,7 @@ function issueUpdateWithReceipt(issue: ReturnType<typeof makeIssue>, patch: Reco
 }
 
 describe("issue activity event routes", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     vi.doUnmock("../services/access.js");
     vi.doUnmock("../services/activity-log.js");
@@ -255,6 +260,7 @@ describe("issue activity event routes", () => {
     });
     mockInstanceSettingsService.listCompanyIds.mockResolvedValue(["company-1"]);
     mockRoutineService.syncRunStatusForIssue.mockResolvedValue(undefined);
+    await loadAppModules();
   });
 
   it("returns a field-change receipt and omits a requested no-op field", async () => {
