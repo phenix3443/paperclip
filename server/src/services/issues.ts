@@ -13,6 +13,7 @@ import { executionWorkspaceService } from "./execution-workspaces.js";
 import { notifyChatPublicationWork } from "./chat-work-notifications.js";
 import { notifyTerminalWorkspaceWork } from "./terminal-workspace-work.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
+import { releaseWaitingReconciledDeliveries } from "./execution-reconciliation-delivery.js";
 import { recordChatHandoff, recordChatCompletion, existingChatCompletionReply, acknowledgeChatCompletionReply } from "./chat-completion-delivery.js";
 import { mirrorSlackBoardComment, slackBoardReplyBindings } from "./slack-board-messages.js";
 import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
@@ -11299,6 +11300,20 @@ export function issueService(db: Db) {
         }
         if ((patch.status !== undefined && patch.status !== receiptExisting.status) || patch.executionState !== undefined) {
           await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionContinuation, id);
+        }
+        if (patch.status === "done" && receiptExisting.status !== "done") {
+          const dependents = await tx.select({ id: issueRelations.relatedIssueId }).from(issueRelations).where(and(
+            eq(issueRelations.companyId, receiptExisting.companyId), eq(issueRelations.issueId, id),
+            eq(issueRelations.type, "blocks"),
+          ));
+          await releaseWaitingReconciledDeliveries(tx, {
+            companyId: receiptExisting.companyId, gates: ["dependency"], issueIds: dependents.map((row) => row.id),
+          });
+        }
+        if (patch.monitorNextCheckAt === null && receiptExisting.monitorNextCheckAt) {
+          await releaseWaitingReconciledDeliveries(tx, {
+            companyId: receiptExisting.companyId, gates: ["monitor"], issueIds: [id],
+          });
         }
         if (patch.monitorNextCheckAt !== undefined || (receiptExisting.monitorNextCheckAt &&
           (patch.status !== undefined || patch.assigneeAgentId !== undefined || patch.assigneeUserId !== undefined))) {

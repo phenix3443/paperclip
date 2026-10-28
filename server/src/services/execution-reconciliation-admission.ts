@@ -198,7 +198,7 @@ export async function admitExecutionReconciliationGates(
   if (issue.workspaceBindingRevision !== input.expected.issue.workspaceBindingRevision || issue.workspacePendingSelection != null) {
     throw gateClosed("workspace", "The workspace binding changed or a workspace selection is pending.");
   }
-  const openBlocker = locked.blockers.find((blocker) => !["done", "cancelled"].includes(blocker.status));
+  const openBlocker = locked.blockers.find((blocker) => blocker.status !== "done");
   if (openBlocker) {
     throw gateClosed("dependency", "A blocking task is not done.", { blockerIssueId: openBlocker.id });
   }

@@ -2719,6 +2719,73 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         expect(await reconciliationWakes(fixture.actionId)).toHaveLength(0);
       });
 
+      describe("early release (#82)", () => {
+        const recheckAt = async (actionId: string) =>
+          new Date(((await actionRow(actionId)).evidence as any).continuationWait.recheckAt).getTime();
+        const waitingOnBlocker = async (key: string) => {
+          const fixture = await admitted(key);
+          const [blocker] = await db.insert(issues).values({ companyId: fixture.companyId, title: "Blocker",
+            status: "in_progress", priority: "medium" }).returning();
+          await db.insert(issueRelations).values({ companyId: fixture.companyId, issueId: blocker!.id,
+            relatedIssueId: fixture.sourceIssueId, type: "blocks" });
+          await deliver();
+          expect((await actionRow(fixture.actionId)).evidence).toMatchObject({
+            continuationDelivery: "waiting", continuationWait: { gate: "dependency" },
+          });
+          return { fixture, blockerId: blocker!.id };
+        };
+
+        it("delivers a dependency wait on the next pass after the blocker is done", async () => {
+          const { fixture, blockerId } = await waitingOnBlocker("recon:a3b-rel-dep-done-01");
+          expect(await recheckAt(fixture.actionId)).toBeGreaterThan(Date.now());
+          await issueService(db).update(blockerId, { status: "done" });
+          expect(await recheckAt(fixture.actionId)).toBeLessThanOrEqual(Date.now());
+          await deliver();
+          expect((await actionRow(fixture.actionId)).evidence).toMatchObject({ continuationDelivery: "delivered" });
+          expect(await reconciliationWakes(fixture.actionId)).toHaveLength(1);
+        });
+
+        it("keeps a dependency wait when the blocker is cancelled, as the queue still treats it as unresolved", async () => {
+          const { fixture, blockerId } = await waitingOnBlocker("recon:a3b-rel-dep-cancel1");
+          const before = await recheckAt(fixture.actionId);
+          await issueService(db).update(blockerId, { status: "cancelled" });
+          expect(await recheckAt(fixture.actionId)).toBe(before);
+          await db.update(issueRecoveryActions).set({
+            evidence: sql`jsonb_set(${issueRecoveryActions.evidence}, '{continuationWait,recheckAt}', to_jsonb(${new Date(Date.now() - 1000).toISOString()}::text))`,
+          }).where(eq(issueRecoveryActions.id, fixture.actionId));
+          await deliver();
+          expect((await actionRow(fixture.actionId)).evidence).toMatchObject({
+            continuationDelivery: "waiting", continuationWait: { gate: "dependency", attempts: 2 },
+          });
+          expect(await reconciliationWakes(fixture.actionId)).toHaveLength(0);
+        });
+
+        it("does not release a wait on another gate when a blocker closes", async () => {
+          const { fixture, blockerId } = await waitingOnBlocker("recon:a3b-rel-other-gate");
+          await db.update(issueRecoveryActions).set({
+            evidence: sql`jsonb_set(${issueRecoveryActions.evidence}, '{continuationWait,gate}', '"interaction"'::jsonb)`,
+          }).where(eq(issueRecoveryActions.id, fixture.actionId));
+          const before = await recheckAt(fixture.actionId);
+          await issueService(db).update(blockerId, { status: "done" });
+          expect(await recheckAt(fixture.actionId)).toBe(before);
+        });
+
+        it("delivers a monitor wait on the next pass after the monitor is cleared", async () => {
+          const fixture = await admitted("recon:a3b-rel-monitor-01");
+          await db.update(issues).set({ monitorNextCheckAt: new Date(Date.now() + 60 * 60 * 1000) })
+            .where(eq(issues.id, fixture.sourceIssueId));
+          await deliver();
+          expect((await actionRow(fixture.actionId)).evidence).toMatchObject({
+            continuationDelivery: "waiting", continuationWait: { gate: "monitor" },
+          });
+          expect(await recheckAt(fixture.actionId)).toBeGreaterThan(Date.now());
+          await issueService(db).update(fixture.sourceIssueId, { monitorNextCheckAt: null } as any);
+          expect(await recheckAt(fixture.actionId)).toBeLessThanOrEqual(Date.now());
+          await deliver();
+          expect((await actionRow(fixture.actionId)).evidence).toMatchObject({ continuationDelivery: "delivered" });
+        });
+      });
+
       it.each([
         ["the owner is cleared", (f: Awaited<ReturnType<typeof seedAdmission>>) => db.update(issues)
           .set({ assigneeAgentId: null }).where(eq(issues.id, f.sourceIssueId)), "owner_mismatch"],
