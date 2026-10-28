@@ -1,4 +1,3 @@
-import { ordinaryWakeRequestPredicate } from "../receipt-namespace.js";
 import { notifyStrandedAgentStatus } from "../../../services/live-run-recovery-notifications.js";
 import { notifyDeferredExecutionWork } from "../../../services/deferred-execution-notifications.js";
 import { notifyRunDispatch } from "../../../services/run-dispatch-notifications.js";
@@ -53,6 +52,7 @@ import {
   withQueuedCommentIdsInWakePayload,
 } from "../../../services/issue-queued-comment-queue.js";
 import { CHAT_CONVERSATION_ID_KEY, extractWakeCommentIds } from "../../run-dispatch/index.js";
+import { ordinaryWakeRequestPredicate } from "../receipt-namespace.js";
 import { hasInteractionContinuationWakeContext } from "../domain/context.js";
 import { decidePreDrain, type PreDrainFacts } from "../domain/policy.js";
 import {

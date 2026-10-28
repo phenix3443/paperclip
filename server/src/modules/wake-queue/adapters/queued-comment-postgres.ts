@@ -1,4 +1,3 @@
-import { ordinaryWakeRequestPredicate } from "../receipt-namespace.js";
 import { notifyStrandedAgentStatus } from "../../../services/live-run-recovery-notifications.js";
 import { notifyExecutionRunWork } from "../../../services/execution-control-notifications.js";
 import { notifyStatusCardIssueChange } from "../../../services/status-card-notifications.js";
@@ -21,6 +20,7 @@ import {
   withQueuedCommentIdsInWakePayload,
 } from "../../../services/issue-queued-comment-queue.js";
 import { logActivity as persistActivityLogRow, type ActivityPublication } from "../../../services/activity-log.js";
+import { ordinaryWakeRequestPredicate } from "../receipt-namespace.js";
 import { decideQueuedCommentWakeLookup } from "../domain/policy.js";
 import { parseObject, readNonEmptyString } from "../domain/values.js";
 import { QueuedCommentMutationError } from "../application/queued-comment-use-cases.js";
