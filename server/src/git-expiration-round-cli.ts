@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { GitExpirationBudgetExceeded, GIT_EXPIRATION_BUDGETS } from "./services/git-expiration-budget.js";
+import { gitExpirationEvidenceContract } from "./services/git-expiration-evidence.js";
 import { inspectGitExpirationRound, GIT_EXPIRATION_ROUND_MODE, type GitExpirationRoundEvent, type GitExpirationRoundJournal,
   type GitExpirationRoundStatus, type GitExpirationRoundStopReason } from "./services/git-expiration-round.js";
 
@@ -128,7 +129,14 @@ export function gitExpirationRoundExitCode(summary: { status: GitExpirationRound
   return summary.status === "complete" ? 0 : 3;
 }
 
+export const PRINT_EVIDENCE_CONTRACT_FLAG = "--print-evidence-contract";
+
 export async function runGitExpirationRoundCli(argv: string[], env: NodeJS.ProcessEnv): Promise<number> {
+  // Reads no environment, opens no database, spawns no child and writes no file.
+  if (argv.length === 1 && argv[0] === PRINT_EVIDENCE_CONTRACT_FLAG) {
+    process.stdout.write(`${JSON.stringify(gitExpirationEvidenceContract())}\n`);
+    return 0;
+  }
   let args: GitExpirationRoundCliArgs;
   try {
     args = parseGitExpirationRoundArgs(argv, env);
