@@ -1,5 +1,5 @@
 {
-  "id": "74916b58-5eb9-4266-928b-07dca56f7a04",
+  "id": "78e0748d-8bd7-4845-a61b-22d521eb3a74",
   "prevId": "c5e83539-76b0-4aba-a45f-1977e455e899",
   "version": "7",
   "dialect": "postgresql",
@@ -3813,6 +3813,50 @@
           "method": "btree",
           "with": {}
         },
+        "agent_wakeup_requests_cross_task_continuation_intent_uq": {
+          "name": "agent_wakeup_requests_cross_task_continuation_intent_uq",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "idempotency_key",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "\"agent_wakeup_requests\".\"idempotency_key\" LIKE 'issue\\_cross\\_task\\_continuation:%'",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "agent_wakeup_requests_cross_task_continuation_dispatch_uq": {
+          "name": "agent_wakeup_requests_cross_task_continuation_dispatch_uq",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "idempotency_key",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "\"agent_wakeup_requests\".\"idempotency_key\" LIKE 'cross-task-continuation-dispatch:%'",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "agent_wakeup_requests_question_response_delivery_idempotency_uq": {
           "name": "agent_wakeup_requests_question_response_delivery_idempotency_uq",
           "columns": [
@@ -3898,28 +3942,6 @@
           "isUnique": true,
           "where": "\"agent_wakeup_requests\".\"idempotency_key\" LIKE 'tool-action-response:%' AND \"agent_wakeup_requests\".\"status\" NOT IN ('skipped', 'failed', 'cancelled')",
           "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "agent_wakeup_requests_execution_reconciliation_delivery_uq": {
-          "name": "agent_wakeup_requests_execution_reconciliation_delivery_uq",
-          "columns": [
-            {
-              "expression": "company_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "idempotency_key",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": true,
-          "where": "\"agent_wakeup_requests\".\"idempotency_key\" LIKE 'execution-reconciliation:%' AND \"agent_wakeup_requests\".\"status\" NOT IN ('skipped', 'failed', 'cancelled')",
-          "concurrently": true,
           "method": "btree",
           "with": {}
         },
@@ -36017,6 +36039,40 @@
         }
       },
       "indexes": {
+        "issue_comments_agent_client_request_uq": {
+          "name": "issue_comments_agent_client_request_uq",
+          "columns": [
+            {
+              "expression": "company_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "issue_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "author_agent_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "client_request_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "\"issue_comments\".\"author_agent_id\" IS NOT NULL AND \"issue_comments\".\"client_request_id\" IS NOT NULL",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "issue_comments_issue_idx": {
           "name": "issue_comments_issue_idx",
           "columns": [
@@ -38231,28 +38287,6 @@
           ],
           "isUnique": false,
           "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
-        "issue_recovery_actions_continuation_wait_due_idx": {
-          "name": "issue_recovery_actions_continuation_wait_due_idx",
-          "columns": [
-            {
-              "expression": "(\"evidence\"#>>'{continuationWait,recheckAt}')",
-              "asc": true,
-              "isExpression": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "where": "\"issue_recovery_actions\".\"status\" = 'resolved' and \"issue_recovery_actions\".\"evidence\"->>'continuationDelivery' = 'waiting'",
-          "concurrently": true,
           "method": "btree",
           "with": {}
         },

@@ -179,6 +179,23 @@ POST /api/issues/{issueId}/comments
 
 Agent @-mentions are context only and do not trigger heartbeats. Normal comment feedback can still wake the current assignee. Use explicit assignment or a review request to ask another agent to act.
 
+#### Resuming a closed task from another task's run
+
+An agent run is bound to one task. It cannot reopen the closed isolated workspace of a different task, even when the same agent is assigned to both. With the instance experimental setting `enableCrossTaskDeferredContinuation` on, such a run can still resume the other task by comment:
+
+```
+POST /api/issues/{targetIssueId}/comments
+{ "body": "Child work is done; please continue.", "resume": true, "clientRequestId": "<uuid>" }
+```
+
+- `clientRequestId` is required on this path. Without it the request gets `422`.
+- The response is `201` with the comment, `replayed: false` and `continuation: { wakeupRequestId, status, runId, coalescedIntoWakeupRequestId? }`. The comment, the move to `todo` and a durable continuation are saved together.
+- The workspace is not reopened in the request. A new run bound to the target task restores it when that run starts, under the target's own identity. If the reopen fails, that run fails before any agent work starts and the target is moved to `blocked` with a "No live execution path" notice; it does not get a workspace repair blocker, and there is no automatic retry. Fix the cause, then resume the target again. The source task is not touched.
+- If a continuation for the same agent and task is already pending, a second request keeps its own comment and gets `continuation.status: "coalesced"` with `coalescedIntoWakeupRequestId`. Only one run starts.
+- Lost response: retry with the same `clientRequestId` and the same body. A committed request returns the original comment with `replayed: true` and the continuation's current `status` and `runId`, even after the workspace was restored, the source run ended, a pause was added or the setting was turned off. The same `clientRequestId` with a different body gets `409 This clientRequestId was already used for a different request`.
+- Refusals write nothing: `409` for a pause hold, unresolved blockers on a `blocked` task, active execution, or a binding to a workspace that cannot be reopened; `403` for an agent `interrupt` or a source run that is not the caller's.
+- With the setting off the request keeps today's `403`. A status-change `PATCH` from another task's run also keeps its `403`; use this comment instead.
+
 ## Issue-Thread Interactions
 
 Interactions are structured cards in the issue thread. Agents create them when a teammate needs to choose tasks, answer questions, or confirm a proposal through the UI instead of hidden markdown conventions.

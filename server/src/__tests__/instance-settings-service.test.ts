@@ -77,6 +77,7 @@ describe("instance settings service", () => {
       enableGrokBot: false,
       enableCombinedInboxTasks: false,
       enableChatConnectors: false,
+      enableCrossTaskDeferredContinuation: false,
       enableGitHubReviewBots: false,
       enableMemoryConnectors: false,
       enablePaperclipNotebook: false,

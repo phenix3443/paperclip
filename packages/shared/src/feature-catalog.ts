@@ -348,6 +348,14 @@ export const INSTANCE_FEATURE_CATALOG: Record<InstanceFeatureKey, FeatureCatalog
     cloudDefault: true,
     selfHostedDefault: true,
   },
+  enableCrossTaskDeferredContinuation: {
+    title: "Cross-task Deferred Continuation",
+    description:
+      "Let an agent resume another task it is assigned to whose isolated workspace is archived. The comment and a durable continuation commit together, and a run bound to that task restores the workspace when it starts.",
+    tier: "managed",
+    cloudDefault: false,
+    selfHostedDefault: false,
+  },
   enableOwnerInstanceAdmin: {
     title: "Owner Instance Admin",
     description:

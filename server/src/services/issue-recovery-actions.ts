@@ -322,6 +322,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       const created = await db.transaction(async (tx) => {
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionDisposition);
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionContinuation);
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.crossTaskContinuations);
         const [superseded] = await tx
           .update(issueRecoveryActions)
           .set({
@@ -385,7 +386,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
         if (existing.cause === "native_workspace_finalization_owner_unverified"
           && input.cause === existing.cause && input.fingerprint === existing.fingerprint
           && !existing.evidence?.workspaceOwnerStop && existing.nextAction !== input.nextAction) {
-          const [updated] = await writeExecutionControl(db, [DELIVERY_QUEUES.executionDisposition, DELIVERY_QUEUES.executionContinuation], tx => tx.update(issueRecoveryActions).set({ nextAction: input.nextAction, updatedAt: now })
+          const [updated] = await writeExecutionControl(db, [DELIVERY_QUEUES.executionDisposition, DELIVERY_QUEUES.executionContinuation, DELIVERY_QUEUES.crossTaskContinuations], tx => tx.update(issueRecoveryActions).set({ nextAction: input.nextAction, updatedAt: now })
             .where(and(eq(issueRecoveryActions.id, existing.id),
               inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
               sql`${issueRecoveryActions.evidence}->'workspaceOwnerStop' is null`)).returning());
@@ -408,7 +409,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
           existing.attemptCount,
           Math.min(nextAttemptCount, effectiveMaxAttempts),
         );
-        const [exhausted] = await writeExecutionControl(db, [DELIVERY_QUEUES.executionDisposition, DELIVERY_QUEUES.executionContinuation], tx => tx
+        const [exhausted] = await writeExecutionControl(db, [DELIVERY_QUEUES.executionDisposition, DELIVERY_QUEUES.executionContinuation, DELIVERY_QUEUES.crossTaskContinuations], tx => tx
           .update(issueRecoveryActions)
           .set({
             status: "escalated",
@@ -462,7 +463,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
         }
         return toReadModel(exhausted);
       }
-      const [updated] = await writeExecutionControl(db, [DELIVERY_QUEUES.executionDisposition, DELIVERY_QUEUES.executionContinuation], tx => tx
+      const [updated] = await writeExecutionControl(db, [DELIVERY_QUEUES.executionDisposition, DELIVERY_QUEUES.executionContinuation, DELIVERY_QUEUES.crossTaskContinuations], tx => tx
         .update(issueRecoveryActions)
         .set({
           recoveryIssueId: input.preserveExistingOwner
@@ -529,7 +530,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
     }
 
     try {
-      const [created] = await writeExecutionControl(db, [DELIVERY_QUEUES.executionDisposition, DELIVERY_QUEUES.executionContinuation], tx => tx
+      const [created] = await writeExecutionControl(db, [DELIVERY_QUEUES.executionDisposition, DELIVERY_QUEUES.executionContinuation, DELIVERY_QUEUES.crossTaskContinuations], tx => tx
         .insert(issueRecoveryActions)
         .values(buildInsertValues(input, ownerType, now))
         .returning());
@@ -569,7 +570,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       predicates.push(eq(issueRecoveryActions.fingerprint, input.fingerprint));
     }
 
-    const [updated] = await writeExecutionControl(dbOrTx, [DELIVERY_QUEUES.executionDisposition, DELIVERY_QUEUES.executionContinuation], tx => tx
+    const [updated] = await writeExecutionControl(dbOrTx, [DELIVERY_QUEUES.executionDisposition, DELIVERY_QUEUES.executionContinuation, DELIVERY_QUEUES.crossTaskContinuations], tx => tx
       .update(issueRecoveryActions)
       .set({
         status: input.status,

@@ -13,6 +13,7 @@ import * as aiConnectionRuntime from "../services/ai-connection-runtime.js";
 import { forbidden, unprocessable } from "../errors.js";
 import { aiConnectionCredentialNotSharedFailure } from "../services/ai-connection-configuration-failure.js";
 import * as executionContinuation from "../services/execution-continuation.js";
+import * as successorReopen from "../services/heartbeat/target-bound-successor-reopen.js";
 import * as environmentOrchestrator from "../services/environment-run-orchestrator.js";
 import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
 import { legacyDispositionFingerprint, LEGACY_DISPOSITION_REPAIR_INSTRUCTION } from "../services/recovery/legacy-continuation.js";
@@ -2048,6 +2049,47 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       )).toBe(false);
     } finally {
       build.mockRestore();
+    }
+  });
+
+  const v3Kinds = [
+    "Execution workspace changed after the continuation request",
+    "Failed to rebuild the execution workspace",
+    "Git cache restoration failed",
+  ];
+  it.each((["in_progress", "todo"] as const).flatMap(status => v3Kinds.map(detail => ({ status, detail, lane: status === "in_progress" ? "V3a" : "V3b" }))))(
+    "$lane: a successor reopen failure ($detail) on a $status target fails setup and blocks the target once", async ({ status, detail }) => {
+    const { companyId, issueId, runId, wakeupRequestId } = await seedQueuedIssueRunFixture();
+    if (status === "todo") await db.update(issues).set({ status: "todo", startedAt: null }).where(eq(issues.id, issueId));
+    const step = vi.spyOn(successorReopen, "reopenTargetBoundSuccessorWorkspace")
+      .mockRejectedValueOnce(new successorReopen.TargetBoundSuccessorReopenError(detail));
+    try {
+      const heartbeat = heartbeatService(db);
+      await heartbeat.resumeQueuedRuns();
+      await waitForRunToSettle(heartbeat, runId);
+      await heartbeat.waitForRunExecutionDrain(runId);
+      const failed = await heartbeat.getRun(runId);
+      expect(failed).toMatchObject({ status: "failed", errorCode: "setup_failed" });
+      expect(failed?.error).toBe(`Cross-task continuation could not reopen the target workspace: ${detail}`);
+      expect((failed?.resultJson as Record<string, any>)?.executionRecovery).toMatchObject({ providerWorkStarted: false });
+      const [wakeup] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeupRequestId));
+      expect(wakeup.status).toBe("failed");
+      expect(mockAdapterExecute.mock.calls.some(([input]) => (input as { runId?: string } | undefined)?.runId === runId)).toBe(false);
+
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(issue.status).toBe("blocked");
+      const notices = (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).map(comment => comment.body);
+      expect(notices.join("\n")).toContain("assigned `in_progress` issue during terminal run recovery, but it still has no live execution path");
+      expect(await getExecutionBlocker(db, companyId, issueId)).not.toMatchObject({ workspaceRepairRequired: true });
+      const runCount = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).length;
+      expect(await runCount()).toBe(1);
+      await heartbeat.reconcileStrandedAssignedIssues();
+      await heartbeat.reconcileStrandedAssignedIssues();
+      expect(await runCount()).toBe(1);
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.status).toBe("blocked");
+      expect(step).toHaveBeenCalledTimes(1);
+    } finally {
+      step.mockRestore();
     }
   });
 

@@ -1063,6 +1063,18 @@ export interface IssueComment {
   updatedAt: Date;
 }
 
+export interface IssueCommentContinuationReceipt {
+  wakeupRequestId: string;
+  status: string;
+  runId: string | null;
+  coalescedIntoWakeupRequestId?: string;
+}
+
+export type IssueCommentCreateResponse = IssueComment & {
+  replayed?: boolean;
+  continuation?: IssueCommentContinuationReceipt;
+};
+
 export type IssueQueuedCommentProtocol = "paperclip_runner_v1" | "legacy";
 export type IssueQueuedCommentQueueState = "deferred" | "queued";
 export type IssueQueuedCommentSteeringDisposition =
