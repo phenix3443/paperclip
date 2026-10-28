@@ -198,6 +198,9 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
       ids.push(id);
       await db.insert(executionWorkspaces).values({ id, companyId, sourceIssueId: issueId, mode: "isolated_workspace", strategyType: "git_worktree",
         name: `Fixture ${index}`, status: "active", providerType: "local_fs", cwd: path.join(os.tmpdir(), `paperclip-round-missing-${id}`),
+        // A recorded isolated source lets the native seam name every protected role of the row.
+        repoUrl: "https://example.test/fixture.git", metadata: { isolatedRemoteSource: { schema: "paperclip.isolated-remote-source.v1",
+          companyId, issueId, repoUrl: "https://example.test/fixture.git" } },
         updatedAt: new Date(Date.now() - (count - index) * 1000), ...row });
     }
     return { companyId, issueId, ids };

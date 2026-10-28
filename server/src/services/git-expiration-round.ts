@@ -216,7 +216,7 @@ function inspectRow(db: Db, workspace: Workspace, key: GitExpirationRoundKey, au
     if (!locked) return;
     after = await observeAfter(async () => (await tx.select({ workspace: executionWorkspaces, updatedAtKey: sql<string>`${executionWorkspaces.updatedAt}::text` })
       .from(executionWorkspaces).where(and(eq(executionWorkspaces.id, workspace.id), eq(executionWorkspaces.companyId, workspace.companyId))))[0] ?? null,
-    locked.locations ?? [], identity);
+    locked.anchorRow, locked.locations ?? [], identity);
   };
   const chain = budget.run(() => withIsolatedRepositorySourceLock(db, workspace.companyId, sourceIssueId, () =>
     withDedicatedDbConnection(db, connection => connection.transaction(async tx => {

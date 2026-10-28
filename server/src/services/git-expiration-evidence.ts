@@ -404,8 +404,11 @@ export async function captureAfterIdentity(anchorRow: Workspace, signal: AbortSi
   return { head: identity.head, identity };
 }
 
-/** Phase B: the fixed reads after drain. `reread` is the one select in the lifecycle transaction. */
-export async function observeAfter(reread: () => Promise<ReadRow>, locations: ReadonlyArray<Location>,
+/**
+ * Phase B: the fixed reads after drain. `reread` is the one select in the lifecycle transaction; a deleted row names
+ * its locations from `anchorRow`, as the before side did.
+ */
+export async function observeAfter(reread: () => Promise<ReadRow>, anchorRow: Workspace, locations: ReadonlyArray<Location>,
   phaseA: { head: Observation<HeadValue>; identity: LiveIdentity | null } | null): Promise<Observation<GitExpirationRowSide>> {
   let current: ReadRow;
   let row: Observation<RowStateValue>;
@@ -419,12 +422,13 @@ export async function observeAfter(reread: () => Promise<ReadRow>, locations: Re
   const paths = await observeProtectedPaths(locations);
   const stoppedPart = unavailable<never>("row_stopped");
   let set: Observation<string>;
-  if (row.state !== "observed" || !current) set = row.state === "observed" ? unavailable("location_unresolved") : failed((row as { code: string }).code);
+  if (row.state !== "observed") set = failed((row as { code: string }).code);
   else {
-    const pending = pendingAnchor(current.workspace);
+    const workspace = current?.workspace ?? anchorRow;
+    const pending = pendingAnchor(workspace);
     if (pending) set = locationSet(pending);
     else if (!phaseA?.identity) set = stoppedPart;
-    else set = locationSet(liveAnchor(current.workspace, phaseA.identity));
+    else set = locationSet(liveAnchor(workspace, phaseA.identity));
   }
   return observed({ row, head: phaseA ? phaseA.head : stoppedPart, locationSet: set, paths });
 }
