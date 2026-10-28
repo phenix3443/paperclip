@@ -537,14 +537,12 @@ test("access granted outside the card retires the request and continues to a too
     const { seed, holder, connectionId, scout, issue, requesterAccess } = requested;
     const connectionIntents = async () =>
       (
-        await json<Array<{ kind: string; status: string }>>(
+        await json<Array<{ kind: string; status: string; result?: { outcome?: string; connectionId?: string } | null }>>(
           await request.get(`/api/issues/${issue.id}/interactions`),
         )
       ).filter((interaction) => interaction.kind === "connection_intent");
     expect((await connectionIntents()).map((interaction) => interaction.status)).toEqual(["pending"]);
 
-    // Installing the connection for the requester satisfies the request
-    // without anyone answering the card.
     await json(
       await request.put(`/api/tool-connections/${connectionId}/installs`, {
         data: {
@@ -558,10 +556,9 @@ test("access granted outside the card retires the request and continues to a too
     expect(await requesterAccess()).toBe("allowed");
 
     await expectContinuationDone(request, provider, requested);
-    expect((await connectionIntents()).map((interaction) => interaction.status)).toEqual(["expired"]);
+    const [retired] = await connectionIntents();
+    expect(retired).toMatchObject({ status: "expired", result: { outcome: "expired", connectionId } });
 
-    // Several passive maintenance cycles later the retired card has not
-    // produced another card or wake.
     await page.waitForTimeout(15_000);
     expect((await connectionIntents()).map((interaction) => interaction.status)).toEqual(["expired"]);
     const runs = await json<Array<{ id: string; status: string }>>(
