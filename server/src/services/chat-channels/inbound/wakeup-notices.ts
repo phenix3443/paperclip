@@ -1,4 +1,4 @@
-import { ordinaryWakeRequestPredicate } from "../../../modules/wake-queue/index.js";
+import { ordinaryWakeRequestPredicate } from "../../../modules/wake-queue/receipt-namespace.js";
 import type { DbOrTransaction } from "../runtime-types.js";
 import { notifyChatPublicationWork } from "../../chat-work-notifications.js";
 import { and, asc, eq, inArray, isNull, or, sql, type SQL } from "drizzle-orm";

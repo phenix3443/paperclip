@@ -1,4 +1,4 @@
-import { ordinaryWakeRequestPredicate } from "../wake-queue/index.js";
+import { ordinaryWakeRequestPredicate } from "../wake-queue/receipt-namespace.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../services/delivery-work-notifications.js";
 import { withExternalAdmissionGuard, withExternalExecutionAdmission } from "./admission.js";
 import { createNativeExternalBroker } from "./native-broker.js";

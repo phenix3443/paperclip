@@ -1,4 +1,4 @@
-import { ordinaryWakeRequestPredicate } from "../wake-queue/index.js";
+import { ordinaryWakeRequestPredicate } from "../wake-queue/receipt-namespace.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../services/delivery-work-notifications.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { and, asc, desc, eq, gt, inArray, isNull, sql } from "drizzle-orm";

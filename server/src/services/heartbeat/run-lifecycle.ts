@@ -1,4 +1,4 @@
-import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/index.js";
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { notifyExecutionRunWork } from "../execution-control-notifications.js";
 import os from "node:os";
 import {

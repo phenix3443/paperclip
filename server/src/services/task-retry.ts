@@ -1,4 +1,4 @@
-import { hasReviewerAssignmentContinuation, ordinaryWakeRequestPredicate } from "../modules/wake-queue/index.js";
+import { hasReviewerAssignmentContinuation, ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, inArray, or, sql } from "drizzle-orm";

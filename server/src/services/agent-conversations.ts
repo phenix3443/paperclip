@@ -1,4 +1,4 @@
-import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/index.js";
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { FAST_RESPONSE_AGENT_GUIDANCE, fastResponseHistoryBody } from "@paperclipai/shared";
 import {
   persistActivity,

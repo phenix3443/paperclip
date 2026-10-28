@@ -1,4 +1,4 @@
-import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/index.js";
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { notifyExecutionRunWork } from "../execution-control-notifications.js";
 import { logger } from "../../middleware/logger.js";
 import { createHash, randomUUID } from "node:crypto";

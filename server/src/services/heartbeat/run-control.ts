@@ -1,4 +1,4 @@
-import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/index.js";
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { readTaskRetryIntent, reconcileTaskChatRetryReceipts } from "../task-retry.js";
 import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED, readNativeLocalProcessStop, recordedLocalExecutionStopped } from "../native-local-process-stop.js";
 import { isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";

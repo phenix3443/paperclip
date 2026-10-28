@@ -1,4 +1,4 @@
-import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/index.js";
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { and, asc, eq, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, caseHandoffs, cases, heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import { caseHandoffService, recordCaseHandoffEvent, type CaseHandoffRow } from "./case-handoffs.js";

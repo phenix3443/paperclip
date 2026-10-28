@@ -1,4 +1,4 @@
-import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/index.js";
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { deriveTaskKeyWithHeartbeatFallback } from "./run-state.js";
 import { infrastructureRetryDelayMs } from "../system-recovery-state.js";
 import {

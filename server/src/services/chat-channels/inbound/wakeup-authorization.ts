@@ -1,4 +1,4 @@
-import { ordinaryWakeRequestPredicate } from "../../../modules/wake-queue/index.js";
+import { ordinaryWakeRequestPredicate } from "../../../modules/wake-queue/receipt-namespace.js";
 import { nonDirectDestinationAllowed } from "./surfaces.js";
 import { lifecycleRuntimeFence } from "./delivery-ledger.js";
 import type { DbTransaction, DbOrTransaction } from "../runtime-types.js";

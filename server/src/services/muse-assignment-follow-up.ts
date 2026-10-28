@@ -1,4 +1,4 @@
-import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/index.js";
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { withExternalAdmissionGuard } from "../modules/external-agents/index.js";
 import { and, eq, gt, gte, inArray, isNull, sql } from "drizzle-orm";
 import { museAgentBindings, museMailboxItems, museRunnerAssignments, museRunnerOperations, agentWakeupRequests, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";

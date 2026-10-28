@@ -1,4 +1,4 @@
-import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/index.js";
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { and, eq, gt, inArray, ne, notInArray, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, assets, environmentLeases, heartbeatRuns, issueAttachments, issueRecoveryActions, issues, nativeRunFinalizations, nativeRunResults, type Db } from "@paperclipai/db";
 import { reconstructWorkspaceSchema, type ExecutionReconciliation } from "@paperclipai/shared";

@@ -1,4 +1,4 @@
-import { ordinaryWakeRequestPredicate } from "../../../modules/wake-queue/index.js";
+import { ordinaryWakeRequestPredicate } from "../../../modules/wake-queue/receipt-namespace.js";
 import type { EndpointRow, DbTransaction, DbOrTransaction, RuntimeContext, LifecycleRuntimeFence } from "../../chat-channels/runtime-types.js";
 import { createChatFailedRunRetry, type ChatFailedRetrySource as FailedChatRetrySource } from "../../chat-channels/failed-run-retry.js";
 

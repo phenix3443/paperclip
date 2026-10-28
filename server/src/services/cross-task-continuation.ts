@@ -1,4 +1,4 @@
-import { hasReviewerAssignmentContinuation, ordinaryWakeRequestPredicate } from "../modules/wake-queue/index.js";
+import { hasReviewerAssignmentContinuation, ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { createHash } from "node:crypto";
 import {
   agentWakeupRequests,

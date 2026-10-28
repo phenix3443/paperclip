@@ -1,4 +1,4 @@
-import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/index.js";
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { and, eq, inArray, isNull } from "drizzle-orm";
 import { agentWakeupRequests, type Db } from "@paperclipai/db";
 import type { createDeliveryWorkCoordinator } from "./delivery-work-coordinator.js";

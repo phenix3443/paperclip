@@ -1,4 +1,4 @@
-import { hasReviewerAssignmentContinuation } from "../modules/wake-queue/index.js";
+import { hasReviewerAssignmentContinuation } from "../modules/wake-queue/receipt-namespace.js";
 import type { agentWakeupRequests, chatActions } from "@paperclipai/db";
 import {
   assertDurableChatWakeupReceipt,

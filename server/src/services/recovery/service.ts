@@ -1,4 +1,4 @@
-import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/index.js";
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";
 import { onboardingFirstTaskAwaitingUserSql } from "./onboarding-first-task-wait.js";
 import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";

@@ -1,4 +1,4 @@
-import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/index.js";
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { connectionIntentService } from "./connection-intents.js";
 import { connectionContinuationPendingResponse, findSatisfiedToolConnection, satisfiedConnectionIntentService } from "./satisfied-connection-intents.js";
 import { isAiConnectionConfigurationFailure } from "./ai-auth-failure.js";

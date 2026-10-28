@@ -2901,10 +2901,12 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     describe("authorization binding (slice A2)", () => {
       const refuse = async (fixture: Awaited<ReturnType<typeof seedAdmission>>, body: any) => {
         const before = await snapshot(fixture);
+        const priorAuditIds = new Set((await refusals()).map(row => row.id));
         const response = await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body).expect(409);
         expect(await snapshot(fixture)).toEqual(before);
-        const audited = await refusals();
-        expect(audited.at(-1)!.details).toMatchObject({ code: refusalCode(response.body) });
+        const audited = (await refusals()).filter(row => !priorAuditIds.has(row.id) && row.companyId === fixture.companyId && row.entityId === fixture.sourceIssueId);
+        expect(audited).toHaveLength(1);
+        expect(audited[0]!.details).toMatchObject({ code: refusalCode(response.body) });
         return response.body;
       };
 

@@ -1,4 +1,4 @@
-import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/index.js";
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { activeIssueInteractionCondition } from "../issue-question-context.js";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import {

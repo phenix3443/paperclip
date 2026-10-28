@@ -1,4 +1,4 @@
-import { ordinaryWakeRequestPredicate } from "../../../modules/wake-queue/index.js";
+import { ordinaryWakeRequestPredicate } from "../../../modules/wake-queue/receipt-namespace.js";
 import { DELIVERY_PROCESSING_STALE_MS } from "./delivery-ledger.js";
 import type { EndpointRow, DbOrTransaction } from "../runtime-types.js";
 import { notifyChatDeliveryWork } from "../../chat-work-notifications.js";

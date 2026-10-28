@@ -1,4 +1,4 @@
-import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/index.js";
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { createHash } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { agentWakeupRequests, type Db } from "@paperclipai/db";

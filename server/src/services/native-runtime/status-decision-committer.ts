@@ -1,4 +1,4 @@
-import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/index.js";
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { scheduledIssueMonitorWait } from "../issue-monitors.js";
 import { readNativeMonitorDelivery, type NativeMonitorDelivery } from "./native-monitor-delivery.js";
 import { readNativePlanWait, type NativePlanWaitSource } from "./native-plan-wait.js";

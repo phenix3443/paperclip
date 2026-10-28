@@ -1,4 +1,4 @@
-import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/index.js";
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { isPreDispatchReviewWait } from "./pre-dispatch-review-wait.js";
 import { preDispatchExecutionWaitRecoveryActionPredicate } from "./pre-dispatch-execution-wait.js";
 import { and, desc, eq, exists, gt, inArray, isNotNull, lte, not, or, sql } from "drizzle-orm";

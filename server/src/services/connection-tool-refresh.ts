@@ -1,4 +1,4 @@
-import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/index.js";
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { and, eq, notInArray } from "drizzle-orm";
 import { agentWakeupRequests, heartbeatRuns, toolMcpGateways, toolMcpGatewayTokens, type Db } from "@paperclipai/db";
 import type { RuntimeToolsTokenClaims } from "../runtime-tools-token.js";

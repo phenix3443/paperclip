@@ -1,4 +1,4 @@
-import { hasReviewerAssignmentContinuation, ordinaryWakeRequestPredicate, ordinaryWakeRunPredicate } from "../../modules/wake-queue/index.js";
+import { hasReviewerAssignmentContinuation, ordinaryWakeRequestPredicate, ordinaryWakeRunPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { authorizationService } from "../authorization.js";
 import { isAdmittedReconciliation, isGuardedReconciliationDelivery, lockReconciledDeliveryPrefix, recordReconciledDeliveryOutcome, revalidateReconciledDelivery } from "../execution-reconciliation-delivery.js";
 import { assertTaskRetryConversationAllowed, readTaskRetryIntent, retireSupersededTaskRetry } from "../task-retry.js";

@@ -1,4 +1,4 @@
-import { ordinaryWakeRequestPredicate } from "../../wake-queue/index.js";
+import { ordinaryWakeRequestPredicate } from "../../wake-queue/receipt-namespace.js";
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { validateReconstructedWorkspaceDispatch } from "../../../services/native-runtime/native-workspace-reconstruction.js";

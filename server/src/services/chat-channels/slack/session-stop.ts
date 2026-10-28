@@ -1,4 +1,4 @@
-import { ordinaryWakeRequestPredicate } from "../../../modules/wake-queue/index.js";
+import { ordinaryWakeRequestPredicate } from "../../../modules/wake-queue/receipt-namespace.js";
 import type { EndpointRow, DbTransaction, DbOrTransaction, RuntimeContext, LifecycleRuntimeFence } from "../runtime-types.js";
 
 import { dueChatAction, PROVIDER_EFFECT_STALE_MS } from "../../chat-action-work.js";

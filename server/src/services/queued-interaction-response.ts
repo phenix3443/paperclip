@@ -1,4 +1,4 @@
-import { hasReviewerAssignmentContinuation, ordinaryWakeRequestPredicate } from "../modules/wake-queue/index.js";
+import { hasReviewerAssignmentContinuation, ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { agentWakeupRequests, issueThreadInteractions, type Db } from "@paperclipai/db";
 import type { IssueComment, IssueQueuedCommentEntry } from "@paperclipai/shared";

@@ -1,4 +1,4 @@
-import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/index.js";
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { continuingTeamsFilePublication, type ContinuingTeamsFileTransfer } from "./microsoft-teams/file-transfer-source.js";
 import { readTaskChatRetryIntent, taskChatRetryExecutionStopped } from "./task-retry-authority.js";
 import { notifyChatActionWork, notifyChatPublicationWork } from "../chat-work-notifications.js";

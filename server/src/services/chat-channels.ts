@@ -1,4 +1,4 @@
-import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/index.js";
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { createChatSdkMessageReceiver } from "./chat-channels/runtime/sdk-messages.js";
 import { admitDiscordSdkMessage } from "./chat-channels/discord/messages.js";
 import { resolveInboundConversationBinding } from "./chat-channels/inbound/conversation-binding.js";

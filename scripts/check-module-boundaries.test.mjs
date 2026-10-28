@@ -90,6 +90,26 @@ test("the repository's feature modules satisfy their import boundaries", () => {
   assert.deepEqual(scanModuleBoundaries(), []);
 });
 
+test("wake classification is public while queue implementation layers stay private", () => {
+  const serverSrc = mkdtempSync(join(tmpdir(), "paperclip-wake-classification-boundaries-"));
+  const modulesRoot = join(serverSrc, "modules");
+  try {
+    mkdirSync(join(modulesRoot, "wake-queue", "adapters"), { recursive: true });
+    mkdirSync(join(serverSrc, "services"));
+    writeFileSync(join(modulesRoot, "wake-queue", "receipt-namespace.ts"), "export const classify = () => true;\n");
+    writeFileSync(join(modulesRoot, "wake-queue", "adapters", "postgres.ts"), "export const adapter = {};\n");
+    writeFileSync(join(serverSrc, "services", "reader.ts"), [
+      'import { classify } from "../modules/wake-queue/receipt-namespace.js";',
+      'import { adapter } from "../modules/wake-queue/adapters/postgres.js";',
+    ].join("\n"));
+    const violations = scanModuleBoundaries({ serverSrc, modulesRoot });
+    assert.equal(violations.length, 1);
+    assert.equal(violations[0].specifier, "../modules/wake-queue/adapters/postgres.js");
+  } finally {
+    rmSync(serverSrc, { recursive: true, force: true });
+  }
+});
+
 test("only the company deletion coordinator can import module deletion entry points", () => {
   const serverSrc = mkdtempSync(join(tmpdir(), "paperclip-company-deletion-boundaries-"));
   const modulesRoot = join(serverSrc, "modules");

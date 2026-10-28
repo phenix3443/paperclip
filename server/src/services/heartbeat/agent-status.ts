@@ -1,4 +1,4 @@
-import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/index.js";
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { agents, heartbeatRuns, type Db } from "@paperclipai/db";
 import { and, asc, desc, eq, lte, sql } from "drizzle-orm";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";

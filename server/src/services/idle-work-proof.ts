@@ -1,4 +1,4 @@
-import { ordinaryWakeRequestSql } from "../modules/wake-queue/index.js";
+import { ordinaryWakeRequestSql } from "../modules/wake-queue/receipt-namespace.js";
 import { verifiedResourceCleanup } from "./cleanup-verification-proof.js";
 
 /** Fixed SQL aliases only. These predicates do not accept request input. */
