@@ -16,6 +16,7 @@ import {
   heartbeatRuns,
   issues,
   issueComments,
+  issueThreadInteractions,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -69,6 +70,7 @@ describeEmbeddedPostgres("heartbeat task-drain admission release", () => {
 
   afterEach(async () => {
     stopTaskDrain();
+    await db.delete(issueThreadInteractions);
     await deleteHeartbeatRunsWithDependents();
     await db.delete(agentWakeupRequests);
     await db.delete(issues);
@@ -186,6 +188,35 @@ describeEmbeddedPostgres("heartbeat task-drain admission release", () => {
     await heartbeat.drainActiveRunExecutions();
     await heartbeat.resumeQueuedRuns();
     expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, reserved.id)))[0]).toEqual(reserved);
+    await heartbeat.drainActiveRunExecutions();
+  });
+
+  it.each([null, "invalid", { version: 99 }])("startup drains an answered interaction behind a reserved receipt (%j)", async namespace => {
+    const { companyId, agentId, issueId } = await seedAgentAndIssue();
+    const heartbeat = heartbeatService(db);
+    await db.insert(heartbeatRuns).values({ companyId, agentId, invocationSource: "assignment",
+      status: "succeeded", runtimeMode: "legacy", finishedAt: new Date(), contextSnapshot: { issueId } });
+    await db.insert(heartbeatRuns).values({ companyId, agentId, invocationSource: "on_demand",
+      status: "running", contextSnapshot: {} });
+    const [interaction] = await db.insert(issueThreadInteractions).values({ companyId, issueId,
+      kind: "ask_user_questions", status: "answered", payload: { version: 1, questions: [] },
+      resolvedByUserId: "responsible-user", resolvedAt: new Date() }).returning();
+    const payload = { issueId, mutation: "interaction", interactionId: interaction.id, interactionStatus: "answered",
+      _paperclipWakeContext: { issueId, interactionId: interaction.id, wakeReason: "interaction_answered" } };
+    const [reserved] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation",
+      reason: "interaction_answered", status: "deferred_issue_execution", requestedAt: new Date(0), updatedAt: new Date(0),
+      requestedByActorType: "user", requestedByActorId: "responsible-user",
+      payload: { ...payload, _paperclipReviewerAssignmentContinuation: namespace } }).returning();
+    const [ordinary] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation",
+      reason: "interaction_answered", status: "deferred_issue_execution", payload,
+      requestedByActorType: "user", requestedByActorId: "responsible-user" }).returning();
+    await heartbeat.resumeQueuedRuns();
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, reserved.id)))[0]).toEqual(reserved);
+    const [delivered] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, ordinary.id));
+    expect(delivered.runId).toEqual(expect.any(String));
+    expect(delivered.status).not.toBe("deferred_issue_execution");
+    const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, delivered.runId!));
+    expect(successor.contextSnapshot).toMatchObject({ issueId, interactionId: interaction.id });
     await heartbeat.drainActiveRunExecutions();
   });
 

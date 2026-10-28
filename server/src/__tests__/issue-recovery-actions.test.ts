@@ -2354,6 +2354,33 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
     const refusals = () => db.select().from(activityLog).where(eq(activityLog.action, "issue.execution_reconciliation_refused"));
 
+    it.each([null, "invalid", { version: 99 }])("reconciles with a reserved receipt but still refuses mixed ordinary work (%j)", async namespace => {
+      for (const ordinaryPending of [false, true]) {
+        const fixture = await seedAdmission();
+        const [reserved] = await db.insert(agentWakeupRequests).values({
+          companyId: fixture.companyId, agentId: fixture.coderId, source: "assignment",
+          status: "deferred_issue_execution", payload: { issueId: fixture.sourceIssueId,
+            _paperclipReviewerAssignmentContinuation: namespace },
+        }).returning();
+        const [ordinary] = ordinaryPending ? await db.insert(agentWakeupRequests).values({
+          companyId: fixture.companyId, agentId: fixture.coderId, source: "automation",
+          status: "deferred_issue_execution", payload: { issueId: fixture.sourceIssueId },
+        }).returning() : [];
+        const body = await admissionBody(fixture, `recon:namespace-${randomUUID()}`);
+        const response = await request(admissionApp()).post(resolvePath(fixture.sourceIssueId)).send(body);
+        if (ordinaryPending) {
+          expect(response.status).toBe(409);
+          expect(refusalCode(response.body)).toBe("newer_execution_exists");
+          expect(JSON.stringify(response.body)).toContain("pending_wake");
+          expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, ordinary!.id)))[0]).toEqual(ordinary);
+        } else {
+          expect(response.status).toBe(200);
+          expect(response.body.receipt).toMatchObject({ state: "committed", actionId: fixture.actionId });
+        }
+        expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, reserved.id)))[0]).toEqual(reserved);
+      }
+    });
+
     it("admits once, commits the receipt with the action, and replays the same request", async () => {
       const fixture = await seedAdmission();
       const body = await admissionBody(fixture, "recon:admit-once-0001");
