@@ -2,24 +2,28 @@
 
 Date: 2026-10-28 (UTC+8). Plan for [#96](https://github.com/phenix3443/paperclip/issues/96),
 part of [#95](https://github.com/phenix3443/paperclip/issues/95).
-Status: proposed. One CTO decision is open (section 6). The plan needs
-independent review of the exact PR head before #97 starts.
+Status: proposed. The CTO decided the CI-gate question in section 6 (option A).
+The plan needs independent review of the exact PR head before any later step starts.
 This document grants no merge, deployment or database authority.
 
 ## 1. Exact revisions
 
-All values come from `git ls-remote`, `git merge-base` and `git rev-list` in this run.
+All values come from `git ls-remote`, `git merge-base` and `git rev-list`.
+They were first taken at `81cb1b201b` and checked again at `d0f8e5ad13`.
 
 | Ref | SHA |
 |---|---|
 | fork `master` = upstream `master` | `70c864633744cd96c0dc7394d631fc7119cd17d2` |
-| fork `develop` (current) | `81cb1b201b46c688c65e3c77ef8033779ed4ab29` (merge of #81) |
+| fork `develop` (current) | `d0f8e5ad130f9940707ed25b201cb5bb0a83b641` (merge of #108) |
+| fork `develop` (first analysis) | `81cb1b201b46c688c65e3c77ef8033779ed4ab29` (merge of #81) |
 | merge base | `043f2514e67c50320433a0013fb228a75a51325c` |
 | develop when #95 was written | `11da652027726cb77e5bb6a62a513772e2a1d7ba` (merge of #86) |
 | production (`/api/health` `commit`) | `fdbafff72d8fd6ae7f12eb5827631efc67d208f3` |
 
-`develop` is 300 commits behind `master`. It is now 160 commits ahead, not 148:
-#81 merged after #95 was written. #97 must start from the `develop` SHA that is
+`develop` is 300 commits behind `master`. It is now 167 commits ahead, not 148:
+#81 and later changes merged after #95 was written. Between `81cb1b201b` and
+`d0f8e5ad13`, develop changed only `.github/workflows/sync-upstream.yml` (removed)
+and two plan documents. No migration, `client.ts` or conflicting path changed. #97 must start from the `develop` SHA that is
 current at that time and repeat sections 2 and 3. A new develop-only migration
 means a new number in section 4 and a new review of this plan.
 
@@ -31,13 +35,14 @@ Command: `git merge-tree --write-tree --name-only <develop> <master>` (Git 2.53)
 |---|---|---|
 | `11da652027` | 37 | The figure in #95. |
 | `81cb1b201b` | 38 | #81 adds `0376_messy_chimera` and a conflict in `execution-control-work.test.ts`. |
+| `d0f8e5ad13` | 38 | Same path list as `81cb1b201b` (compared with `diff`); 26 with `-X no-renames`. |
 
 With default rename detection, Git pairs the large snapshot files by similarity.
 This gives 4 `rename/rename` conflicts over 12 snapshot paths. They are artifacts.
 With `-X no-renames` there are 26 content conflicts. The 12 snapshot paths have
 no conflict, and the snapshot set is rebuilt anyway (section 4.4).
 
-Content conflicts at `81cb1b201b` (hunks / conflicted lines):
+Content conflicts at `81cb1b201b` (hunks / conflicted lines; same paths at `d0f8e5ad13`):
 
 | Area | File | Hunks | Lines |
 |---|---|---|---|
@@ -251,7 +256,7 @@ CI applies all migrations to fresh embedded databases in the db and server tests
 That proves the order and the client.ts name list on a fresh database. It does not
 prove the upgrade path of the production database. Section 7 covers that.
 
-## 6. Open decision: the CI migration-order gate (CTO)
+## 6. Decision: the CI migration-order gate (CTO, option A)
 
 `pr-trusted.yml` runs `.github/scripts/check-pr-migration-order.mjs <base> <head>`
 in the `policy` job. The script lists `--diff-filter=A` SQL files in `base...head`.
@@ -262,23 +267,39 @@ are upstream `0372`–`0394`. The five renames are not additions. Upstream
 pass without a change. Renaming first does not help: after that the base is at
 `0399`, and all 23 upstream files are lower.
 
-Options:
+The CTO chose option A. A separate small PR to `develop` fixes the gate before the
+merge PR starts. Rejected: merging with `policy` red under a waiver (breaks "full CI
+green" in #95 and repeats on every sync), and changing the #95 direction to a rebase
+(redoes the conflict work and rewrites published history).
 
-- **A (recommended).** Before #97, a separate small PR to `develop` changes the
-  script and its tests. An added migration is exempt when the same path and blob
-  exist in a non-first parent of a merge commit in `base..head`, and that parent is
-  in fork `master` (mirror of upstream). All other additions keep the current rule.
-  Also, every fork-only migration must stay numbered after every exempt file.
-  Result: full CI can be green for this merge and for later syncs. The gate still
-  protects feature PRs. Cost: one more reviewed PR.
-- **B.** Merge #97 with only the `policy` migration-order step red, after a written
-  CTO waiver. This conflicts with "full CI green" in #95. The waiver repeats on every
-  upstream sync.
-- **C.** Stop and change the direction in #95. For example: rebase develop work onto
-  master. This repeats the whole conflict work and changes published history.
+Scope of the gate PR:
 
-Recommendation: A. It keeps the gate, keeps the #95 direction, and is a small,
-testable change.
+- Only `.github/scripts/check-pr-migration-order.mjs`, any trusted-ref fetch the CI
+  job needs, and regression tests. No SQL change. `policy` stays on. `verify` and
+  `e2e` get no exemption. No hand-kept list of exempt numbers.
+- An added migration is exempt from the old-number check only when all of these hold:
+  a real merge commit in `base..head` has a non-first parent that contains the same
+  path with the same blob, and that parent is in the trusted upstream-mirror history
+  of fork `master`. The proof uses the trusted base and CI context. A ref with the
+  same name that the PR itself creates is not proof. A missing ref, history or object
+  fails the check with a reason.
+- Other added migrations keep the current rule. Every fork-only migration must be
+  numbered after every exempt file.
+- No exemption for: same path with changed bytes, same bytes at a different path,
+  a parent that is not in the mirror history, or an ordinary feature PR.
+- Tests cover a real upstream merge that passes, each rejected case above, and the
+  fork-only ordering rule.
+
+Order:
+
+1. This plan (#96) passes independent review and merges into `develop`.
+2. The gate PR is built on its own Issue and task, passes cross-type independent
+   review of its exact SHA and full PR CI, and merges into `develop`.
+3. #97 starts from the `develop` of that time.
+
+Nobody changes the gate or starts the merge before this plan is approved. The
+dispatcher of #95 opens the gate Issue and task and records the native dependency
+of #97 on it.
 
 Later syncs: upstream's next migration will be `0395`, so the next sync collides
 again. The same rename (identical bytes, higher numbers) is safe each time because
@@ -323,13 +344,16 @@ Rollback limits:
 
 ## 8. Out of scope
 
-Conflict resolution and the merge PR (#97), the CI-gate PR from section 6, deployment
+Conflict resolution and the merge PR (#97), the implementation of the CI-gate PR from
+section 6 (only its scope is set here), deployment
 and acceptance (#98), changes to any SQL file, changes to upstream PRs, and a
 permanent numbering policy for fork migrations.
 
 ## 9. Acceptance for #97 (from this plan)
 
-- [ ] Base is the then-current `develop`. Sections 2 and 3 were repeated on it.
+- [ ] The CI-gate PR from section 6 is merged into `develop` before #97 starts.
+- [ ] Base is the then-current `develop`. Sections 2 and 3 were repeated on it,
+      including the migration list and numbers.
 - [ ] The five develop SQL files are 100% renames with the hashes in 4.1.
       Upstream `0372`–`0394` are byte-identical to `70c8646337`.
 - [ ] The journal has upstream entries 0–394 plus 395–399 as in 4.1.
@@ -339,5 +363,5 @@ permanent numbering policy for fork migrations.
 - [ ] The snapshot set is `0391`–`0394` plus `0399`. The 3-way merge output is
       recorded and has no conflicts.
 - [ ] Every conflict is resolved under section 3, with no develop regression test removed.
-- [ ] Full PR CI is green under the section 6 decision.
+- [ ] Full PR CI is green, `policy` included, with the section 6 gate change.
 - [ ] Independent review of the exact head SHA.
