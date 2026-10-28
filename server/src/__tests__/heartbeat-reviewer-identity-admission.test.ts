@@ -1,3 +1,5 @@
+import { issueReferenceService } from "../services/issue-references.js";
+import { externalObjectService } from "../services/external-objects.js";
 import { tmpdir } from "node:os";
 import { createQueuedCommentQueue } from "../modules/wake-queue/index.js";
 import { createQueuedCommentIssueLockWriter } from "../modules/wake-queue/adapters/queued-comment-postgres.js";
@@ -180,7 +182,11 @@ const support = await getEmbeddedPostgresTestSupport();
     const [busy] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" }).returning();
     await db.update(agents).set({ adapterConfig: { command: process.execPath, args: ["-e", "process.exit(0)"] } }).where(eq(agents.id, f.agentId));
     const service = heartbeatService(db, { runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "false" } });
-    const deps = { syncCommentReferences: async () => {}, deleteCommentReferenceSource: async () => {}, syncCommentExternalObjectsSafely: async () => {} };
+    const references = issueReferenceService(db);
+    const externalObjects = externalObjectService(db, { enabled: async () => false });
+    const deps = { syncCommentReferences: (id: string, tx: typeof db) => references.syncComment(id, tx),
+      deleteCommentReferenceSource: (id: string, tx: typeof db) => references.deleteCommentSource(id, tx),
+      syncCommentExternalObjectsSafely: (id: string, tx: typeof db) => externalObjects.syncCommentSafely(id, tx) };
     try {
       const run = await service.wakeup(f.agentId, { source: "assignment", reason: "execution_review_requested",
         payload: { issueId: f.issueId }, contextSnapshot: { wakeCommentIds: messages.map(message => message.id) },
