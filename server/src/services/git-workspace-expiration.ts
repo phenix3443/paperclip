@@ -11,7 +11,7 @@ import { abandonGitRestorePoint, abandonGitRestorePointsByKey, activateGitRestor
 import { withIsolatedRepositorySourceLock, verifiedRecordedIsolatedRemoteSource } from "./isolated-remote-workspace-source.js";
 import type { GitRemoteAuthProvider } from "./git-credentials.js";
 import { assertReproducibleGitFiles, assertReproducibleBaseGitStorage, provenManagedCheckoutHistory, readGitCacheRestoration, GIT_CACHE_RESTORATION_SCHEMA_V2,
-  verifyRemoteGitCommit, gitCacheExpirationLockLocations, recoverGitCacheExpirationLocks, gitCacheCommand, readGitCacheExpiration, finishGitCacheTrash, type GitCacheExpiration, GIT_CACHE_RESTORATION_KEY, GIT_CACHE_EXPIRATION_REASON } from "./git-workspace-restoration.js";
+  verifyRemoteGitCommit, onGitExit, gitCacheExpirationLockLocations, recoverGitCacheExpirationLocks, gitCacheCommand, readGitCacheExpiration, finishGitCacheTrash, type GitCacheExpiration, GIT_CACHE_RESTORATION_KEY, GIT_CACHE_EXPIRATION_REASON } from "./git-workspace-restoration.js";
 import { allocatedBytes, pathExists, gitExpirationSkipReason, expirationGitAuth, isGitWorkspaceExpirationEligible, inspectLockedGitExpirationCandidate, managedCheckoutProver,
   GIT_CACHE_EXPIRATION_KEY, type CheckoutRestorePointNeed, type Workspace } from "./git-workspace-expiration-inspection.js";
 
@@ -59,10 +59,10 @@ async function restorePointBoundary(cwd: string, repoUrl: string, headOnRemote: 
   const head = (await gitCacheCommand(cwd, ["rev-parse", "--verify", "HEAD^{commit}"], signal)).trim();
   if (headOnRemote) return [head];
   const upstream = await gitCacheCommand(cwd, ["rev-parse", "--verify", "-q", "refs/remotes/origin/HEAD"], signal)
-    .catch(() => "");
+    .catch(onGitExit(() => ""));
   const tip = upstream.trim();
   if (!tip) return [];
-  const base = (await gitCacheCommand(cwd, ["merge-base", "HEAD", tip], signal).catch(() => "")).trim();
+  const base = (await gitCacheCommand(cwd, ["merge-base", "HEAD", tip], signal).catch(onGitExit(() => ""))).trim();
   if (!/^[a-f0-9]{40}$/.test(base)) return [];
   try { await verifyRemoteGitCommit(repoUrl, base, auth, signal); return [base]; }
   catch (error) { if (signal?.aborted) throw error; return []; }
@@ -118,12 +118,12 @@ export async function expireReconstructableGitWorkspace(db: Db, snapshot: Worksp
     return await withIsolatedRepositorySourceLock(db, snapshot.companyId, snapshot.sourceIssueId, () =>
       withDedicatedDbConnection(db, connection => connection.transaction(async tx => {
         const inspection = await inspectLockedGitExpirationCandidate(tx, snapshot, { now: options.now, signal: options.signal,
-          auth: expirationGitAuth(db, snapshot), idleCutoff: options.idleCutoff, restorePoint: options.restorePoint });
+          auth: expirationGitAuth(db, snapshot), idleCutoff: options.idleCutoff, restorePoint: options.restorePoint,
+          onRestorePointFallback: () => { result.restorePoint = true; } });
         let { workspace, state } = inspection as { workspace: Workspace | undefined; state: Expiration | null };
         if (!workspace) throw new Error("workspace_changed");
         const { present, auth, checkouts, proveManagedCheckout, headOnRemote, needsRestorePoint, checkoutRestorePoints } = inspection;
         let { recipe } = inspection;
-        if (needsRestorePoint) result.restorePoint = true;
         const identity = { companyId: workspace.companyId, workspaceId: workspace.id };
         if (!state) recipe.contents = await captureGitWorkspaceContents(recipe.worktreePath, identity, [...checkouts.values()]);
         result.candidate = true;

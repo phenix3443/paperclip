@@ -232,6 +232,7 @@ export type GitExpirationInspection = {
 export async function inspectLockedGitExpirationCandidate(tx: Tx, snapshot: Workspace,
   options: { now: Date; auth: GitRemoteAuthProvider; signal?: AbortSignal; idleCutoff?: Date;
     restorePoint?: { notBefore: Date; keyDurable: boolean };
+    onRestorePointFallback?: () => void;
     observeCurrent?: (current: { workspace: Workspace; updatedAtKey: string } | null) => void }): Promise<GitExpirationInspection> {
   const acquired = await tx.execute<{ locked: boolean }>(sql`select pg_try_advisory_xact_lock(hashtextextended(${`execution_workspace_lifecycle:${snapshot.id}`}, 0)) as locked`);
   if (!acquired[0]?.locked) throw new Error("lifecycle_busy");
@@ -266,6 +267,7 @@ export async function inspectLockedGitExpirationCandidate(tx: Tx, snapshot: Work
       recipe = inspected.recipe;
       headOnRemote = inspected.headOnRemote;
       needsRestorePoint = true;
+      options.onRestorePointFallback?.();
     }
   }
   const present = await pathExists(recipe.worktreePath);

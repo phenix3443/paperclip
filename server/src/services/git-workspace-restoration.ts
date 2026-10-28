@@ -262,7 +262,7 @@ async function assertCommitMessageSaved(cwd: string, gitDir: string, signal?: Ab
   const message = await readCommitMessage(gitDir);
   if (message === null) return;
   const saved = [(await gitCacheCommand(cwd, ["log", "-1", "--format=%B"], signal)).trim(),
-    ...(await gitCacheCommand(cwd, ["log", "-g", "--format=%B%x00", "HEAD"], signal).catch(() => "")).split("\0").map(entry => entry.trim())];
+    ...(await gitCacheCommand(cwd, ["log", "-g", "--format=%B%x00", "HEAD"], signal).catch(onGitExit(() => ""))).split("\0").map(entry => entry.trim())];
   if (!saved.includes(message.trim())) throw new Error("uncommitted_git_message");
 }
 
@@ -278,7 +278,7 @@ async function ownedNestedRefs(linked: LinkedNestedCheckout, signal?: AbortSigna
 async function ownedNestedReflogs(linked: LinkedNestedCheckout, refs: Array<[string, string]>, signal?: AbortSignal) {
   const commits = new Set<string>();
   for (const [, ref] of refs) {
-    for (const line of (await gitCacheCommand(linked.checkout, ["reflog", "show", "--format=%H", ref], signal).catch(() => "")).split("\n")) {
+    for (const line of (await gitCacheCommand(linked.checkout, ["reflog", "show", "--format=%H", ref], signal).catch(onGitExit(() => ""))).split("\n")) {
       if (shaPattern.test(line.trim())) commits.add(line.trim());
     }
     if (commits.size > MANAGED_CHECKOUT_LOCAL_TIP_LIMIT) throw new Error("managed_checkout_local_tip_budget");
@@ -287,7 +287,7 @@ async function ownedNestedReflogs(linked: LinkedNestedCheckout, refs: Array<[str
 }
 
 async function assertOwnedNestedHead(linked: LinkedNestedCheckout, signal?: AbortSignal) {
-  const head = (await gitCacheCommand(linked.checkout, ["symbolic-ref", "--quiet", "HEAD"], signal).catch(() => "")).trim();
+  const head = (await gitCacheCommand(linked.checkout, ["symbolic-ref", "--quiet", "HEAD"], signal).catch(onGitExit(() => ""))).trim();
   if (head && !head.startsWith(`refs/heads/${linked.branchPrefix}`)) throw new Error("unowned_nested_worktree_branch");
 }
 
@@ -355,9 +355,9 @@ export async function provenManagedCheckoutHistory(checkout: string, repoUrl: st
   const head = (await gitCacheCommand(checkout, ["rev-parse", "--verify", "HEAD^{commit}"], signal)).trim();
   const shas = (output: string) => output.split("\n").map(line => line.trim()).filter(sha => shaPattern.test(sha));
   const covered = new Set([head,
-    ...shas(await gitCacheCommand(checkout, ["reflog", "show", "--format=%H", "HEAD"], signal).catch(() => "")),
-    ...shas(await gitCacheCommand(checkout, ["rev-parse", "--verify", "-q", "ORIG_HEAD^{commit}"], signal).catch(() => ""))]);
-  const reflogs = [...new Set((await gitCacheCommand(checkout, ["reflog", "show", "--all", "--format=%H %gD"], signal).catch(() => ""))
+    ...shas(await gitCacheCommand(checkout, ["reflog", "show", "--format=%H", "HEAD"], signal).catch(onGitExit(() => ""))),
+    ...shas(await gitCacheCommand(checkout, ["rev-parse", "--verify", "-q", "ORIG_HEAD^{commit}"], signal).catch(onGitExit(() => "")))]);
+  const reflogs = [...new Set((await gitCacheCommand(checkout, ["reflog", "show", "--all", "--format=%H %gD"], signal).catch(onGitExit(() => "")))
     .split("\n").map(line => line.trim().split(" ")).filter(([sha]) => shaPattern.test(sha ?? ""))
     .map(([sha, selector]) => `${sha} ${(selector ?? "").startsWith("refs/remotes/") ? "remote" : "local"}`))].map(entry => entry.split(" "));
   if (reflogs.length > MANAGED_CHECKOUT_LOCAL_TIP_LIMIT) throw new Error("managed_checkout_local_tip_budget");
@@ -370,7 +370,7 @@ export async function provenManagedCheckoutHistory(checkout: string, repoUrl: st
     ...shas(await gitCacheCommand(checkout, ["for-each-ref", "--format=%(objectname)", "refs/remotes"], signal)),
     ...reflogs.filter(([, selector]) => remote(selector)).map(([sha]) => sha!),
   ])];
-  const current = (await gitCacheCommand(checkout, ["symbolic-ref", "--quiet", "HEAD"], signal).catch(() => "")).trim();
+  const current = (await gitCacheCommand(checkout, ["symbolic-ref", "--quiet", "HEAD"], signal).catch(onGitExit(() => ""))).trim();
   const otherTips = (await gitCacheCommand(checkout, ["for-each-ref", "--format=%(objectname) %(refname)", "refs/heads", "refs/tags"], signal))
     .split("\n").map(line => line.trim().split(" ")).filter(([sha, ref]) => shaPattern.test(sha ?? "") && ref !== current).map(([sha]) => sha!);
   if (otherTips.length && await hasCommitsMissingUpstream(checkout, otherTips, repoUrl, resolveGitAuth, signal, [head])) {
@@ -394,8 +394,8 @@ async function provenNestedWorktreeHistory(linked: LinkedNestedCheckout, repoUrl
   const head = (await gitCacheCommand(checkout, ["rev-parse", "--verify", "HEAD^{commit}"], signal)).trim();
   const shas = (output: string) => output.split("\n").map(line => line.trim()).filter(sha => shaPattern.test(sha));
   const covered = new Set([head,
-    ...shas(await gitCacheCommand(checkout, ["reflog", "show", "--format=%H", "HEAD"], signal).catch(() => "")),
-    ...shas(await gitCacheCommand(checkout, ["rev-parse", "--verify", "-q", "ORIG_HEAD^{commit}"], signal).catch(() => ""))]);
+    ...shas(await gitCacheCommand(checkout, ["reflog", "show", "--format=%H", "HEAD"], signal).catch(onGitExit(() => ""))),
+    ...shas(await gitCacheCommand(checkout, ["rev-parse", "--verify", "-q", "ORIG_HEAD^{commit}"], signal).catch(onGitExit(() => "")))]);
   const allOwned = await ownedNestedRefs(linked, signal);
   const remotePrefix = `refs/heads/${linked.branchPrefix}remotes/`;
   const owned = allOwned.filter(([, ref]) => !ref.startsWith(remotePrefix));
@@ -403,7 +403,7 @@ async function provenNestedWorktreeHistory(linked: LinkedNestedCheckout, repoUrl
     ...await ownedNestedReflogs(linked, allOwned.filter(([, ref]) => ref.startsWith(remotePrefix)), signal)])];
   const recorded = new Set([...owned.map(([sha]) => sha), ...await ownedNestedReflogs(linked, owned, signal)]);
   if (recorded.size + covered.size + remoteTracked.length > MANAGED_CHECKOUT_LOCAL_TIP_LIMIT) throw new Error("managed_checkout_local_tip_budget");
-  const current = (await gitCacheCommand(checkout, ["symbolic-ref", "--quiet", "HEAD"], signal).catch(() => "")).trim();
+  const current = (await gitCacheCommand(checkout, ["symbolic-ref", "--quiet", "HEAD"], signal).catch(onGitExit(() => ""))).trim();
   const otherTips = owned.filter(([, ref]) => ref !== current).map(([sha]) => sha);
   if (otherTips.length && await hasCommitsMissingUpstream(checkout, otherTips, repoUrl, resolveGitAuth, signal, [head])) {
     throw new Error("unpushed_managed_checkout_branches");
