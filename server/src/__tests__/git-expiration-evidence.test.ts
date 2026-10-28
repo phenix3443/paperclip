@@ -445,4 +445,39 @@ describeEmbeddedPostgres("native Git expiration row evidence", () => {
     }
     expect(value?.paths.filter(entry => entry.role === "expiration_lock_marker")).toHaveLength(6);
   });
+
+  it("stops protected_state_changed when the worktree .git link is pointed at another admin dir", async () => {
+    const f = await reconstructable();
+    const admin = git(f.cwd, "rev-parse", "--absolute-git-dir");
+    const other = `${admin}-relinked`;
+    const journal = memoryJournal();
+    const summary = await round(journal, { companyId: f.companyId, budgetHooks: { beforeDirectoryRead: onWalk(f.cwd, async () => {
+      await coarseTick();
+      await fs.cp(admin, other, { recursive: true });
+      await fs.writeFile(path.join(f.cwd, ".git"), `gitdir: ${other}\n`);
+    }) } });
+    expect(summary).toMatchObject({ status: "partial", stopReason: "protected_state_changed" });
+    expect(rowOf(journal).evidence.drift).toMatchObject({ state: "changed",
+      fields: expect.arrayContaining(["head.gitDir", "paths.locationSet", "paths.worktree_git_link"]) });
+  });
+
+  it("stops protected_state_changed when a nested checkout switches branch before the phase A checkout read", async () => {
+    const f = await reconstructable();
+    const container = path.join(f.cwd, ".paperclip-repositories");
+    const checkout = path.join(container, "nested");
+    await fs.mkdir(checkout, { recursive: true });
+    git(checkout, "init", "--initial-branch=topic");
+    await fs.writeFile(path.join(checkout, "file.txt"), "x\n");
+    git(checkout, "add", "."); git(checkout, "commit", "-m", "nested");
+    let reads = 0;
+    const journal = memoryJournal();
+    const summary = await round(journal, { companyId: f.companyId, budgetHooks: { beforeDirectoryRead: async (directory: string) => {
+      if (directory !== container || ++reads !== 2) return;
+      await coarseTick();
+      git(checkout, "checkout", "-q", "-b", "switched");
+    } } });
+    expect(reads).toBe(2);
+    expect(summary).toMatchObject({ status: "partial", stopReason: "protected_state_changed" });
+    expect(rowOf(journal).evidence.drift).toMatchObject({ state: "changed", fields: expect.arrayContaining(["paths.locationSet", "paths.checkout_head"]) });
+  });
 });
