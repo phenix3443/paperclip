@@ -96,7 +96,8 @@ type Observation<T> =
 ```
 
 - `reason` values: `row_not_locked`, `not_candidate`, `lock_busy`, `row_stopped`,
-  `undrained`, `worktree_absent`, `rejected_before_walk`, `sentinel_not_installed`.
+  `undrained`, `worktree_absent`, `rejected_before_walk`, `sentinel_not_installed`,
+  `location_unresolved`, `invalid_metadata`, `checkout_budget`, `incomplete_measurement`.
 - `code` values are sanitized: an errno name (`EACCES`, `ENOENT`, `ELOOP`), a Git
   exit (`git_exit_128`), `git_output`, `statement_timeout` or `invalid_output`.
   Messages, argv, URLs and environment never enter evidence.
@@ -112,10 +113,10 @@ type Observation<T> =
 | --- | --- | --- | --- | --- |
 | E1 keys | Page row key (`page_selected`) and reread key under the lifecycle lock | `row_inspected.key`, `.current` (unchanged) | `row_keys.v1`; every key of `page_selected` has at most one `row_inspected` | Unchanged: key change gives rejection `workspace_changed` |
 | E2 row state | Locked reread in the lifecycle transaction, before and after the row work; page snapshot as `selected` | `row_inspected.evidence.{selected,before,after}.row` | `row_state.v1` | Before/after change: stop `protected_state_changed`. Missing after for a locked, unstopped row: stop `evidence_unavailable` |
-| E2 paths | `lstat` with `bigint: true` of the row's protected paths, before and after, inside the lock chain | `evidence.{before,after}.paths` | `row_paths.v1` | Same as row state |
+| E2 paths | `lstat` with `bigint: true` of the roles named by the native location seam `resolveProtectedLocations` for every row state, fixed at before and reused for after, inside the lock chain | `evidence.{before,after}.paths`, `evidence.before.locationSet` | `row_paths.v1`; every required role present | Same as row state. An unresolved required role is `unavailable` and stops `evidence_unavailable`; an empty list is never an observed absence |
 | E2 HEAD | One bounded Git child per side: `rev-parse --absolute-git-dir HEAD --symbolic-full-name HEAD` in the worktree | `evidence.{before,after}.head` | `row_head.v1` | Same as row state. Skipped after a row stop: `unavailable` `row_stopped` |
-| E3 row bytes | One extended walk of the candidate worktree (the existing walk, same entry budget) | `evidence.bytes`; `candidateBytes` unchanged | `row_bytes.v1` | Walk error keeps today's rejection and reports `error`. Never zero for an unwalked tree |
-| E3 round bytes | Sum of row values plus a round hardlink index | `round_finished.bytes`, stdout `bytes` | `round_bytes.v1`; `state` must be `observed` for full reconciliation | Index cap: stop `resource_limit` `hardlink_index` |
+| E3 row bytes | One extended walk of the candidate worktree (the existing walk, same entry budget) | `evidence.bytes`; `candidateBytes` unchanged | `row_bytes.v1` | Walk error keeps today's rejection, reports `error` and stops `evidence_unavailable`. Never zero for an unwalked tree |
+| E3 round bytes | Sum of row values plus a round hardlink index | `round_finished.bytes`, stdout `bytes` | `round_bytes.v1`; `state` must be `observed` and `failedRows` 0 for full reconciliation | Index cap: stop `resource_limit` `hardlink_index`. A failed walk makes `state` `incomplete` and totals `unavailable` |
 | E4 counters | Entry mutation sentinel at every native mutation site | `round_finished.entryMutations`, stdout `entryMutations` | `entry_mutations.v1`; all counts 0 and `reclaimedBytes` 0 | Any attempt: trap throws, stop `mutation_detected`, overrides every other reason |
 | E5 | Tagged observations above; `drift` per row | `evidence.drift` | Consumer counts `unavailable`/`error` and shows them | See stop rules |
 | E6 | Comparison of E2 before/after; sentinel | Stop reasons below | Consumer treats each as partial | Round partial, exit 3 |
@@ -181,22 +182,79 @@ Value of a row observation:
 
 ### Protected paths
 
-The role list is computed once, from the `before` row, and reused for `after`:
+A live row has no `gitCacheRestoration`, and `gitCacheExpirationLockLocations`
+returns `[]` for every row without an owned, uncompleted expiration lock token
+(`git-workspace-restoration.ts:423–432`). Neither can name the protected set alone.
+The plan therefore adds one read-only native location seam. An empty list never
+stands for an observed absence.
 
-| Role | Path source |
+**Seam.** Two parts, both native:
+
+1. `gitExpirationMarkerLocations(anchor)` in `git-workspace-restoration.ts`. It is
+   the body of `gitCacheExpirationLockLocations` from line 431 on, extracted with no
+   change: the same `index.lock`, `HEAD.lock` and `refs/heads/<branch>.lock` names,
+   the same branch-name validation, and the same nested checkout rules. Its input is
+   an anchor `{ sourcePath, worktreePath, worktreeAdmin, branchName, checkouts }`
+   instead of the validated metadata. `gitCacheExpirationLockLocations` keeps its
+   ownership gate (state, recipe, `lockToken`, `!completed`) and then calls the
+   extracted function, so acquire and recover get the same list as today. The
+   extraction gives no new acquire, recover or remove path.
+2. `resolveProtectedLocations(workspace, signal)` in the new evidence module. It
+   builds the anchor for every row state from the reread row and read-only reads,
+   with no dependence on lock ownership. It calls the native validators that already
+   exist (`readGitCacheRestoration`, `readGitCacheExpiration`,
+   `recordedIsolatedRemoteSource`, and `managedSourcePaths`, which is exported with
+   no change) and the worktree admin check that is extracted, with no change, from
+   `git-workspace-expiration.ts:87–91` into `verifiedWorktreeAdmin(sourcePath, rawAdmin)`
+   for both callers. It does not copy eligibility, proof or source-ownership logic:
+   it names paths, it does not decide whether they are owned.
+
+**Anchor per row state.**
+
+| Anchor field | Pending row (`gitCacheExpiration` present) | Live row (no restoration) |
+| --- | --- | --- |
+| `worktreePath` | `gitCacheRestoration.worktreePath` | `cwd` (equal to `providerRef` when set) |
+| `sourcePath` | `gitCacheRestoration.sourcePath` | `recordedIsolatedRemoteSource(workspace)` when recorded; else every path of `managedSourcePaths(workspace)` (two candidates), each as its own role |
+| `worktreeAdmin` | `gitCacheExpiration.worktreeAdmin` (recorded and validated; independent of the worktree) | `verifiedWorktreeAdmin` of the absolute Git dir from the before HEAD read, which must resolve under one source candidate |
+| `branchName` | `gitCacheRestoration.branchName` | `branchName` column |
+| `checkouts` | `gitCacheRestoration.contents.checkouts` | Directory entries of `<worktree>/<PROJECT_REPOSITORIES_DIR>`, read with `readBoundedDirectory` (shared entry budget), at most `CHECKOUT_LIMIT` (50, `git-workspace-contents.ts:17`, exported with no change); branch of each from one bounded Git child (`rev-parse --absolute-git-dir --symbolic-full-name HEAD`) under the child gate |
+
+A row that has an existing `gitCacheRestoration` but no expiration state uses the
+live-row column. Its recorded `sourcePath` is added as one more `source` role.
+
+The before observation runs in this order: row reread, HEAD read, anchor, then
+`lstat` of every role. After runs the same order, with the HEAD read before drain
+and the rest after drain (see capture points).
+
+**Roles.** All roles are required. The list is fixed at `before` and reused for
+`after`, and `after` also recomputes the anchor and compares its digest
+(`paths.locationSet`), so a changed admin path or source is drift, not a silent
+new list.
+
+| Role | Path |
 | --- | --- |
-| `worktree` | `cwd` for a live row; `gitCacheRestoration.worktreePath` for a pending row |
-| `worktree_git_link` | `<worktree>/.git` |
-| `gitdir_head`, `gitdir_index` | `HEAD` and `index` under the absolute Git dir from the before HEAD read |
-| `source` | `gitCacheRestoration.sourcePath` when present |
-| `worktree_trash`, `base_trash` | `gitCacheExpiration` trash paths when present |
-| `expiration_lock_marker` | Each location from `gitCacheExpirationLockLocations(workspace)` (native function, reused) |
+| `worktree`, `worktree_git_link` | `worktreePath`, `<worktreePath>/.git` |
+| `source`, `source_git` | Each source path and its `.git` |
+| `worktree_admin`, `gitdir_head`, `gitdir_index` | `worktreeAdmin`, and `HEAD` and `index` under it |
+| `worktree_trash`, `base_trash` | `gitCacheExpiration` trash paths; for a live row only `worktree_trash`, at the next generation, derived by the same `path.join` rule as `git-workspace-expiration.ts:93`, extracted with no change |
+| `expiration_lock_marker` | Each location of `gitExpirationMarkerLocations(anchor)` |
+| `expiration_lock_marker_dir` | The parent directory of each marker, so a marker that appears and goes again inside the window still changes `mtimeNs`/`ctimeNs` |
+| `checkout_root` | Each `<worktree>/<PROJECT_REPOSITORIES_DIR>/<name>` |
 
 Each entry reports `role`, `pathDigest` and an observation whose value is
 `{ present: false }` on `ENOENT` or `{ present: true, statDigest, type }`, where
 `statDigest` covers `dev`, `ino`, `mode`, `uid`, `gid`, `nlink`, `size`, `mtimeNs`
 and `ctimeNs`. Raw paths are not written; the journal already has workspace IDs and
 the host has the private manifest.
+
+**Unresolved roles.** When the seam cannot name a required path, the role is still
+listed, with `unavailable` and one of these reasons: `location_unresolved` (no
+source candidate, admin outside every candidate, before HEAD read failed),
+`invalid_metadata` (a native validator threw), `checkout_budget` (more checkouts than
+the native limit). Each one is a not-`observed` before observation and stops the
+round `evidence_unavailable` (see stop rules). For a pending row whose worktree is
+gone, the anchor comes only from metadata, so `worktree_admin`, `gitdir_*`, `source`
+and markers stay observed, and `worktree` is observed `present: false`.
 
 ### HEAD
 
@@ -242,11 +300,19 @@ Per entry it reads `lstat(path, { bigint: true })` and adds:
 - A pending row whose worktree is absent reports `{ state: "observed", value:
   { present: false } }` and no byte fields. Today's `candidateBytes = 0` for that
   case stays for compatibility; the evidence makes the absence explicit.
-- An `EACCES`, `ELOOP` or unsupported entry keeps today's behavior (the walk throws,
-  the row is rejected) and adds `bytes: error <code>`.
-- Rows rejected before the walk report `unavailable` `rejected_before_walk`.
+- An `EACCES`, `ELOOP` or unsupported entry keeps today's native outcome (the walk
+  throws, the row is rejected) and reports `bytes: error <code>`. The walk was
+  attempted and failed, so this is a failed measurement, not a legitimate absence:
+  it stops the round `partial` `evidence_unavailable` (see stop rules) and counts in
+  the round `failedRows`.
+- Rows rejected before the walk report `unavailable` `rejected_before_walk`. This is
+  a legitimate rejection: no stop, and the row is outside the byte denominator.
 - A budget hit or abort during the walk keeps today's `resource_limit` or stop and
-  reports `unavailable` `row_stopped`.
+  reports `unavailable` `row_stopped`. The round is already partial.
+
+The three cases are told apart by the tag: observed `present: false` (absent
+worktree, no stop), `unavailable` `rejected_before_walk` (no stop), and `error`
+(walk attempted, stop).
 
 ### Round
 
@@ -254,11 +320,21 @@ Per entry it reads `lstat(path, { bigint: true })` and adds:
 
 ```ts
 { state: "observed" | "incomplete",
-  candidateRows, measuredRows, unavailableRows,
-  raw: { allocated, apparent },                 // sum of row raw values
-  unique: { allocated, apparent, distinctInodes }, // over all measured candidate rows
+  candidateRows, attemptedRows, measuredRows, failedRows, unavailableRows,
+  raw: Observation<{ allocated, apparent }>,                  // sum of row raw values
+  unique: Observation<{ allocated, apparent, distinctInodes }>, // over all measured rows
+  measuredSubset: { raw: { allocated, apparent }, unique: { allocated, apparent, distinctInodes } },
   hardlinkIndex: { entries, limit } }
 ```
+
+- `attemptedRows` counts every row whose walk started, whatever its final outcome
+  (candidate or rejected). `failedRows` counts rows with `bytes` `error`. A
+  rejected row with a failed walk stays in `attemptedRows` and `failedRows`; it does
+  not leave the denominator.
+- `raw` and `unique` are `observed` only when `state` is `observed`. Otherwise both
+  are `unavailable` `incomplete_measurement`. `measuredSubset` keeps the sums of the
+  rows that were measured, for diagnosis only; the consumer never reads it as a
+  total.
 
 - `unique` across rows uses a round index of `(dev, ino)` for non-directory inodes
   with `nlink > 1`. Inodes with `nlink = 1` are unique without an index. Overlapping
@@ -268,9 +344,9 @@ Per entry it reads `lstat(path, { bigint: true })` and adds:
   `MemoryMax=512M`). Reaching it stops the round `partial` with `resource_limit`
   `hardlink_index`. This is a new stricter evidence budget. It relaxes no approved
   value, and it is listed in `budgets` so the host can match it with its manifest.
-- `state` is `incomplete` when a candidate row has no observed bytes. The consumer
-  then reports bytes as incomplete. `raw` and `unique` never mix: there is no
-  combined total.
+- `state` is `incomplete` when `failedRows > 0`, or when a candidate row has no
+  observed bytes. The consumer then reports bytes as incomplete and rejects full
+  reconciliation. `raw` and `unique` never mix: there is no combined total.
 
 ## Entry mutation sentinel
 
@@ -353,7 +429,7 @@ New stop reasons. All give `partial` and exit 3.
 | --- | --- | --- |
 | `mutation_detected` | Any sentinel attempt | After the row in which it happened, and again at round end |
 | `protected_state_changed` | Row `drift.state = "changed"` | After the row is recorded |
-| `evidence_unavailable` | A row that got both locks and was not stopped has a before or after observation that is not `observed`, except `worktree_absent` | After the row is recorded |
+| `evidence_unavailable` | A row that got both locks and was not stopped has a before or after observation that is not `observed` (including an unresolved protected-path role), except `worktree_absent`; or its `bytes` is `error`, also when the row outcome is a rejection | After the row is recorded |
 
 - `mutation_detected` overrides every other stop reason in the summary and in the
   final `round_finished`. The earlier reason is kept as `supersededStopReason`.
@@ -363,7 +439,8 @@ New stop reasons. All give `partial` and exit 3.
   round is partial, so the consumer cannot count it as complete.
 - `complete` still needs `exhausted`, no stop reason and `inspected == selected`. In
   addition it needs zero sentinel attempts, `drift.state = "none"` for every locked
-  row and an installed sentinel. A library round without a sentinel can still be
+  row, round `bytes.state = "observed"` (so `failedRows = 0`) and an installed
+  sentinel. A library round without a sentinel can still be
   `complete` (tests), but it omits `entry_mutations.v1`, and the consumer rejects
   it.
 
@@ -402,12 +479,15 @@ a near-full journal stops `resource_limit` `evidence`, never a truncated record.
 
 | File | Change |
 | --- | --- |
-| `server/src/services/git-expiration-evidence.ts` (new) | Contract constant, `Observation`, canonical digest, `observeRowState(tx, row)`, `observeProtectedPaths(roles)`, `observeHead(worktree)` via `runBoundedGit`, `ByteTally`, `RoundHardlinkIndex` |
+| `server/src/services/git-expiration-evidence.ts` (new) | Contract constant, `Observation`, canonical digest, `observeRowState(tx, row)`, `resolveProtectedLocations(workspace, signal)`, `observeProtectedPaths(roles)`, `observeHead(worktree)` via `runBoundedGit`, `ByteTally`, `RoundHardlinkIndex` |
 | `server/src/services/git-expiration-mutation-sentinel.ts` (new) | Ledger, kinds, `noteEntryMutation`, trap error |
 | `server/src/services/git-workspace-expiration-inspection.ts` | `onLocked` async hook; `measureWorktree`; `allocatedBytes` wraps it |
 | `server/src/services/git-expiration-round.ts` | Capture points, row `evidence`, summary `bytes`, `entryMutations`, `evidenceContract`, new stop reasons and precedence |
 | `server/src/services/git-expiration-budget.ts` | `hardlinkIndexKeys: 250_000` in `GIT_EXPIRATION_BUDGETS` |
 | `server/src/git-expiration-round-cli.ts` | Install sentinel at start; `--print-evidence-contract` |
+| `server/src/services/git-workspace-restoration.ts` | Extract `gitExpirationMarkerLocations(anchor)` from `gitCacheExpirationLockLocations` (gate kept, same output); export `managedSourcePaths` unchanged |
+| `server/src/services/git-workspace-expiration.ts` | Extract `verifiedWorktreeAdmin` and the worktree trash path rule; the expiration path calls them with the same result |
+| `server/src/services/git-workspace-contents.ts` | Export `CHECKOUT_LIMIT` unchanged |
 | Sentinel sites | `git-workspace-expiration.ts`, `git-workspace-restoration.ts`, `git-workspace-expiration-locks.ts`, `workspace-compaction.ts`, `execution-workspaces.ts`: one call each, no other change |
 | `docs/deploy/git-expiration-round.md` | Evidence contract, fields, stop reasons, consumer rules |
 
@@ -437,8 +517,14 @@ uninstall the ledger in a dedicated test file.
 | Selection drift | Metadata changed after selection with the same `updatedAt`; key changed | `selectionDrift.changed`; no stop for the first; `workspace_changed` for the second, as today |
 | Hardlinks | Two hardlinks to one file in a row; one inode shared by two candidate rows; index at 249,999, 250,000, 250,001 keys (injected limit) | Row `raw` counts both, `unique` once; round `unique` once across rows; limit + 1 stops `resource_limit` `hardlink_index` |
 | Sparse | A 64 MiB sparse file with 4 KiB written | `rawApparent` ≥ 64 MiB, `rawAllocated` small, `sparseEntries` 1 |
-| Inaccessible | Directory mode 000 inside the worktree (test skipped when it runs as root) | Row rejected as today; `bytes` `error EACCES`; never `observed` 0 |
-| Absent worktree | Pending row with worktree gone | `bytes` observed `present: false`; HEAD `worktree_absent`; no `evidence_unavailable` stop |
+| Inaccessible | Directory mode 000 inside the worktree, and a symlink loop, on a row whose protected root, HEAD and DB reads succeed (test skipped when it runs as root) | Row outcome rejected as today; `bytes` `error EACCES` / `ELOOP`; round `partial` `evidence_unavailable`, exit 3; round `bytes.state` `incomplete`, `attemptedRows` and `failedRows` 1, `raw` and `unique` `unavailable incomplete_measurement`; no `observed` 0 for the row or the round |
+| Rejected before walk | Row rejected by eligibility or proof before the walk | `bytes` `unavailable rejected_before_walk`; no stop from bytes; row not in `attemptedRows` |
+| Absent worktree | Pending row with worktree gone and its admin dir still present | `bytes` observed `present: false`; HEAD `worktree_absent`; `worktree` observed `present: false`; `worktree_admin`, `gitdir_*`, `source` and marker roles observed from the recorded metadata; no `evidence_unavailable` stop. Variant: admin dir removed or replaced between before and after gives `drift.changed` `paths.worktree_admin` and stop `protected_state_changed` |
+| Live protected paths | Live row with no `gitCacheRestoration`, managed-project source and isolated-remote source; one nested checkout | Roles `source`, `worktree_admin`, `gitdir_*`, `expiration_lock_marker` (admin `index.lock`/`HEAD.lock`, source branch lock, checkout locks) and `checkout_root` all listed and observed; no role missing |
+| Marker creation | Live row and pending row without `lockToken`: create, and separately create then remove, an `index.lock` and a branch `.lock` at a marker location between before and after | `drift.changed` names `paths.expiration_lock_marker` or `paths.expiration_lock_marker_dir`; stop `protected_state_changed` |
+| Admin path change | Live row whose `.git` link is changed to point at another admin dir between before and after | `drift.changed` names `paths.locationSet` or `head.gitDir`; stop `protected_state_changed` |
+| Unresolved paths | Live row whose Git dir is outside every source candidate; pending row with invalid `gitCacheExpiration`; more than `CHECKOUT_LIMIT` checkout entries | Roles listed with `unavailable` `location_unresolved` / `invalid_metadata` / `checkout_budget`; stop `evidence_unavailable`, exit 3; never an empty role list |
+| Lock location parity | Existing lock acquire and recover tests | `gitCacheExpirationLockLocations` returns the same list as before the extraction |
 | Budget | Entry budget hit, row deadline and Git output cap during the walk and during the after HEAD read | Existing `resource_limit` reasons; `after.head` `unavailable row_stopped`; after row and paths still observed after drain |
 | Abort | Abort during proof and during the before HEAD read; abort with undrained row | No new child after abort; locks held until drain; `after` `undrained` when the bound is passed; round `aborted` |
 | Lock | Busy source lock; busy lifecycle lock | `lock_busy` with `unavailable lock_busy` evidence; no observation taken without both locks |
@@ -454,9 +540,9 @@ Issue #85 implements this plan. It touches two guarantee classes: evidence
 observation and mutation detection. If the core logic grows beyond about 400 lines,
 split it into PRs in this order:
 
-1. Contract, observation types, row state, paths, HEAD, drift stop and CLI contract
-   flag (E1, E2, E5, part of E6).
-2. Byte tally and round hardlink index (E3).
+1. Contract, observation types, row state, the protected location seam, paths, HEAD,
+   drift stop and CLI contract flag (E1, E2, E5, part of E6).
+2. Byte tally, round hardlink index and the byte-error stop (E3).
 3. Entry mutation sentinel, its sites and `mutation_detected` (E4, rest of E6).
 
 Each slice gets its own independent review. The host consumer (ai-team#484) checks
