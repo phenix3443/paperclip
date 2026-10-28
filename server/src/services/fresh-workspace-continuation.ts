@@ -52,6 +52,14 @@ export async function canSelectFreshWorkspace(input: {
   return ["complete", "exhausted"].includes(system.state) ? wake.id : null;
 }
 
+// The executor release marker written by recordRunExecutionReleased for this exact run.
+function isOwnExecutionReleaseMarker(value: unknown, runId: string, issueId: string) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const marker = value as Record<string, unknown>;
+  return marker.schema === "paperclip.run-execution-release.v1" && marker.runId === runId && marker.issueId === issueId &&
+    typeof marker.settledAt === "string" && Object.keys(marker).every(key => ["schema", "runId", "issueId", "settledAt"].includes(key));
+}
+
 async function reusableDirectoryAfterPreparationFailure(db: Db, source: typeof heartbeatRuns.$inferSelect, issueId: string) {
   const validation = source.resultJson?.workspaceValidation as Record<string, unknown> | undefined;
   const recovery = source.resultJson?.executionRecovery as Record<string, unknown> | undefined;
@@ -72,7 +80,8 @@ async function reusableDirectoryAfterPreparationFailure(db: Db, source: typeof h
       source.lastOutputSeq !== 0 || source.logCompressed ||
       Object.keys(source.usageJson ?? {}).some(key => key !== "ledgerScope") ||
       Object.keys(source.runnerProfileJson ?? {}).some(key => !["adapterDispatch", "chatControlRecoveryAdmission", "aiConnectionNonAssigneeCommentWake"].includes(key)) ||
-      Object.keys(source.resultJson ?? {}).some(key => !["effectiveTimeoutSec", "executionRecovery", "stopReason", "timeoutConfigured", "timeoutFired", "timeoutSource", "workspaceValidation"].includes(key))) return null;
+      Object.keys(source.resultJson ?? {}).some(key => !["effectiveTimeoutSec", "executionRecovery", "executionReleased", "stopReason", "timeoutConfigured", "timeoutFired", "timeoutSource", "workspaceValidation"].includes(key)) ||
+      (source.resultJson?.executionReleased !== undefined && !isOwnExecutionReleaseMarker(source.resultJson.executionReleased, source.id, issueId))) return null;
   const events = await db.select().from(heartbeatRunEvents).where(and(
     eq(heartbeatRunEvents.companyId, source.companyId), eq(heartbeatRunEvents.runId, source.id),
   )).orderBy(asc(heartbeatRunEvents.seq)).limit(4);
