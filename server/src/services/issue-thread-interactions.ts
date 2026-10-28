@@ -1,4 +1,5 @@
 import { normalizeEscapedLineBreaks } from "@paperclipai/shared/validators/text";
+import { releaseWaitingReconciledDeliveries } from "./execution-reconciliation-release.js";
 import { notifyDeliveryWork, DELIVERY_QUEUES } from "./delivery-work-notifications.js";
 import { activeIssueInteractionCondition, historicalQuestionCondition } from "./issue-question-context.js";
 import {
@@ -2170,6 +2171,7 @@ export function issueThreadInteractionService(
     const now = new Date();
     const postCommitActivityPublications: ActivityPublication[] = [];
     const result = await db.transaction(async (tx) => {
+      await releaseWaitingReconciledDeliveries(tx, { companyId: args.issue.companyId, gates: ["interaction"], issueIds: [args.issue.id] });
       await assertInteractionRunWriteAllowed(tx as unknown as Db, args.issue, args.actor);
       await args.mutationOptions?.beforeResolveInTransaction?.(tx);
       // Policy mutations and review transitions use the same issue-row lock,
@@ -2452,6 +2454,7 @@ export function issueThreadInteractionService(
 
     const now = new Date();
     const updated = await db.transaction(async (tx) => {
+      await releaseWaitingReconciledDeliveries(tx, { companyId: args.issue.companyId, gates: ["interaction"], issueIds: [args.issue.id] });
       await assertInteractionRunWriteAllowed(tx as unknown as Db, args.issue, args.actor);
       await args.mutationOptions?.beforeResolveInTransaction?.(tx);
       const issueContext = await tx
@@ -4007,6 +4010,7 @@ export function issueThreadInteractionService(
       const createdWakeTargets: IssueWakeTarget[] = [];
 
       await db.transaction(async (tx) => {
+        await releaseWaitingReconciledDeliveries(tx, { companyId: issue.companyId, gates: ["interaction"], issueIds: [issue.id] });
         await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
         const resolvedAt = new Date();
         const [claimed] = await tx
@@ -4165,6 +4169,7 @@ export function issueThreadInteractionService(
       assertIssueOpenForInteractionResolution(issue);
       const data = submitIssueThreadInteractionVerdictsSchema.parse(input);
       const submission = await db.transaction(async (tx) => {
+        await releaseWaitingReconciledDeliveries(tx, { companyId: issue.companyId, gates: ["interaction"], issueIds: [issue.id] });
         await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
         const current = await tx
           .select()
@@ -4304,6 +4309,7 @@ export function issueThreadInteractionService(
       }
 
       const [updated] = await db.transaction(async (tx) => {
+        await releaseWaitingReconciledDeliveries(tx, { companyId: issue.companyId, gates: ["interaction"], issueIds: [issue.id] });
         await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
         return tx.update(issueThreadInteractions)
         .set({
@@ -4910,6 +4916,7 @@ export function issueThreadInteractionService(
       // review queue while the card is still pending, and an executable
       // request must not outlive a withdrawn card.
       const updated = await db.transaction(async (tx) => {
+        await releaseWaitingReconciledDeliveries(tx, { companyId: issue.companyId, gates: ["interaction"], issueIds: [issue.id] });
         await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
         await resolveLinkedToolActionRequests(tx, current, {
           status: "cancelled",
@@ -5030,6 +5037,7 @@ export function issueThreadInteractionService(
       }
 
       const updated = await db.transaction(async (tx) => {
+        await releaseWaitingReconciledDeliveries(tx, { companyId: issue.companyId, gates: ["interaction"], issueIds: [issue.id] });
         // Serialize against task completion/cancellation and use the persisted
         // status, including when the caller read the task before it closed.
         const [issueRow] = await tx.select({ status: issues.status }).from(issues)
@@ -5126,6 +5134,7 @@ export function issueThreadInteractionService(
       const reason = data.reason?.trim() || null;
       const now = new Date();
       const updated = await db.transaction(async (tx) => {
+        await releaseWaitingReconciledDeliveries(tx, { companyId: issue.companyId, gates: ["interaction"], issueIds: [issue.id] });
         await assertInteractionRunWriteAllowed(tx as unknown as Db, issue, actor);
         await resolveLinkedToolActionRequests(tx, current, {
           status: "cancelled",
