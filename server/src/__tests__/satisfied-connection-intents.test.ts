@@ -476,7 +476,7 @@ describePostgres("already available connection requests", () => {
     return (await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, f.intent.id)))[0]!;
   }
 
-  it.each(["allowed", "ask_first"] as const)("retires an exact %s access request once its grant commits through the normal producer", async (permission) => {
+  it.each(["allowed", "ask_first"] as const)("retires an exact %s access request once its grant commits", async (permission) => {
     const f = await seed(); const intent = await requestAccess(f, permission);
     const wakeup = vi.fn().mockResolvedValue(null);
     const worker = connectionIntentDeliveryService(db, { wakeup });
@@ -493,6 +493,17 @@ describePostgres("already available connection requests", () => {
     expect(wakeup).toHaveBeenCalledOnce();
   });
 
+  it("does not strand the task when a retired access request's exact tool version later changes", async () => {
+    const f = await seed(); const intent = await requestAccess(f);
+    await db.transaction(async (tx) => grantConnectionAgentTools(tx as unknown as typeof db, { connection: f.connection, agentId: f.agentId,
+      userId: "connection-owner", tools: intent.payload.accessRequest!.tools, context: { issueId: f.issueId, projectId: null } }));
+    await connectionIntentDeliveryService(db, { wakeup: vi.fn().mockResolvedValue(null) }).sweepPending();
+    expect((await db.select().from(issueThreadInteractions))[0].status).toBe("expired");
+    await db.update(toolCatalogEntries).set({ versionHash: "v2" });
+    const [task] = await db.select().from(issues);
+    expect(await connectionContinuationPendingResponse(db, task, "connection-owner")).toBeNull();
+  });
+
   it.each(["missing", "revoked", "blocked", "weaker", "changed_version", "inactive_tool", "other_connection", "wrong_requester", "wrong_user", "other_company", "ambiguous"] as const)("keeps an access request pending for %s", async (reason) => {
     const f = await seed();
     let intent = await requestAccess(f, "allowed", reason === "wrong_requester" ? { requestingAgentId: randomUUID() } : {});
@@ -506,7 +517,6 @@ describePostgres("already available connection requests", () => {
     if (reason === "other_connection") {
       const [other] = await db.insert(toolConnections).values({ companyId: f.companyId, applicationId: f.connection.applicationId, name: "Other Sentry", uid: "sentry-other",
         transport: "mcp_remote", authKind: "api_key", credentialPolicy: "per_user", status: "active", enabled: true, healthStatus: "ok", config: { sourceTemplateKey: "sentry" } }).returning();
-      intent = await requestAccess(f, "allowed", {});
       await db.update(issueThreadInteractions).set({ payload: { ...intent.payload, accessRequest: { ...intent.payload.accessRequest!, connectionId: other!.id } } as typeof intent.payload });
       await db.update(toolProfiles).set({ defaultAction: "allow" });
     }
@@ -545,7 +555,7 @@ describePostgres("already available connection requests", () => {
     const [task] = await db.select().from(issues);
     expect(await connectionContinuationPendingResponse(db, task, "connection-owner")).toBe("interaction");
     expect(wakeup).not.toHaveBeenCalled();
-    expect(question!.status).toBe("pending");
+    expect((await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, question!.id)))[0].status).toBe("pending");
     await clearApproval();
   });
 });

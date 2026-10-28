@@ -74,7 +74,8 @@ export async function connectionContinuationPendingResponse(db: Db, task: Task, 
     if (interaction.status !== "pending" && !retired) continue;
     if (retired && (interaction.payload as { requestingAgentId?: string }).requestingAgentId !== task.assigneeAgentId) continue;
     if (interaction.addresseeUserId !== responsibleUserId) return "interaction";
-    const connection = await findAvailableToolConnection(db, task, { ...interaction, status: "pending" }, policyRunId);
+    const payload = retired ? { ...(interaction.payload as Record<string, unknown>), accessRequest: undefined } : interaction.payload;
+    const connection = await findAvailableToolConnection(db, task, { ...interaction, payload: payload as Intent["payload"], status: "pending" }, policyRunId);
     // Historical system retirements describe a service need, not a permanent
     // binding to an account the user may later replace. Delivery and native
     // response projection still validate their own exact recorded connection.
