@@ -9,6 +9,7 @@ import { adapterExecutionControls } from "./adapter-execution-control.js";
 import { hasPendingRunCleanup } from "./execution-blocker.js";
 import { toExecutionWorkspace } from "./execution-workspaces.js";
 import { isBoundIsolatedTaskDirectory } from "./isolated-task-directory.js";
+import { isOwnExecutionReleaseMarker } from "./run-execution-release-marker.js";
 
 export type ContinuationReadiness =
   | { mode: "resume_preserved_workspace"; preservationReceiptId: string }
@@ -50,14 +51,6 @@ export async function canSelectFreshWorkspace(input: {
   // Saved input can use the automatic fallback only after maintenance settled.
   // A pending export keeps its current attempt; it cannot spawn another agent.
   return ["complete", "exhausted"].includes(system.state) ? wake.id : null;
-}
-
-// The executor release marker written by recordRunExecutionReleased for this exact run.
-function isOwnExecutionReleaseMarker(value: unknown, runId: string, issueId: string) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const marker = value as Record<string, unknown>;
-  return marker.schema === "paperclip.run-execution-release.v1" && marker.runId === runId && marker.issueId === issueId &&
-    typeof marker.settledAt === "string" && Object.keys(marker).every(key => ["schema", "runId", "issueId", "settledAt"].includes(key));
 }
 
 async function reusableDirectoryAfterPreparationFailure(db: Db, source: typeof heartbeatRuns.$inferSelect, issueId: string) {

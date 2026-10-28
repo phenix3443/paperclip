@@ -89,6 +89,7 @@ import {
 import { isExternalChatWaitAuthorizationContention } from "../native-runtime/chat-attachment-reuse.js";
 import { CHAT_CONVERSATION_ID_KEY } from "../../modules/run-dispatch/index.js";
 import { projectSafeChatPublication } from "../chat-publication-projection.js";
+import { isOwnExecutionReleaseMarker } from "../run-execution-release-marker.js";
 
 import {
   inboundWakePublicationKey,
@@ -228,7 +229,8 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
       Object.keys(recovery).every(key => ["kind", "providerWorkStarted"].includes(key)) &&
       run.resultJson?.stopReason === "adapter_failed" &&
       Object.keys(run.resultJson).every(key => ["executionRecovery", "workspaceValidation", "stopReason",
-        "effectiveTimeoutSec", "timeoutConfigured", "timeoutFired", "timeoutSource"].includes(key));
+        "effectiveTimeoutSec", "timeoutConfigured", "timeoutFired", "timeoutSource"].includes(key) ||
+        (key === "executionReleased" && isOwnExecutionReleaseMarker(run.resultJson?.executionReleased, run.id, validation.issueId as string)));
     const diagnostic = failedRetry ? retryDiagnostic : workspacePreparation ? run.error : "reviewed_chat_execution_binding_not_authorized";
     const dispatchOnlyProfile = failedRetry || workspacePreparation;
     if (
