@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { agents, heartbeatRuns, type Db } from "@paperclipai/db";
 import { and, asc, desc, eq, lte, sql } from "drizzle-orm";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
@@ -63,7 +64,7 @@ export function settledAgentWorkCondition(liveRunIds: ReadonlySet<string>, now: 
           OR COALESCE(l.metadata->>'pendingCleanupInFlight', 'false') <> 'false'
           OR COALESCE(l.metadata, '{}'::jsonb) ?| ARRAY['nativeWorkspaceExportResume', 'sandboxStopAndRetain']))
     AND NOT EXISTS (SELECT 1 FROM agent_wakeup_requests w
-      WHERE w.company_id = ${agents.companyId} AND w.agent_id = ${agents.id}
+      WHERE ${ordinaryWakeRequestPredicate(sql.raw('w.payload'))} AND w.company_id = ${agents.companyId} AND w.agent_id = ${agents.id}
         AND (${sql.raw(finishedIdleWake("w"))}) IS NOT TRUE)
     AND NOT EXISTS (SELECT 1 FROM agent_instruction_working_copies c
       WHERE c.company_id = ${agents.companyId} AND c.agent_id = ${agents.id}

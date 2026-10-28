@@ -1,3 +1,4 @@
+import { hasReviewerAssignmentContinuation } from "../domain/receipt-namespace.js";
 import { readWakeChatConversationId } from "../../run-dispatch/index.js";
 import { enrichPromotedWakeContext, wakeMustNotJoinActiveRun } from "../domain/context.js";
 import {
@@ -168,6 +169,10 @@ async function runReleaseDrain(
       );
     }
     processedWakeIds.add(candidate.id);
+    if (hasReviewerAssignmentContinuation(candidate.payload)) {
+      preservedWakeIds.push(candidate.id);
+      continue;
+    }
 
     // A lead can post its closing comment before committing Done. Check
     // again when the source run releases its queue, using every original
@@ -585,12 +590,21 @@ async function runReleaseRecoveryTail(
     : false;
 
   const hasExplicitBlockerPath =
-    immediateApplies && !reviewParticipantApplies
+    reviewParticipantApplies || immediateApplies
       ? await transaction.hasExplicitBlockerPath({
           companyId: issue.companyId,
           issueId: issue.id,
         })
       : false;
+
+  const hasReviewBlockerWait =
+    reviewParticipantApplies &&
+    issue.assigneeAgentId === currentParticipant?.agentId &&
+    (hasExplicitBlockerPath ||
+      (await transaction.hasPendingFinalizeBlocker({
+        companyId: issue.companyId,
+        issueId: issue.id,
+      })));
 
   const expectedRetryReason:
     "assignment_recovery" | "issue_continuation_needed" =
@@ -624,6 +638,7 @@ async function runReleaseRecoveryTail(
       isExecutionReviewParticipantRecoveryRun:
         isExecutionReviewParticipantRecoveryRun(run),
       hasPendingWakeInteraction,
+      hasBlockerWait: hasReviewBlockerWait,
     },
     immediate: {
       applies: immediateApplies,

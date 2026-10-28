@@ -321,6 +321,22 @@ describe("durable inbound chat scheduler receipts", () => {
     });
   });
 
+  it("reconsiders the same held inbound receipt only through its live durable owner", async () => {
+    const f = await fixture();
+    const clearHold = await executionHold(f);
+    const request = f.request();
+    expect(await f.wake(request)).toBeNull();
+    await clearHold();
+    const reconsidered = createDurableChatWakeupRequest({ ...request, resumeDeferred: true });
+    const [first, second] = await Promise.all([f.wake(reconsidered), f.wake(reconsidered)]);
+    const receipts = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId));
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]).toMatchObject({ id: request.id, status: "queued", requestedAt: request.requestedAt });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, request.id))).toHaveLength(1);
+    expect(first?.id ?? second?.id).toBe(receipts[0].runId);
+    expect(f.authorize.mock.calls.length).toBeGreaterThan(1);
+  });
+
   async function retryFixture(deferred = false) {
     const f = await fixture(deferred);
     const applicationId = randomUUID(),
@@ -1025,6 +1041,24 @@ describe("durable inbound chat scheduler receipts", () => {
         ),
     ).toHaveLength(1);
     expect(f.authorize).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([null, "invalid", { version: 99 }])("coalesces ordinary inbound chat behind a reserved receipt (%j)", async namespace => {
+    const f = await fixture(true);
+    const first = f.request(), second = f.request();
+    const [reserved] = await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+      source: "assignment", reason: "issue_commented", status: "deferred_issue_execution", requestedAt: new Date(0),
+      requestedByActorType: "user", requestedByActorId: "board-user",
+      payload: { issueId: f.issueId, _paperclipReviewerAssignmentContinuation: namespace,
+        _paperclipWakeContext: { issueId: f.issueId, source: "chat:slack", wakeCommentIds: [first.commentId] } } }).returning();
+    await f.wake(first);
+    await f.wake(second);
+    await f.wake(second);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, reserved.id)))[0]).toEqual(reserved);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, first.id)))[0])
+      .toMatchObject({ status: "deferred_issue_execution", coalescedCount: 1 });
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, second.id)))[0])
+      .toMatchObject({ status: "coalesced", payload: { coalescedIntoWakeupRequestId: first.id } });
   });
 
   it("records a stable receipt when merging into a deferred wake and never merges the replay twice", async () => {

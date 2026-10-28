@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type {
   IssueExecutionDecision,
   IssueExecutionMonitorClearReason,
@@ -31,6 +31,17 @@ type IssueLike = AssigneeLike & {
   monitorNotes?: string | null;
   monitorScheduledBy?: string | null;
 };
+
+export function issueExecutionGeneration(task: IssueLike) {
+  function canonical(value: unknown): string {
+    if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+    if (value && typeof value === "object") return `{${Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+      .map(([key, entry]) => `${JSON.stringify(key)}:${canonical(entry)}`).join(",")}}`;
+    return JSON.stringify(value ?? null);
+  }
+  return createHash("sha256").update(canonical({ policy: task.executionPolicy, state: task.executionState,
+    agentId: task.assigneeAgentId, userId: task.assigneeUserId, responsibleUserId: task.responsibleUserId })).digest("hex");
+}
 
 type ActorLike = {
   agentId?: string | null;
@@ -644,6 +655,18 @@ function clearExecutionStatePatch(input: {
   }
 }
 
+function boardPendingStatusOverride(patch: Record<string, unknown>, requestedStatus: string): TransitionResult {
+  if (requestedStatus === "blocked") return { patch };
+  if (requestedStatus === "done" || requestedStatus === "cancelled") {
+    patch.executionState = null;
+    return { patch };
+  }
+  throw unprocessable(
+    `A pending review cannot move to ${requestedStatus}. Block, restore (in_review), or cancel it, or let the reviewer decide.`,
+    { code: "pending_review_status_override" },
+  );
+}
+
 function canAutoSkipPendingStage(input: {
   stage: IssueExecutionStage;
   returnAssignee: IssueExecutionStagePrincipal | null;
@@ -739,6 +762,14 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
       currentParticipant.type === "user" &&
       !stageHasParticipant(activeStage, currentParticipant) &&
       (existingState?.changesRequestedCount ?? 0) >= resolveMaxReviewRounds(input.policy);
+    const holdUntouched =
+      input.issue.status === "blocked" &&
+      (requestedStatus === undefined || requestedStatus === "blocked") &&
+      (!requestedAssigneePatchProvided ||
+        principalsEqual(explicitAssignee, escalatedHold ? currentParticipant : currentAssignee));
+    if (holdUntouched) {
+      return { patch };
+    }
     if (escalatedHold && !principalsEqual(currentParticipant, actor)) {
       // An empty patch would not override the caller's own requested fields,
       // so a status or assignee change from a non-escalated actor must be
@@ -859,8 +890,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         requestedStatus !== "in_review" &&
         requestedStatus !== "in_progress"
       ) {
-        patch.executionState = null;
-        return { patch };
+        return boardPendingStatusOverride(patch, requestedStatus);
       }
 
       if (requestedStatus && requestedStatus !== "in_review") {
@@ -926,8 +956,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
 
     if (input.allowBoardOverride && attemptedStageAdvance) {
       if (requestedStatus !== undefined && requestedStatus !== "in_review") {
-        patch.executionState = null;
-        return { patch };
+        return boardPendingStatusOverride(patch, requestedStatus);
       }
       // Assignee-only override: the issue stays in_review, so clearing the
       // execution state would strand it with no participant or return
@@ -983,6 +1012,16 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     requestedStatus === "in_review";
 
   if (!shouldStartWorkflow) {
+    if (
+      existingState?.status === CHANGES_REQUESTED_STATUS &&
+      currentStage &&
+      explicitAssignee &&
+      !principalsEqual(explicitAssignee, currentAssignee) &&
+      !principalsEqual(explicitAssignee, existingState.returnAssignee) &&
+      !input.policy.stages.some((stage) => stageHasParticipant(stage, explicitAssignee))
+    ) {
+      patch.executionState = { ...existingState, returnAssignee: explicitAssignee };
+    }
     return { patch };
   }
 

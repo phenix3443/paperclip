@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { notifyExecutionRunWork } from "../execution-control-notifications.js";
 import os from "node:os";
 import {
@@ -193,7 +194,7 @@ type HeartbeatRun = typeof heartbeatRuns.$inferSelect;
 
 /** Lifecycle owns run writes; the service supplies reporting and admission effects. */
 export interface HeartbeatLifecycleDependencies extends Pick<ReturnType<typeof createHeartbeatRunState>,
-  "getRun" | "resolveSessionBeforeForWakeup" | "ensureRuntimeState">,
+  "getRunStatus" | "resolveSessionBeforeForWakeup" | "ensureRuntimeState">,
   Pick<ReturnType<typeof createHeartbeatRunPreparation>,
     "getIssueExecutionContext" | "resolveResponsibleUserIdForRunContext">,
   Pick<HeartbeatRetryDependencies, "getAgentInvokability"> {
@@ -244,6 +245,7 @@ const LIVENESS_BOOKKEEPING_EVENT_TYPES = [
 ];
 
 export const NON_RETRYABLE_PREFLIGHT_FAILURE_CODES = new Set<string>([
+  "project_access_denied",
   "low_trust_isolation_unavailable",
   "low_trust_requires_isolated_workspace",
   "low_trust_boundary_mismatch",
@@ -388,7 +390,7 @@ export function publishHeartbeatRunRuntimeProgress(status: {
 function recordHeartbeatRunRuntimeProgress(
   run: Pick<
     typeof heartbeatRuns.$inferSelect,
-    "id" | "companyId" | "agentId" | "status" | "contextSnapshot"
+    "id" | "companyId" | "agentId" | "status"
   >,
   update: RuntimeStatusUpdate,
   issueId: string | null,
@@ -635,7 +637,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     issuesSvc,
     recovery,
     companySkills,
-    getRun,
+    getRunStatus,
     emitTerminalAgentTaskRun,
     getIssueExecutionContext,
     budgets,
@@ -992,7 +994,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
   async function recordCurrentHeartbeatRunRuntimeProgress(
     run: Pick<
       typeof heartbeatRuns.$inferSelect,
-      "id" | "companyId" | "agentId" | "status" | "contextSnapshot"
+      "id" | "companyId" | "agentId" | "status"
     >,
     update: RuntimeStatusUpdate,
     issueId: string | null,
@@ -1002,7 +1004,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
       return null;
     }
 
-    const currentRun = await getRun(run.id);
+    const currentRun = await getRunStatus(run.id);
     if (!currentRun || !isHeartbeatRunRuntimeStatusActive(currentRun.status)) {
       clearHeartbeatRunRuntimeStatus(run.id);
       return null;
@@ -1391,7 +1393,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
       .set({ status, ...patch, updatedAt: new Date() })
       // Reassignment revokes requests transactionally. Late execution settlement
       // must not turn a revoked request back into authority for a later retry.
-      .where(and(eq(agentWakeupRequests.id, wakeupRequestId), ne(agentWakeupRequests.status, "cancelled")));
+      .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, wakeupRequestId), ne(agentWakeupRequests.status, "cancelled")));
   }
 
   async function addContinuationExhaustedCommentOnce(input: {
@@ -1733,7 +1735,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
             .from(agentWakeupRequests)
             .where(
               and(
-                eq(agentWakeupRequests.companyId, issue.companyId),
+                ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, issue.companyId),
                 eq(agentWakeupRequests.agentId, run.agentId),
                 inArray(agentWakeupRequests.status, [
                   "queued",
@@ -1998,7 +2000,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
       .from(agentWakeupRequests)
       .where(
         and(
-          eq(agentWakeupRequests.companyId, issue.companyId),
+          ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, issue.companyId),
           eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
           notInArray(agentWakeupRequests.status, ["skipped"]),
         ),
@@ -2434,7 +2436,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
           runId: queuedRun.id,
           updatedAt: now,
         })
-        .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+        .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, wakeupRequest.id)));
 
       await tx
         .update(issues)
@@ -2485,7 +2487,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
       .from(agentWakeupRequests)
       .where(
         and(
-          eq(agentWakeupRequests.companyId, companyId),
+          ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, companyId),
           eq(agentWakeupRequests.agentId, agentId),
           eq(agentWakeupRequests.status, "deferred_issue_execution"),
           sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,

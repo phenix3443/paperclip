@@ -1,3 +1,4 @@
+import { writeApprovalChange } from "./approval-work-notifications.js";
 import { and, desc, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { approvals, issueApprovals, issues } from "@paperclipai/db";
@@ -11,7 +12,7 @@ interface LinkActor {
 }
 
 export async function insertIssueApprovalLinks(
-  tx: Parameters<Parameters<Db["transaction"]>[0]>[0],
+  tx: Db | Parameters<Parameters<Db["transaction"]>[0]>[0],
   input: { companyId: string; approvalId: string; issueIds: string[]; linkedByAgentId?: string | null; linkedByUserId?: string | null },
 ) {
   await lockIssuesForGateWrite(tx, input.companyId, input.issueIds);
@@ -125,7 +126,7 @@ export function issueApprovalService(db: Db) {
     link: async (issueId: string, approvalId: string, actor?: LinkActor) => {
       const { issue } = await assertIssueAndApprovalSameCompany(issueId, approvalId);
 
-      await db.transaction((tx) => insertIssueApprovalLinks(tx, {
+      await writeApprovalChange(db, issue.companyId, tx => insertIssueApprovalLinks(tx, {
         companyId: issue.companyId, approvalId, issueIds: [issueId],
         linkedByAgentId: actor?.agentId, linkedByUserId: actor?.userId,
       }));
@@ -138,10 +139,10 @@ export function issueApprovalService(db: Db) {
     },
 
     unlink: async (issueId: string, approvalId: string) => {
-      await assertIssueAndApprovalSameCompany(issueId, approvalId);
-      await db
+      const { issue } = await assertIssueAndApprovalSameCompany(issueId, approvalId);
+      await writeApprovalChange(db, issue.companyId, tx => tx
         .delete(issueApprovals)
-        .where(and(eq(issueApprovals.issueId, issueId), eq(issueApprovals.approvalId, approvalId)));
+        .where(and(eq(issueApprovals.issueId, issueId), eq(issueApprovals.approvalId, approvalId))));
     },
 
     linkManyForApproval: async (approvalId: string, issueIds: string[], actor?: LinkActor) => {
@@ -169,7 +170,7 @@ export function issueApprovalService(db: Db) {
         }
       }
 
-      await db.transaction((tx) => insertIssueApprovalLinks(tx, {
+      await writeApprovalChange(db, approval.companyId, tx => insertIssueApprovalLinks(tx, {
         companyId: approval.companyId, approvalId, issueIds: uniqueIssueIds,
         linkedByAgentId: actor?.agentId, linkedByUserId: actor?.userId,
       }));

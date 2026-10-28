@@ -1,3 +1,4 @@
+import { notifyToolConnectionHealth } from "./tool-connection-health-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import type { Db } from "@paperclipai/db";
 import { companies, instanceSettings } from "@paperclipai/db";
@@ -247,6 +248,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
       enableCases: parsed.data.enableCases ?? false,
       enableAgentChat: parsed.data.enableAgentChat ?? false,
       enableCombinedInboxTasks: parsed.data.enableCombinedInboxTasks ?? false,
+      enableArtifactsV1: parsed.data.enableArtifactsV1 ?? false,
       enableConferenceRoomChat: parsed.data.enableConferenceRoomChat ?? false,
       enableClassicTaskInterface: parsed.data.enableClassicTaskInterface ?? false,
       enableIssuePlanDecompositions: parsed.data.enableIssuePlanDecompositions ?? false,
@@ -299,6 +301,7 @@ export function normalizeExperimentalSettings(raw: unknown): InstanceExperimenta
     enableCases: false,
     enableAgentChat: false,
     enableCombinedInboxTasks: false,
+    enableArtifactsV1: false,
     enableConferenceRoomChat: false,
     enableClassicTaskInterface: false,
     enableIssuePlanDecompositions: false,
@@ -612,6 +615,8 @@ export function instanceSettingsService(db: Db, options: InstanceSettingsService
       const [updated] = await db.transaction(async tx => {
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.mcpEvents, "*");
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.dotEvents, "*");
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.grokDispatch);
+        await notifyToolConnectionHealth(tx, "*");
         return tx
           .update(instanceSettings)
           .set({

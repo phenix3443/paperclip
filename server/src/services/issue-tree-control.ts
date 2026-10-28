@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -71,6 +72,7 @@ type RestoreTreeStatusResult = TreeStatusUpdateResult & {
 };
 
 const TERMINAL_ISSUE_STATUSES = new Set<IssueStatus>(["done", "cancelled"]);
+export const ISSUE_TREE_RESUME_EXECUTABLE_STATUSES = ["todo", "in_progress", "in_review"];
 const ACTIVE_RUN_STATUSES = ["queued", "running"] as const;
 const DEFAULT_RELEASE_POLICY: IssueTreeHoldReleasePolicy = { strategy: "manual" };
 const MAX_PAUSE_HOLD_ANCESTOR_DEPTH = 100;
@@ -163,7 +165,7 @@ async function hasVerifiedInteractionWakeRequest(
       requestedByActorId: agentWakeupRequests.requestedByActorId,
     })
     .from(agentWakeupRequests)
-    .where(and(...predicates));
+    .where(and(ordinaryWakeRequestPredicate(), ...predicates));
 
   return requests.some((request) => actorMatchesComment(request, input.comment));
 }
@@ -325,13 +327,21 @@ function issueSkipReason(input: {
   return null;
 }
 
-function buildAffectedAgents(issuesToPreview: IssueTreePreviewIssue[]): IssueTreePreviewAgent[] {
+function canWakeOnResume(issue: IssueTreePreviewIssue): boolean {
+  return !!issue.assigneeAgentId && ISSUE_TREE_RESUME_EXECUTABLE_STATUSES.includes(issue.status);
+}
+
+function buildAffectedAgents(
+  issuesToPreview: IssueTreePreviewIssue[],
+  mode: IssueTreeControlMode,
+): IssueTreePreviewAgent[] {
   const byAgentId = new Map<string, IssueTreePreviewAgent>();
   for (const issue of issuesToPreview) {
     if (issue.skipped) continue;
+    if (mode === "resume" && !canWakeOnResume(issue)) continue;
     const agentIds = new Set<string>();
     if (issue.assigneeAgentId) agentIds.add(issue.assigneeAgentId);
-    if (issue.activeRun) agentIds.add(issue.activeRun.agentId);
+    if (mode !== "resume" && issue.activeRun) agentIds.add(issue.activeRun.agentId);
     for (const agentId of agentIds) {
       const current = byAgentId.get(agentId) ?? { agentId, issueCount: 0, activeRunCount: 0 };
       current.issueCount += 1;
@@ -386,6 +396,17 @@ function buildWarnings(input: {
       code: "no_active_pause_holds",
       message: "No active pause holds were found in this subtree.",
     });
+  }
+
+  if (input.mode === "resume") {
+    const idleIssueIds = affectedIssues.filter((issue) => !canWakeOnResume(issue)).map((issue) => issue.id);
+    if (idleIssueIds.length > 0) {
+      warnings.push({
+        code: "resume_tasks_remain_idle",
+        message: "Blocked, backlog, and unassigned tasks will be unpaused but will not start.",
+        issueIds: idleIssueIds.sort(),
+      });
+    }
   }
 
   if (input.mode === "restore") {
@@ -687,7 +708,7 @@ export function issueTreeControlService(db: Db) {
     const activeRuns = activeRunRows
       .map(toPreviewRun)
       .sort((a, b) => a.issueId.localeCompare(b.issueId) || a.id.localeCompare(b.id));
-    const affectedAgents = buildAffectedAgents(issuesToPreview);
+    const affectedAgents = buildAffectedAgents(issuesToPreview, input.mode);
 
     return {
       companyId,
@@ -1200,7 +1221,7 @@ export function issueTreeControlService(db: Db) {
       })
       .where(
         and(
-          eq(agentWakeupRequests.companyId, companyId),
+          ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, companyId),
           inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
           isNull(agentWakeupRequests.runId),
           inArray(sql<string | null>`${agentWakeupRequests.payload} ->> 'issueId'`, issueIds),

@@ -263,6 +263,11 @@ function hasRunExecutionReleaseMarker(run: typeof heartbeatRuns.$inferSelect, is
   return handoff?.schema === "paperclip.case-handoff-release.v1" && handoff.runId === run.id && handoff.issueId === issueId;
 }
 
+export async function hasRecordedRunExecutionRelease(db: Db, run: typeof heartbeatRuns.$inferSelect, issueId: string) {
+  return TERMINAL_RUN_STATUSES.includes(run.status) && !isNativeRunnerOwnershipHeld(run) &&
+    hasRunExecutionReleaseMarker(run, issueId) && !await hasPendingRunCleanup(db, run.companyId, run.id);
+}
+
 export async function isRunExecutionReleased(db: Db, input: { runId: string; issueId: string }): Promise<boolean> {
   const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.runId)).then(rows => rows[0]);
   if (!run || !TERMINAL_RUN_STATUSES.includes(run.status) || isNativeRunnerOwnershipHeld(run)) return false;

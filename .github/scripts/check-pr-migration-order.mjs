@@ -14,7 +14,7 @@ function formatMigrationNumber(number) {
   return String(number).padStart(4, '0');
 }
 
-export function checkMigrationOrder(baseMigrationFiles, prMigrationFiles) {
+export function checkMigrationOrder(baseMigrationFiles, prMigrationFiles, exemptFiles = []) {
   const invalidFiles = [...baseMigrationFiles, ...prMigrationFiles]
     .filter((file) => !parseMigration(file));
 
@@ -32,8 +32,8 @@ export function checkMigrationOrder(baseMigrationFiles, prMigrationFiles) {
     return { passed: true, message: 'No new migrations in this PR.' };
   }
 
-  const baseMigrations = baseMigrationFiles.map(parseMigration);
-  const prMigrations = prMigrationFiles.map(parseMigration);
+  const baseMigrations = [...baseMigrationFiles, ...exemptFiles].map(parseMigration);
+  const prMigrations = prMigrationFiles.filter((file) => !exemptFiles.includes(file)).map(parseMigration);
   const latestBaseMigration = baseMigrations.reduce(
     (latest, migration) => migration.number > latest.number ? migration : latest,
     { file: '(none)', number: -1 },
@@ -78,22 +78,63 @@ function escapeWorkflowCommand(message) {
     .replaceAll('\n', '%0A');
 }
 
+function git(args) {
+  return execFileSync('git', ['--no-replace-objects', ...args], { encoding: 'utf8' }).trim();
+}
+
+function trustedMergeFiles(baseSha, headSha, trustedSha, files) {
+  if (git(['rev-parse', '--is-shallow-repository']) !== 'false') {
+    throw new Error('Incomplete history: fetch full base, head, and trusted master history.');
+  }
+  for (const sha of [baseSha, headSha, trustedSha]) {
+    git(['cat-file', '-e', `${sha}^{commit}`]);
+  }
+  const merges = git(['rev-list', '--min-parents=2', '--parents', `${baseSha}..${headSha}`]);
+  const parents = new Set(merges.split('\n').filter(Boolean).flatMap((line) => line.split(' ').slice(2)));
+  const trustedParents = [];
+  for (const parent of parents) {
+    try {
+      git(['merge-base', '--is-ancestor', parent, trustedSha]);
+      trustedParents.push(parent);
+    } catch (error) {
+      if (error.status !== 1) throw error;
+    }
+  }
+  const blob = (sha, file) => {
+    const entry = git(['ls-tree', sha, '--', file]);
+    const match = entry.match(/^100(?:644|755) blob ([0-9a-f]{40})\t/);
+    if (!match) return null;
+    git(['cat-file', '-e', match[1]]);
+    return match[1];
+  };
+  return files.filter((file) => {
+    const headBlob = blob(headSha, file);
+    return headBlob && trustedParents.some((parent) => blob(parent, file) === headBlob);
+  });
+}
+
 function main() {
-  const [baseSha, headSha] = process.argv.slice(2);
+  const [baseSha, headSha, trustedSha] = process.argv.slice(2);
   const shaPattern = /^[0-9a-f]{40}$/i;
-  if (!shaPattern.test(baseSha ?? '') || !shaPattern.test(headSha ?? '')) {
-    console.error('Usage: check-pr-migration-order.mjs <40-character base SHA> <40-character head SHA>');
+  if (![baseSha, headSha, trustedSha].every((sha) => shaPattern.test(sha ?? ''))) {
+    console.error('Usage: check-pr-migration-order.mjs <40-character base SHA> <40-character head SHA> <trusted master SHA fetched by CI>');
     process.exit(2);
   }
 
-  const baseMigrationFiles = gitPaths([
-    'ls-tree', '-r', '--name-only', '-z', baseSha, '--', MIGRATIONS_DIRECTORY,
-  ]).filter((file) => file.endsWith('.sql'));
-  const prMigrationFiles = gitPaths([
-    'diff', '--name-only', '--diff-filter=A', '-z', `${baseSha}...${headSha}`, '--',
-    MIGRATIONS_DIRECTORY,
-  ]).filter((file) => file.endsWith('.sql'));
-  const result = checkMigrationOrder(baseMigrationFiles, prMigrationFiles);
+  let result;
+  try {
+    const baseMigrationFiles = gitPaths([
+      'ls-tree', '-r', '--name-only', '-z', baseSha, '--', MIGRATIONS_DIRECTORY,
+    ]).filter((file) => file.endsWith('.sql'));
+    const prMigrationFiles = gitPaths([
+      'diff', '--name-only', '--diff-filter=A', '-z', `${baseSha}...${headSha}`, '--',
+      MIGRATIONS_DIRECTORY,
+    ]).filter((file) => file.endsWith('.sql'));
+    const exemptFiles = trustedMergeFiles(baseSha, headSha, trustedSha, prMigrationFiles);
+    result = checkMigrationOrder(baseMigrationFiles, prMigrationFiles, exemptFiles);
+  } catch (error) {
+    result = { passed: false, message: `Cannot prove migration origin. Fetch complete trusted master, base, and head objects. ${error.message}` };
+  }
 
   if (result.passed) {
     console.log(result.message);

@@ -2154,6 +2154,62 @@ describe("review round circuit breaker", () => {
     expect(result.patch.assigneeAgentId).toBeUndefined();
   });
 
+  it("keeps an escalated review blocked through another actor's unrelated edit", () => {
+    const escalated = (status: string) =>
+      reviewPendingIssue(
+        { status, assigneeAgentId: null, assigneeUserId: boardUserId },
+        {
+          currentParticipant: { type: "user", userId: boardUserId },
+          changesRequestedCount: 3,
+        },
+      );
+
+    const blocked = applyIssueExecutionPolicyTransition({
+      issue: escalated("in_review"),
+      policy,
+      requestedStatus: "blocked",
+      requestedAssigneePatch: {},
+      actor: { userId: boardUserId },
+      allowBoardOverride: true,
+    });
+    expect(blocked.patch).toEqual({});
+
+    for (const [actor, allowBoardOverride] of [
+      [{ userId: ctoUserId }, true],
+      [{ agentId: coderAgentId }, false],
+    ] as const) {
+      const edit = applyIssueExecutionPolicyTransition({
+        issue: escalated("blocked"),
+        policy,
+        requestedAssigneePatch: {},
+        actor,
+        allowBoardOverride,
+      });
+      expect(edit.patch).toEqual({});
+
+      expect(() =>
+        applyIssueExecutionPolicyTransition({
+          issue: escalated("blocked"),
+          policy,
+          requestedStatus: "in_progress",
+          requestedAssigneePatch: {},
+          actor,
+          allowBoardOverride,
+        }),
+      ).toThrow("Only the escalated reviewer can advance the current execution stage");
+    }
+
+    expect(() =>
+      applyIssueExecutionPolicyTransition({
+        issue: { ...escalated("blocked"), assigneeAgentId: coderAgentId, assigneeUserId: null },
+        policy,
+        requestedAssigneePatch: { assigneeAgentId: coderAgentId, assigneeUserId: null },
+        actor: { userId: ctoUserId },
+        allowBoardOverride: true,
+      }),
+    ).toThrow("Only the escalated reviewer can advance the current execution stage");
+  });
+
   it("rejects a non-escalated actor advancing the stage during the hold", () => {
     expect(() =>
       applyIssueExecutionPolicyTransition({
@@ -2320,5 +2376,330 @@ describe("review round circuit breaker", () => {
       currentParticipant: { type: "user", userId: boardUserId },
       changesRequestedCount: 1,
     });
+  });
+});
+
+describe("board holds on a pending review cycle", () => {
+  const policy = reviewOnlyPolicy();
+  const reviewStageId = policy.stages[0].id;
+
+  const userPolicy = makePolicy([{ type: "review", participants: [{ type: "user", userId: boardUserId }] }]);
+
+  function pendingState(changesRequestedCount: number, participant: unknown, stageId: string) {
+    return {
+      status: "pending",
+      currentStageId: stageId,
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: participant,
+      returnAssignee: { type: "agent", agentId: coderAgentId },
+      completedStageIds: [],
+      lastDecisionId: "55555555-5555-4555-8555-555555555555",
+      lastDecisionOutcome: "changes_requested",
+      changesRequestedCount,
+    } as IssueExecutionState;
+  }
+
+  function issueWith(status: string, changesRequestedCount: number, participant?: { type: string; agentId?: string; userId?: string }) {
+    const p = participant ?? { type: "agent", agentId: qaAgentId };
+    return {
+      status,
+      assigneeAgentId: p.type === "agent" ? p.agentId ?? null : null,
+      assigneeUserId: p.type === "user" ? p.userId ?? null : null,
+      responsibleUserId: boardUserId,
+      executionPolicy: p.type === "user" ? userPolicy : policy,
+      executionState: pendingState(changesRequestedCount, p, p.type === "user" ? userPolicy.stages[0].id : reviewStageId),
+    };
+  }
+
+  describe.each([1, 2])("with changesRequestedCount %i", (count) => {
+    it("keeps the pending state when the board moves the review to blocked", () => {
+      const result = applyIssueExecutionPolicyTransition({
+        issue: issueWith("in_review", count),
+        policy,
+        requestedStatus: "blocked",
+        requestedAssigneePatch: {},
+        actor: { userId: boardUserId },
+        allowBoardOverride: true,
+      });
+
+      expect(result.patch).toEqual({});
+      expect(result.decision).toBeUndefined();
+    });
+
+    it.each(["todo", "in_progress", "backlog"])("rejects a board %s that would dissolve the review gate", (status) => {
+      for (const current of ["in_review", "blocked"]) {
+        expect(() =>
+          applyIssueExecutionPolicyTransition({
+            issue: issueWith(current, count),
+            policy,
+            requestedStatus: status,
+            requestedAssigneePatch: {},
+            actor: { userId: boardUserId },
+            allowBoardOverride: true,
+          }),
+        ).toThrow("pending review");
+      }
+    });
+
+    it("leaves a blocked hold untouched on edits that change neither status nor assignee", () => {
+      for (const actor of [{ userId: boardUserId }, { agentId: coderAgentId }]) {
+        const result = applyIssueExecutionPolicyTransition({
+          issue: issueWith("blocked", count),
+          policy,
+          requestedAssigneePatch: {},
+          actor,
+          allowBoardOverride: "userId" in actor,
+        });
+        expect(result.patch).toEqual({});
+      }
+    });
+
+    it("restores the held review to the same participant with its cycle intact", () => {
+      const result = applyIssueExecutionPolicyTransition({
+        issue: issueWith("blocked", count),
+        policy,
+        requestedStatus: "in_review",
+        requestedAssigneePatch: {},
+        actor: { userId: boardUserId },
+        allowBoardOverride: true,
+      });
+
+      expect(result.patch).toMatchObject({
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        assigneeUserId: null,
+        executionState: {
+          status: "pending",
+          currentStageId: reviewStageId,
+          currentParticipant: { type: "agent", agentId: qaAgentId },
+          returnAssignee: { type: "agent", agentId: coderAgentId },
+          lastDecisionId: "55555555-5555-4555-8555-555555555555",
+          lastDecisionOutcome: "changes_requested",
+          changesRequestedCount: count,
+        },
+      });
+    });
+
+    it("still lets the board cancel the held review explicitly", () => {
+      const result = applyIssueExecutionPolicyTransition({
+        issue: issueWith("blocked", count),
+        policy,
+        requestedStatus: "cancelled",
+        requestedAssigneePatch: {},
+        actor: { userId: boardUserId },
+        allowBoardOverride: true,
+      });
+
+      expect(result.patch).toEqual({ executionState: null });
+    });
+
+    it("applies the same rules when the board user is the current participant", () => {
+      const participant = { type: "user", userId: boardUserId };
+      const blocked = applyIssueExecutionPolicyTransition({
+        issue: issueWith("in_review", count, participant),
+        policy: userPolicy,
+        requestedStatus: "blocked",
+        requestedAssigneePatch: {},
+        actor: { userId: boardUserId },
+        allowBoardOverride: true,
+      });
+      expect(blocked.patch).toEqual({});
+
+      expect(() =>
+        applyIssueExecutionPolicyTransition({
+          issue: issueWith("in_review", count, participant),
+          policy: userPolicy,
+          requestedStatus: "todo",
+          requestedAssigneePatch: {},
+          actor: { userId: boardUserId },
+          allowBoardOverride: true,
+        }),
+      ).toThrow("pending review");
+    });
+  });
+});
+
+describe("explicit executor reassignment during changes requested", () => {
+  const policy = reviewOnlyPolicy();
+  const reviewStageId = policy.stages[0].id;
+  const originalExecutorId = "44444444-4444-4444-8444-444444444444";
+  const replacementExecutorId = "55555555-5555-4555-8555-555555555555";
+  const changesRequestedState = {
+    status: "changes_requested",
+    currentStageId: reviewStageId,
+    currentStageIndex: 0,
+    currentStageType: "review",
+    currentParticipant: { type: "agent", agentId: qaAgentId, userId: null },
+    returnAssignee: { type: "agent", agentId: originalExecutorId, userId: null },
+    reviewRequest: null,
+    completedStageIds: ["99999999-9999-4999-8999-999999999999"],
+    lastDecisionId: "88888888-8888-4888-8888-888888888888",
+    lastDecisionOutcome: "changes_requested",
+    monitor: null,
+    changesRequestedCount: 2,
+  } satisfies IssueExecutionState;
+
+  function reworkIssue(overrides: Record<string, unknown> = {}) {
+    return {
+      status: "blocked",
+      assigneeAgentId: coderAgentId,
+      assigneeUserId: null,
+      responsibleUserId: boardUserId,
+      executionPolicy: policy,
+      executionState: changesRequestedState,
+      ...overrides,
+    };
+  }
+
+  it("rebinds the return executor to the explicitly assigned executor and preserves review history", () => {
+    const result = applyIssueExecutionPolicyTransition({
+      issue: reworkIssue(),
+      policy,
+      requestedAssigneePatch: { assigneeAgentId: replacementExecutorId },
+      actor: { userId: boardUserId },
+    });
+
+    expect(result.decision).toBeUndefined();
+    expect(result.workflowControlledAssignment).toBeUndefined();
+    expect(result.patch).toEqual({
+      executionState: {
+        ...changesRequestedState,
+        returnAssignee: { type: "agent", agentId: replacementExecutorId, userId: null },
+      },
+    });
+  });
+
+  it("resubmits the reassigned rework to the same stage and escalates the next agent round to the responsible human", () => {
+    const reassignment = applyIssueExecutionPolicyTransition({
+      issue: reworkIssue(),
+      policy,
+      requestedAssigneePatch: { assigneeAgentId: replacementExecutorId },
+      actor: { userId: boardUserId },
+    });
+    const resubmission = applyIssueExecutionPolicyTransition({
+      issue: reworkIssue({
+        status: "in_progress",
+        assigneeAgentId: replacementExecutorId,
+        executionState: reassignment.patch.executionState,
+      }),
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: replacementExecutorId },
+      commentBody: "Rework ready",
+    });
+
+    expect(resubmission.patch).toMatchObject({ status: "in_review", assigneeAgentId: qaAgentId });
+    expect(resubmission.patch.executionState).toMatchObject({
+      status: "pending",
+      currentStageId: reviewStageId,
+      currentParticipant: { type: "agent", agentId: qaAgentId },
+      returnAssignee: { type: "agent", agentId: replacementExecutorId },
+      completedStageIds: changesRequestedState.completedStageIds,
+      lastDecisionId: changesRequestedState.lastDecisionId,
+      changesRequestedCount: 2,
+    });
+
+    const thirdRound = applyIssueExecutionPolicyTransition({
+      issue: reworkIssue({
+        status: "in_review",
+        assigneeAgentId: qaAgentId,
+        executionState: resubmission.patch.executionState,
+      }),
+      policy,
+      requestedStatus: "in_progress",
+      requestedAssigneePatch: {},
+      actor: { agentId: qaAgentId },
+      commentBody: "Third agent round",
+    });
+
+    expect(thirdRound.decision).toMatchObject({ stageId: reviewStageId, outcome: "changes_requested" });
+    expect(thirdRound.patch).toMatchObject({ status: "in_review", assigneeAgentId: null, assigneeUserId: boardUserId });
+    expect(thirdRound.patch.executionState).toMatchObject({
+      status: "pending",
+      currentStageId: reviewStageId,
+      currentParticipant: { type: "user", userId: boardUserId },
+      returnAssignee: { type: "agent", agentId: replacementExecutorId },
+      changesRequestedCount: 3,
+    });
+  });
+
+  it.each([
+    { name: "an unrelated update", requestedAssigneePatch: {} },
+    { name: "an unassignment", requestedAssigneePatch: { assigneeAgentId: null, assigneeUserId: null } },
+    { name: "a no-op reassignment to the current assignee", requestedAssigneePatch: { assigneeAgentId: coderAgentId } },
+    { name: "a reassignment to the recorded return executor", requestedAssigneePatch: { assigneeAgentId: originalExecutorId } },
+    { name: "a reassignment to a stage participant", requestedAssigneePatch: { assigneeAgentId: qaAgentId } },
+  ])("keeps the return executor for $name", ({ requestedAssigneePatch }) => {
+    const result = applyIssueExecutionPolicyTransition({
+      issue: reworkIssue(),
+      policy,
+      requestedAssigneePatch,
+      actor: { userId: boardUserId },
+    });
+
+    expect(result.patch).toEqual({});
+  });
+
+  it("treats an assignee on a resubmission as the reviewer preference without rebinding the return executor", () => {
+    const result = applyIssueExecutionPolicyTransition({
+      issue: reworkIssue({ status: "in_progress", assigneeAgentId: originalExecutorId }),
+      policy,
+      requestedStatus: "in_review",
+      requestedAssigneePatch: { assigneeAgentId: qaAgentId },
+      actor: { agentId: originalExecutorId },
+    });
+
+    expect(result.patch.executionState).toMatchObject({
+      status: "pending",
+      currentParticipant: { type: "agent", agentId: qaAgentId },
+      returnAssignee: { type: "agent", agentId: originalExecutorId },
+      changesRequestedCount: 2,
+    });
+  });
+
+  it("rebinds the return executor to an explicitly assigned human executor", () => {
+    const result = applyIssueExecutionPolicyTransition({
+      issue: reworkIssue(),
+      policy,
+      requestedAssigneePatch: { assigneeAgentId: null, assigneeUserId: boardUserId },
+      actor: { userId: boardUserId },
+    });
+
+    expect(result.patch).toEqual({
+      executionState: {
+        ...changesRequestedState,
+        returnAssignee: { type: "user", userId: boardUserId, agentId: null },
+      },
+    });
+  });
+
+  it("keeps the return executor for a reassignment to a later stage participant", () => {
+    const multiStagePolicy = twoStagePolicy();
+    const result = applyIssueExecutionPolicyTransition({
+      issue: reworkIssue({
+        executionPolicy: multiStagePolicy,
+        executionState: { ...changesRequestedState, currentStageId: multiStagePolicy.stages[0].id },
+      }),
+      policy: multiStagePolicy,
+      requestedAssigneePatch: { assigneeAgentId: null, assigneeUserId: ctoUserId },
+      actor: { userId: boardUserId },
+    });
+
+    expect(result.patch).toEqual({});
+  });
+
+  it("does not rebind the return executor while a review stage is pending", () => {
+    const pendingState = { ...changesRequestedState, status: "pending" as const, lastDecisionOutcome: null };
+    const result = applyIssueExecutionPolicyTransition({
+      issue: reworkIssue({ status: "in_review", assigneeAgentId: qaAgentId, executionState: pendingState }),
+      policy,
+      requestedAssigneePatch: { assigneeAgentId: replacementExecutorId },
+      actor: { userId: boardUserId },
+      allowBoardOverride: true,
+    });
+
+    expect(result.patch.executionState ?? null).toBeNull();
   });
 });

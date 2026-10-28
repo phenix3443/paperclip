@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestSql } from "../modules/wake-queue/receipt-namespace.js";
 import { verifiedResourceCleanup } from "./cleanup-verification-proof.js";
 
 /** Fixed SQL aliases only. These predicates do not accept request input. */
@@ -32,7 +33,7 @@ export function completedAgentUnblockRequest(issue: string): string {
       WHERE unblock_owner.company_id = ${issue}.company_id
         AND unblock_owner.id::text = ${issue}.unblock_descriptor->'owner'->>'agentId')
     AND EXISTS (SELECT 1 FROM agent_wakeup_requests unblock_wake
-      WHERE unblock_wake.company_id = ${issue}.company_id
+      WHERE ${ordinaryWakeRequestSql('unblock_wake')} AND unblock_wake.company_id = ${issue}.company_id
         AND unblock_wake.agent_id::text = ${issue}.unblock_descriptor->'owner'->>'agentId'
         AND unblock_wake.idempotency_key = 'issue-unblock:' || ${issue}.id::text || ':'
           || to_char(${issue}.blocked_transition_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')

@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../wake-queue/receipt-namespace.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../services/delivery-work-notifications.js";
 import { withExternalAdmissionGuard, withExternalExecutionAdmission } from "./admission.js";
 import { createNativeExternalBroker } from "./native-broker.js";
@@ -380,7 +381,7 @@ function createBroker(db: Db) {
       const admissionMessage = b.providerKind === "grok_bot"
         ? "Normal admission determines when this task can run. Keep checking the original request with the same request ID and arguments, then read and accept its inbox assignment. Queued admission does not start another Grok routine."
         : "Normal admission determines when this task can run. Read the mailbox after its event.";
-      const receipt = async () => (await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, b.companyId), eq(agentWakeupRequests.agentId, b.agentId), eq(agentWakeupRequests.idempotencyKey, key))).limit(1))[0];
+      const receipt = async () => (await db.select().from(agentWakeupRequests).where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, b.companyId), eq(agentWakeupRequests.agentId, b.agentId), eq(agentWakeupRequests.idempotencyKey, key))).limit(1))[0];
       const replay = async (row: typeof agentWakeupRequests.$inferSelect) => {
         if (row.payload?.issueId !== issueId) throw fail("requestId was reused for another task.");
         const [run] = row.runId ? await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(and(

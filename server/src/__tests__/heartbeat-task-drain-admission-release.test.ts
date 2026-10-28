@@ -1,4 +1,9 @@
 import { randomUUID } from "node:crypto";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { registerTaskDrainExpiryWork } from "../services/task-admission.js";
+import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
@@ -15,6 +20,8 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issues,
+  issueComments,
+  issueThreadInteractions,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -22,6 +29,10 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService, getTaskDrainStatus, startTaskDrain, stopTaskDrain } from "../services/heartbeat.ts";
 import { subscribeCompanyLiveEvents } from "../services/live-events.ts";
+import express from "express";
+import request from "supertest";
+import { instanceSettingsRoutes } from "../routes/instance-settings.js";
+import { errorHandler } from "../middleware/error-handler.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -68,6 +79,7 @@ describeEmbeddedPostgres("heartbeat task-drain admission release", () => {
 
   afterEach(async () => {
     stopTaskDrain();
+    await db.delete(issueThreadInteractions);
     await deleteHeartbeatRunsWithDependents();
     await db.delete(agentWakeupRequests);
     await db.delete(issues);
@@ -157,6 +169,87 @@ describeEmbeddedPostgres("heartbeat task-drain admission release", () => {
     return { companyId, agentId, issueId, runId, wakeupRequestId };
   }
 
+  it("startup drains ordinary messages behind a reserved receipt without adopting it", async () => {
+    const { companyId, agentId, issueId } = await seedAgentAndIssue();
+    const heartbeat = heartbeatService(db);
+    const [source] = await db.insert(heartbeatRuns).values({ companyId, agentId, invocationSource: "assignment",
+      status: "succeeded", runtimeMode: "legacy", finishedAt: new Date(), contextSnapshot: { issueId } }).returning();
+    await db.insert(heartbeatRuns).values({ companyId, agentId, invocationSource: "on_demand",
+      status: "running", contextSnapshot: {} });
+    const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user",
+      authorUserId: "responsible-user", body: "An ordinary message must still progress" }).returning();
+    const payload = { issueId, _paperclipWakeContext: { issueId, wakeReason: "issue_commented", wakeCommentIds: [comment.id] } };
+    const [reserved] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "assignment",
+      reason: "issue_commented", status: "deferred_issue_execution", requestedByActorType: "user",
+      requestedByActorId: "responsible-user", requestedAt: new Date(0), updatedAt: new Date(0),
+      payload: { ...payload, _paperclipReviewerAssignmentContinuation: null } }).returning();
+    const [ordinary] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation",
+      reason: "issue_commented", status: "deferred_issue_execution", requestedByActorType: "user",
+      requestedByActorId: "responsible-user", payload }).returning();
+    await heartbeat.resumeQueuedRuns();
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, reserved.id)))[0]).toEqual(reserved);
+    const [delivered] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, ordinary.id));
+    expect(delivered).toMatchObject({ runId: expect.any(String) });
+    expect(delivered.status).not.toBe("deferred_issue_execution");
+    const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, delivered.runId!));
+    expect(successor.id).not.toBe(source.id);
+    expect(successor.contextSnapshot).toMatchObject({ issueId, wakeCommentIds: [comment.id] });
+    await heartbeat.drainActiveRunExecutions();
+    await heartbeat.resumeQueuedRuns();
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, reserved.id)))[0]).toEqual(reserved);
+    await heartbeat.drainActiveRunExecutions();
+  });
+
+  it.each([null, "invalid", { version: 99 }])("startup drains an answered interaction behind a reserved receipt (%j)", async namespace => {
+    const { companyId, agentId, issueId } = await seedAgentAndIssue();
+    const heartbeat = heartbeatService(db);
+    await db.insert(heartbeatRuns).values({ companyId, agentId, invocationSource: "assignment",
+      status: "succeeded", runtimeMode: "legacy", finishedAt: new Date(), contextSnapshot: { issueId } });
+    await db.insert(heartbeatRuns).values({ companyId, agentId, invocationSource: "on_demand",
+      status: "running", contextSnapshot: {} });
+    const [interaction] = await db.insert(issueThreadInteractions).values({ companyId, issueId,
+      kind: "ask_user_questions", status: "answered", payload: { version: 1, questions: [] },
+      resolvedByUserId: "responsible-user", resolvedAt: new Date() }).returning();
+    const payload = { issueId, mutation: "interaction", interactionId: interaction.id, interactionStatus: "answered",
+      _paperclipWakeContext: { issueId, interactionId: interaction.id, wakeReason: "interaction_answered" } };
+    const [reserved] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation",
+      reason: "interaction_answered", status: "deferred_issue_execution", requestedAt: new Date(0), updatedAt: new Date(0),
+      requestedByActorType: "user", requestedByActorId: "responsible-user",
+      payload: { ...payload, _paperclipReviewerAssignmentContinuation: namespace } }).returning();
+    const [ordinary] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation",
+      reason: "interaction_answered", status: "deferred_issue_execution", payload,
+      requestedByActorType: "user", requestedByActorId: "responsible-user" }).returning();
+    await heartbeat.resumeQueuedRuns();
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, reserved.id)))[0]).toEqual(reserved);
+    const [delivered] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, ordinary.id));
+    expect(delivered.runId).toEqual(expect.any(String));
+    expect(delivered.status).not.toBe("deferred_issue_execution");
+    const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, delivered.runId!));
+    expect(successor.contextSnapshot).toMatchObject({ issueId, interactionId: interaction.id });
+    await heartbeat.drainActiveRunExecutions();
+  });
+
+  it.each([null, "invalid", { version: 99 }])("rejects caller-supplied reviewer namespace before admission (%j)", async namespace => {
+    const { agentId } = await seedAgentAndIssue();
+    const heartbeat = heartbeatService(db);
+    await expect(heartbeat.wakeup(agentId, {
+      source: "on_demand", payload: { _paperclipReviewerAssignmentContinuation: namespace },
+    })).rejects.toMatchObject({ status: 400 });
+    expect(await db.select().from(agentWakeupRequests)).toEqual([]);
+    expect(await db.select().from(heartbeatRuns)).toEqual([]);
+  });
+
+  it.each([null, "invalid", { version: 99 }])("rejects reserved context that retry writers could copy into a receipt (%j)", async namespace => {
+    const { agentId, issueId } = await seedAgentAndIssue();
+    const heartbeat = heartbeatService(db);
+    await expect(heartbeat.wakeup(agentId, {
+      source: "on_demand", requestedByActorType: "user", requestedByActorId: "responsible-user",
+      contextSnapshot: { issueId, _paperclipReviewerAssignmentContinuation: namespace },
+    })).rejects.toMatchObject({ status: 400 });
+    expect(await db.select().from(agentWakeupRequests)).toEqual([]);
+    expect(await db.select().from(heartbeatRuns)).toEqual([]);
+  });
+
   it("releases the run, wakeup, and issue lock when a task drain trips right after the run is claimed", async () => {
     const { companyId, issueId, runId, wakeupRequestId } = await seedQueuedRun();
     const heartbeat = heartbeatService(db);
@@ -232,6 +325,88 @@ describeEmbeddedPostgres("heartbeat task-drain admission release", () => {
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
     expect(finished?.status).toBe("succeeded");
+  }, 20_000);
+
+  it.each(["release", "paused agent", "new drain"] as const)("reconsiders queued work after maintenance with current gates: %s", async gate => {
+    const { companyId, agentId, issueId } = await seedAgentAndIssue();
+    const heartbeat = heartbeatService(db);
+    const counterDir = mkdtempSync(join(tmpdir(), "drain-executor-"));
+    const counter = join(counterDir, "executions");
+    await db.update(agents).set({ adapterConfig: { command: process.execPath,
+      args: ["-e", `require("node:fs").appendFileSync(${JSON.stringify(counter)}, process.env.PAPERCLIP_RUN_ID + "\\n")`] } })
+      .where(eq(agents.id, agentId));
+    startTaskDrain({});
+    await heartbeat.wakeup(agentId, {
+      source: "assignment", triggerDetail: "system", reason: "issue_assigned",
+      payload: { issueId }, contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      requestedByActorType: "system", requestedByActorId: "issue_assignment",
+    });
+    await heartbeat.drainActiveRunExecutions();
+    const [queued] = await db.select({ id: heartbeatRuns.id, wakeupRequestId: heartbeatRuns.wakeupRequestId })
+      .from(heartbeatRuns);
+    expect(queued).toBeDefined();
+    if (gate === "paused agent") await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+    const unsubscribe = subscribeCompanyLiveEvents(companyId, event => {
+      if (gate === "new drain" && event.type === "activity.logged" && event.payload.action === "instance.task_drain.stopped") startTaskDrain({});
+    });
+    try {
+      const app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => {
+        req.actor = { type: "board", userId: "local-board", source: "local_implicit", isInstanceAdmin: true };
+        next();
+      });
+      app.use("/api", instanceSettingsRoutes(db));
+      app.use(errorHandler);
+      const response = await request(app).delete("/api/instance/task-drain");
+      expect(response.status).toBe(200);
+      await heartbeat.drainActiveRunExecutions();
+      const runs = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, startedAt: heartbeatRuns.startedAt })
+        .from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, queued!.wakeupRequestId!));
+      expect(runs).toHaveLength(1);
+      const executions = existsSync(counter) ? readFileSync(counter, "utf8").trim().split("\n") : [];
+      if (gate === "release") {
+        expect(runs[0]).toMatchObject({ id: queued!.id, status: "succeeded" });
+        expect(executions.filter(id => id === queued!.id)).toHaveLength(1);
+        await request(app).delete("/api/instance/task-drain").expect(200);
+        await heartbeat.drainActiveRunExecutions();
+        expect(readFileSync(counter, "utf8").trim().split("\n").filter(id => id === queued!.id)).toHaveLength(1);
+      } else {
+        expect(runs[0]?.startedAt).toBeNull();
+        expect(executions).toEqual([]);
+      }
+    } finally {
+      unsubscribe();
+      await heartbeat.drainActiveRunExecutions();
+      rmSync(counterDir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("dispatches existing queued work at the drain deadline", async () => {
+    const { agentId, issueId } = await seedAgentAndIssue();
+    const heartbeat = heartbeatService(db);
+    startTaskDrain({});
+    await heartbeat.wakeup(agentId, {
+      source: "assignment", triggerDetail: "system", reason: "issue_assigned",
+      payload: { issueId }, contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      requestedByActorType: "system", requestedByActorId: "issue_assignment",
+    });
+    await heartbeat.drainActiveRunExecutions();
+    const [queued] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns);
+    const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true,
+      onError: error => { throw error; } });
+    let worker: ReturnType<typeof registerTaskDrainExpiryWork> | undefined;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        worker = registerTaskDrainExpiryWork(coordinator, () => {
+          void heartbeat.resumeQueuedRunsAfterDrain().then(resolve, reject);
+        });
+        startTaskDrain({ ttlMs: 5 });
+      });
+      await heartbeat.drainActiveRunExecutions();
+      const [run] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, queued!.id));
+      expect(run?.status).toBe("succeeded");
+    } finally { await worker?.stop(); await coordinator.stop(); }
   }, 20_000);
 
   it("keeps a wake that arrives during a task drain queued and runs it once the drain lifts", async () => {

@@ -27,7 +27,11 @@ API: `present` — representative operation IDs:
 Agent access: `available` — Native create_task/reassign_task; REST / CLI / MCP.
 
 Policy: Task visibility/mutation, task-assignment and ownership policy; review audience
-independent; tree controls board-only.
+independent; tree controls board-only. Resume preview counts only current agent
+assignees on todo, in-progress, and in-review tasks as wake targets. Release keeps
+blocked and backlog statuses intact; existing execution gates still apply.
+Reopened tasks use current eligibility rather than the pause snapshot's skipped
+flag. Other active pause holds and execution reconciliation gates remain effective.
 
 Evidence: `source-only` —
 [implementation](../../server/src/routes/issue-tree-control.ts#L95) at the reviewed
@@ -94,6 +98,12 @@ Verification: `not-run` — exercise a listed permitted operation with actual ag
 credentials/run context; inspect its result and applicable persistence/attribution.
 Assert the relevant denied actor, owner, company or mode from Policy. Review the
 remaining operations before qualifying the whole capability.
+
+The reserved reviewer-intent creation seam is server-internal and has no new
+agent endpoint. The [service/PostgreSQL suite](../../server/src/__tests__/heartbeat-reviewer-intent-consumer.test.ts)
+checks original actor, reviewer, responsible-user and project authority, with
+current access rechecked at provider dispatch. This does not qualify the REST
+operations above or prove live native producer integration.
 
 Gaps: Review policy determines final completion; formal board approval is a different
 boundary.
