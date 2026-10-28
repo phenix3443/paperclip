@@ -61,8 +61,12 @@ const support = await getEmbeddedPostgresTestSupport();
   const seed = (produce = true, limit?: null | number, released = true) => seedReviewerIntent(db, produce, limit, released);
 
   it("keeps a paused assignment due with persisted backoff and unchanged review state", async () => {
-    const f = await seed();
+    const f = await seed(false);
     await companyService(db).update(f.companyId, { status: "paused" });
+    const receipt = await db.transaction(tx => createReviewerAssignmentIntent(tx, { companyId: f.companyId, issueId: f.issueId,
+      sourceRunId: f.source.id, requestedByActorType: "agent", requestedByActorId: f.source.agentId }));
+    expect(receipt).not.toBeNull();
+    f.receipt = receipt!;
     vi.useFakeTimers({ toFake: ["Date"] });
     const at = Date.now();
     const service = heartbeatService(db);
@@ -244,9 +248,13 @@ const support = await getEmbeddedPostgresTestSupport();
 
 
   it("rechecks an actual company resume only at its registered receipt deadline", async () => {
-    const f = await seed();
+    const f = await seed(false);
     await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
     await companyService(db).update(f.companyId, { status: "paused" });
+    const receipt = await db.transaction(tx => createReviewerAssignmentIntent(tx, { companyId: f.companyId, issueId: f.issueId,
+      sourceRunId: f.source.id, requestedByActorType: "agent", requestedByActorId: f.source.agentId }));
+    expect(receipt).not.toBeNull();
+    f.receipt = receipt!;
     vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"], shouldAdvanceTime: true });
     const errors: unknown[] = [];
     const c = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => errors.push(error) });
@@ -732,7 +740,7 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(await executionControlSchedule(db).continuation()).toBe(now + interval);
       const duplicate = await db.transaction(tx => createReviewerAssignmentIntent(tx, { companyId: f.companyId, issueId: f.issueId,
         sourceRunId: f.source.id, requestedByActorType: "agent", requestedByActorId: f.source.agentId }));
-      expect(duplicate).toBeNull();
+      expect(duplicate).toEqual(receipt);
       await heartbeatService(db).reconcileReviewerAssignments();
       expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.receipt.id)))[0]).toEqual(receipt);
       vi.setSystemTime(now + interval);

@@ -6,6 +6,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { seedReviewerIntent } from "./helpers/reviewer-intent.js";
 import { createReviewerAssignmentIntent } from "../services/heartbeat/reviewer-assignment-continuation.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { startAgentLifecycle } from "../services/agent-lifecycle.js";
 import { companyService } from "../services/companies.js";
 import { issueTreeControlService } from "../services/issue-tree-control.js";
 import { issueService } from "../services/issues.js";
@@ -35,11 +36,14 @@ const support = await getEmbeddedPostgresTestSupport();
     "retains the registered duty when %s clears inside the uncommitted receipt transaction", async kind => {
     const f = await seedReviewerIntent(db, false);
     await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+    const lifecycle = startAgentLifecycle(db, { requiredPluginIds: async () => [],
+      runHost: async () => "complete", runPlugin: async () => "complete" }, () => true);
     let clear: (owner: Db) => Promise<unknown>;
     const actor = { actorType: "system" as const, actorId: "fixture" };
     if (kind === "company") {
       await companyService(db).update(f.companyId, { status: "paused" });
-      clear = owner => companyService(owner).update(f.companyId, { status: "active" });
+      await lifecycle.sweep();
+      clear = async owner => { await companyService(owner).update(f.companyId, { status: "active" }); await lifecycle.sweep(); };
     } else if (kind === "tree") {
       const { hold } = await issueTreeControlService(db).createHold(f.companyId, f.issueId, { mode: "pause", actor });
       clear = owner => issueTreeControlService(owner).releaseHold(f.companyId, f.issueId, hold.id, { actor });
@@ -111,7 +115,7 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(2);
     } finally {
       release?.();
-      try { await transaction; } finally { await c.stop(); await service.drainActiveRunExecutions(); }
+      try { await transaction; } finally { await c.stop(); await lifecycle.stop(); await service.drainActiveRunExecutions(); }
     }
   });
 });

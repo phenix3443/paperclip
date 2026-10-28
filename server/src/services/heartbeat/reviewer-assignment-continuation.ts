@@ -72,7 +72,8 @@ export async function createReviewerAssignmentIntent(tx: IntentDb, input: {
   companyId: string; issueId: string; sourceRunId: string;
   requestedByActorType: "agent" | "user" | "system"; requestedByActorId: string;
 }) {
-  if (await lockReviewerIntentCompany(tx, input.companyId) !== "active") return null;
+  const company = await lockReviewerIntentCompany(tx, input.companyId);
+  if (!company || company === "archived") return null;
   const [task] = await tx.select().from(issues).where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId))).for("update");
   const state = task && pending(task);
   const [source] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.sourceRunId)));
