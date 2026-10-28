@@ -97,6 +97,13 @@ remaining operations before qualifying the whole capability.
 Gaps: Convenience archive and general company PATCH have different authorization. Review
 equivalence rather than declaring all archival human-only.
 
+Archive lifecycle: Both mutations retire reserved unfinished reviewer intent in
+the archive transaction. Its payload and historical rows remain intact;
+unarchive cannot replay it. Company pause retains this duty. The real service
+and PostgreSQL contract is covered by
+[retirement tests](../../server/src/__tests__/heartbeat-reviewer-intent-retirement.test.ts);
+this is not live agent authorization evidence.
+
 ## `portability`
 
 Capability ID: `companies/portability`.

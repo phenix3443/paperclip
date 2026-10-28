@@ -1,3 +1,4 @@
+import { retireReviewerIntents } from "./reviewer-assignment-continuation.js";
 import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { readTaskRetryIntent, reconcileTaskChatRetryReceipts } from "../task-retry.js";
 import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED, readNativeLocalProcessStop, recordedLocalExecutionStopped } from "../native-local-process-stop.js";
@@ -267,6 +268,7 @@ function readNonEmptyString(value: unknown): string | null {
 }
 
 export type CancelRunOptions = {
+    reviewerIntentDisposition?: "retire" | "preserve";
     /** Return null if a parked retry was promoted or settled before this cancellation. */
     expectedStatus?: "scheduled_retry";
     budgetEnforcement?: BudgetEnforcementScope;
@@ -1091,7 +1093,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     const supersedesCaseHandoff = options.resultJson?.cancelledByActorType === "user" || options.errorCode === "issue_reassigned";
     let cancellationClaimed = false;
     let caseHandoffRetryClaimed = false;
-    if (handoffIssueId && supersedesCaseHandoff && options.resultJson?.caseHandoffYieldStop !== true) {
+    if (handoffIssueId && (supersedesCaseHandoff || options.reviewerIntentDisposition === "retire") && options.resultJson?.caseHandoffYieldStop !== true) {
       const publications: ActivityPublication[] = [];
       const supersessionApplied = await db.transaction(async tx => {
         const [issue] = await tx.select({ id: issues.id, executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId,
@@ -1140,6 +1142,10 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
           inArray(heartbeatRuns.status, cancellableStatuses))).returning();
         if (options.expectedStatus && !fenced) return false;
         if (fenced) run = fenced;
+        if (fenced && options.reviewerIntentDisposition === "retire") {
+          await retireReviewerIntents(tx as unknown as Db, { companyId: currentRun.companyId,
+            issueId: handoffIssueId, reason });
+        }
         // A board terminal request deliberately has no source run. It belongs
         // to the current task execution, not whichever historical run is stopped.
         // Queue admission may bind execution before adopting an old checkout.

@@ -1863,8 +1863,33 @@ queue adapters, rather than interpreting the reserved value in another service.
 Public wake admission rejects this key
 in both payload and context, since retry paths can copy context into a receipt.
 Authorized diagnostics retain visibility, and unfinished receipts still block
-instance sleep. This fence does not enable a reviewer producer or implement its
-owner-specific retirement/delivery lifecycle.
+instance sleep. This fence does not enable a reviewer producer or delivery.
+
+The queue owner in `services/heartbeat/reviewer-assignment-continuation.ts`
+retires unfinished reserved receipts for explicit task Stop, terminal task
+updates, target-agent termination and company archive. Retirement records
+`cancelled`, `finishedAt` and a reason in `error`; the original payload, actor,
+identity and terminal history stay intact. Adopted receipts keep their linked
+run, which follows ordinary run cancellation. Destructive entity deletion
+retains its existing separate retention contract.
+
+Retirement uses the caller's transaction and existing company, issue or agent
+serialization. It never acquires a company lock after an issue/run/coordinator
+lock. Future reviewer creation/adoption must call `lockReviewerIntentCompany`
+first, before issue and run locks, and retain that company `FOR SHARE` lock
+through commit. Its returned status distinguishes a temporary pause from an
+archive. Archive already holds the conflicting company `FOR NO KEY UPDATE`
+lock. Check current issue, source-run cancellation, agent and generation again
+under their existing locks before writing. The company seam alone is not
+reviewer authority.
+
+Run cancellation callers use the internal `reviewerIntentDisposition: "retire"`
+only for an explicit task Stop. Omission or `"preserve"` leaves this duty alone;
+generic cancellation strings and user attribution do not establish permanent
+invalidation. Budget, subtree, agent, project and company pause paths keep
+unfinished intent. Comment/session cancellation keeps its source-specific
+authority and cannot retire reviewer intent. No real producer, consumer,
+deadline or operational replay is enabled by these retirement seams.
 
 Run lifecycle handling is in `server/src/services/heartbeat/run-lifecycle.ts`.
 It owns status transitions, run events and progress, liveness classification,
