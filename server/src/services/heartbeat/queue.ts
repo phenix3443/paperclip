@@ -1,3 +1,4 @@
+import { parseIssueExecutionState } from "../issue-execution-policy.js";
 import { admitReviewerIntent, consumeReviewerIntent, reconcileReviewerAssignments, reviewerAssignmentGeneration } from "./reviewer-assignment-continuation.js";
 import { hasReviewerAssignmentContinuation, ordinaryWakeRequestPredicate, ordinaryWakeRunPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { authorizationService } from "../authorization.js";
@@ -3206,7 +3207,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             return { kind: "skipped" as const };
           }
 
-          const reviewerGeneration = reviewerAssignmentGeneration(issue);
+          const reviewState = parseIssueExecutionState(issue.executionState);
+          const reviewerGeneration = issue.status === "in_review" && reviewState?.status === "pending" &&
+            reviewState.currentStageType === "review" && reviewState.currentParticipant?.type === "agent" &&
+            reviewState.currentParticipant.agentId === agentId ? reviewerAssignmentGeneration(issue) : null;
 
           if (taskRetryActorId) {
             await assertTaskRetryConversationAllowed(tx as unknown as Db, issue, taskRetryActorId);
@@ -4516,7 +4520,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               contextSnapshot: {
                 ...(adoptedComments.length ? withQueuedCommentIdsInRunContext(
                   enrichedContextSnapshot, adoptedCommentIds, adoptedComments.map(wake => wake.id),
-                ) : enrichedContextSnapshot), reviewerAssignmentGeneration: reviewerGeneration,
+                ) : enrichedContextSnapshot), ...(reviewerGeneration ? { reviewerAssignmentGeneration: reviewerGeneration } : {}),
               },
               sessionIdBefore: explicitContinuation || decidedReviewAdmitted ? null : sessionBefore,
               continuationAttempt,
@@ -4587,7 +4591,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           if (reviewerIntent && reviewerAdmitted) {
             if (!("run" in result) || !result.run || result.run.contextSnapshot?.reviewerAssignmentGeneration !== reviewerAssignmentGeneration(
               (await tx.select().from(issues).where(and(eq(issues.companyId, agent.companyId), eq(issues.id, issueId!))))[0]!,
-            )) throw new Error("Reviewer admission held");
+            )) {
+              const [diagnostic] = await tx.select({ reason: agentWakeupRequests.reason }).from(agentWakeupRequests).where(and(
+                eq(agentWakeupRequests.companyId, agent.companyId), eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey!),
+                eq(agentWakeupRequests.status, "skipped"),
+              )).orderBy(desc(agentWakeupRequests.requestedAt)).limit(1);
+              throw new Error(`Reviewer admission held: ${diagnostic?.reason ?? result.kind}`);
+            }
             await consumeReviewerIntent(tx as unknown as Db, reviewerIntent, result.run);
           }
           if (guardedDeliveryAction && result.kind !== "queued") {

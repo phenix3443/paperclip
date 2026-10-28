@@ -1896,7 +1896,13 @@ successor association. It reads recorded executor-release proof; it does not run
 fallback cleanup or create that proof. Full policy/state, assignment and
 responsibility form the canonical generation. Ordinary runs record their admitted
 generation so the consumer can adopt matching queued/running/scheduled-retry work.
+The existing run-dispatch owner compares this generation under issue/run locks
+at queue claim and both provider admission phases, including ordinary review
+turns that the consumer adopts. Other task turns do not receive this stamp.
 Held receipts retain per-receipt 15-to-300-second backoff in existing JSON.
+`nextAttemptAt` is an integer Unix time in milliseconds. SQL selects at most 50
+due candidates before decoding payloads; the deadline query returns one aggregate.
+Each validated receipt associates individually with its successor.
 The existing `executionContinuation` worker includes their earliest due time;
 empty or terminal-only history adds no deadline. No native producer or cleanup
 notification hook is enabled here. Production integration and operational replay

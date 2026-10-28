@@ -1,3 +1,11 @@
+import express from "express";
+import request from "supertest";
+import { issueRoutes } from "../routes/issues.js";
+import { errorHandler } from "../middleware/error-handler.js";
+import { createStorageService } from "../storage/service.js";
+import { createLocalDiskStorageProvider } from "../storage/local-disk-provider.js";
+import { createRunDispatch } from "../modules/run-dispatch/index.js";
+import { reserveRunBudget } from "../services/budget-reservations.js";
 import { environmentService } from "../services/environments.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { ensureProjectAccessMember, projectService } from "../services/projects.js";
@@ -13,7 +21,7 @@ import { recordRunExecutionReleased } from "../services/heartbeat/case-handoff-l
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { agents, authUsers, agentWakeupRequests, companies, companyMemberships, costEvents, createDb, databaseWorkPending, heartbeatRuns, issueExecutionDecisions, issues } from "@paperclipai/db";
+import { agents, authUsers, agentWakeupRequests, companies, companyMemberships, costEvents, createDb, databaseWorkPending, heartbeatRuns, issueExecutionDecisions, issueRecoveryActions, issues } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.js";
 
@@ -85,7 +93,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const read = async () => (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.receipt.id)))[0];
     const after = await read();
     expect(after).toMatchObject({ status: "deferred_issue_execution", runId: null, finishedAt: null });
-    expect(after.payload?._paperclipReviewerAssignmentContinuation).toMatchObject({ attempt: 1, nextAttemptAt: new Date(at + 15_000).toISOString() });
+    expect(after.payload?._paperclipReviewerAssignmentContinuation).toMatchObject({ attempt: 1, nextAttemptAt: at + 15_000 });
     expect(await executionControlSchedule(db).continuation()).toBe(at + 15_000);
     await service.reconcileReviewerAssignments();
     expect(await read()).toEqual(after);
@@ -220,7 +228,7 @@ const support = await getEmbeddedPostgresTestSupport();
   });
 
   it.each(["commit", "rollback"])("retains unresolved outer %s duty after a released savepoint and an empty sweep", async outcome => {
-    const f = await seed(false);
+    const f = await seed(false, undefined, false);
     await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
     vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"], shouldAdvanceTime: true });
     const errors: unknown[] = [];
@@ -239,6 +247,7 @@ const support = await getEmbeddedPostgresTestSupport();
         if (outcome === "rollback") throw new Error("synthetic outer rollback");
       }).then(() => "committed", () => "rolled_back");
       await inserted;
+      await recordRunExecutionReleased(db, f.source.id, f.issueId);
       await vi.advanceTimersByTimeAsync(15_000);
       expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toHaveLength(0);
       expect(databaseWorkPending(db, DELIVERY_QUEUES.executionContinuation)).toBe(true);
@@ -305,24 +314,33 @@ const support = await getEmbeddedPostgresTestSupport();
     } else {
       const [blocker] = await db.insert(issues).values({ companyId: f.companyId, title: "Required work", status: "todo" }).returning();
       await issueService(db).update(f.issueId, { blockedByIssueIds: [blocker.id] });
-      release = () => issueService(db).update(blocker.id, { status: "done" });
+      release = async () => {
+        expect(await issueService(db).update(blocker.id, { status: "done" })).toMatchObject({ status: "done" });
+        expect((await issueService(db).listDependencyReadiness(f.companyId, [f.issueId])).get(f.issueId)?.isDependencyReady).toBe(true);
+      };
     }
     vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"], shouldAdvanceTime: true });
     const errors: unknown[] = [];
     const c = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => errors.push(error) });
     const service = heartbeatService(db);
+    let passes = 0;
     const read = async () => (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.receipt.id)))[0];
     try {
       await registerExecutionControlWork(c, [{ queue: DELIVERY_QUEUES.executionContinuation,
-        run: service.reconcileReviewerAssignments, next: executionControlSchedule(db).continuation }]).ready;
+        run: async () => { await service.reconcileReviewerAssignments(); passes++; }, next: executionControlSchedule(db).continuation }]).ready;
       const held = await read();
       expect(held).toMatchObject({ status: "deferred_issue_execution", runId: null });
       expect(await executionControlSchedule(db).continuation()).toBeGreaterThan(Date.now());
       await release();
       await service.reconcileReviewerAssignments();
       expect(await read()).toEqual(held);
-      await vi.advanceTimersByTimeAsync(15_000);
-      await vi.waitFor(async () => expect(await read()).toMatchObject({ status: "coalesced", error: null }), { timeout: 5000 });
+      for (let pass = 0; pass < 2 && (await read()).runId === null; pass++) {
+        await vi.waitFor(() => expect(c.nextWakeAt()).not.toBeNull(), { timeout: 5000 });
+        const before = passes;
+        await vi.advanceTimersByTimeAsync(Math.max(0, c.nextWakeAt()! - Date.now()) + 1);
+        await vi.waitFor(() => expect(passes).toBeGreaterThan(before), { timeout: 5000 });
+      }
+      expect(await read()).toMatchObject({ status: "coalesced", error: null });
       const [current] = await db.select().from(issues).where(eq(issues.id, f.issueId));
       expect(current.executionState).toEqual(f.issue.executionState);
       expect(current.executionPolicy).toEqual(f.issue.executionPolicy);
@@ -755,6 +773,119 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(source.resultJson).toEqual(recovery);
     const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.receipt.id));
     expect(receipt).toMatchObject({ status: "deferred_issue_execution", runId: null });
+  });
+
+
+  it.each(["consumer successor", "adopted ordinary turn"])("cancels a queued %s when only the submission changes before capacity release", async kind => {
+    const f = await seed();
+    const [busy] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" }).returning();
+    const service = heartbeatService(db);
+    if (kind === "adopted ordinary turn") await service.wakeup(f.agentId, { source: "assignment", reason: "execution_review_requested",
+      payload: { issueId: f.issueId }, requestedByActorType: "agent", requestedByActorId: f.source.agentId });
+    await service.reconcileReviewerAssignments();
+    const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.receipt.id));
+    expect(receipt.runId).toBeTruthy();
+    await db.update(issues).set({ executionState: { ...f.issue.executionState!, reviewRequest: { instructions: "A different submission" } } })
+      .where(eq(issues.id, f.issueId));
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, busy.id));
+    try {
+      await service.resumeQueuedRuns();
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, receipt.runId!));
+      expect(run).toMatchObject({ status: "cancelled", startedAt: null, errorCode: "issue_review_participant_changed" });
+    } finally { await service.drainActiveRunExecutions(); }
+  });
+
+
+  it("returns bounded database batches even when future receipts precede the due receipt", async () => {
+    const f = await seed();
+    await companyService(db).update(f.companyId, { status: "paused" });
+    const record = f.receipt.payload!._paperclipReviewerAssignmentContinuation as Record<string, unknown>;
+    await db.insert(agentWakeupRequests).values(Array.from({ length: 1000 }, () => ({ companyId: f.companyId,
+      agentId: f.agentId, source: "assignment", triggerDetail: "system", reason: "execution_review_requested",
+      status: "deferred_issue_execution", requestedByActorType: f.receipt.requestedByActorType,
+      requestedByActorId: f.receipt.requestedByActorId, createdAt: new Date(Date.now() - 60_000),
+      payload: { ...f.receipt.payload, _paperclipReviewerAssignmentContinuation: { ...record,
+        nextAttemptAt: Date.now() + 300_000 } },
+    })));
+    const returned: number[] = [];
+    const observed = new Proxy(db, { get(target, key) {
+      if (key !== "select") return Reflect.get(target, key);
+      return (...args: unknown[]) => {
+        const builder = Reflect.apply(target.select, target, args);
+        return new Proxy(builder, { get(select, method) {
+          if (method !== "from") return Reflect.get(select, method);
+          return (table: unknown) => {
+            const query = Reflect.apply(select.from, select, [table]);
+            if (table !== agentWakeupRequests) return query;
+            return new Proxy(query, { get(statement, field, receiver) {
+              if (field !== "then") return Reflect.get(statement, field, receiver);
+              return (resolve: (value: unknown) => unknown, reject: (error: unknown) => unknown) =>
+                statement.then((rows: unknown[]) => { returned.push(rows.length); return resolve(rows); }, reject);
+            } });
+          };
+        } });
+      };
+    } });
+    await heartbeatService(observed).reconcileReviewerAssignments();
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.receipt.id)))[0].payload?._paperclipReviewerAssignmentContinuation)
+      .toMatchObject({ attempt: 1 });
+    await executionControlSchedule(observed).continuation();
+    expect(returned.length).toBeGreaterThan(0);
+    expect(Math.max(...returned)).toBeLessThanOrEqual(50);
+  });
+
+
+  it("rechecks reviewer generation at the final provider gate even without interaction continuation", async () => {
+    const f = await seed();
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+    await heartbeatService(db).reconcileReviewerAssignments();
+    const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.receipt.id));
+    await db.update(heartbeatRuns).set({ status: "running", startedAt: new Date() }).where(eq(heartbeatRuns.id, receipt.runId!));
+    await db.update(issues).set({ executionRunId: receipt.runId,
+      executionState: { ...f.issue.executionState!, reviewRequest: { instructions: "Changed during preparation" } } }).where(eq(issues.id, f.issueId));
+    const reservation = await reserveRunBudget(db, f.companyId, receipt.runId!, null);
+    const invoke = vi.fn(async () => null);
+    const result = await createRunDispatch(db).dispatchResolvedInteractionIfCurrent({ companyId: f.companyId, runId: receipt.runId!,
+      expectedStatus: "running", reservationId: reservation.id, enforceContinuationOwnership: false, dispatch: invoke });
+    expect(result).toMatchObject({ dispatched: false, cancellation: { outcome: "cancelled", errorCode: "issue_review_participant_changed" } });
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+
+  it("delivers at the registered deadline after real pre-start reviewer reconciliation clears its hold", async () => {
+    const f = await seed();
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+    const [stopped] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      status: "cancelled", errorCode: "issue_assignee_changed", finishedAt: new Date(), contextSnapshot: { issueId: f.issueId } }).returning();
+    const [action] = await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+      kind: "active_run_watchdog", status: "resolved", outcome: "blocked", ownerType: "board", returnOwnerAgentId: f.agentId,
+      cause: "legacy_execution_requires_reconciliation", fingerprint: stopped.id, nextAction: "Preserve without replay",
+      evidence: { runId: stopped.id, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } } }).returning();
+    const service = heartbeatService(db);
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId: "board" }; next(); });
+    app.use("/api", issueRoutes(db, createStorageService(createLocalDiskStorageProvider(`${process.env.TMPDIR}/recovery-storage`)),
+      { recoveryActionEnqueueWakeup: service.wakeup }));
+    app.use(errorHandler);
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"], shouldAdvanceTime: true });
+    const errors: unknown[] = [];
+    const c = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => errors.push(error) });
+    const read = async () => (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.receipt.id)))[0];
+    try {
+      await registerExecutionControlWork(c, [{ queue: DELIVERY_QUEUES.executionContinuation,
+        run: service.reconcileReviewerAssignments, next: executionControlSchedule(db).continuation }]).ready;
+      expect(await read()).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      const response = await request(app).post(`/api/issues/${f.issueId}/recovery-actions/resolve`).send({ actionId: action.id,
+        outcome: "restored", sourceIssueStatus: "in_review", executionReconciliation: { runId: stopped.id,
+          providerStopped: true, actionOutcome: "not_performed", outcomeEvidence: "Cancelled before any provider or process started." } });
+      expect(response.status).toBe(200);
+      expect(response.body.issue.executionState).toEqual(f.issue.executionState);
+      await vi.advanceTimersByTimeAsync(30_000);
+      await vi.waitFor(async () => expect(await read()).toMatchObject({ status: "coalesced", error: null }), { timeout: 5000 });
+      expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id)))[0].evidence).not.toHaveProperty("automaticRecovery");
+      expect(errors).toEqual([]);
+    } finally { await c.stop(); await service.drainActiveRunExecutions(); }
   });
 
 });
