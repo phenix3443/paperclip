@@ -206,6 +206,92 @@ committed receipts, including commits whose notification was lost with the proce
 This contract uses the same instrumented root client for all supported producers.
 It makes no cross-process notification or independent SQL writer guarantee.
 
+#### Isolation from existing deferred-wake readers and writers
+
+The status alone does not identify this duty. On the fixed base,
+`modules/wake-queue/adapters/postgres.ts:223` selects the oldest deferred wake
+by company/issue, with no agent restriction except for queue interrupts. Its
+application use case can promote that row during any outgoing run's release.
+`execution-reconciliation-admission.ts:35,89-103,163-165` counts deferred wakes
+as active work and rejects reconciliation when any remains. Reusing the status
+without changing these readers would bypass this consumer or deadlock recovery.
+Neither behavior is permitted by this amendment.
+
+Reserve payload key `_paperclipReviewerAssignmentContinuation`, with internal
+`version: 1`, for this duty. Its **presence**, including null, malformed values
+and unknown versions, excludes a row from all generic deferred promotion,
+adoption, merging, replay and active-execution predicates. A valid v1 record is
+eligible only through the owning module. Unknown/malformed records remain
+non-executable and visible for diagnosis; the owner may retire proven invalid
+records with a reason, but must never reinterpret them as ordinary deferred work.
+Use one queue-owned classification contract with equivalent SQL and in-memory
+predicates. For example, the ordinary-row SQL predicate is
+`NOT COALESCE(payload ? '_paperclipReviewerAssignmentContinuation', false)`.
+Apply it in SQL **before ordering/limit**, and in compare-and-set mutation
+predicates as well as selection. A post-limit filter can starve ordinary wakes.
+The contract exposes classification, not digest parsing or eligibility policy,
+to other modules. Public producers reject the reserved key; its presence is an
+exclusion fence, never proof of server authority. The consumer separately proves
+internal provenance and the complete immutable contract.
+
+The following is the required call-site disposition on the fixed base. Paths
+are under `server/src/`; each row describes proposed implementation work, not
+behavior already present. `Ignore` means the shared ordinary-row predicate at
+selection and mutation; `delegate` means call the queue owner under the existing
+transaction/locks, never call its private eligibility logic from another module.
+Rows without the namespace retain their existing behavior and idempotency keys.
+
+| Existing reader/writer | Required disposition for namespaced unfinished intent |
+| --- | --- |
+| `modules/wake-queue/adapters/postgres.ts` (`findNextDeferredWake`, interrupt lookup, promotion/adoption writes); `application/use-cases.ts`, `domain/policy.ts`, `application/ports.ts` | Ignore in generic candidates and conditional writes. Carry classification through the adapter seam so alternate adapters cannot promote it. Releasing author or any other run may drain ordinary work but cannot claim this receipt or its issue execution lock. Notify the continuation owner instead. |
+| `services/execution-reconciliation-admission.ts` (`ACTIVE_WAKE_STATUSES`, `lockAdmissionRows`) | Ignore unfinished namespaced rows in pending-wake admission. Keep queued/claimed ordinary successors and real active runs as blockers. The parked duty is not competing execution. No recovery authority or other reconciliation gate is relaxed. |
+| `services/execution-blocker.ts` | Ignore in saved-message enumeration and continuation evidence. Keep every actual recovery/process/workspace blocker; a receipt cannot clear its own hold. |
+| `services/explicit-native-continuation.ts` | Ignore in task-retry, queued-comment and interrupt lookups, including exact receipt-ID requests. It cannot be used as user continuation authority. |
+| `services/cross-task-continuation.ts` | Ignore in promotable dispatch scans, trusted-receipt reads and reuse writes; retain its separate actor/key proof for its own rows. |
+| `services/dot-assignment-follow-up.ts` | Ignore in follow-up lookup and coalescing/retirement writes. No conversion into a dot follow-up even if malformed payload contains its key. |
+| `services/muse-assignment-follow-up.ts` | Ignore in follow-up receipt handling; preserve its own identity contract. |
+| `services/decided-review-reassignment.ts` | Ignore in parked recovery-wake lookup and adoption. This consumer continues its own decided reassignment duty; it cannot consume an undecided reviewer intent. |
+| `services/chat-completion-delivery.ts` | Ignore in wake-key lookup before run selection and pending-wake suppression. Preserve the disjoint `chat-completion:` key; a reviewer row cannot satisfy or suppress completion delivery. |
+| `services/companies.ts` (`applyArchiveCascadeInTx`) | Retire, rather than exclude from archive. Delegate namespaced rows to owner retirement in the archive transaction, retaining identity/payload and recording `cancelled`, `finishedAt` and archive reason. Generic archive cancellation handles other rows. No unarchive resurrection. |
+| `routes/issues.ts` (wake diagnostics) | Read-only visibility may include it under existing authorization/redaction. Deferred does not mean running or delivered; never expose internal provenance/digest as authority. |
+| `routes/issues.ts` (queued-comment selection, exact-ID mutation, interrupt, comment deletion/cancellation) | Ignore at lookup and guarded write. A no-input reviewer receipt is never a queued user message and cannot be edited, merged or cancelled by a comment action. Task Stop/cancellation delegates explicit invalidation to the owner. |
+| `services/heartbeat/queue.ts` (startup resume, execution-wait reuse, follow-up merge, dispatch receipt promotion, bulk deferred coalescing) | Ignore in all generic paths, including direct-ID options and `runId` association writes. Only the continuation owner's locked adoption may consume this class, using its generation/idempotency contract. Ordinary wakes that deliver the same generation are later adopted by the owner; generic bulk coalescing cannot claim that equivalence. |
+| `services/heartbeat/run-control.ts` (saved comments, interrupts, task retry and execution-wait resume) | Ignore. Cleanup notifies by company/issue across agents; no legacy resume path promotes the receipt. |
+| `services/heartbeat/run-control.ts` (budget/project/company/agent pause cancellation and pending-wake bulk cancellation) | Temporary pause/budget holds ignore this class and retain its retry duty. Explicit Stop, task cancellation or permanent target removal delegates auditable invalidation to the owner. Classify the cancellation reason at the existing caller; a generic cancellation reason cannot silently retire a temporary hold. |
+| `services/heartbeat/run-lifecycle.ts` (pending-wake suppression, `hasDeferredIssueCommentWake`); `services/heartbeat.ts` (outgoing-agent pending lookup) | Ignore as saved input or competing execution. Preserve real successor/run checks; lifecycle wiring only notifies the owner on proven release. |
+| `services/fresh-workspace-continuation.ts`, `services/task-retry.ts`, `services/preserved-result-finalization.ts`, `services/queued-interaction-response.ts` | Ignore in exact-ID receipt validation, adoption and pending-input evidence. Retain their own retry/interaction/workspace authority. |
+| `services/issue-tree-control.ts` | Temporary tree pause preserves the unfinished receipt. Explicit subtree Stop delegates retirement for affected company-scoped issues; retain historical rows. |
+| `services/issue-dependency-wakeups.ts`, `services/question-response-delivery.ts`, `services/task-watchdogs.ts`, `services/native-runtime/native-child-completion-delivery.ts` | Ignore in their pending/idempotency predicates; reviewer intents cannot suppress a gate-releasing wake. Preserve distinct keys and existing delivery rules. |
+| `services/recovery/service.ts`, `services/recovery/disposition-repair.ts`, `services/recovery/successful-run-handoff.ts`, `services/recovery/run-liveness-continuations.ts`, `services/successful-run-handoff-state.ts` | Ignore as recovery input, delivery proof, active-wake suppression or bulk mutation target. Recovery resolution keeps its own authority; afterward the reviewer owner retries actual admission. |
+| `services/workspace-recovery.ts`, `services/workspace-recovery-backfill.ts` | Ignore as saved user input or repair authority and in receipt updates. Workspace repair retains its actual proof requirements. |
+| `services/issues.ts` (blocker attention/inbox pending wakes and wake updates) | Ignore in active-execution or pending-input suppression and generic writes; read-only diagnostics may retain visibility. Terminal issue/Stop invalidation delegates to owner. |
+| `services/task-interruption-presentation.ts`, `services/slack-conversation-state.ts`, `services/slack-conversation-lifecycle.ts` | Ignore as user message, pending turn or conversation liveness proof. Retain actual queued/running successor visibility. |
+| `services/chat-inbound-wakeup-publications.ts`, `services/chat-channels.ts`, `services/chat-channels/inbound/wakeup-notices.ts`, `services/chat-channels/failed-run-retry.ts`, `services/chat-channels/slack/session-stop.ts` | Ignore in inbound publication association, retry receipt adoption, deferred-owner joins and session message cancellation. Their source-specific receipts retain normal behavior; a channel/session Stop cannot confer reviewer recovery authority. Explicit task Stop uses the owner invalidation path. |
+| `services/native-runtime/status-decision-committer.ts` | Ignore in unrelated dispatch/coalescing writes. At the authorized reviewer-handoff seam delegate creation to the owner; a task terminal/Stop transition delegates invalidation. Preserve decisions, review generation and responsibility. |
+
+Receipt creation, archive retirement and consumer adoption must serialize with
+company archive. Extend the receipt transactions to take a shared company-row
+lock and re-read active status before the issue lock; archive's company update
+holds the conflicting row lock before its cascade. Restructure the internal
+handoff caller to acquire that lock before an issue lock, rather than adding it
+inside an already issue-locked callback. This is proposed transaction work to
+prove on the fixed base, not a claim that current admission already does it.
+An archive winning first prevents new receipt/successor creation;
+an adoption winning first leaves its associated run to the existing archive run
+cancellation lifecycle. Both outcomes retain auditable receipt/run links. Never
+hold an issue lock and then acquire a company lock in reverse order. Temporary
+holds are not bulk retirement. Retirement removes the receipt deadline; archive
+settlement notifies the same existing topic to recompute it.
+
+Before enabling the producer in a future implementation, review all accesses to
+`agentWakeupRequests` (including raw SQL, aliases, exact-ID and status-independent
+writes), not only literal status matches. Update this inventory for intervening
+base changes. Tests must cover both SQL and in-memory classification and all
+mutating consumers above. If any existing path cannot honor the fence under the
+allowed JSON/status/transaction interfaces, record that exact primitive gap and
+failing case in #135 / the parent task and stop. Adding a status or another
+scheduler is not an authorized workaround.
+
 #### Consumer transaction and retirement
 
 For a bounded batch (at most 50 due intents), use the existing admission
@@ -215,7 +301,7 @@ successors. Never hold the lock over provider calls or external cleanup.
 
 | Result | Receipt and execution effect |
 | --- | --- |
-| Current generation and all admission gates pass | Atomically create one queued successor and associate/consume the receipt using existing receipt statuses; dispatch remains separately gated |
+| Current generation and all admission gates pass | Atomically create one ordinary queued successor receipt/run with the continuation idempotency key, then mark the canonical intent `coalesced` with that `runId` and `finishedAt`; preserve its namespace for audit. The successor does not carry the reserved payload namespace; dispatch remains separately gated |
 | Matching queued/running/scheduled_retry successor for the same generation | Coalesce against that run; no second wake or provider execution |
 | Equivalent duplicate receipt | Coalesce against the canonical receipt's successor in the same issue-lock transaction; a receipt UUID alone is not the dedup key |
 | Still-current assignment, temporary gate or ambiguous release | Keep unfinished; persist hold and future retry due time; no skipped diagnostic conversion |
@@ -401,6 +487,27 @@ scheduler clock, not sleeps or direct helper calls as sole evidence.
    no repeated SQL/network and `nextWakeAt` contains no reviewer duty. The first
    producer reactivates it. Cover notification during sweep, unresolved outer
    commit, drain/resume and shutdown without discarding work.
+9. With a held reviewer receipt first in issue order and an ordinary deferred
+   wake behind it, release the author and another agent through actual generic
+   queue draining. Only ordinary work may promote; the reviewer receipt retains
+   its identity, due time, null run and no execution lock. Race generic drain,
+   startup/resume and the reviewer consumer across two instances. Before due or
+   while held, no reviewer successor exists; after eligibility/due, exactly one
+   successor uses the continuation key and unchanged generation. Include null,
+   malformed and unknown-version namespace values and direct receipt-ID inputs.
+10. Hold the reviewer on a real recovery action. Perform authorized reconciliation
+    through its owning service. The receipt alone is not `pending_wake` refusal;
+    real active wakes/runs and all other recovery gates still refuse as before.
+    Proven resolution/release then permits the due consumer to deliver once.
+11. Archive the company with a held receipt through the real service, racing
+    consumer adoption and receipt creation. Observe auditable cancellation and
+    archive reason, preserved immutable payload/history and no unfinished reviewer
+    deadline. No provider starts after archive. If adoption wins, its linked run
+    follows ordinary archive cancellation. Unarchive does not replay retired work.
+12. Exercise the inventory's temporary budget/tree/agent/project/company pause
+    bulk-cancellation paths and explicit Stop paths. Holds retain the duty; Stop
+    retires it. Run existing ordinary comment/interaction/retry/recovery/chat
+    regressions with no namespace and mixed rows to prove unchanged behavior.
 
 This document defines acceptance; it does not report those future tests as run.
 The documentation revision requires link/structure/whitespace checks and CI.
@@ -436,9 +543,19 @@ SHA under its own authorization. Synthetic acceptance precedes any separately
 approved incident recovery. Capture source-to-successor IDs, real queued/running
 and provider output, plus complete before/after review snapshots. Original
 business reviewers decide their own work; the existing incident reviewer verifies
-recovery independently. Rolling back software must leave unfinished receipts and
-review history intact; it does not retract an already admitted successor. Pause
-further recovery and assess existing runs rather than replaying or editing receipts.
+recovery independently.
+
+The implementation must ship the reader/writer fence before any new receipt can
+be produced. Do not run older unfenced workers against a database containing
+this class: they could promote it as ordinary deferred work. Deployment must
+quiesce old workers using the existing ops lifecycle before starting fenced
+producers; no new flag is introduced. A compatible rollback retains the fence,
+unfinished receipts and review history. Rolling back to an unfenced binary while
+any such receipt is unfinished is unsafe and is excluded. Stop compute and retain
+the compatible consumer until ordinary delivery or authorized retirement settles
+those obligations; do not edit/replay receipts to make rollback possible. A
+rollback does not retract an admitted successor. Future implementation acceptance
+must prove this version constraint before ops chooses a deployment/rollback SHA.
 
 ## Amendment delivery gate
 
