@@ -1,3 +1,4 @@
+import { seedReviewerIntent } from "./helpers/reviewer-intent.js";
 import express from "express";
 import request from "supertest";
 import { issueRoutes } from "../routes/issues.js";
@@ -57,31 +58,7 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(after.finishedAt).toBeInstanceOf(Date);
   });
 
-  async function seed(produce = true, limit?: null | number, released = true) {
-    const companyId = randomUUID(), agentId = randomUUID(), authorId = randomUUID(), issueId = randomUUID(), stageId = randomUUID();
-    await db.insert(companies).values({ id: companyId, name: "Consumer fixture", issuePrefix: "C" + companyId.slice(0, 7), defaultResponsibleUserId: "board" });
-    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "board",
-      membershipRole: "operator", status: "active" });
-    await db.insert(agents).values([
-      { id: agentId, companyId, name: "Reviewer", role: "engineer", status: "idle", adapterType: "process", runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } },
-      { id: authorId, companyId, name: "Author", role: "engineer", status: "idle", adapterType: "process", runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } },
-    ]);
-    const [issue] = await db.insert(issues).values({ id: issueId, companyId, title: "Pending review", status: "in_review",
-      responsibleUserId: "board", assigneeAgentId: agentId,
-      executionPolicy: { mode: "normal", commentRequired: true, ...(limit === undefined ? {} : { maxReviewRounds: limit }), stages: [{ id: stageId, type: "review", approvalsNeeded: 1,
-        participants: [{ id: randomUUID(), type: "agent", agentId }] }] },
-      executionState: { status: "pending", currentStageId: stageId, currentStageIndex: 0, currentStageType: "review",
-        currentParticipant: { type: "agent", agentId }, returnAssignee: { type: "agent", agentId: authorId },
-        completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null, changesRequestedCount: 2,
-        reviewRequest: { instructions: "Review the same submission" } } }).returning();
-    const [source] = await db.insert(heartbeatRuns).values({ companyId, agentId: authorId, status: "cancelled",
-      errorCode: "issue_reassigned", finishedAt: new Date(), responsibleUserId: "board", contextSnapshot: { issueId },
-      resultJson: { executionCancellation: { state: "acknowledged" }, reassignmentStopConfirmed: true } }).returning();
-    if (released) await recordRunExecutionReleased(db, source.id, issueId);
-    const receipt = produce ? await db.transaction(tx => createReviewerAssignmentIntent(tx, { companyId, issueId, sourceRunId: source.id,
-      requestedByActorType: "agent", requestedByActorId: authorId })) : null;
-    return { companyId, agentId, issueId, source, issue, receipt: receipt! };
-  }
+  const seed = (produce = true, limit?: null | number, released = true) => seedReviewerIntent(db, produce, limit, released);
 
   it("keeps a paused assignment due with persisted backoff and unchanged review state", async () => {
     const f = await seed();
@@ -851,6 +828,85 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(invoke).not.toHaveBeenCalled();
   });
 
+
+  it("rejects an unchanged review submission when a question appears during preparation", async () => {
+    const f = await seed();
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+    await heartbeatService(db).reconcileReviewerAssignments();
+    const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.receipt.id));
+    await db.update(heartbeatRuns).set({ status: "running", startedAt: new Date() }).where(eq(heartbeatRuns.id, receipt.runId!));
+    await db.update(issues).set({ executionRunId: receipt.runId }).where(eq(issues.id, f.issueId));
+    await issueThreadInteractionService(db).create({ id: f.issueId, companyId: f.companyId }, {
+      kind: "ask_user_questions", addresseeUserId: "board", sourceRunId: f.source.id,
+      continuationPolicy: "wake_assignee", payload: { version: 1, questions: [{ id: "permission",
+        prompt: "Continue this submission?", selectionMode: "single", required: true,
+        options: [{ id: "yes", label: "Continue" }] }] },
+    }, { userId: "board" });
+    const reservation = await reserveRunBudget(db, f.companyId, receipt.runId!, null);
+    const invoke = vi.fn(async () => null);
+    const result = await createRunDispatch(db).dispatchResolvedInteractionIfCurrent({ companyId: f.companyId, runId: receipt.runId!,
+      expectedStatus: "running", reservationId: reservation.id, enforceContinuationOwnership: false, dispatch: invoke });
+    expect(result).toMatchObject({ dispatched: false, cancellation: { outcome: "cancelled", errorCode: "issue_waiting_for_response" } });
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it.each(["none", "question", "tree", "dependency", "authority", "project", "recovery", "agent chain"] as const)("rechecks a new %s hold between accounting and provider handoff", async kind => {
+    const f = await seed();
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+    await heartbeatService(db).reconcileReviewerAssignments();
+    const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.receipt.id));
+    await db.update(heartbeatRuns).set({ status: "running", startedAt: new Date() }).where(eq(heartbeatRuns.id, receipt.runId!));
+    await db.update(issues).set({ executionRunId: receipt.runId }).where(eq(issues.id, f.issueId));
+    const reservation = await reserveRunBudget(db, f.companyId, receipt.runId!, null);
+    let mutated = false;
+    const observed = new Proxy(db, { get(target, key) {
+      if (key !== "transaction") return Reflect.get(target, key);
+      return async (...args: Parameters<typeof db.transaction>) => {
+        const result = await Reflect.apply(target.transaction, target, args);
+        if (!mutated && result?.kind === "value" && result.value?.claim) {
+          mutated = true;
+          if (kind === "tree") await issueTreeControlService(db).createHold(f.companyId, f.issueId,
+            { mode: "pause", actor: { actorType: "system", actorId: "fixture" } });
+          else if (kind === "dependency") {
+            const [blocker] = await db.insert(issues).values({ companyId: f.companyId, title: "New dependency", status: "todo" }).returning();
+            await issueService(db).update(f.issueId, { blockedByIssueIds: [blocker.id] });
+          } else if (kind === "authority") await db.update(companyMemberships).set({ status: "suspended" }).where(eq(companyMemberships.companyId, f.companyId));
+          else if (kind === "question") await issueThreadInteractionService(db).create({ id: f.issueId, companyId: f.companyId }, {
+            kind: "ask_user_questions", addresseeUserId: "board", sourceRunId: f.source.id, continuationPolicy: "wake_assignee",
+            payload: { version: 1, questions: [{ id: "permission", prompt: "Continue?", selectionMode: "single", required: true,
+              options: [{ id: "yes", label: "Continue" }] }] },
+          }, { userId: "board" });
+          else if (kind === "project") {
+            vi.stubEnv("PAPERCLIP_ISSUE_PRIVACY_MODE", "enforce");
+            const project = await projectService(db).create(f.companyId, { name: "Restricted", visibility: "private" });
+            await issueService(db).update(f.issueId, { projectId: project.id });
+          } else if (kind === "agent chain") {
+            await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, f.source.agentId));
+            await db.update(agents).set({ reportsTo: f.source.agentId }).where(eq(agents.id, f.agentId));
+          } else if (kind === "recovery") await db.insert(issueRecoveryActions).values({ companyId: f.companyId,
+            sourceIssueId: f.issueId, kind: "active_run_watchdog", status: "resolved", outcome: "blocked", ownerType: "board",
+            returnOwnerAgentId: f.agentId, cause: "legacy_execution_requires_reconciliation", fingerprint: f.source.id,
+            nextAction: "Inspect before continuing", evidence: { runId: f.source.id,
+              automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } } });
+        }
+        return result;
+      };
+    } });
+    const invoke = vi.fn(async () => null);
+    const result = await createRunDispatch(observed).dispatchResolvedInteractionIfCurrent({ companyId: f.companyId, runId: receipt.runId!,
+      expectedStatus: "running", reservationId: reservation.id, enforceContinuationOwnership: false, dispatch: invoke });
+    expect(mutated).toBe(true);
+    const [task] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    expect(task.executionState).toEqual(f.issue.executionState);
+    if (kind === "none") {
+      expect(result).toMatchObject({ dispatched: true });
+      expect(invoke).toHaveBeenCalledOnce();
+      return;
+    }
+    expect(result).toMatchObject({ dispatched: false });
+    expect(invoke).not.toHaveBeenCalled();
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, receipt.runId!)))[0].status).toBe("cancelled");
+  });
 
   it("delivers at the registered deadline after real pre-start reviewer reconciliation clears its hold", async () => {
     const f = await seed();

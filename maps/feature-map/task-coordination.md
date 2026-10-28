@@ -47,6 +47,13 @@ Manual: Block one task on another, finish the prerequisite, and observe the depe
 
 Automated: [execution policy](../../server/src/__tests__/issue-execution-policy.test.ts), [tree control](../../server/src/__tests__/issue-tree-control-service.test.ts), and [signoff browser suite](../../tests/e2e/signoff-policy.spec.ts) target these layers. A linked suite is not a claim that its current run is green.
 
+Synthetic server-proven reviewer intents are covered by the
+[PostgreSQL consumer suite](../../server/src/__tests__/heartbeat-reviewer-intent-consumer.test.ts)
+and [transaction suite](../../server/src/__tests__/heartbeat-reviewer-intent-transactions.test.ts).
+They cover generation-bound adoption, durable held retries, lifecycle deadlines,
+and current gates at provider handoff. Real intent production remains disabled;
+these fixtures do not prove the final executor-cleanup integration.
+
 Manual: Complete implementation under a review-required policy and confirm it waits for the required review outcome. Exercise rejection and later approval. Pause the parent while child work is pending, then verify resumption respects budget and ownership gates.
 
 ## Gotchas

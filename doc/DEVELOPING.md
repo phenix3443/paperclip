@@ -1898,7 +1898,10 @@ responsibility form the canonical generation. Ordinary runs record their admitte
 generation so the consumer can adopt matching queued/running/scheduled-retry work.
 The existing run-dispatch owner compares this generation under issue/run locks
 at queue claim and both provider admission phases, including ordinary review
-turns that the consumer adopts. Other task turns do not receive this stamp.
+turns that the consumer adopts. At both provider phases, stamped review turns
+also re-read current response, dependency, tree, access, invokability and recovery
+gates through their existing owners. Accounting still commits before the final
+read-only ownership gate. Other task turns do not receive this stamp.
 Held receipts retain per-receipt 15-to-300-second backoff in existing JSON.
 `nextAttemptAt` is an integer Unix time in milliseconds. SQL selects at most 50
 due candidates before decoding payloads; the deadline query returns one aggregate.
