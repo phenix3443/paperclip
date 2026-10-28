@@ -1,5 +1,5 @@
 import { and, asc, eq, gt, inArray, isNull, or } from "drizzle-orm";
-import { approvals, companyMemberships, connectionIntentDeliveries, issueApprovals, issueThreadInteractions, issues, type Db } from "@paperclipai/db";
+import { approvals, companyMemberships, connectionIntentDeliveries, issueApprovals, issueThreadInteractions, issues, toolCatalogEntries, type Db } from "@paperclipai/db";
 import { connectionIntentPayloadSchema } from "@paperclipai/shared";
 import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 import { connectionIntentService } from "./connection-intents.js";
@@ -18,9 +18,9 @@ async function findAvailableToolConnection(db: Db, task: Task, intent: Intent, p
   const parsed = connectionIntentPayloadSchema.safeParse(intent.payload);
   if (!parsed.success) return null;
   const payload = parsed.data;
-  // Additional permissions, provider authentication and inbox setup still need
-  // their governed completion paths. Aggregator cards also name an upstream app.
-  if (payload.purpose || payload.accessRequest || payload.upstreamService
+  // Provider authentication and inbox setup still need their governed
+  // completion paths. Aggregator cards also name an upstream app.
+  if (payload.purpose || payload.upstreamService
     || payload.requestingAgentId !== task.assigneeAgentId || !intent.addresseeUserId) return null;
   if (intent.addresseeUserId !== "local-board") {
     const [membership] = await db.select().from(companyMemberships).where(and(
@@ -32,6 +32,8 @@ async function findAvailableToolConnection(db: Db, task: Task, intent: Intent, p
   const connection = await connectionIntentService(db).usableConnectionForAgent({ companyId: task.companyId,
     agentId: payload.requestingAgentId, responsibleUserId: intent.addresseeUserId, serviceSlug: payload.serviceSlug });
   if (!connection) return null;
+  const accessRequest = payload.accessRequest;
+  if (accessRequest && connection.id !== accessRequest.connectionId) return null;
   // Use the gateway's exact descriptors and listing policy, including task,
   // project and routine context. Per-invocation approvals remain enforced.
   const access = await createToolGatewayService(db).summarizeConnectionAccessForAgent({
@@ -39,7 +41,19 @@ async function findAvailableToolConnection(db: Db, task: Task, intent: Intent, p
     heartbeatRunId: policyRunId === undefined ? intent.sourceRunId ?? null : policyRunId,
     issueId: task.id, projectId: task.projectId,
   });
-  return access.allowedCount + access.askFirstCount > 0 ? connection : null;
+  if (!accessRequest) return access.allowedCount + access.askFirstCount > 0 ? connection : null;
+  const catalog = await db.select().from(toolCatalogEntries).where(and(
+    eq(toolCatalogEntries.companyId, task.companyId), eq(toolCatalogEntries.connectionId, connection.id),
+    inArray(toolCatalogEntries.id, accessRequest.tools.map(tool => tool.catalogEntryId)),
+  ));
+  const satisfied = accessRequest.tools.every((requested) => {
+    const entry = catalog.find(candidate => candidate.id === requested.catalogEntryId);
+    if (!entry || entry.status !== "active" || entry.entryKind !== "tool"
+      || entry.toolName !== requested.toolName || entry.versionHash !== requested.versionHash) return false;
+    const decisions = access.tools.filter(tool => tool.toolName === entry.toolName).map(tool => tool.decision);
+    return decisions.length === 1 && (decisions[0] === "allowed" || (requested.permission === "ask_first" && decisions[0] === "ask_first"));
+  });
+  return satisfied ? connection : null;
 }
 
 export async function findSatisfiedToolConnection(db: Db, task: Task, intent: Intent, policyRunId?: string | null) {
