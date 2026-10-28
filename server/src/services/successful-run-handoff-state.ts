@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { activityLog, agentWakeupRequests, heartbeatRuns } from "@paperclipai/db";
@@ -42,7 +43,7 @@ export async function hydrateSuccessfulRunHandoffLiveness(
       .select({ issueId: wakeRequestIssueId })
       .from(agentWakeupRequests)
       .where(and(
-        eq(agentWakeupRequests.companyId, companyId),
+        ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, companyId),
         inArray(agentWakeupRequests.status, [...SUCCESSFUL_RUN_HANDOFF_LIVE_WAKE_STATUSES]),
         inArray(wakeRequestIssueId, unresolvedIssueIds),
       )),

@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -163,7 +164,7 @@ async function hasVerifiedInteractionWakeRequest(
       requestedByActorId: agentWakeupRequests.requestedByActorId,
     })
     .from(agentWakeupRequests)
-    .where(and(...predicates));
+    .where(and(ordinaryWakeRequestPredicate(), ...predicates));
 
   return requests.some((request) => actorMatchesComment(request, input.comment));
 }
@@ -1200,7 +1201,7 @@ export function issueTreeControlService(db: Db) {
       })
       .where(
         and(
-          eq(agentWakeupRequests.companyId, companyId),
+          ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, companyId),
           inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
           isNull(agentWakeupRequests.runId),
           inArray(sql<string | null>`${agentWakeupRequests.payload} ->> 'issueId'`, issueIds),

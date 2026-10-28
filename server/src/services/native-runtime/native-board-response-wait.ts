@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { activeIssueInteractionCondition } from "../issue-question-context.js";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import {
@@ -70,7 +71,7 @@ export async function readNativeBoardResponseWaitOrigin(
     .from(heartbeatRuns)
     .innerJoin(
       agentWakeupRequests,
-      and(
+      and(ordinaryWakeRequestPredicate(), and(
         eq(agentWakeupRequests.id, heartbeatRuns.wakeupRequestId),
         eq(agentWakeupRequests.companyId, binding.companyId),
         eq(agentWakeupRequests.agentId, binding.agentId),
@@ -78,7 +79,7 @@ export async function readNativeBoardResponseWaitOrigin(
         eq(agentWakeupRequests.source, "automation"),
         inArray(agentWakeupRequests.reason, ["issue_commented", "issue_reopened_via_comment"]),
         eq(agentWakeupRequests.requestedByActorType, "user"),
-      ),
+      )),
     )
     .innerJoin(
       nativeRunFinalizations,
@@ -200,7 +201,7 @@ export async function readNativeBoardResponseWaitSource(
     .from(agentWakeupRequests)
     .where(
       and(
-        eq(agentWakeupRequests.id, run.wakeupRequestId),
+        ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, run.wakeupRequestId),
         eq(agentWakeupRequests.companyId, binding.companyId),
         eq(agentWakeupRequests.agentId, binding.agentId),
         eq(agentWakeupRequests.runId, binding.runId),

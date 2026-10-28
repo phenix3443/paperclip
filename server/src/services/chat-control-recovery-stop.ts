@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { and, eq, inArray, or, sql } from "drizzle-orm";
 import {
   agentWakeupRequests,
@@ -109,7 +110,7 @@ export async function readChatControlNativeParent(
     .from(agentWakeupRequests)
     .where(
       and(
-        eq(agentWakeupRequests.id, intentId),
+        ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, intentId),
         eq(agentWakeupRequests.companyId, scope.companyId),
         eq(agentWakeupRequests.agentId, scope.agentId),
       ),
@@ -207,7 +208,7 @@ export async function readChatControlRecoveryStop(
           .from(agentWakeupRequests)
           .where(
             and(
-              eq(agentWakeupRequests.id, run.wakeupRequestId),
+              ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, run.wakeupRequestId),
               eq(agentWakeupRequests.companyId, scope.companyId),
               eq(agentWakeupRequests.agentId, scope.agentId),
             ),
@@ -219,7 +220,7 @@ export async function readChatControlRecoveryStop(
       .from(agentWakeupRequests)
       .where(
         and(
-          eq(agentWakeupRequests.companyId, scope.companyId),
+          ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, scope.companyId),
           eq(agentWakeupRequests.agentId, scope.agentId),
           eq(agentWakeupRequests.runId, run.id),
           eq(agentWakeupRequests.status, "coalesced"),
@@ -352,11 +353,11 @@ export async function readChatControlRecoveryStop(
             .from(chatActions)
             .innerJoin(
               agentWakeupRequests,
-              and(
+              and(ordinaryWakeRequestPredicate(), and(
                 eq(agentWakeupRequests.id, chatActions.id),
                 eq(agentWakeupRequests.companyId, scope.companyId),
                 eq(agentWakeupRequests.agentId, scope.agentId),
-              ),
+              )),
             )
             .where(
               and(
@@ -435,7 +436,7 @@ export async function readChatControlRecoveryStop(
         .from(agentWakeupRequests)
         .where(
           and(
-            eq(agentWakeupRequests.id, source.id),
+            ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, source.id),
             eq(agentWakeupRequests.companyId, scope.companyId),
             eq(agentWakeupRequests.agentId, scope.agentId),
           ),

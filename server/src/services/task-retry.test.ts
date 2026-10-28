@@ -48,6 +48,23 @@ describe("durable task Retry admission", () => {
     const next = await requestTaskRetry({ ...input, idempotencyKey: randomUUID() });
     expect(next.requestId).not.toBe(one.requestId);
   });
+  it.each([null, "invalid", { version: 99 }])("keeps reserved receipts out of ordinary Retry admission (%j)", async namespace => {
+    const input = await seed();
+    const [issue] = await db.select().from(issues).where(eq(issues.id, input.issueId));
+    const [reserved] = await db.insert(agentWakeupRequests).values({
+      companyId: input.companyId, agentId: issue.assigneeAgentId!, source: "on_demand",
+      reason: "task_retry", status: "deferred_issue_execution", requestedAt: new Date(0),
+      requestedByActorType: "user", requestedByActorId: input.actorId,
+      payload: { issueId: input.issueId, _paperclipReviewerAssignmentContinuation: namespace,
+        taskRetry: { schema: "paperclip.task-retry.v1", generationId: randomUUID(),
+          sourceRunId: input.observedRunId, actorId: input.actorId, strategy: "evaluate" } },
+    }).returning();
+    const accepted = await requestTaskRetry(input);
+    expect(accepted).toMatchObject({ accepted: true, stale: false });
+    expect(accepted.requestId).not.toBe(reserved.id);
+    expect((await requestTaskRetry({ ...input, idempotencyKey: randomUUID() })).requestId).toBe(accepted.requestId);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, reserved.id)))[0]).toEqual(reserved);
+  });
   it("does not resurrect completed tasks or retry an obsolete assignment", async () => {
     const input = await seed();
     await db.update(issues).set({ status: "done" }).where(eq(issues.id, input.issueId));

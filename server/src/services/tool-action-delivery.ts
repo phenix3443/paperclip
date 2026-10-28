@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import {
   and,
   asc,
@@ -200,7 +201,7 @@ export function toolActionDeliveryService(
             .from(agentWakeupRequests)
             .where(
               and(
-                eq(agentWakeupRequests.companyId, source.companyId),
+                ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, source.companyId),
                 eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
                 notInArray(agentWakeupRequests.status, [
                   "skipped",

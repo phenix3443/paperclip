@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { photonAnswersMatch } from "../photon/interactions.js";
 import { and, or, eq, lte, inArray, notExists, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -290,12 +291,12 @@ async function resolveQuestionResponseChain(
     )
     .innerJoin(
       agentWakeupRequests,
-      and(
+      and(ordinaryWakeRequestPredicate(), and(
         eq(agentWakeupRequests.id, run.wakeupRequestId),
         eq(agentWakeupRequests.companyId, issueThreadInteractions.companyId),
         eq(agentWakeupRequests.agentId, binding.agentId),
         eq(agentWakeupRequests.runId, binding.runId),
-      ),
+      )),
     )
     .where(
       and(

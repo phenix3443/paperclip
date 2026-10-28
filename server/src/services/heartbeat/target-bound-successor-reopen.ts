@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { and, eq } from "drizzle-orm";
 import { agentWakeupRequests, executionWorkspaces, issues, type Db } from "@paperclipai/db";
 import {
@@ -60,7 +61,7 @@ async function loadDispatchedIntent(db: Db, run: TargetBoundSuccessorRun) {
     idempotencyKey: agentWakeupRequests.idempotencyKey,
     requestedByActorId: agentWakeupRequests.requestedByActorId,
   }).from(agentWakeupRequests).where(and(
-    eq(agentWakeupRequests.id, run.wakeupRequestId),
+    ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, run.wakeupRequestId),
     eq(agentWakeupRequests.companyId, run.companyId),
   ));
   const dispatchKey = receipt?.idempotencyKey ?? null;
@@ -76,7 +77,7 @@ async function loadDispatchedIntent(db: Db, run: TargetBoundSuccessorRun) {
     requestedByActorId: agentWakeupRequests.requestedByActorId,
     payload: agentWakeupRequests.payload,
   }).from(agentWakeupRequests).where(and(
-    eq(agentWakeupRequests.id, intentId),
+    ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, intentId),
     eq(agentWakeupRequests.companyId, run.companyId),
   ));
   if (!intent

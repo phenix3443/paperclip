@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { taskInterruptionPresentation, taskInterruptionPresentations } from "../services/task-interruption-presentation.js";
 import { parseObject } from "../adapters/utils.js";
 import { prepareRestrictedWorkspaceRetry } from "../services/restricted-workspace-retry.js";
@@ -7346,7 +7347,7 @@ export function issueRoutes(
       .from(agentWakeupRequests)
       .where(
         and(
-          eq(agentWakeupRequests.companyId, issue.companyId),
+          ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, issue.companyId),
           eq(agentWakeupRequests.agentId, issue.assigneeAgentId),
           inArray(agentWakeupRequests.status, [
             "deferred_issue_execution",
@@ -7525,7 +7526,7 @@ export function issueRoutes(
       .from(agentWakeupRequests)
       .where(
         and(
-          eq(agentWakeupRequests.id, input.queueId),
+          ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, input.queueId),
           eq(agentWakeupRequests.companyId, input.issue.companyId),
           input.issue.assigneeAgentId
             ? eq(agentWakeupRequests.agentId, input.issue.assigneeAgentId)
@@ -16929,7 +16930,7 @@ export function issueRoutes(
             actorId: actor.actorId, requestedAt: new Date().toISOString(),
           } },
           updatedAt: new Date(),
-        }).where(eq(agentWakeupRequests.id, locked.wake.id));
+        }).where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, locked.wake.id)));
         return locked.activeRun?.status === "running" ? locked.activeRun.id : null;
       });
       // Never hold the issue lock while joining the adapter. Queue edits and
@@ -16976,7 +16977,7 @@ export function issueRoutes(
       if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
       const actor = getActorInfo(req);
       const responseWake = await db.select().from(agentWakeupRequests).where(and(
-        eq(agentWakeupRequests.id, req.body.queueId), eq(agentWakeupRequests.companyId, issue.companyId),
+        ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, req.body.queueId), eq(agentWakeupRequests.companyId, issue.companyId),
       )).then(rows => rows[0]);
       const response = responseWake ? await readQueuedInteractionResponse(db, issue.companyId, issue.id, responseWake.payload) : null;
       const steeringIdentity = await reserveSteeredIdentity(db, {
@@ -17011,7 +17012,7 @@ export function issueRoutes(
             .from(agentWakeupRequests)
             .where(
               and(
-                eq(agentWakeupRequests.id, req.body.queueId),
+                ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, req.body.queueId),
                 eq(agentWakeupRequests.companyId, issue.companyId),
                 issue.assigneeAgentId
                   ? eq(agentWakeupRequests.agentId, issue.assigneeAgentId)
@@ -17159,7 +17160,7 @@ export function issueRoutes(
               ? await tx
                   .update(agentWakeupRequests)
                   .set({ status: "cancelled", finishedAt: now, updatedAt: now })
-                  .where(eq(agentWakeupRequests.id, locked.wake.id))
+                  .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, locked.wake.id)))
                   .returning()
                   .then(() => null)
               : await tx
@@ -17171,7 +17172,7 @@ export function issueRoutes(
                     ),
                     updatedAt: now,
                   })
-                  .where(eq(agentWakeupRequests.id, locked.wake.id))
+                  .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, locked.wake.id)))
                   .returning()
                   .then((rows) => rows[0] ?? locked.wake);
           await tx
@@ -18418,7 +18419,7 @@ export function issueRoutes(
           .from(agentWakeupRequests)
           .where(
             and(
-              eq(agentWakeupRequests.companyId, issue.companyId),
+              ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, issue.companyId),
               eq(agentWakeupRequests.agentId, issue.assigneeAgentId),
               inArray(agentWakeupRequests.status, [
                 "deferred_issue_execution",

@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { deriveTaskKeyWithHeartbeatFallback } from "./run-state.js";
 import { infrastructureRetryDelayMs } from "../system-recovery-state.js";
 import {
@@ -775,10 +776,10 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
                 .select({ coalescedCount: agentWakeupRequests.coalescedCount })
                 .from(agentWakeupRequests)
                 .where(
-                  eq(
+                  and(ordinaryWakeRequestPredicate(), eq(
                     agentWakeupRequests.id,
                     existingContinuation.wakeupRequestId,
-                  ),
+                  )),
                 )
                 .then((rows) => rows[0] ?? null);
 
@@ -789,10 +790,10 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
                   updatedAt: now,
                 })
                 .where(
-                  eq(
+                  and(ordinaryWakeRequestPredicate(), eq(
                     agentWakeupRequests.id,
                     existingContinuation.wakeupRequestId,
-                  ),
+                  )),
                 );
             }
 
@@ -842,10 +843,10 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
                 .select({ coalescedCount: agentWakeupRequests.coalescedCount })
                 .from(agentWakeupRequests)
                 .where(
-                  eq(
+                  and(ordinaryWakeRequestPredicate(), eq(
                     agentWakeupRequests.id,
                     existingContinuation.wakeupRequestId,
-                  ),
+                  )),
                 )
                 .then((rows) => rows[0] ?? null);
 
@@ -856,10 +857,10 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
                   updatedAt: now,
                 })
                 .where(
-                  eq(
+                  and(ordinaryWakeRequestPredicate(), eq(
                     agentWakeupRequests.id,
                     existingContinuation.wakeupRequestId,
-                  ),
+                  )),
                 );
             }
 
@@ -1075,7 +1076,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
             runId: scheduledRun.id,
             updatedAt: now,
           })
-          .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+          .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, wakeupRequest.id)));
 
         let detachWorkspaceFromIssue = false;
         if (issueId && shouldQuarantineWorkspaceForRetry) {
@@ -1769,7 +1770,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
             await tx
               .select({ payload: agentWakeupRequests.payload })
               .from(agentWakeupRequests)
-              .where(eq(agentWakeupRequests.id, row.wakeupRequestId))
+              .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, row.wakeupRequestId)))
               .then((rows) => rows[0]?.payload ?? null),
           ),
           scheduledRetryAt: now.toISOString(),
@@ -1781,7 +1782,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
             payload: wakeupPayload,
             updatedAt: now,
           })
-          .where(eq(agentWakeupRequests.id, row.wakeupRequestId));
+          .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, row.wakeupRequestId)));
       }
 
       return row;

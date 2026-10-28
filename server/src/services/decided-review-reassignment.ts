@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { and, asc, desc, eq, gt, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import {
   activityLog,
@@ -387,7 +388,7 @@ export async function admitDecidedReviewContinuation(
   }
   const holdIds = proof.holds.map(hold => hold.id);
   const parked = await db.select().from(agentWakeupRequests).where(and(
-    eq(agentWakeupRequests.companyId, proof.task.companyId), eq(agentWakeupRequests.agentId, proof.source.agentId),
+    ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, proof.task.companyId), eq(agentWakeupRequests.agentId, proof.source.agentId),
     eq(agentWakeupRequests.status, "deferred_issue_execution"),
     sql`${agentWakeupRequests.payload}->>'issueId' = ${proof.task.id}`,
     inArray(sql`${agentWakeupRequests.payload}->'executionWait'->>'recoveryActionId'`, holdIds),
@@ -513,7 +514,7 @@ export async function parkedReviewRequestSubmission(
   db: Db, input: { companyId: string; issueId: string; wakeId: string },
 ): Promise<{ kind: "superseded" } | { kind: "serves"; submission: SubmissionIdentity } | null> {
   const [wake] = await db.select().from(agentWakeupRequests).where(and(
-    eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.id, input.wakeId),
+    ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.id, input.wakeId),
   )).limit(1);
   const [task] = await db.select().from(issues).where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)));
   if (!wake || !task) return null;

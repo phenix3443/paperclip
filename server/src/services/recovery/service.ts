@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";
 import { onboardingFirstTaskAwaitingUserSql } from "./onboarding-first-task-wait.js";
 import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
@@ -1131,7 +1132,7 @@ export function recoveryService(
         .from(agentWakeupRequests)
         .where(
           and(
-            eq(agentWakeupRequests.companyId, companyId),
+            ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, companyId),
             eq(agentWakeupRequests.status, "deferred_issue_execution"),
             sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
             agentId ? eq(agentWakeupRequests.agentId, agentId) : sql`true`,
@@ -1833,7 +1834,7 @@ export function recoveryService(
       .from(agentWakeupRequests)
       .where(
         and(
-          eq(agentWakeupRequests.companyId, companyId),
+          ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, companyId),
           eq(agentWakeupRequests.status, "queued"),
           sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
           agentId ? eq(agentWakeupRequests.agentId, agentId) : sql`true`,
@@ -2759,7 +2760,7 @@ export function recoveryService(
       await tx
         .update(agentWakeupRequests)
         .set({ runId: scheduledRun.id, updatedAt: now })
-        .where(eq(agentWakeupRequests.id, wakeup.id));
+        .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, wakeup.id)));
       await tx
         .update(issueRecoveryActions)
         .set({
@@ -3261,7 +3262,7 @@ export function recoveryService(
         )
         .where(
           and(
-            eq(agentWakeupRequests.companyId, input.issue.companyId),
+            ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, input.issue.companyId),
             eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
             sql`${agentWakeupRequests.status} <> 'skipped'`,
           ),
@@ -3348,7 +3349,7 @@ export function recoveryService(
             await tx
               .update(agentWakeupRequests)
               .set({ runId: run.id, updatedAt: now })
-              .where(eq(agentWakeupRequests.id, wakeup.id));
+              .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, wakeup.id)));
             return run;
           });
           created = true;
@@ -3464,7 +3465,7 @@ export function recoveryService(
         .from(agentWakeupRequests)
         .where(
           and(
-            eq(agentWakeupRequests.companyId, action.companyId),
+            ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, action.companyId),
             inArray(agentWakeupRequests.status, [
               "queued",
               "claimed",
@@ -3774,7 +3775,7 @@ export function recoveryService(
       .select({ id: agentWakeupRequests.id, runId: agentWakeupRequests.runId })
       .from(agentWakeupRequests)
       .where(and(
-        eq(agentWakeupRequests.id, settlement.wakeupRequestId),
+        ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, settlement.wakeupRequestId),
         eq(agentWakeupRequests.companyId, action.companyId),
         eq(agentWakeupRequests.agentId, settlement.ownerAgentId),
         eq(agentWakeupRequests.idempotencyKey, settlement.continuationKey),

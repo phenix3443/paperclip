@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { createHash } from "node:crypto";
 import { and, asc, desc, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { z } from "zod";
@@ -368,7 +369,7 @@ export async function buildExecutionContinuation(input: {
       ["failed", "timed_out", "interrupted", "cancelled"].includes(run.status));
     const failedRunId = string(explicitContinuation.failedRunId);
     const retryWakes = failedRunId ? await db.select().from(agentWakeupRequests).where(and(
-      eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, input.agentId),
+      ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, input.agentId),
       eq(agentWakeupRequests.reason, "retry_failed_run"), eq(agentWakeupRequests.requestedByActorType, "user"),
       sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
     )) : [];
@@ -386,7 +387,7 @@ export async function buildExecutionContinuation(input: {
     }))];
     const interruptQueues = interruptQueueIds.length
       ? await db.select().from(agentWakeupRequests).where(and(
-        inArray(agentWakeupRequests.id, interruptQueueIds),
+        ordinaryWakeRequestPredicate(), inArray(agentWakeupRequests.id, interruptQueueIds),
         eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, input.agentId),
         eq(agentWakeupRequests.status, "coalesced"),
         sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
@@ -396,7 +397,7 @@ export async function buildExecutionContinuation(input: {
     const taskRetryId = string(explicitContinuation.taskRetryRequestId);
     const [taskRetryWake] = taskRetryId && z.string().guid().safeParse(taskRetryId).success
       ? await db.select().from(agentWakeupRequests).where(and(
-        eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.id, taskRetryId),
+        ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.id, taskRetryId),
         eq(agentWakeupRequests.agentId, input.agentId), eq(agentWakeupRequests.reason, "task_retry"),
         eq(agentWakeupRequests.requestedByActorType, "user"), eq(agentWakeupRequests.status, "coalesced"),
         sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
