@@ -109,6 +109,7 @@ const {
       skipped: 0,
       issueIds: [],
     })),
+    reconcileReviewerAssignments: vi.fn(async () => undefined),
     reconcileResolvedDependencyWakes: vi.fn(async () => ({ healed: 0 })),
     reconcileTaskWatchdogs: vi.fn(async () => ({ triggered: 0 })),
     scanSilentActiveRuns: vi.fn(async () => ({ created: 0, escalated: 0 })),
@@ -828,6 +829,7 @@ describe("startServer feedback export wiring", () => {
       expect(continuation).toBeDefined();
       await expect(continuation).resolves.toBeUndefined();
       expect(decidedReviewRetryPending).toHaveBeenCalled();
+      expect(heartbeatServiceMock.reconcileReviewerAssignments).toHaveBeenCalled();
     } finally {
       scheduleStub.enabled = false;
       deliveryWorkRegisterMock.mockImplementation(original);
