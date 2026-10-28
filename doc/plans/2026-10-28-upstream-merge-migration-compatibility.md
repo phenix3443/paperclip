@@ -133,11 +133,20 @@ Source: `packages/db/src/client.ts` at both SHAs.
 - `ensureMigrationJournalTable` creates the table as `(id, hash, created_at)`.
   Drizzle's table has no `name` column either. With that shape, a renamed file with
   the same bytes counts as applied. It does not run again.
-- If the production table has a `name` column, the rename makes the applied develop
-  migrations pending again. They would then run again. This is a deployment stop
-  condition (section 7).
-- `migrationHistoryEntryExists` (the guard before each apply) matches
-  `hash = … OR name = …`. It skips a file whose hash is already recorded.
+- `migrationHistoryEntryExists` (the guard before each apply) builds its filter
+  from the columns that exist: `hash = …` if there is a `hash` column, `name = …`
+  if there is a `name` column, joined with `OR`. It skips a file that matches.
+- If the production table has a `name` column, `loadAppliedMigrations` reads by
+  name, so the renamed develop files (`0395`–`0399`) are pending. What happens
+  next depends on the other columns:
+  - `name` and `hash`: the guard finds the old hash and skips each file. The SQL
+    does not run again, and no row gets the new name. The final `inspectMigrations`
+    still lists the five files as pending, so `applyPendingMigrations` throws
+    `Failed to apply pending migrations` and the server does not start.
+  - `name` without `hash`: the guard only compares names. The new names do not
+    match, so the SQL runs again.
+  Neither case has been tested against a real named history. Any `name` column is
+  therefore a deployment stop condition (section 7).
 - `reconcilePendingMigrationHistory` walks pending files in name order. It stops
   at the first file whose statements are not all present. Upstream `0372` creates
   `execution_workspace_restore_points`, so it stops at once. Nothing is backfilled
@@ -316,7 +325,9 @@ Before deployment:
 1. Full database backup. Record its location and size.
 2. Read only: `SELECT column_name FROM information_schema.columns WHERE table_name = '__drizzle_migrations'`.
    If a `name` column exists, **stop**. The rename would make applied files pending.
-   Bring the result to CTO.
+   With `hash` too, startup fails with `Failed to apply pending migrations`; without
+   `hash`, the SQL runs again (4.2). Compatibility with a named history is not
+   verified. Bring the result to CTO.
 3. Read only: count all rows in `__drizzle_migrations`. Also list which of the five
    hashes in 4.1 are present. Record the result.
 
