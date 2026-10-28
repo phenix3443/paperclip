@@ -5,6 +5,11 @@ Status: proposed; requires independent approval of the exact PR head before impl
 Source baseline: `99481ae2e0f5869d85c95a8cb3961930dc23b489` on `origin/develop`.
 Documentation draft [#132](https://github.com/phenix3443/paperclip/pull/132) was opened before this file was created.
 
+Upstream adaptation is tracked in [#149](https://github.com/phenix3443/paperclip/issues/149).
+The approval of #132 does not approve that adaptation. The worker and topic named
+below are fork-specific. Keep implementation #131 and draft #138 paused until
+the supplemental design has passed exact-head independent review and merged.
+
 ## Problem and acceptance contract
 
 A dependency can finish while its dependent's agent is manually paused or budget-blocked. The completion must remain durable without starting work. After an authorized resume or a real budget release, the existing delivery worker must admit one wake automatically. A saved queue row alone does not establish delivery: acceptance requires a linked heartbeat run and one adapter invocation, with no second invocation after repeated events or restart.
