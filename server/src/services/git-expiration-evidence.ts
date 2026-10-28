@@ -138,7 +138,7 @@ export type LiveIdentity = {
 type Location = { role: string; path: Observation<string> };
 
 type Anchor = {
-  sourcePaths: string[];
+  sourcePaths: string[] | null;
   worktreePath: Observation<string>;
   markerSource: Observation<string>;
   worktreeAdmin: Observation<string>;
@@ -152,8 +152,10 @@ function isLive(workspace: Workspace) {
   return LIVE_EXECUTION_WORKSPACE_STATUSES.includes(workspace.status);
 }
 
-function liveSourcePaths(workspace: Workspace): string[] {
-  const recorded = recordedIsolatedRemoteSource(workspace);
+/** Source candidates of a live row; `null` when a native validator rejects the recorded identity. */
+function liveSourcePaths(workspace: Workspace): string[] | null {
+  let recorded: string | null;
+  try { recorded = recordedIsolatedRemoteSource(workspace); } catch { return null; }
   const sources = recorded ? [recorded] : managedSourcePaths(workspace);
   let restoration: ReturnType<typeof readGitCacheRestoration> = null;
   try { restoration = readGitCacheRestoration(workspace); } catch { restoration = null; }
@@ -188,7 +190,8 @@ function liveAnchor(workspace: Workspace, identity: LiveIdentity): Anchor {
   return {
     sourcePaths: liveSourcePaths(workspace),
     worktreePath: worktree ? observed(worktree) : unavailable("location_unresolved"),
-    markerSource: identity.sourcePath ? observed(identity.sourcePath) : unavailable("location_unresolved"),
+    markerSource: identity.sourcePath ? observed(identity.sourcePath)
+      : identity.worktreeAdmin.state === "unavailable" && identity.worktreeAdmin.reason === "worktree_absent" ? identity.worktreeAdmin : unavailable("location_unresolved"),
     worktreeAdmin: identity.worktreeAdmin,
     branchName: workspace.branchName,
     checkouts: identity.checkouts,
@@ -205,8 +208,9 @@ export async function captureLiveIdentity(workspace: Workspace, signal?: AbortSi
   const stop = (): LiveIdentity => ({ head: head.observation, sourcePath: null, worktreeAdmin: unavailable("row_stopped"), checkouts: unavailable("row_stopped") });
   let sourcePath: string | null = null;
   let worktreeAdmin: Observation<string> = unavailable("location_unresolved");
+  if (head.observation.state === "unavailable" && head.observation.reason === "worktree_absent") worktreeAdmin = unavailable("worktree_absent");
   if (head.gitDir) {
-    for (const candidate of liveSourcePaths(workspace)) {
+    for (const candidate of liveSourcePaths(workspace) ?? []) {
       if (signal?.aborted) return stop();
       try {
         worktreeAdmin = observed(await verifiedWorktreeAdmin(candidate, head.gitDir));
@@ -272,8 +276,11 @@ function protectedLocations(anchor: Anchor): Location[] {
     { role: "worktree", path: anchor.worktreePath },
     { role: "worktree_git_link", path: under(anchor.worktreePath, ".git") },
   ];
-  if (!anchor.sourcePaths.length) locations.push({ role: "source", path: unavailable("location_unresolved") }, { role: "source_git", path: unavailable("location_unresolved") });
-  for (const source of anchor.sourcePaths) locations.push({ role: "source", path: observed(source) }, { role: "source_git", path: observed(path.join(source, ".git")) });
+  if (!anchor.sourcePaths?.length) {
+    const reason = unavailable<string>(anchor.sourcePaths ? "location_unresolved" : "invalid_metadata");
+    locations.push({ role: "source", path: reason }, { role: "source_git", path: reason });
+  }
+  for (const source of anchor.sourcePaths ?? []) locations.push({ role: "source", path: observed(source) }, { role: "source_git", path: observed(path.join(source, ".git")) });
   locations.push({ role: "worktree_admin", path: anchor.worktreeAdmin }, { role: "gitdir_head", path: under(anchor.worktreeAdmin, "HEAD") },
     { role: "gitdir_index", path: under(anchor.worktreeAdmin, "index") }, { role: "worktree_trash", path: anchor.worktreeTrash });
   if (anchor.baseTrash) locations.push({ role: "base_trash", path: observed(anchor.baseTrash) });
