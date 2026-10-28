@@ -113,7 +113,7 @@ type Observation<T> =
 | --- | --- | --- | --- | --- |
 | E1 keys | Page row key (`page_selected`) and reread key under the lifecycle lock | `row_inspected.key`, `.current` (unchanged) | `row_keys.v1`; every key of `page_selected` has at most one `row_inspected` | Unchanged: key change gives rejection `workspace_changed` |
 | E2 row state | Locked reread in the lifecycle transaction, before and after the row work; page snapshot as `selected` | `row_inspected.evidence.{selected,before,after}.row` | `row_state.v1` | Before/after change: stop `protected_state_changed`. Missing after for a locked, unstopped row: stop `evidence_unavailable` |
-| E2 paths | `lstat` with `bigint: true` of the roles named by the native location seam `resolveProtectedLocations` for every row state, fixed at before and reused for after, inside the lock chain; after `lstat` in phase B (after drain), after location set from phase B row + phase A identity | `evidence.{before,after}.paths`, `evidence.{before,after}.locationSet` | `row_paths.v1`; every required role present | Same as row state. An unresolved required role is `unavailable` and stops `evidence_unavailable`; an empty list is never an observed absence |
+| E2 paths | `lstat` with `bigint: true` of the roles named by the native location seam `resolveProtectedLocations` for every row state, including the `checkout_container` directory with zero checkouts, fixed at before and reused for after, inside the lock chain; after `lstat` in phase B (after drain), after location set from phase B row + phase A identity | `evidence.{before,after}.paths`, `evidence.{before,after}.locationSet` | `row_paths.v1`; every required role present | Same as row state. An unresolved required role is `unavailable` and stops `evidence_unavailable`; an empty list is never an observed absence |
 | E2 HEAD | One bounded Git child per side: `rev-parse --absolute-git-dir HEAD --symbolic-full-name HEAD` in the worktree; the after child runs in phase A, before drain | `evidence.{before,after}.head` | `row_head.v1` | Same as row state. Not started after a row stop: `unavailable` `row_stopped` |
 | E3 row bytes | One extended walk of the candidate worktree (the existing walk, same entry budget) | `evidence.bytes`; `candidateBytes` unchanged | `row_bytes.v1` | Walk error keeps today's rejection, reports `error` and stops `evidence_unavailable`. Never zero for an unwalked tree |
 | E3 round bytes | Sum of row values plus a round hardlink index | `round_finished.bytes`, stdout `bytes` | `round_bytes.v1`; `state` must be `observed` and `failedRows` 0 for full reconciliation | Index cap: stop `resource_limit` `hardlink_index`. A failed walk makes `state` `incomplete` and totals `unavailable` |
@@ -176,9 +176,12 @@ directory and uses no budget:
    is `unavailable` `row_stopped`; it is not copied from before.
 
 Because phase A ends before drain, a change to HEAD or a checkout after phase A is
-still seen in phase B: the fixed roles include the admin `HEAD` and `index`, each
-checkout's `.git/HEAD` and `.git/index`, and the marker directories, and phase B
-`lstat`s them after drain.
+still seen in phase B: the fixed roles include the admin `HEAD` and `index`, the
+checkout container `<worktree>/<PROJECT_REPOSITORIES_DIR>`, each checkout's
+`.git/HEAD` and `.git/index`, and the marker directories, and phase B `lstat`s them
+after drain. A checkout added to or removed from the container after phase A
+changes the container's `mtimeNs`/`ctimeNs` (and `nlink` when it stays added), so it
+is drift `paths.checkout_container` even though the phase A checkout list is stale.
 
 - `inspectLockedGitExpirationCandidate` gets an optional async `onLocked(current)`
   hook. It replaces the synchronous `observeCurrent` and runs at the same place,
@@ -291,6 +294,7 @@ checkout branch is reported, not a silent new list. When phase A did not finish,
 | `worktree_trash`, `base_trash` | `gitCacheExpiration` trash paths; for a live row only `worktree_trash`, at the next generation, derived by the same `path.join` rule as `git-workspace-expiration.ts:93`, extracted with no change |
 | `expiration_lock_marker` | Each location of `gitExpirationMarkerLocations(anchor)` |
 | `expiration_lock_marker_dir` | The parent directory of each marker, so a marker that appears and goes again inside the window still changes `mtimeNs`/`ctimeNs` |
+| `checkout_container` | `<worktree>/<PROJECT_REPOSITORIES_DIR>` itself, always listed, also with zero checkouts and when it does not exist (then observed `present: false`), so a checkout added or removed after the checkout list was read is still seen |
 | `checkout_root` | Each `<worktree>/<PROJECT_REPOSITORIES_DIR>/<name>` |
 | `checkout_head`, `checkout_index` | `HEAD` and `index` under each checkout's Git dir from the before anchor (for a pending row `<checkout_root>/.git`, as in the lock locations), so a branch switch after phase A is still seen by phase B |
 
@@ -307,7 +311,9 @@ source candidate, admin outside every candidate, before HEAD read failed),
 the native limit). Each one is a not-`observed` before observation and stops the
 round `evidence_unavailable` (see stop rules). For a pending row whose worktree is
 gone, the anchor comes only from metadata, so `worktree_admin`, `gitdir_*`, `source`
-and markers stay observed, and `worktree` is observed `present: false`.
+and markers stay observed, and `worktree` and `checkout_container` are observed
+`present: false`. The container path depends only on `worktreePath`, so it is
+`location_unresolved` only when `worktreePath` is.
 
 ### HEAD
 
@@ -575,7 +581,7 @@ uninstall the ledger in a dedicated test file.
 | Inaccessible | Directory mode 000 inside the worktree, and a symlink loop, on a row whose protected root, HEAD and DB reads succeed (test skipped when it runs as root) | Row outcome rejected as today; `bytes` `error EACCES` / `ELOOP`; round `partial` `evidence_unavailable`, exit 3; round `bytes.state` `incomplete`, `attemptedRows` and `failedRows` 1, `raw` and `unique` `unavailable incomplete_measurement`; no `observed` 0 for the row or the round |
 | Rejected before walk | Row rejected by eligibility or proof before the walk | `bytes` `unavailable rejected_before_walk`; no stop from bytes; row not in `attemptedRows` |
 | Absent worktree | Pending row with worktree gone and its admin dir still present | `bytes` observed `present: false`; HEAD `worktree_absent`; `worktree` observed `present: false`; `worktree_admin`, `gitdir_*`, `source` and marker roles observed from the recorded metadata; no `evidence_unavailable` stop. Variant: admin dir removed or replaced between before and after gives `drift.changed` `paths.worktree_admin` and stop `protected_state_changed` |
-| Live protected paths | Live row with no `gitCacheRestoration`, managed-project source and isolated-remote source; one nested checkout | Roles `source`, `worktree_admin`, `gitdir_*`, `expiration_lock_marker` (admin `index.lock`/`HEAD.lock`, source branch lock, checkout locks) and `checkout_root` all listed and observed; no role missing |
+| Live protected paths | Live row with no `gitCacheRestoration`, managed-project source and isolated-remote source; one nested checkout | Roles `source`, `worktree_admin`, `gitdir_*`, `expiration_lock_marker` (admin `index.lock`/`HEAD.lock`, source branch lock, checkout locks) `checkout_container` and `checkout_root` all listed and observed; no role missing. Variant with no `<PROJECT_REPOSITORIES_DIR>`: `checkout_container` listed and observed `present: false`, no `checkout_root` |
 | Marker creation | Live row and pending row without `lockToken`: create, and separately create then remove, an `index.lock` and a branch `.lock` at a marker location between before and after | `drift.changed` names `paths.expiration_lock_marker` or `paths.expiration_lock_marker_dir`; stop `protected_state_changed` |
 | Admin path change | Live row whose `.git` link is changed to point at another admin dir between before and after | `drift.changed` names `paths.locationSet` or `head.gitDir`; stop `protected_state_changed` |
 | Unresolved paths | Live row whose Git dir is outside every source candidate; pending row with invalid `gitCacheExpiration`; more than `CHECKOUT_LIMIT` checkout entries | Roles listed with `unavailable` `location_unresolved` / `invalid_metadata` / `checkout_budget`; stop `evidence_unavailable`, exit 3; never an empty role list |
@@ -583,6 +589,7 @@ uninstall the ledger in a dedicated test file.
 | Budget | Entry budget hit, row deadline and Git output cap during the walk and during the after HEAD read | Existing `resource_limit` reasons; `after.head` `unavailable row_stopped`; after row and paths still observed after drain |
 | Nested checkout, stop before after anchor | Live row with one nested checkout; separately: (a) abort the round, (b) exhaust the entry budget, (c) hit the Git child cap, each after the walk and before phase A; and (d) abort inside phase A between the HEAD child and the checkout child. A spawn hook records every child start with a timestamp | No child and no `readBoundedDirectory` call after the abort or budget hit, and none after the final `drain()` returns (spawn log vs drain timestamp); `after.head`, the live anchor inputs and `after.locationSet` `unavailable row_stopped`, never equal to the before values; phase B row and fixed-role paths observed; row keeps native `resource_limit` or abort and round `partial`/`aborted`, exit 3; locks released within the drain bound, or `after` `undrained` with the existing hold when a child is held past it |
 | Nested checkout change | Successful live row with one nested checkout: (a) switch the checkout branch from a proof-step hook (before phase A); (b) replace the checkout `.git` with one that points at another Git dir (before phase A); (c) switch the checkout branch from a hook that runs after phase A and before drain | (a) `drift.changed` names `paths.locationSet` and `paths.checkout_head`; (b) names `paths.locationSet`; (c) names `paths.checkout_head` from the phase B `lstat`; all stop `protected_state_changed`, `partial`, exit 3; row outcome unchanged; no child after drain |
+| Checkout container change | Successful live row with one nested checkout; variants with an empty container and with no container. From a hook that runs after phase A and before drain: (a) add a checkout to the container; (b) add a checkout and remove it again; (c) for the no-container variant, create the container with one checkout. Each hook first waits at least 10 ms after the before `lstat` so the coarse kernel timestamp moves, and the test never sets timestamps itself | All three: `drift.changed` names `paths.checkout_container`; stop `protected_state_changed`, `partial`, exit 3; row outcome unchanged; `after.locationSet` built from the phase A list, not re-read; no child and no directory read after the final `drain()` returns (spawn and read log vs drain timestamp); locks released within the drain bound |
 | Abort | Abort during proof and during the before HEAD read; abort with undrained row | No new child after abort; locks held until drain; phase A parts `unavailable row_stopped`; `after` `undrained` when the bound is passed; round `aborted` |
 | Lock | Busy source lock; busy lifecycle lock | `lock_busy` with `unavailable lock_busy` evidence; no observation taken without both locks |
 | Mutation traps | Install sentinel, then call each instrumented site from a test seam inside a row; also from a detached promise whose error is swallowed | Trap thrown before any filesystem or DB effect (checked by `lstat` and row select); `attempts[kind]` 1; round `mutation_detected`, overriding an earlier `lock_busy` or `resource_limit`, with `supersededStopReason` set |
