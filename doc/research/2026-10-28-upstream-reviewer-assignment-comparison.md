@@ -54,9 +54,10 @@
 
 1. `server/src/services/heartbeat/queue.ts`：在现有 issue 锁内、首次 park 时从 DB 生成完整 canonical generation；resume/adoption 的同一 owner 谓词比较它。禁止从 caller payload 接受 generation authority；重复信号不能悄悄把旧 receipt 改成新 submission。
 2. `server/src/services/heartbeat/run-control.ts`：若需多读 `executionPolicy`/identity，只向既有 eligibility/admission 传递必要的当前值；不另写一套快照策略。
-3. `server/src/__tests__/heartbeat-execution-ownership-wait.test.ts`：加入 unchanged 正向对照与 submission/policy/decision/identity 改变的表驱动反例、ordinary adoption 反例。
+3. `server/src/modules/wake-queue/adapters/postgres.ts`：若普通 drain 可触及该 class，须在排序/limit 前及受锁写入边界调用同一 generation 合同或 delegate；不能只保护 owning resume，也不能建立 module→service 循环依赖。
+4. `server/src/__tests__/heartbeat-execution-ownership-wait.test.ts`：加入 unchanged 正向对照与 submission/policy/decision/identity 改变的表驱动反例、ordinary adoption 反例。
 
-预计增量约 150–250 行（生产逻辑约 60–90 行，测试约 90–160 行），不是已测量 diff；批准前应以精确方案和真实 diff 预算复核。不得为了满足行数删掉必要验证。
+预计增量约 190–280 行（生产逻辑约 80–120 行，测试约 110–160 行），不是已测量 diff；批准前应以精确方案和真实 diff 预算复核。不得为了满足行数删掉必要验证。
 
 **master 前提尚未成立：** 上述三个改动点依赖 #16966 的 receipt/resume owner。当前 master 没有它，不能把此候选当作现在可独立编译的 master 修复。建议 CTO 选择：在 #16966 的最终实现进入 master 后，重新固定 base 并批准该小补丁；或明确批准与该 PR 作者协调复用其现有 PR 的增量方式。没有这一步，既不创建竞争性的巨大 master PR，也不把 pending 合并写成已完成依赖。若需要一个“现在立即可独立编译、无 #16966 前提”的不同保证，须另做重复贡献核对与范围批准，不能把已有 #18060 的 queued-generation 工作重新提交为本片。
 
@@ -68,7 +69,7 @@
 
 1. 原样执行 `timeout 180 pnpm --filter @paperclipai/server exec vitest run src/__tests__/heartbeat-execution-ownership-wait.test.ts`：**25 passed**，36.08 秒。该证据只覆盖提交内25项测试，不等于完整fork契约。
 2. 仅在临时快照测试文件增加反例，生产源码不变：`seed()` → `parkWake()` → 仅更新 `executionState.reviewRequest.instructions`（stage和participant不变）→ `releaseLease()` → `resumeExecutionOwnershipWaits()` → 断言零 successor、旧receipt取消。与原始第一个正向test一起运行：`timeout 180 pnpm --filter @paperclipai/server exec vitest run src/__tests__/heartbeat-execution-ownership-wait.test.ts -t 'obsolete submission|parks a stage handoff'`。
-3. 实际结果：**1 failed / 1 passed / 24 filtered**，21.75 秒；反例 `expected length 0 / actual 1`。旧receipt确实产生了一个执行新submission时仍携带旧handoff的 successor。因此full-generation缺口已动态证实，不能认定等价。没有给上游生产代码打补丁，没有创建/发布新的Issue或PR。
+3. 实际结果：**1 failed / 1 passed / 24 filtered**，21.75 秒；反例 `expected length 0 / actual 1`。旧receipt确实产生了一个 queued successor。另一次只运行反例的探针输出确认 status=queued，executionStage.reviewRequest 仍是旧指令；没有观察 provider 执行。因此full-generation缺口已动态证实，不能认定等价。没有给上游生产代码打补丁，没有创建/发布新的Issue或PR。
 
 反例测试本身是取证探针，不是已提交上游的测试。归档报告随本任务生成的artifact提供，实际日志不能被“源码中有测试”替代。这个结论只确证同stage/participant的submission变化缺口；其他generation维度、native释放双顺序、两receipt同submission的跨actor场景仍是明确未充分验证项，不推断全部已复现。
 
