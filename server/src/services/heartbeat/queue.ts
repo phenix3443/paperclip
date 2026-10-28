@@ -374,9 +374,9 @@ function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
-/** Queue admission and dispatch share the service lifecycle callbacks and execution ownership. */
 class MonitorAdmissionHeld extends Error {}
 
+/** Queue admission and dispatch share the service lifecycle callbacks and execution ownership. */
 export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDependencies) {
   const {
     setRunStatus,
@@ -1560,7 +1560,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 : { kind: "stale" as const, run: null };
             })
             .catch((error) => {
-              if (error instanceof MonitorAdmissionHeld || isExternalChatWaitAuthorizationContention(error))
+              if (isExternalChatWaitAuthorizationContention(error))
                 return { kind: "stale" as const, run: null };
               throw error;
             })

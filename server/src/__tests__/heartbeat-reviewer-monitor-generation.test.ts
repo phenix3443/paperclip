@@ -201,4 +201,37 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(2);
   });
 
+  it.each(["queued", "running"] as const)("does not rebind an existing %s review during monitor admission", async status => {
+    const { f } = await monitored();
+    const service = heartbeatService(db);
+    const original = await service.wakeup(f.agentId, { source: "assignment", reason: "execution_review_requested",
+      payload: { issueId: f.issueId }, requestedByActorType: "agent", requestedByActorId: f.source.agentId });
+    expect(original).toBeTruthy();
+    await db.update(heartbeatRuns).set({ status }).where(eq(heartbeatRuns.id, original!.id));
+    const [before] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, original!.id));
+    await service.triggerIssueMonitor(f.issueId);
+    const [after] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, original!.id));
+    expect(after.contextSnapshot).toEqual(before.contextSnapshot);
+    expect(after.wakeupRequestId).toBe(before.wakeupRequestId);
+    expect(after.status).toBe(status);
+  });
+
+  it("rejects a real submission change after monitor admission commits", async () => {
+    const { f, busy, marker } = await monitored();
+    const service = heartbeatService(db, { runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "false" } });
+    try {
+      expect(await service.triggerIssueMonitor(f.issueId)).toMatchObject({ outcome: "triggered" });
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId));
+      const review = runs.find(run => run.id !== busy.id)!;
+      const [task] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+      await db.update(issues).set({ executionState: { ...task.executionState!, reviewRequest: { instructions: "Changed submission" } } })
+        .where(eq(issues.id, f.issueId));
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, busy.id));
+      await service.resumeQueuedRuns(); await service.drainActiveRunExecutions();
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, review.id)))[0])
+        .toMatchObject({ status: "cancelled", errorCode: "issue_review_participant_changed", contextSnapshot: review.contextSnapshot });
+      await expect(readFile(marker)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally { await service.drainActiveRunExecutions(); }
+  });
+
 });
