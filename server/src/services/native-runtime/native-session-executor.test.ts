@@ -6518,7 +6518,11 @@ describe("native startup restart detachment", () => {
       run: { id: item.binding.runId, companyId: item.binding.companyId, agentId: item.binding.agentId,
         runtimeMode: "native", nativeSessionId: item.session.normalizedSessionId, status: "running", contextSnapshot: {} },
     }));
-    const snapshotDb = { select: () => ({ from: () => ({ innerJoin: () => ({ where: async () => snapshotRows }) }) }) } as unknown as Db;
+    const snapshotDb = { select: () => ({ from: () => ({
+      innerJoin: () => ({ where: async () => snapshotRows }),
+      // Develop's detachment re-reads each run's status before detaching it.
+      where: async () => [{ status: "running" }],
+    }) }) } as unknown as Db;
     const { logger } = await import("../../middleware/logger.js");
     const logged = vi.spyOn(logger, "info").mockImplementation(() => undefined);
     const recovery = createHeartbeatRecovery(snapshotDb, {
