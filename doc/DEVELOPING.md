@@ -2006,6 +2006,14 @@ turns that the consumer adopts. At both provider phases, stamped review turns
 also re-read current response, dependency, tree, access, invokability and recovery
 gates through their existing owners. Accounting still commits before the final
 read-only ownership gate. Other task turns do not receive this stamp.
+For a pending review, the monitor owner supplies a scoped admission object to
+the queue. After ordinary admission succeeds, the same company-scoped issue
+transaction consumes the exact claimed monitor and creates the new run with the
+complete post-consumption generation. Existing runs and immutable intents keep
+their original generation. Refused admission rolls back without consuming the
+monitor. Queue dispatch begins after the admission transaction commits. Other
+monitor paths retain their existing handling.
+
 Held receipts retain per-receipt 15-to-300-second backoff in existing JSON.
 `nextAttemptAt` is an integer Unix time in milliseconds. SQL selects at most 50
 due candidates before decoding payloads; the deadline query returns one aggregate.

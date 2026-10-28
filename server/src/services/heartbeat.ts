@@ -1549,6 +1549,7 @@ export function heartbeatService(
   } = createHeartbeatScheduling(db, {
     issuesSvc,
     enqueueWakeup,
+    enqueueMonitorWakeup: heartbeatQueue.enqueueMonitorWakeup,
     getRun,
     getAgent,
     scheduleBoundedRetryForRun,
