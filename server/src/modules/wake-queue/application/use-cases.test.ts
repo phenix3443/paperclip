@@ -122,6 +122,7 @@ function createFakeTransaction(overrides: Partial<WakeQueueTransaction> = {}): W
     finalizePromotedWake: vi.fn(async (input) => runSummary(input.wakeId)),
     hasExistingExecutionPath: vi.fn(async () => false),
     hasExplicitBlockerPath: vi.fn(async () => false),
+    hasPendingFinalizeBlocker: vi.fn(async () => false),
     hasPendingWakeInteraction: vi.fn(async () => false),
     isAutomaticRecoverySuppressedByPauseHold: vi.fn(async () => false),
     isImmediateRecoverySourceBlocked: vi.fn(async () => false),
@@ -801,10 +802,11 @@ describe("releaseIssueExecution review-participant recovery", () => {
     contextSnapshot: { issueId: ISSUE.id, wakeReason: "execution_review_requested" },
   };
 
-  async function release(hasPendingWakeInteraction: boolean, hasExplicitBlockerPath = false) {
+  async function release(hasPendingWakeInteraction: boolean, hasExplicitBlockerPath = false, hasPendingFinalizeBlocker = false) {
     const transaction = createFakeTransaction({
       hasPendingWakeInteraction: vi.fn(async () => hasPendingWakeInteraction),
       hasExplicitBlockerPath: vi.fn(async () => hasExplicitBlockerPath),
+      hasPendingFinalizeBlocker: vi.fn(async () => hasPendingFinalizeBlocker),
     });
     const recovery = createFakeRecovery();
     const issueLock = createFakeIssueLock(createFakeHost(), transaction, reviewIssue, reviewRun);
@@ -826,8 +828,32 @@ describe("releaseIssueExecution review-participant recovery", () => {
     expect(recovery.escalateStrandedAssignedIssue).not.toHaveBeenCalled();
   });
 
+  it("leaves a review whose done blocker is still finalizing its workspace to the finalize wake", async () => {
+    const { transaction, recovery } = await release(false, false, true);
+    expect(transaction.hasPendingFinalizeBlocker).toHaveBeenCalledWith({ companyId: "company-1", issueId: ISSUE.id });
+    expect(transaction.queueReviewParticipantRecoveryRun).not.toHaveBeenCalled();
+    expect(recovery.escalateStrandedAssignedIssue).not.toHaveBeenCalled();
+  });
+
   it("does not escalate a review recovery retry that waits on an unresolved explicit blocker", async () => {
     const transaction = createFakeTransaction({ hasExplicitBlockerPath: vi.fn(async () => true) });
+    const recovery = createFakeRecovery();
+    const retryRun: RunSnapshot = {
+      ...reviewRun,
+      contextSnapshot: {
+        issueId: ISSUE.id,
+        wakeReason: "execution_review_participant_recovery",
+        retryReason: "execution_review_participant_recovery",
+      },
+    };
+    const issueLock = createFakeIssueLock(createFakeHost(), transaction, reviewIssue, retryRun);
+    await createReleaseIssueExecution({ issueLock, recovery })({ companyId: "company-1", runId: "run-1", now: new Date() });
+    expect(transaction.queueReviewParticipantRecoveryRun).not.toHaveBeenCalled();
+    expect(recovery.escalateStrandedAssignedIssue).not.toHaveBeenCalled();
+  });
+
+  it("does not escalate a review recovery retry whose done blocker is still finalizing", async () => {
+    const transaction = createFakeTransaction({ hasPendingFinalizeBlocker: vi.fn(async () => true) });
     const recovery = createFakeRecovery();
     const retryRun: RunSnapshot = {
       ...reviewRun,
@@ -854,6 +880,7 @@ describe("releaseIssueExecution review-participant recovery", () => {
     await createReleaseIssueExecution({ issueLock, recovery: createFakeRecovery() })(
       { companyId: "company-1", runId: "run-1", now: new Date() });
     expect(transaction.hasPendingWakeInteraction).not.toHaveBeenCalled();
+    expect(transaction.hasPendingFinalizeBlocker).not.toHaveBeenCalled();
   });
 });
 

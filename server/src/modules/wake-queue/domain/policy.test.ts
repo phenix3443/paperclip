@@ -304,7 +304,7 @@ const baseReleaseRecoveryFacts: ReleaseRecoveryFacts = {
     applies: false,
     isExecutionReviewParticipantRecoveryRun: false,
     hasPendingWakeInteraction: false,
-    hasExplicitBlockerPath: false,
+    hasBlockerWait: false,
   },
   immediate: {
     applies: false,
@@ -456,32 +456,32 @@ describe("decideReleaseRecovery", () => {
           applies: true,
           isExecutionReviewParticipantRecoveryRun: true,
           hasPendingWakeInteraction: true,
-          hasExplicitBlockerPath: false,
+          hasBlockerWait: false,
         },
       },
       expected: { kind: "released" },
     },
     {
-      name: "released: review-participant recovery applies but the issue waits on an unresolved explicit blocker",
+      name: "released: review-participant recovery applies but the issue waits on an unresolved blocker",
       facts: {
         ...baseReleaseRecoveryFacts,
         reviewParticipant: {
           ...baseReleaseRecoveryFacts.reviewParticipant,
           applies: true,
-          hasExplicitBlockerPath: true,
+          hasBlockerWait: true,
         },
       },
       expected: { kind: "released" },
     },
     {
-      name: "released: an unresolved explicit blocker also stops escalation after a review-participant recovery retry",
+      name: "released: an unresolved blocker also stops escalation after a review-participant recovery retry",
       facts: {
         ...baseReleaseRecoveryFacts,
         reviewParticipant: {
           applies: true,
           isExecutionReviewParticipantRecoveryRun: true,
           hasPendingWakeInteraction: false,
-          hasExplicitBlockerPath: true,
+          hasBlockerWait: true,
         },
       },
       expected: { kind: "released" },
