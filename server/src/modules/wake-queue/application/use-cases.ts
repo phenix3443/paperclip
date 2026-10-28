@@ -590,12 +590,21 @@ async function runReleaseRecoveryTail(
     : false;
 
   const hasExplicitBlockerPath =
-    immediateApplies && !reviewParticipantApplies
+    reviewParticipantApplies || immediateApplies
       ? await transaction.hasExplicitBlockerPath({
           companyId: issue.companyId,
           issueId: issue.id,
         })
       : false;
+
+  const hasReviewBlockerWait =
+    reviewParticipantApplies &&
+    issue.assigneeAgentId === currentParticipant?.agentId &&
+    (hasExplicitBlockerPath ||
+      (await transaction.hasPendingFinalizeBlocker({
+        companyId: issue.companyId,
+        issueId: issue.id,
+      })));
 
   const expectedRetryReason:
     "assignment_recovery" | "issue_continuation_needed" =
@@ -629,6 +638,7 @@ async function runReleaseRecoveryTail(
       isExecutionReviewParticipantRecoveryRun:
         isExecutionReviewParticipantRecoveryRun(run),
       hasPendingWakeInteraction,
+      hasBlockerWait: hasReviewBlockerWait,
     },
     immediate: {
       applies: immediateApplies,
