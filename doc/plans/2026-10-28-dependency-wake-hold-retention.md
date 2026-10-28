@@ -9,6 +9,10 @@ Upstream adaptation is tracked in [#149](https://github.com/phenix3443/paperclip
 The approval of #132 does not approve that adaptation. The worker and topic named
 below are fork-specific. Keep implementation #131 and draft #138 paused until
 the supplemental design has passed exact-head independent review and merged.
+The crash-boundary decision in #149/#131 supersedes the unqualified invocation
+wording below: one durable dependency admission/run link, one invocation for normal
+release/proven pre-dispatch recovery, and visible uncertainty with no blind replay
+after ambiguous external acceptance. The supplemental plan defines the three fault phases.
 
 ## Problem and acceptance contract
 
