@@ -12,7 +12,7 @@ import {
   hasStopOnlyCleanup,
   settleStopOnlyCleanup,
 } from "../sandbox-stop-and-retain.js";
-import { discoverSettledNativeRunProcesses, recordNativeLocalProcessStop, retryPendingSettledNativeRunProcesses } from "../native-local-process-stop.js";
+import { recordedLocalExecutionStopped, discoverSettledNativeRunProcesses, recordNativeLocalProcessStop, retryPendingSettledNativeRunProcesses } from "../native-local-process-stop.js";
 import { isRunExecutionReleased, pendingCaseHandoffForRun } from "./case-handoff-lifecycle.js";
 import {
   legacyControllerBootId,
@@ -2044,6 +2044,18 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     return blocked;
   }
 
+  async function settleRecoveredExecutionRelease(runId: string, owner: Db = db) {
+    await owner.transaction(async transaction => {
+      const tx = transaction as unknown as Db;
+      const [source] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).for("update");
+      if (!source) return;
+      const issueId = source.nativeIssueId ?? readNonEmptyString(source.contextSnapshot?.issueId);
+      if (!issueId) return;
+      if (await recordedLocalExecutionStopped(tx, source)) await recordNativeLocalProcessStop(tx, source);
+      await isRunExecutionReleased(tx, { runId, issueId });
+    });
+  }
+
   async function settleRecoveredNativeWorkspace(input: {
     runId: string;
     companyId: string;
@@ -2065,10 +2077,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         : "stop_and_retain",
     });
     await releaseRuntimeServicesForRun(input.runId).catch(() => undefined);
-    const [source] = await db.select({ issueId: heartbeatRuns.nativeIssueId, context: heartbeatRuns.contextSnapshot })
-      .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId)));
-    const issueId = source?.issueId ?? readNonEmptyString(source?.context?.issueId);
-    if (issueId) await isRunExecutionReleased(db, { runId: input.runId, issueId });
+    await settleRecoveredExecutionRelease(input.runId);
     await finalizeAgentStatus(
       input.agentId,
       input.succeeded ? "succeeded" : "failed",
@@ -2238,7 +2247,10 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           )
           .returning({ id: heartbeatRuns.id })
           .then((rows) => rows[0] ?? null);
-        if (cleared) await recordNativeLocalProcessStop(tx as unknown as Db, run);
+        if (cleared) {
+          await recordNativeLocalProcessStop(tx as unknown as Db, run);
+          await settleRecoveredExecutionRelease(run.id, tx as unknown as Db);
+        }
         return cleared;
       });
       if (cleared) claimableNativeRunIds.add(cleared.id);
@@ -2246,12 +2258,12 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
 
     const executingRun = (runId: string) => activeRunExecutions.has(runId) || runningProcesses.has(runId);
     if (!settledProcessesDiscovered) {
-      settledProcessesDiscovered = await discoverSettledNativeRunProcesses(db, { skip: executingRun }).then(() => true, (error) => {
+      settledProcessesDiscovered = await discoverSettledNativeRunProcesses(db, { skip: executingRun, onReleased: (tx, runId) => settleRecoveredExecutionRelease(runId, tx) }).then(() => true, (error) => {
         logger.warn({ err: error }, "failed to discover settled native process identities");
         return false;
       });
     } else {
-      await retryPendingSettledNativeRunProcesses(db, { skip: executingRun }).catch((error) => {
+      await retryPendingSettledNativeRunProcesses(db, { skip: executingRun, onReleased: (tx, runId) => settleRecoveredExecutionRelease(runId, tx) }).catch((error) => {
         logger.warn({ err: error }, "failed to retry settled native process identity release");
       });
     }

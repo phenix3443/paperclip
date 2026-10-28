@@ -1,6 +1,6 @@
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { agents, agentWakeupRequests, authUsers, companies, createDb, heartbeatRuns, issues, type Db } from "@paperclipai/db";
+import { agents, agentWakeupRequests, authUsers, createDb, heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { seedReviewerIntent } from "./helpers/reviewer-intent.js";
 import { heartbeatService } from "../services/heartbeat.js";
@@ -57,6 +57,14 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(after?.executionPolicy).toEqual(f.issue.executionPolicy);
       expect(after?.responsibleUserId).toBe("board");
     } finally { await c.stop(); await service.drainActiveRunExecutions(); }
+  });
+
+  it("does not manufacture a new stage handoff from assignment-only repair", async () => {
+    const f = await seedReviewerIntent(db, false);
+    await db.update(issues).set({ assigneeAgentId: f.source.agentId }).where(eq(issues.id, f.issueId));
+    await issueService(db).update(f.issueId, { assigneeAgentId: f.agentId, actorAgentId: f.source.agentId,
+      executionHandoffRunId: f.source.id });
+    expect(await receipts(f)).toHaveLength(0);
   });
 
   it("does not turn a caller-declared stage wake into durable reviewer authority", async () => {

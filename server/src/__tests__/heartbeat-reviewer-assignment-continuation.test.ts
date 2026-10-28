@@ -27,11 +27,6 @@ const support = await getEmbeddedPostgresTestSupport();
 
   type Fixture = Awaited<ReturnType<typeof seed>>;
 
-  /**
-   * The production shape of a stage handoff: the outgoing run was cancelled
-   * for the reassignment, its provider stop was acknowledged, and its
-   * environment lease is still held while executor cleanup runs.
-   */
   async function seed(input: { stage?: boolean } = {}) {
     const stage = input.stage ?? true;
     const companyId = randomUUID(), previousAgentId = randomUUID(), nextAgentId = randomUUID();
@@ -70,7 +65,6 @@ const support = await getEmbeddedPostgresTestSupport();
     const [lease] = await db.insert(environmentLeases).values({
       companyId, issueId, heartbeatRunId: runId, status: "active", provider: "local",
     }).returning();
-    // Occupy the next agent so admission queues its run without launching a provider.
     const [busy] = await db.insert(heartbeatRuns).values({ companyId, agentId: nextAgentId, status: "running" }).returning();
     const executionStage = {
       stageId, wakeRole: "reviewer", stageType: "review", reviewRequest,

@@ -144,7 +144,9 @@ export async function readNativeLocalProcessStop(db: Db, companyId: string, runI
 
 type SettledProcessRelease = "released" | "pending" | "skipped";
 
-export async function releaseSettledNativeRunProcess(db: Db, runId: string): Promise<SettledProcessRelease> {
+type NativeProcessReleased = (tx: Db, runId: string) => Promise<void>;
+
+export async function releaseSettledNativeRunProcess(db: Db, runId: string, onReleased?: NativeProcessReleased): Promise<SettledProcessRelease> {
   return db.transaction(async transaction => {
     const tx = transaction as unknown as Db;
     const [run] = await tx.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
@@ -177,6 +179,7 @@ export async function releaseSettledNativeRunProcess(db: Db, runId: string): Pro
     await tx.update(heartbeatRuns).set({
       processPid: null, processGroupId: null, processStartedAt: null, updatedAt: new Date(),
     }).where(eq(heartbeatRuns.id, run.id));
+    await onReleased?.(tx, run.id);
     return "released";
   });
 }
@@ -184,8 +187,8 @@ export async function releaseSettledNativeRunProcess(db: Db, runId: string): Pro
 const MAX_SETTLED_PROCESS_RELEASE_ATTEMPTS = 20;
 const pendingSettledProcessReleases = new Map<string, number>();
 
-export async function settleNativeRunProcess(db: Db, runId: string) {
-  const outcome = await releaseSettledNativeRunProcess(db, runId);
+export async function settleNativeRunProcess(db: Db, runId: string, onReleased?: NativeProcessReleased) {
+  const outcome = await releaseSettledNativeRunProcess(db, runId, onReleased);
   const attempts = (pendingSettledProcessReleases.get(runId) ?? 0) + 1;
   if (outcome === "pending" && attempts < MAX_SETTLED_PROCESS_RELEASE_ATTEMPTS) {
     pendingSettledProcessReleases.set(runId, attempts);
@@ -199,15 +202,15 @@ export function pendingSettledNativeRunProcessIds() {
   return [...pendingSettledProcessReleases.keys()];
 }
 
-export async function retryPendingSettledNativeRunProcesses(db: Db, input: { skip?: (runId: string) => boolean } = {}) {
+export async function retryPendingSettledNativeRunProcesses(db: Db, input: { skip?: (runId: string) => boolean; onReleased?: NativeProcessReleased } = {}) {
   for (const runId of pendingSettledNativeRunProcessIds()) {
     if (input.skip?.(runId)) continue;
-    await settleNativeRunProcess(db, runId);
+    await settleNativeRunProcess(db, runId, input.onReleased);
   }
 }
 
 export async function discoverSettledNativeRunProcesses(db: Db, input: {
-  limit?: number; skip?: (runId: string) => boolean;
+  limit?: number; skip?: (runId: string) => boolean; onReleased?: NativeProcessReleased;
 } = {}) {
   const limit = input.limit ?? 50;
   let after: string | null = null;
@@ -222,7 +225,7 @@ export async function discoverSettledNativeRunProcesses(db: Db, input: {
     )).orderBy(asc(heartbeatRuns.id)).limit(limit);
     for (const candidate of candidates) {
       if (input.skip?.(candidate.id)) continue;
-      if (await settleNativeRunProcess(db, candidate.id) === "released") released += 1;
+      if (await settleNativeRunProcess(db, candidate.id, input.onReleased) === "released") released += 1;
     }
     after = candidates.length < limit ? null : candidates.at(-1)!.id;
   } while (after);

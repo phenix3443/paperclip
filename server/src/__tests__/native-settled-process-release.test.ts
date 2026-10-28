@@ -157,6 +157,21 @@ suite("settled native run process identity", () => {
     expect(await releaseSettledNativeRunProcess(db, runId)).toBe("skipped");
   });
 
+  it("rolls process release back when its execution-release settlement fails", async () => {
+    const { runId, pid } = await seed();
+    await expect(releaseSettledNativeRunProcess(db, runId, async () => { throw new Error("release settlement failed"); }))
+      .rejects.toThrow("release settlement failed");
+    expect(await readRun(runId)).toMatchObject({ processPid: pid, processGroupId: pid });
+    expect(await hasNativeLocalProcessStop(db, companyId, runId)).toBe(false);
+    const settled = vi.fn(async (tx, id: string) => {
+      expect(tx).toBeDefined(); expect(id).toBe(runId);
+      expect(await hasNativeLocalProcessStop(tx, companyId, runId)).toBe(true);
+    });
+    expect(await releaseSettledNativeRunProcess(db, runId, settled)).toBe("released");
+    expect(settled).toHaveBeenCalledOnce();
+    expect(await readRun(runId)).toMatchObject({ processPid: null, processGroupId: null });
+  });
+
   it("releases the identity from the periodic recovery sweep", async () => {
     const { runId } = await seed({ status: "timed_out" });
     const child = startDetached();

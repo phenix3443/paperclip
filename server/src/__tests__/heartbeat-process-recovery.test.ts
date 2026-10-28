@@ -25,6 +25,9 @@ import { waitForPendingRunFailureReports } from "../services/run-failure-report.
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { createHash, randomUUID } from "node:crypto";
 import { recordLegacyWorkspaceRestoreFailure, terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
+import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
+import { registerExecutionControlWork, executionControlSchedule } from "../services/execution-control-work.js";
+import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
 import { issueService } from "../services/issues.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { adapterExecutionControls, createAdapterExecutionControl } from "../services/adapter-execution-control.js";
@@ -2631,6 +2634,53 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(mockAdapterExecute).not.toHaveBeenCalled();
     await heartbeat.drainActiveRunExecutions();
   });
+
+  it("delivers the reviewer after actual native finalization and verified local workspace cleanup", async () => {
+    const f = await seedPendingNativeFinalization();
+    const reviewerId = randomUUID(), stageId = randomUUID();
+    await db.insert(agents).values({ id: reviewerId, companyId: f.companyId, name: "Reviewer", role: "engineer",
+      adapterType: "process", status: "idle", runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } });
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: reviewerId, status: "running" });
+    const state = { status: "pending", currentStageId: stageId, currentStageIndex: 0, currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: reviewerId }, returnAssignee: { type: "agent", agentId: f.agentId },
+      reviewRequest: { instructions: "Review the same native submission" }, completedStageIds: [],
+      lastDecisionId: null, lastDecisionOutcome: null, changesRequestedCount: 2 };
+    await issueService(db).update(f.issueId, { status: "in_review", assigneeAgentId: reviewerId, executionState: state,
+      executionPolicy: { mode: "normal", stages: [{ id: stageId, type: "review", approvalsNeeded: 1,
+        participants: [{ id: randomUUID(), type: "agent", agentId: reviewerId }] }] },
+      actorAgentId: f.agentId, executionHandoffRunId: f.runId });
+    const before = (await db.select().from(issues).where(eq(issues.id, f.issueId)))[0];
+    const heartbeat = heartbeatService(db);
+    const c = createDeliveryWorkCoordinator({ owner: db, canRun: () => true });
+    try {
+      await registerExecutionControlWork(c, [{ queue: DELIVERY_QUEUES.executionContinuation,
+        run: heartbeat.reconcileReviewerAssignments, next: executionControlSchedule(db).continuation }]).ready;
+      const [receipt] = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
+        sql`${agentWakeupRequests.payload} ? '_paperclipReviewerAssignmentContinuation'`));
+      expect(receipt).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      const started = new Date(0);
+      await db.update(heartbeatRuns).set({ processStartedAt: started, runnerProfileJson: {} }).where(eq(heartbeatRuns.id, f.runId));
+      await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, agentId: f.agentId, runId: f.runId,
+        seq: 100, eventType: "native.process_identity_recorded", payload: { targetKind: "local", hostname: os.hostname(),
+          processPid: 2_000_000_000, processGroupId: null, processStartedAt: started.toISOString() } });
+      await db.update(heartbeatRuns).set({ nextEventSeq: 101 }).where(eq(heartbeatRuns.id, f.runId));
+      await db.insert(workspaceOperations).values({ companyId: f.companyId, issueId: f.issueId,
+        heartbeatRunId: f.runId, phase: "workspace_finalize", status: "succeeded" });
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"], shouldAdvanceTime: true });
+      await heartbeat.reapOrphanedRuns();
+      expect(await heartbeat.getRun(f.runId)).toMatchObject({ runtimeMode: "native", nativePhase: "committed" });
+      expect((await heartbeat.getRun(f.runId))?.resultJson?.executionReleased).toMatchObject({ runId: f.runId, issueId: f.issueId });
+      await vi.advanceTimersByTimeAsync(60_000);
+      await vi.waitFor(async () => expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt.id)))[0])
+        .toMatchObject({ status: "coalesced", runId: expect.any(String) }), { timeout: 5000 });
+      const after = (await db.select().from(issues).where(eq(issues.id, f.issueId)))[0];
+      expect(after.executionPolicy).toEqual(before.executionPolicy);
+      expect(after.executionState).toEqual(before.executionState);
+      expect(after.responsibleUserId).toEqual(before.responsibleUserId);
+      expect(mockExecutePaperclipNativeSession).not.toHaveBeenCalled();
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); await c.stop(); await heartbeat.drainActiveRunExecutions(); }
+  }, 30_000);
 
   it("rejects foreign result, company, and issue bindings for native finalization", async () => {
     const source = await seedPendingNativeFinalization();

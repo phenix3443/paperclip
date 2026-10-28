@@ -8728,7 +8728,6 @@ export function issueService(db: Db) {
     },
 
     getByIdForUpdate: async (id: string, dbOrTx: any) => {
-      await dbOrTx.execute(sql`select c.id from companies c join issues i on i.company_id = c.id where i.id = ${id} for share of c`);
       return dbOrTx
         .select()
         .from(issues)
@@ -11423,7 +11422,7 @@ export function issueService(db: Db) {
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;
-        await produceReviewerAssignmentTransition(tx, receiptExisting, updated, {
+        if (patch.executionState !== undefined) await produceReviewerAssignmentTransition(tx, receiptExisting, updated, {
           sourceRunId: executionHandoffRunId ?? actorRunId ?? receiptExisting.executionRunId ?? receiptExisting.checkoutRunId,
           actorType: actorAgentId ? "agent" : actorUserId ? "user" : "system",
           actorId: actorAgentId ?? actorUserId ?? "issue.execution_stage",
