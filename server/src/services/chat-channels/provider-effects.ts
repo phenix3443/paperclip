@@ -1,3 +1,4 @@
+import { notifyChatConnectionHealth } from "./connection-health-notifications.js";
 import { createTelegramCallbackNoticeAuthority } from "./telegram/callback-notices.js";
 
 import { slackThreadChannelId } from "./slack/messages.js";
@@ -325,6 +326,7 @@ export function createProviderEffects(db: Db, options: ProviderEffectsOptions) {
             updatedAt: new Date(),
           })
           .where(eq(chatEndpoints.id, currentEndpoint.id));
+        await notifyChatConnectionHealth(tx, currentEndpoint);
         await tx
           .update(toolConnections)
           .set({

@@ -1,3 +1,4 @@
+import { notifyToolConnectionHealth } from "./tool-connection-health-notifications.js";
 import { and, eq, inArray, ne, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -323,6 +324,7 @@ export function accessService(db: Db) {
             && grant.credentialSecretRefs.length > 0
             && grant.credentialSecretRefs.every((ref) => !connectionSecretIdsToRemove.has(ref.secretId)),
           );
+          if (!hasUnaffectedActiveGrant) await notifyToolConnectionHealth(tx, { companyId, id: connection.id });
           await tx.update(toolConnections).set({
             credentialRefs,
             credentialSecretRefs,
@@ -1162,6 +1164,7 @@ export function accessService(db: Db) {
   return {
     isInstanceAdmin,
     decide,
+    decideReads: authorization.decideReads,
     projectDiscoveryCandidateIds: authorization.projectDiscoveryCandidateIds,
     canUser,
     hasPermission,
