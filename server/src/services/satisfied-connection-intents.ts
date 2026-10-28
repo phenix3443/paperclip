@@ -2,7 +2,7 @@ import { and, asc, eq, gt, inArray, isNull, or } from "drizzle-orm";
 import { approvals, companyMemberships, connectionIntentDeliveries, issueApprovals, issueThreadInteractions, issues, toolCatalogEntries, type Db } from "@paperclipai/db";
 import { connectionIntentPayloadSchema } from "@paperclipai/shared";
 import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
-import { connectionIntentService } from "./connection-intents.js";
+import { connectionIntentService, gatewaySatisfiesTools } from "./connection-intents.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { logger } from "../middleware/logger.js";
 import { createToolGatewayService } from "./tool-gateway.js";
@@ -52,11 +52,9 @@ async function findAvailableToolConnection(db: Db, task: Task, intent: Intent, p
   ));
   const satisfied = accessRequest.tools.every((requested) => {
     const entry = catalog.find(candidate => candidate.id === requested.catalogEntryId);
-    if (!entry || entry.status !== "active" || entry.entryKind !== "tool"
-      || entry.toolName !== requested.toolName || entry.versionHash !== requested.versionHash) return false;
-    const decisions = access.tools.filter(tool => tool.toolName === entry.toolName).map(tool => tool.decision);
-    return decisions.length === 1 && (decisions[0] === "allowed" || (requested.permission === "ask_first" && decisions[0] === "ask_first"));
-  });
+    return entry && entry.status === "active" && entry.entryKind === "tool"
+      && entry.toolName === requested.toolName && entry.versionHash === requested.versionHash;
+  }) && gatewaySatisfiesTools(access.tools, accessRequest.tools);
   return satisfied ? connection : null;
 }
 
