@@ -55,12 +55,16 @@ describePostgres("tool policy writes notify the connection delivery worker", () 
     expect(delivery.wakeup).toHaveBeenCalledOnce();
   });
 
-  it("notifies on a narrowing write without retiring the card", async () => {
+  it("notifies on disabled-copy and narrowing writes without retiring the card", async () => {
     const f = await seedPendingAccessRequest(db, "owner");
-    const allow = await policy(f.companyId, "allow", { enabled: false });
+    const allow = await policy(f.companyId, "allow", { enabled: false, priority: 20 });
     delivery = await startConnectionDelivery(db);
-    const baseline = delivery.sweeps;
+    let baseline = delivery.sweeps;
     await service().duplicatePolicy({ companyId: f.companyId, policyId: allow.id, body: {} });
+    await delivery.settle(baseline + 1);
+    baseline = delivery.sweeps;
+    await service().createPolicy(f.companyId, { name: "Block", policyType: "block", priority: 10, selectors: {} });
+    await service().updatePolicy({ companyId: f.companyId, policyId: allow.id, body: { enabled: true } });
     await delivery.settle(baseline + 1);
     expect((await card()).status).toBe("pending");
     expect(delivery.wakeup).not.toHaveBeenCalled();
@@ -82,11 +86,12 @@ describePostgres("tool policy writes notify the connection delivery worker", () 
   it("keeps the card pending with no durable effect when the policy write rolls back", async () => {
     const f = await seedPendingAccessRequest(db, "owner");
     delivery = await startConnectionDelivery(db);
+    const baseline = delivery.sweeps;
     await expect(db.transaction(async (tx) => {
       await toolAccessPolicyService(tx as unknown as typeof db).createPolicy(f.companyId, { name: "Allow", policyType: "allow", selectors: {} });
       throw new Error("rollback");
     })).rejects.toThrow("rollback");
-    await delivery.settle();
+    await delivery.settle(baseline + 1);
     expect((await card()).status).toBe("pending");
     expect(await db.select().from(toolPolicies)).toHaveLength(0);
     expect(await db.select().from(connectionIntentDeliveries)).toHaveLength(0);

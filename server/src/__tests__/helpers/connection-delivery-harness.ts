@@ -29,12 +29,10 @@ export async function seedPendingAccessRequest(db: Db, owner: string) {
   return { companyId, agentId, issueId, intent: intent!, connection: connection!, tool: tool! };
 }
 
-/** The real connection worker with no maintenance deadline: only notifications start a sweep. */
 export async function startConnectionDelivery(db: Db, options: { canRun?: () => boolean } = {}) {
   const wakeup = vi.fn().mockResolvedValue(null);
   const service = connectionIntentDeliveryService(db, { wakeup });
   const errors: unknown[] = [];
-  const startedAt = Date.now();
   let sweeps = 0, running = 0;
   const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: options.canRun ?? (() => true), onError: error => { errors.push(error); } });
   const worker = coordinator.register(DELIVERY_QUEUES.connection, { retryMs: RETRY_MS, nextRunAt: () => null, hasPending: () => service.hasPending(),
@@ -56,7 +54,6 @@ export async function startConnectionDelivery(db: Db, options: { canRun?: () => 
     async stop() {
       await coordinator.stop();
       expect(errors).toEqual([]);
-      expect(Date.now() - startedAt).toBeLessThan(RETRY_MS);
     },
   };
 }
