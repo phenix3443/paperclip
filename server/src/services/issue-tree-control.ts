@@ -24,6 +24,7 @@ import {
 import { conflict, notFound, unprocessable } from "../errors.js";
 import type { IssuePostCommitAction } from "./issues.js";
 import { notifyTerminalWorkspaceWork } from "./terminal-workspace-work.js";
+import { releaseWaitingReconciledDeliveries } from "./execution-reconciliation-release.js";
 
 type IssueRow = typeof issues.$inferSelect;
 type HoldRow = typeof issueTreeHolds.$inferSelect;
@@ -1157,24 +1158,28 @@ export function issueTreeControlService(db: Db) {
       throw conflict("Issue tree hold is already released");
     }
 
-    const [updated] = await db
-      .update(issueTreeHolds)
-      .set({
-        status: "released",
-        releasedAt: new Date(),
-        releasedByActorType: input.actor.actorType,
-        releasedByAgentId: input.actor.agentId ?? null,
-        releasedByUserId: input.actor.userId ?? (input.actor.actorType === "user" ? input.actor.actorId : null),
-        releasedByRunId: input.actor.runId ?? null,
-        releaseReason: input.reason ?? null,
-        releasePolicy: input.releasePolicy
-          ? (normalizeReleasePolicy(input.releasePolicy) as unknown as Record<string, unknown>)
-          : existing.releasePolicy,
-        releaseMetadata: input.metadata ?? null,
-        updatedAt: new Date(),
-      })
-      .where(and(eq(issueTreeHolds.id, holdId), eq(issueTreeHolds.companyId, companyId)))
-      .returning();
+    const updated = await db.transaction(async (tx) => {
+      const [row] = await tx
+        .update(issueTreeHolds)
+        .set({
+          status: "released",
+          releasedAt: new Date(),
+          releasedByActorType: input.actor.actorType,
+          releasedByAgentId: input.actor.agentId ?? null,
+          releasedByUserId: input.actor.userId ?? (input.actor.actorType === "user" ? input.actor.actorId : null),
+          releasedByRunId: input.actor.runId ?? null,
+          releaseReason: input.reason ?? null,
+          releasePolicy: input.releasePolicy
+            ? (normalizeReleasePolicy(input.releasePolicy) as unknown as Record<string, unknown>)
+            : existing.releasePolicy,
+          releaseMetadata: input.metadata ?? null,
+          updatedAt: new Date(),
+        })
+        .where(and(eq(issueTreeHolds.id, holdId), eq(issueTreeHolds.companyId, companyId)))
+        .returning();
+      await releaseWaitingReconciledDeliveries(tx, { companyId, gates: ["subtree_pause"] });
+      return row!;
+    });
 
     const members = await db
       .select()

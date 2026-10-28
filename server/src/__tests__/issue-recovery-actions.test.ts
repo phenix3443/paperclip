@@ -61,6 +61,7 @@ import { workspaceOperationService, isNativeWorkspaceFinalizationOperationActive
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { issueService } from "../services/issues.js";
+import { issueTreeControlService } from "../services/issue-tree-control.js";
 import { caseHandoffService } from "../services/case-handoffs.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { withNativeWorkspaceFinalizationOwnership } from "../services/native-runtime/native-workspace-finalization-ownership.js";
@@ -2783,6 +2784,61 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           expect(await recheckAt(fixture.actionId)).toBeLessThanOrEqual(Date.now());
           await deliver();
           expect((await actionRow(fixture.actionId)).evidence).toMatchObject({ continuationDelivery: "delivered" });
+        });
+
+        const expectReleasedThenDelivered = async (actionId: string, open: () => Promise<unknown>) => {
+          expect(await recheckAt(actionId)).toBeGreaterThan(Date.now());
+          await open();
+          expect(await recheckAt(actionId)).toBeLessThanOrEqual(Date.now());
+          await deliver();
+          expect((await actionRow(actionId)).evidence).toMatchObject({ continuationDelivery: "delivered" });
+        };
+
+        it("delivers a dependency wait on the next pass after the blocker relation is removed", async () => {
+          const { fixture } = await waitingOnBlocker("recon:a3b-rel-dep-unlink");
+          await expectReleasedThenDelivered(fixture.actionId,
+            () => issueService(db).update(fixture.sourceIssueId, { blockedByIssueIds: [] }));
+        });
+
+        it("delivers an approval wait on the next pass after the approval is decided", async () => {
+          const fixture = await admitted("recon:a3b-rel-approval-1");
+          const [approval] = await db.insert(approvals).values({ companyId: fixture.companyId, type: "approve_ceo_strategy",
+            status: "pending", payload: {} }).returning();
+          await db.insert(issueApprovals).values({ companyId: fixture.companyId, issueId: fixture.sourceIssueId,
+            approvalId: approval!.id } as any);
+          await deliver();
+          expect((await actionRow(fixture.actionId)).evidence).toMatchObject({
+            continuationDelivery: "waiting", continuationWait: { gate: "approval" },
+          });
+          try {
+            await expectReleasedThenDelivered(fixture.actionId, () => approvalService(db).approve(approval!.id, "board-user"));
+          } finally {
+            await db.delete(issueApprovals).where(eq(issueApprovals.companyId, fixture.companyId));
+            await db.delete(approvals).where(eq(approvals.companyId, fixture.companyId));
+          }
+        });
+
+        it("delivers a subtree pause wait on the next pass after the hold is released", async () => {
+          const fixture = await admitted("recon:a3b-rel-treehold-1");
+          const [hold] = await db.insert(issueTreeHolds).values({ companyId: fixture.companyId,
+            rootIssueId: fixture.sourceIssueId, mode: "pause", status: "active", releasePolicy: {} }).returning();
+          await deliver();
+          expect((await actionRow(fixture.actionId)).evidence).toMatchObject({
+            continuationDelivery: "waiting", continuationWait: { gate: "subtree_pause" },
+          });
+          await expectReleasedThenDelivered(fixture.actionId, () => issueTreeControlService(db).releaseHold(
+            fixture.companyId, fixture.sourceIssueId, hold!.id, { actor: { actorType: "user", actorId: "board-user" } }));
+        });
+
+        it("releases a checkout wait when the execution lock is force-released", async () => {
+          const fixture = await admitted("recon:a3b-rel-checkout-1");
+          await db.update(issues).set({ executionRunId: fixture.runId }).where(eq(issues.id, fixture.sourceIssueId));
+          await db.update(issueRecoveryActions).set({
+            evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({ continuationDelivery: "waiting",
+              continuationWait: { gate: "checkout", since: new Date().toISOString(), attempts: 1,
+                recheckAt: new Date(Date.now() + 60 * 60 * 1000).toISOString() } })}::jsonb`,
+          }).where(eq(issueRecoveryActions.id, fixture.actionId));
+          await expectReleasedThenDelivered(fixture.actionId, () => issueService(db).adminForceRelease(fixture.sourceIssueId));
         });
       });
 

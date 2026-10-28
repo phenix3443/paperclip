@@ -15,7 +15,6 @@ import { admitExecutionReconciliationGates, lockAdmissionRows, memberRunPredicat
 import { isHeartbeatWakeOnDemandEnabled } from "./heartbeat-policy.js";
 import { lockAdmissionOwnerAndTreeHolds } from "./execution-reconciliation-locks.js";
 import { toExecutionReconciliationRefusal } from "./execution-reconciliation-receipts.js";
-import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 
 type DbOrTransaction = Db | Parameters<Parameters<Db["transaction"]>[0]>[0];
 
@@ -157,26 +156,4 @@ export async function isGuardedReconciliationDelivery(
     ));
   const decision = action?.evidence.executionReconciliation;
   return Boolean(decision && typeof decision === "object" && isAdmittedReconciliation(decision as Record<string, unknown>));
-}
-
-export async function releaseWaitingReconciledDeliveries(
-  tx: DbOrTransaction,
-  input: { companyId: string; gates: readonly string[]; issueIds?: readonly string[] },
-) {
-  if (input.gates.length === 0 || input.issueIds?.length === 0) return 0;
-  const released = await tx
-    .update(issueRecoveryActions)
-    .set({
-      evidence: sql`jsonb_set(${issueRecoveryActions.evidence}, '{continuationWait,recheckAt}', to_jsonb(${new Date().toISOString()}::text))`,
-    })
-    .where(and(
-      eq(issueRecoveryActions.companyId, input.companyId),
-      eq(issueRecoveryActions.status, "resolved"),
-      sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'waiting'`,
-      inArray(sql<string>`${issueRecoveryActions.evidence}#>>'{continuationWait,gate}'`, [...input.gates]),
-      input.issueIds ? inArray(issueRecoveryActions.sourceIssueId, [...input.issueIds]) : undefined,
-    ))
-    .returning({ id: issueRecoveryActions.id });
-  if (released.length > 0) await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionContinuation);
-  return released.length;
 }

@@ -8,6 +8,7 @@ import { unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { createAgentLifecycle } from "./agent-lifecycle.js";
 import { lockIssuesLinkedToApproval } from "./execution-reconciliation-locks.js";
+import { releaseWaitingReconciledDeliveriesForApproval } from "./execution-reconciliation-release.js";
 
 import { instanceSettingsService } from "./instance-settings.js";
 
@@ -65,17 +66,21 @@ export function approvalRecords(db: Db) {
     // cleanup. Idempotent: a no-op on already-resolved approvals.
     cancel: async (id: string, reason?: string | null) => {
       const now = new Date();
-      const updated = await db
-        .update(approvals)
-        .set({
-          status: "cancelled",
-          decisionNote: reason ?? null,
-          decidedAt: now,
-          updatedAt: now,
-        })
-        .where(and(eq(approvals.id, id), inArray(approvals.status, resolvableStatuses)))
-        .returning()
-        .then((rows) => rows[0] ?? null);
+      const updated = await db.transaction(async (tx) => {
+        const row = await tx
+          .update(approvals)
+          .set({
+            status: "cancelled",
+            decisionNote: reason ?? null,
+            decidedAt: now,
+            updatedAt: now,
+          })
+          .where(and(eq(approvals.id, id), inArray(approvals.status, resolvableStatuses)))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (row) await releaseWaitingReconciledDeliveriesForApproval(tx, { companyId: row.companyId, approvalId: id });
+        return row;
+      });
       return updated;
     },
 
@@ -195,7 +200,13 @@ export function approvalService(db: Db) {
       const result = await decideHire({ approvalId: id }, status, userId, note);
       return { approval: result!.approval!, applied: result!.applied };
     }
-    return resolveApproval(id, status, userId, note);
+    return db.transaction(async (tx) => {
+      const result = await resolveApproval(id, status, userId, note, tx as unknown as Db);
+      if (result.applied) {
+        await releaseWaitingReconciledDeliveriesForApproval(tx, { companyId: result.approval.companyId, approvalId: id });
+      }
+      return result;
+    });
   }
   return { ...records,
     approveHire: (agentId: string, userId: string, note?: string | null) => decideHire(agentId, "approved", userId, note),

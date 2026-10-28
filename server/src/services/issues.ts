@@ -13,7 +13,7 @@ import { executionWorkspaceService } from "./execution-workspaces.js";
 import { notifyChatPublicationWork } from "./chat-work-notifications.js";
 import { notifyTerminalWorkspaceWork } from "./terminal-workspace-work.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
-import { releaseWaitingReconciledDeliveries } from "./execution-reconciliation-delivery.js";
+import { releaseWaitingReconciledDeliveries } from "./execution-reconciliation-release.js";
 import { recordChatHandoff, recordChatCompletion, existingChatCompletionReply, acknowledgeChatCompletionReply } from "./chat-completion-delivery.js";
 import { mirrorSlackBoardComment, slackBoardReplyBindings } from "./slack-board-messages.js";
 import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
@@ -7535,7 +7535,7 @@ export function issueService(db: Db) {
       await assertNoBlockingCycles(companyId, issueId, deduped, dbOrTx);
     }
 
-    await dbOrTx
+    const removed = await dbOrTx
       .delete(issueRelations)
       .where(
         and(
@@ -7543,7 +7543,11 @@ export function issueService(db: Db) {
           eq(issueRelations.relatedIssueId, issueId),
           eq(issueRelations.type, "blocks"),
         ),
-      );
+      )
+      .returning({ blockerIssueId: issueRelations.issueId });
+    if (removed.some((row: { blockerIssueId: string }) => !deduped.includes(row.blockerIssueId))) {
+      await releaseWaitingReconciledDeliveries(dbOrTx, { companyId, gates: ["dependency"], issueIds: [issueId] });
+    }
 
     if (deduped.length === 0) return;
 
@@ -12282,6 +12286,11 @@ export function issueService(db: Db) {
           .returning()
           .then((rows) => rows[0] ?? null);
         if (!updated) return null;
+        if (existing.checkoutRunId || existing.executionRunId) {
+          await releaseWaitingReconciledDeliveries(tx, {
+            companyId: updated.companyId, gates: ["checkout"], issueIds: [id],
+          });
+        }
 
         const [enriched] = await withIssueLabels(tx, [updated]);
         return {
