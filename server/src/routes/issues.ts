@@ -2801,6 +2801,7 @@ function buildExecutionStageWakeup(input: {
   interruptedRunId: string | null;
   requestedByActorType: "user" | "agent";
   requestedByActorId: string;
+  restoredFromHold?: boolean;
 }) {
   const { issueId, previousState, nextState, interruptedRunId } = input;
   if (!nextState) return null;
@@ -2817,7 +2818,7 @@ function buildExecutionStageWakeup(input: {
         previousState?.currentParticipant ?? null,
         nextState.currentParticipant ?? null,
       );
-    if (!agentId || !stageChanged) return null;
+    if (!agentId || (!stageChanged && !input.restoredFromHold)) return null;
 
     const reason =
       nextState.currentStageType === "approval"
@@ -15989,6 +15990,10 @@ export function issueRoutes(
         interruptedRunId,
         requestedByActorType: actor.actorType,
         requestedByActorId: actor.actorId,
+        restoredFromHold:
+          req.body.status === "in_review" &&
+          existing.status === "blocked" &&
+          issue.status === "in_review",
       });
 
       // Merge all wakeups from this update into one enqueue per agent to avoid duplicate runs.
