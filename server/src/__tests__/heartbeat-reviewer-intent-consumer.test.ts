@@ -655,14 +655,30 @@ const support = await getEmbeddedPostgresTestSupport();
     if (kind === "responsible user") changes.responsibleUserId = "another-sponsor";
     if (kind === "assignment") changes.assigneeAgentId = f.source.agentId;
     await db.update(issues).set({ ...changes, executionState: state }).where(eq(issues.id, f.issueId));
-    if (kind === "source identity") await db.update(heartbeatRuns).set({ nativeIssueId: randomUUID() }).where(eq(heartbeatRuns.id, f.source.id));
+    if (kind === "source identity") await db.update(heartbeatRuns).set({ agentId: f.agentId }).where(eq(heartbeatRuns.id, f.source.id));
     const [current] = await db.select().from(issues).where(eq(issues.id, f.issueId));
     await heartbeatService(db).reconcileReviewerAssignments();
     expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.receipt.id)))[0])
       .toMatchObject({ status: "cancelled", runId: null, payload: f.receipt.payload });
     expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0]).toEqual(current);
-    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(0);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(1);
     expect(await executionControlSchedule(db).continuation()).toBeNull();
+  });
+
+  it("does not launder an invalid duplicate actor through another receipt's association", async () => {
+    const f = await seed();
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+    const payload = structuredClone(f.receipt.payload!);
+    const record = payload._paperclipReviewerAssignmentContinuation as { immutable: { actorType: string; actorId: string } };
+    record.immutable.actorType = "user";
+    record.immutable.actorId = "unrelated-user";
+    const [invalid] = await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+      source: "assignment", triggerDetail: "system", reason: "execution_review_requested", status: "deferred_issue_execution",
+      requestedByActorType: "user", requestedByActorId: "unrelated-user", payload, createdAt: new Date(Date.now() + 1) }).returning();
+    await heartbeatService(db).reconcileReviewerAssignments();
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.receipt.id)))[0].status).toBe("coalesced");
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, invalid.id)))[0])
+      .toMatchObject({ status: "cancelled", runId: null, payload });
   });
 
   it("bounds each pass to 50 due receipts and gives overflow its next pass", async () => {

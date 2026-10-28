@@ -200,7 +200,7 @@ export async function consumeReviewerIntent(tx: Db, candidate: Receipt, run: typ
   )).for("update");
   const ids = rows.filter(row => {
     const record = readIntent(row);
-    return record?.immutable.sourceRunId === intent.immutable.sourceRunId;
+    return record !== null && canonical(record.immutable) === canonical(intent.immutable);
   }).map(row => row.id);
   if (!ids.length) return;
   await tx.update(agentWakeupRequests).set({ status: "coalesced", runId: run.id,
