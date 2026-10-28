@@ -15,6 +15,7 @@ import { preserveNativeFailedWorkspace } from "./native-runtime/native-failed-wo
 import { NativeWorkspaceFinalizationBusyError } from "./native-runtime/native-workspace-finalization-ownership.js";
 import { adapterExecutionControls } from "./adapter-execution-control.js";
 import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state.js";
+import { ownExecutionReleaseMarkerSql } from "./run-execution-release-marker.js";
 
 export async function taskRetryMutationAllowed(db: Db, input: {
   companyId: string; issueId: string; actorId: string; actorSource: TaskRetryIntent["actorSource"];
@@ -84,12 +85,7 @@ async function readBoardMessageRetrySource(db: Db, input: {
       sql`not exists (select 1 from jsonb_object_keys(case when jsonb_typeof(${heartbeatRuns.resultJson}) = 'object'
         then ${heartbeatRuns.resultJson} else '{}'::jsonb end) key
         where key not in ('effectiveTimeoutSec', 'executionRecovery', 'stopReason', 'timeoutConfigured', 'timeoutFired', 'timeoutSource')
-          and not (key = 'executionReleased' and jsonb_typeof(${heartbeatRuns.resultJson}->'executionReleased') = 'object'
-            and ${heartbeatRuns.resultJson}#>>'{executionReleased,schema}' = 'paperclip.run-execution-release.v1'
-            and ${heartbeatRuns.resultJson}#>>'{executionReleased,runId}' = ${heartbeatRuns.id}::text
-            and ${heartbeatRuns.resultJson}#>>'{executionReleased,issueId}' = ${input.issueId}
-            and jsonb_typeof(${heartbeatRuns.resultJson}#>'{executionReleased,settledAt}') = 'string'
-            and (${heartbeatRuns.resultJson}->'executionReleased') - 'schema' - 'runId' - 'issueId' - 'settledAt' = '{}'::jsonb))`,
+          and not (key = 'executionReleased' and ${ownExecutionReleaseMarkerSql(heartbeatRuns.resultJson, heartbeatRuns.id, input.issueId)}))`,
       sql`${heartbeatRuns.runnerProfileJson}->'adapterDispatch' = '{"adapterType":"paperclip_runner"}'::jsonb`,
       sql`not exists (select 1 from jsonb_object_keys(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object'
         then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) key
