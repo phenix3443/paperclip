@@ -3679,3 +3679,29 @@ The shared `runChildProcess` helper records child stdin stream errors through
 The helper still waits for the child and preserves its exit status and output.
 Run `pnpm exec vitest run packages/adapter-utils/src/server-utils.test.ts` to
 verify broken-pipe handling, normal input delivery and process cleanup.
+
+### Reviewer assignment delivery after cleanup
+
+The issue service persists a future pending agent-review handoff as an unfinished
+reviewer intent in the same transaction as the stage/assignment update. Only
+server-owned transition inputs identify the interrupted source run; public wake
+payloads cannot create the intent. Repeated handoff wakes leave delivery to the
+existing execution-continuation consumer. Ordinary matching reviewer turns still
+satisfy the intent through generation-based adoption.
+
+The executor release marker transaction notifies `executionContinuation` after
+actual process, lease and workspace settlement. Recovered native workspace
+settlement uses the existing release-proof verifier; a terminal status alone
+cannot release a reviewer. Missing hints and later gate changes use the retained
+receipt's deadline through the existing coordinator. No unfinished intent means
+no reviewer retry deadline. Stop/archive retire the intent; pause and budget holds
+preserve it. Policy, complete review state, decisions and responsible identity are
+not rewritten by delivery.
+
+See `heartbeat-reviewer-assignment-continuation.test.ts` for the original symptom,
+`heartbeat-reviewer-handoff.test.ts` for real local executor cancellation/cleanup
+and transactional handoff tests, and `heartbeat-native-cleanup-admission.test.ts`
+for the native terminal-before-cleanup boundary. The intent consumer, transaction,
+retirement and namespace suites cover the remaining assembled-service contracts.
+An unfenced binary must never consume storage containing unfinished reviewer
+intents; deployment and compatible rollback remain separate operator work.

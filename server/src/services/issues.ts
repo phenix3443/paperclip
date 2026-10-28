@@ -6,7 +6,7 @@ import { assertOnboardingFirstTaskCreationAllowed } from "./onboarding-first-tas
 
 import { resolveConnectionIntentContinuationSource, resolveItemVerdictContinuationWake } from "./chat-interaction-continuation.js";
 import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
-import { retireReviewerIntents } from "./heartbeat/reviewer-assignment-continuation.js";
+import { produceReviewerAssignmentTransition, retireReviewerIntents } from "./heartbeat/reviewer-assignment-continuation.js";
 import { insertIssueComment } from "./issue-comment-writes.js";
 import { measureRunTransaction } from "./execution-transaction-timing.js";
 import { readNativeMonitorSource } from "./native-runtime/native-monitor-delivery.js";
@@ -8728,6 +8728,7 @@ export function issueService(db: Db) {
     },
 
     getByIdForUpdate: async (id: string, dbOrTx: any) => {
+      await dbOrTx.execute(sql`select c.id from companies c join issues i on i.company_id = c.id where i.id = ${id} for share of c`);
       return dbOrTx
         .select()
         .from(issues)
@@ -10934,6 +10935,7 @@ export function issueService(db: Db) {
         expectedExecutionPolicy?: typeof issues.$inferInsert.executionPolicy;
         expectedStatusVersion?: number;
         expectedExecutionPolicyTransition?: { inputs: string; changesTask: boolean };
+        executionHandoffRunId?: string | null;
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
@@ -10980,6 +10982,7 @@ export function issueService(db: Db) {
         actorRunId,
         caseHandoffId,
         actorRunStopId,
+        executionHandoffRunId,
         actorUserId,
         companyGuard,
         workspaceSelectionActor,
@@ -11234,7 +11237,7 @@ export function issueService(db: Db) {
       }
 
       const runUpdate = async (tx: any) => {
-        if (parseObject(parseObject(patch.executionPolicy).monitor).serviceName === PROVIDER_QUOTA_MONITOR_SERVICE_NAME)
+        if (patch.executionState !== undefined || parseObject(parseObject(patch.executionPolicy).monitor).serviceName === PROVIDER_QUOTA_MONITOR_SERVICE_NAME)
           await tx.select({ id: companies.id }).from(companies).where(eq(companies.id, existing.companyId)).for("share");
         const changesPrivacy = issueData.visibility !== undefined || issueData.parentId !== undefined || issueData.projectId !== undefined;
         if (changesPrivacy) await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`issue-privacy-tree:${existing.companyId}`}, 0))`);
@@ -11420,6 +11423,11 @@ export function issueService(db: Db) {
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;
+        await produceReviewerAssignmentTransition(tx, receiptExisting, updated, {
+          sourceRunId: executionHandoffRunId ?? actorRunId ?? receiptExisting.executionRunId ?? receiptExisting.checkoutRunId,
+          actorType: actorAgentId ? "agent" : actorUserId ? "user" : "system",
+          actorId: actorAgentId ?? actorUserId ?? "issue.execution_stage",
+        });
         const quotaProofPublication = await recordReviewQuotaMonitorInstallation(tx as unknown as Db, receiptExisting, updated);
         if (quotaProofPublication) activityPublications.push(quotaProofPublication);
         if (updated.status === "done" || updated.status === "cancelled") {

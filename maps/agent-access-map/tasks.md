@@ -357,6 +357,16 @@ does not count as terminal. See the
 [service/PostgreSQL coverage](../../server/src/__tests__/heartbeat-reviewer-intent-retirement.test.ts);
 this does not qualify a live agent completion journey.
 
+Reviewer handoff delivery: Server-owned stage transitions save source identity
+and the full generation in the handoff transaction. Public wake payloads cannot
+create that authority. Cleanup notifies across outgoing/incoming agent IDs;
+ordinary admission and final dispatch retain current company, identity, project,
+budget, pause and task gates. Repeated stage wakes defer to the retained duty;
+ordinary matching turns may be adopted once. See
+[handoff coverage](../../server/src/__tests__/heartbeat-reviewer-handoff.test.ts)
+and [consumer matrix](../../server/src/__tests__/heartbeat-reviewer-intent-consumer.test.ts).
+No new agent API or recovery permission is introduced.
+
 ### `start-backlog-cas`
 
 API: `present` — PATCH /api/issues/{id} exactly{status:todo,expectedStatusVersion:N}, N>=0.

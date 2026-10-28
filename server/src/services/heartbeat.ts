@@ -3909,7 +3909,7 @@ export function heartbeatService(
       const executionReleased = executionCleanupSettled && latestRun !== null && !nativeSessionResumeScheduled &&
         !nativeWorkspaceFinalizeScheduled && !nativeOwnershipHeld && isHeartbeatRunTerminalStatus(latestRun.status);
       if (executionReleased) {
-        const releasedIssueId = readNonEmptyString(latestRun!.contextSnapshot?.issueId);
+        const releasedIssueId = latestRun!.nativeIssueId ?? readNonEmptyString(latestRun!.contextSnapshot?.issueId);
         if (releasedIssueId) await recordRunExecutionReleased(db, run.id, releasedIssueId);
         const handoff = await pendingCaseHandoffForRun(db, run.id);
         if (handoff) await recordCaseHandoffExecutionReleased(db, run.id, handoff.issueId);

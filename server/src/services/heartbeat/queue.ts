@@ -1,7 +1,7 @@
 import { settleNewReviewRunIdentity, settleReviewRunClaimIdentity } from "../run-identity.js";
 import type { IssueMonitorAdmission } from "./scheduling.js";
 import { parseIssueExecutionState } from "../issue-execution-policy.js";
-import { admitReviewerIntent, consumeReviewerIntent, reconcileReviewerAssignments, reviewerAssignmentGeneration } from "./reviewer-assignment-continuation.js";
+import { hasPendingReviewerAssignment, admitReviewerIntent, consumeReviewerIntent, reconcileReviewerAssignments, reviewerAssignmentGeneration } from "./reviewer-assignment-continuation.js";
 import { hasReviewerAssignmentContinuation, ordinaryWakeRequestPredicate, ordinaryWakeRunPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { isAdmittedReconciliation, isGuardedReconciliationDelivery, lockReconciledDeliveryPrefix, recordReconciledDeliveryOutcome, revalidateReconciledDelivery } from "../execution-reconciliation-delivery.js";
 import { assertTaskRetryConversationAllowed, readTaskRetryIntent, readTaskRetryBoardMessageOrigin, retireSupersededTaskRetry, taskRetryMutationAllowed } from "../task-retry.js";
@@ -2937,6 +2937,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           await tx.execute(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );
+
+          if (!reviewerIntent && enrichedContextSnapshot.source === "issue.execution_stage" && !wakeCommentId) {
+            const [pendingReviewIssue] = await tx.select().from(issues).where(and(eq(issues.companyId, agent.companyId), eq(issues.id, issueId!)));
+            if (pendingReviewIssue && source === "assignment" && reason === "execution_review_requested" &&
+                await hasPendingReviewerAssignment(tx, pendingReviewIssue)) return { kind: "deferred" as const };
+          }
 
           let reusedDispatchReceipt: typeof agentWakeupRequests.$inferSelect | null = null;
           const dispatchReceiptReadmission = Boolean(executionWaitRequestId)

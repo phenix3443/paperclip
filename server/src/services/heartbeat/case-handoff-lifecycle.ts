@@ -250,10 +250,14 @@ const RUN_EXECUTION_RELEASE_SCHEMA = "paperclip.run-execution-release.v1";
 const TERMINAL_RUN_STATUSES = ["succeeded", "failed", "cancelled", "interrupted", "timed_out"];
 
 export async function recordRunExecutionReleased(db: Db, runId: string, issueId: string) {
-  await db.update(heartbeatRuns).set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ||
-    ${JSON.stringify({ executionReleased: { schema: RUN_EXECUTION_RELEASE_SCHEMA, runId, issueId,
-      settledAt: new Date().toISOString() } })}::jsonb` }).where(and(eq(heartbeatRuns.id, runId),
-    inArray(heartbeatRuns.status, TERMINAL_RUN_STATUSES)));
+  await db.transaction(async transaction => {
+    const tx = transaction as unknown as Db;
+    await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionContinuation, issueId);
+    await tx.update(heartbeatRuns).set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ||
+      ${JSON.stringify({ executionReleased: { schema: RUN_EXECUTION_RELEASE_SCHEMA, runId, issueId,
+        settledAt: new Date().toISOString() } })}::jsonb` }).where(and(eq(heartbeatRuns.id, runId),
+      inArray(heartbeatRuns.status, TERMINAL_RUN_STATUSES)));
+  });
 }
 
 function hasRunExecutionReleaseMarker(run: typeof heartbeatRuns.$inferSelect, issueId: string) {

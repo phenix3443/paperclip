@@ -15120,6 +15120,7 @@ export function issueRoutes(
         actorAgentId: actor.agentId ?? null,
         actorRunId: actor.agentId ? actor.runId : null,
         actorRunStopId: actor.agentId && interruptedRunId === actor.runId ? issueMutationStopId : null,
+        executionHandoffRunId: interruptedRunId ?? actor.runId ?? null,
         actorUserId: actor.actorType === "user" ? actor.actorId : null,
       };
       const shouldCollectCompletionPublication =
@@ -19382,6 +19383,7 @@ export function issueRoutes(
         issueBeforeCommentDecision = currentIssue;
         const updatePatch = {
           ...transition.patch,
+          executionHandoffRunId: interruptedRunId ?? actor.runId ?? null,
           status:
             typeof transition.patch.status === "string"
               ? transition.patch.status

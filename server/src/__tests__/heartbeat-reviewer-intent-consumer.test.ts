@@ -639,7 +639,7 @@ const support = await getEmbeddedPostgresTestSupport();
       else await recordRunExecutionReleased(db, f.source.id, f.issueId);
       await service.reconcileReviewerAssignments();
       expect(await read()).toEqual(held);
-      await vi.advanceTimersByTimeAsync(15_000);
+      await vi.advanceTimersByTimeAsync(30_000);
       await vi.waitFor(async () => expect(await read()).toMatchObject({ status: "coalesced", error: null }), { timeout: 5000 });
       expect(errors).toEqual([]);
     } finally { await c.stop(); }

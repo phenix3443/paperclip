@@ -40,6 +40,15 @@ Terminal task updates retire unfinished reviewer assignment intent through the
 common issue service. Reopening does not replay that retired receipt. Service
 coverage: [retirement tests](../../server/src/__tests__/heartbeat-reviewer-intent-retirement.test.ts).
 
+Pending agent-review handoffs retain a durable assignment intent while the
+outgoing executor cleans up. The original reviewer receives one eligible turn
+through the existing execution-continuation coordinator, preserving complete
+review state and authority. [Handoff service tests](../../server/src/__tests__/heartbeat-reviewer-handoff.test.ts)
+exercise a real local process plus rollback/archive, and the
+[original symptom regression](../../server/src/__tests__/heartbeat-reviewer-assignment-continuation.test.ts)
+checks one successor without resubmitting the assignment. These are isolated
+service/DB checks, not deployment or historical recovery evidence.
+
 ### `new-task`
 
 Use New task from the global launcher, task list, or project task view.

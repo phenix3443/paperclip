@@ -4,6 +4,12 @@ import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, authUsers, companies, companyMemberships, createDb, heartbeatRuns, issues } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { agentWakeupRequests } from "@paperclipai/db";
+import { seedReviewerIntent } from "./helpers/reviewer-intent.js";
+import { issueService } from "../services/issues.js";
+import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
+import { registerExecutionControlWork, executionControlSchedule } from "../services/execution-control-work.js";
+import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
 import { heartbeatService } from "../services/heartbeat.js";
 
 const execute = vi.hoisted(() => vi.fn());
@@ -70,4 +76,40 @@ suite("native terminal-run cleanup admission", () => {
     expect((await heartbeat.getRun(nextId))?.status).toBe("succeeded");
     expect(execute).toHaveBeenCalledTimes(3);
   }, 30_000);
+  it("notifies the reviewer duty only after the native-shaped terminal executor leaves cleanup", async () => {
+    await db.insert(authUsers).values({ id: "board", name: "Sponsor", email: "native-review@example.test", createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();
+    const f = await seedReviewerIntent(db, false);
+    await db.update(issues).set({ status: "in_progress", assigneeAgentId: f.source.agentId, executionState: null }).where(eq(issues.id, f.issueId));
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+    let release!: () => void, entered!: (runId: string) => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const terminal = new Promise<string>(resolve => { entered = resolve; });
+    execute.mockImplementation(async (context: { runId: string }) => {
+      await db.update(heartbeatRuns).set({ status: "succeeded", runtimeMode: "native", nativeIssueId: f.issueId,
+        finishedAt: new Date() }).where(eq(heartbeatRuns.id, context.runId));
+      entered(context.runId); await gate;
+      return { exitCode: 0, signal: null, timedOut: false, summary: "Completed" };
+    });
+    const service = heartbeatService(db);
+    const c = createDeliveryWorkCoordinator({ owner: db, canRun: () => true });
+    try {
+      await service.invoke(f.source.agentId, "on_demand", { issueId: f.issueId }, "manual");
+      const sourceRunId = await terminal;
+      await issueService(db).update(f.issueId, { status: "in_review", assigneeAgentId: f.agentId,
+        executionState: f.issue.executionState, actorAgentId: f.source.agentId, executionHandoffRunId: sourceRunId });
+      await registerExecutionControlWork(c, [{ queue: DELIVERY_QUEUES.executionContinuation,
+        run: service.reconcileReviewerAssignments, next: executionControlSchedule(db).continuation }]).ready;
+      const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      expect(receipt).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      expect((await service.getRun(sourceRunId))?.resultJson?.executionReleased).toBeUndefined();
+      vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"], shouldAdvanceTime: true });
+      release(); await service.drainActiveRunExecutions();
+      expect((await service.getRun(sourceRunId))?.resultJson?.executionReleased).toMatchObject({ runId: sourceRunId, issueId: f.issueId });
+      await vi.advanceTimersByTimeAsync(60_000);
+      await vi.waitFor(async () => expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt.id)))[0])
+        .toMatchObject({ status: "coalesced", runId: expect.any(String) }), { timeout: 5000 });
+      expect((await issueService(db).getById(f.issueId))?.executionState).toEqual(f.issue.executionState);
+    } finally { vi.useRealTimers(); release(); await service.drainActiveRunExecutions(); await c.stop(); }
+  }, 30_000);
+
 });

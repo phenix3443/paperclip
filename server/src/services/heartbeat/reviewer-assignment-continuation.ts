@@ -102,6 +102,22 @@ export async function createReviewerAssignmentIntent(tx: IntentDb, input: {
   return receipt;
 }
 
+export async function produceReviewerAssignmentTransition(tx: IntentDb, before: Task, after: typeof issues.$inferSelect,
+  input: { sourceRunId: string | null; actorType: "agent" | "user" | "system"; actorId: string }) {
+  const next = pending(after), previous = pending(before);
+  if (!next || !input.sourceRunId || (previous?.currentStageId === next.currentStageId &&
+      canonical(previous.currentParticipant) === canonical(next.currentParticipant))) return null;
+  return createReviewerAssignmentIntent(tx, { companyId: after.companyId, issueId: after.id,
+    sourceRunId: input.sourceRunId, requestedByActorType: input.actorType, requestedByActorId: input.actorId });
+}
+
+export async function hasPendingReviewerAssignment(tx: IntentDb, task: typeof issues.$inferSelect) {
+  const [row] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(unfinished(),
+    eq(agentWakeupRequests.companyId, task.companyId), sql`${agentWakeupRequests.payload}->>'issueId' = ${task.id}`,
+    sql`${agentWakeupRequests.payload}->${KEY}->'immutable'->>'generation' = ${reviewerAssignmentGeneration(task)}`)).limit(1);
+  return Boolean(row);
+}
+
 function unfinished() {
   return and(not(ordinaryWakeRequestPredicate()), eq(agentWakeupRequests.status, "deferred_issue_execution"),
     isNull(agentWakeupRequests.runId), isNull(agentWakeupRequests.finishedAt));

@@ -13,7 +13,7 @@ import {
   settleStopOnlyCleanup,
 } from "../sandbox-stop-and-retain.js";
 import { discoverSettledNativeRunProcesses, recordNativeLocalProcessStop, retryPendingSettledNativeRunProcesses } from "../native-local-process-stop.js";
-import { pendingCaseHandoffForRun } from "./case-handoff-lifecycle.js";
+import { isRunExecutionReleased, pendingCaseHandoffForRun } from "./case-handoff-lifecycle.js";
 import {
   legacyControllerBootId,
   hasLiveLegacyController,
@@ -2065,6 +2065,10 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         : "stop_and_retain",
     });
     await releaseRuntimeServicesForRun(input.runId).catch(() => undefined);
+    const [source] = await db.select({ issueId: heartbeatRuns.nativeIssueId, context: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId)));
+    const issueId = source?.issueId ?? readNonEmptyString(source?.context?.issueId);
+    if (issueId) await isRunExecutionReleased(db, { runId: input.runId, issueId });
     await finalizeAgentStatus(
       input.agentId,
       input.succeeded ? "succeeded" : "failed",

@@ -1,13 +1,18 @@
 import { randomUUID } from "node:crypto";
 import { and, asc, eq, ne } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  agentWakeupRequests, agents, companies, createDb, environmentLeases, heartbeatRuns, issues,
+  agentWakeupRequests, agents, authUsers, companyMemberships, companies, createDb, environmentLeases, heartbeatRuns, issues,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
-import { executionControlSchedule } from "../services/execution-control-work.js";
+import { executionControlSchedule, registerExecutionControlWork } from "../services/execution-control-work.js";
 import { heartbeatService } from "../services/heartbeat.js";
+
+import { issueService } from "../services/issues.js";
+import { recordRunExecutionReleased } from "../services/heartbeat/case-handoff-lifecycle.js";
+import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
+import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("wakes parked behind an execution ownership hold", () => {
@@ -16,6 +21,7 @@ const support = await getEmbeddedPostgresTestSupport();
   beforeAll(async () => {
     database = await startEmbeddedPostgresTestDatabase("execution-ownership-wait-");
     db = createDb(database.connectionString);
+    await db.insert(authUsers).values({ id: "board", name: "Sponsor", email: "oracle@example.test", createdAt: new Date(), updatedAt: new Date() });
   }, 90_000);
   afterAll(async () => { await db?.$client.end(); await database?.cleanup(); });
 
@@ -31,6 +37,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const companyId = randomUUID(), previousAgentId = randomUUID(), nextAgentId = randomUUID();
     const issueId = randomUUID(), runId = randomUUID(), stageId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Handoff", defaultResponsibleUserId: "board", issuePrefix: "H" + companyId.replaceAll("-", "") });
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "board", membershipRole: "operator", status: "active" });
     await db.insert(agents).values([
       { id: previousAgentId, companyId, name: "Author", role: "engineer", adapterType: "opencode_local", status: "idle", runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } },
       { id: nextAgentId, companyId, name: "Reviewer", role: "engineer", adapterType: "opencode_local", status: "idle", runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } },
@@ -100,11 +107,20 @@ const support = await getEmbeddedPostgresTestSupport();
     const before = (await db.select().from(issues).where(eq(issues.id, f.issueId)))[0];
     const heartbeat = heartbeatService(db);
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({cause: "execution_owner_active", runId: f.runId});
+    await db.update(issues).set({ status: "in_progress", assigneeAgentId: f.previousAgentId, executionState: null }).where(eq(issues.id, f.issueId));
+    await issueService(db).update(f.issueId, { status: "in_review", assigneeAgentId: f.nextAgentId,
+      executionState: before.executionState, actorAgentId: f.previousAgentId, executionHandoffRunId: f.runId });
     expect(await heartbeat.wakeup(f.nextAgentId, f.wake)).toBeNull();
     const [receipt] = await nextAgentWakes(f);
     console.log("DIAG admission", JSON.stringify({status: receipt.status, reason: receipt.reason, runId:receipt.runId}));
     await releaseLease(f);
+    await recordRunExecutionReleased(db, f.runId, f.issueId);
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+    const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true });
+    try {
+      await registerExecutionControlWork(coordinator, [{ queue: DELIVERY_QUEUES.executionContinuation,
+        run: heartbeat.reconcileReviewerAssignments, next: executionControlSchedule(db).continuation }]).ready;
+    } finally { await coordinator.stop(); }
     await Promise.all([heartbeatService(db).resumeQueuedRuns(), heartbeatService(db).resumeQueuedRuns()]);
     const runs = await nextAgentIssueRuns(f);
     const after = (await db.select().from(issues).where(eq(issues.id, f.issueId)))[0];
