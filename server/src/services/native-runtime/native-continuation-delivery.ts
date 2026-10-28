@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { agentWakeupRequests, heartbeatRuns, statusDecisions, statusDecisionEffects, type Db } from "@paperclipai/db";
 import { and, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
@@ -12,7 +13,7 @@ export async function readNativeContinuationSource(
   const source = alias(heartbeatRuns, "continuation_source");
   const dispatch = alias(agentWakeupRequests, "continuation_dispatch");
   const sources = await db.select({ runId: source.id }).from(heartbeatRuns)
-    .innerJoin(agentWakeupRequests, and(
+    .innerJoin(agentWakeupRequests, and(ordinaryWakeRequestPredicate(), and(
       eq(agentWakeupRequests.companyId, binding.companyId),
       or(isNull(agentWakeupRequests.runId), eq(agentWakeupRequests.runId, heartbeatRuns.id)),
       eq(agentWakeupRequests.agentId, heartbeatRuns.agentId),
@@ -22,8 +23,8 @@ export async function readNativeContinuationSource(
       eq(agentWakeupRequests.requestedByActorId, "native-status-committer"),
       sql`${agentWakeupRequests.payload}->>'issueId' = ${binding.issueId}`,
       sql`${heartbeatRuns.contextSnapshot}->>'nativeStatusWakeIntentId' = ${agentWakeupRequests.id}::text`,
-    ))
-    .innerJoin(dispatch, and(
+    )))
+    .innerJoin(dispatch, and(ordinaryWakeRequestPredicate(dispatch.payload),
       eq(dispatch.companyId, binding.companyId), eq(dispatch.agentId, heartbeatRuns.agentId),
       eq(dispatch.runId, heartbeatRuns.id), eq(dispatch.reason, "issue_status_changed"),
       eq(dispatch.requestedByActorType, "system"),

@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import {
   agentWakeupRequests,
@@ -20,7 +21,7 @@ export async function explicitOperatorRunIdentity(
   run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId" | "contextSnapshot" | "wakeupRequestId">,
 ) {
   const [request] = run.wakeupRequestId ? await executor.select().from(agentWakeupRequests).where(and(
-    eq(agentWakeupRequests.id, run.wakeupRequestId), eq(agentWakeupRequests.companyId, run.companyId),
+    ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, run.wakeupRequestId), eq(agentWakeupRequests.companyId, run.companyId),
     eq(agentWakeupRequests.agentId, run.agentId), eq(agentWakeupRequests.runId, run.id),
   )) : [];
   if (request?.payload?.manualUserWake === true) {
@@ -38,7 +39,7 @@ export async function explicitOperatorRunIdentity(
     throw forbidden("Queued-message interrupt authority is unavailable");
   }
   const [receipt] = await executor.select().from(agentWakeupRequests).where(and(
-    eq(agentWakeupRequests.id, queueId), eq(agentWakeupRequests.companyId, run.companyId),
+    ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, queueId), eq(agentWakeupRequests.companyId, run.companyId),
     eq(agentWakeupRequests.agentId, run.agentId), eq(agentWakeupRequests.runId, run.id),
     eq(agentWakeupRequests.status, "coalesced"),
   ));

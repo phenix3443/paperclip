@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { createChatSdkMessageReceiver } from "./chat-channels/runtime/sdk-messages.js";
 import { admitDiscordSdkMessage } from "./chat-channels/discord/messages.js";
 import { resolveInboundConversationBinding } from "./chat-channels/inbound/conversation-binding.js";
@@ -1341,7 +1342,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         const [receipt] = await tx
           .select()
           .from(agentWakeupRequests)
-          .where(eq(agentWakeupRequests.id, action.id))
+          .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, action.id)))
           .for("share", { noWait: true });
         return (
           publication.commentId === source.commentIds.at(-1) &&
@@ -3242,7 +3243,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             eq(chatActions.deliveryId, delivery.id),
             eq(chatActions.kind, "inbound_wakeup"),
             eq(chatActions.status, "failed"),
-            sql`not exists (select 1 from ${agentWakeupRequests} where ${agentWakeupRequests.id} = ${chatActions.id})`,
+            sql`not exists (select 1 from ${agentWakeupRequests} where ${ordinaryWakeRequestPredicate()} and ${agentWakeupRequests.id} = ${chatActions.id})`,
           ),
         );
     });

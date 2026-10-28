@@ -157,7 +157,9 @@ export function scanModuleBoundaries({
           normalizedRelative(serverSrc, sourceFile) === "services/agent-configuration-transaction.ts";
         const companyDeletionIntegration = /^company-deletion\.(?:js|ts)$/.test(targetRelative) &&
           normalizedRelative(serverSrc, sourceFile) === "services/company-deletion.ts";
-        if (targetRelative !== "index.js" && targetRelative !== "index.ts" && !companyDeletionIntegration && !configurationIntegration) {
+        const wakeReceiptClassification = targetLocation.moduleName === "wake-queue" &&
+          /^receipt-namespace\.(?:js|ts)$/.test(targetRelative);
+        if (targetRelative !== "index.js" && targetRelative !== "index.ts" && !companyDeletionIntegration && !configurationIntegration && !wakeReceiptClassification) {
           addViolation(
             violations,
             sourceLabel,

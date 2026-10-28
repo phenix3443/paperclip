@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { and, asc, eq, inArray, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -82,6 +83,7 @@ export async function lockAdmissionRows(
       eq(agentWakeupRequests.companyId, companyId),
       sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
       inArray(agentWakeupRequests.status, ACTIVE_WAKE_STATUSES),
+      ordinaryWakeRequestPredicate(),
     ))
     .orderBy(asc(agentWakeupRequests.id))
     .for("update");

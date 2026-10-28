@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { and, eq, inArray, isNull } from "drizzle-orm";
 import { agentWakeupRequests, type Db } from "@paperclipai/db";
 import type { createDeliveryWorkCoordinator } from "./delivery-work-coordinator.js";
@@ -12,7 +13,7 @@ export async function readCrossTaskContinuationWork(db: Db, now = Date.now()) {
   const rows = await db.select({ status: agentWakeupRequests.status, claimedAt: agentWakeupRequests.claimedAt })
     .from(agentWakeupRequests)
     .where(and(
-      eq(agentWakeupRequests.requestedByActorType, "system"),
+      ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.requestedByActorType, "system"),
       eq(agentWakeupRequests.requestedByActorId, CROSS_TASK_CONTINUATION_COMMITTER_ID),
       inArray(agentWakeupRequests.status, ["queued", "claimed"]),
       isNull(agentWakeupRequests.runId),
