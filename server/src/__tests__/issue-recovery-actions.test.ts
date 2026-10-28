@@ -62,6 +62,7 @@ import { issueRecoveryActionService } from "../services/issue-recovery-actions.j
 import { recoveryService } from "../services/recovery/service.js";
 import { issueService } from "../services/issues.js";
 import { issueTreeControlService } from "../services/issue-tree-control.js";
+import { companyService } from "../services/companies.js";
 import { caseHandoffService } from "../services/case-handoffs.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { withNativeWorkspaceFinalizationOwnership } from "../services/native-runtime/native-workspace-finalization-ownership.js";
@@ -2828,6 +2829,17 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           });
           await expectReleasedThenDelivered(fixture.actionId, () => issueTreeControlService(db).releaseHold(
             fixture.companyId, fixture.sourceIssueId, hold!.id, { actor: { actorType: "user", actorId: "board-user" } }));
+        });
+
+        it("delivers a company pause wait on the next pass after the company is reactivated", async () => {
+          const fixture = await admitted("recon:a3b-rel-company-01");
+          await db.update(companies).set({ status: "paused" }).where(eq(companies.id, fixture.companyId));
+          await deliver();
+          expect((await actionRow(fixture.actionId)).evidence).toMatchObject({
+            continuationDelivery: "waiting", continuationWait: { gate: "company_pause" },
+          });
+          await expectReleasedThenDelivered(fixture.actionId,
+            () => companyService(db).update(fixture.companyId, { status: "active" }));
         });
 
         it("releases a checkout wait when the execution lock is force-released", async () => {

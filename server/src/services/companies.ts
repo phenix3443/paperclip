@@ -29,6 +29,7 @@ import {
   rekeyCompanyIssueIdentifiers,
 } from "./issue-prefix.js";
 import { environmentService } from "./environments.js";
+import { releaseWaitingReconciledDeliveries } from "./execution-reconciliation-release.js";
 import { logActivity, type ActivityPublication } from "./activity-log.js";
 import { builtInAgentService } from "./built-in-agents.js";
 
@@ -336,6 +337,9 @@ export function companyService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
         if (companyPatch.status !== undefined && companyPatch.status !== existing.status) {
           await notifyDeliveryWork(tx, DELIVERY_QUEUES.skillSourceSync);
           await notifyDeliveryWork(tx, DELIVERY_QUEUES.agentLifecycle, id);
+        }
+        if (willReactivate) {
+          await releaseWaitingReconciledDeliveries(tx, { companyId: id, gates: ["company_pause"] });
         }
         const updated = await tx
           .update(companies)

@@ -32,6 +32,7 @@ import { withAccountingTransaction } from "./accounting-transaction.js";
 import { logActivity, type LogActivityInput, type ActivityPublication } from "./activity-log.js";
 import { computeObservedSpend, computeObservedSpends, type ObservedSpend } from "./budget-exposure.js";
 import { notifyDeliveryWork, DELIVERY_QUEUES } from "./delivery-work-notifications.js";
+import { releaseWaitingReconciledDeliveries } from "./execution-reconciliation-release.js";
 import { listPendingBudgetCancellationScopes } from "./heartbeat/budget-cancellation.js";
 import { withBudgetSpan } from "./budget-tracing.js";
 export { computeObservedSpend, computeObservedSpends } from "./budget-exposure.js";
@@ -330,6 +331,10 @@ export function budgetServiceInTransaction(db: Db, publications: ActivityPublica
     const observations = await computeObservedSpends(db, policies);
     if (policies.some((candidate, index) => observedBlocks(candidate, observations[index]))) return;
     const now = new Date();
+    await releaseWaitingReconciledDeliveries(db, {
+      companyId: policy.companyId,
+      gates: ["budget", ({ agent: "agent_pause", project: "project_pause" } as Record<string, string>)[policy.scopeType] ?? "company_pause"],
+    });
     if (policy.scopeType === "agent") {
       const { applyAgentBudgetHoldInTransaction } = await import("./agent-lifecycle.js");
       await applyAgentBudgetHoldInTransaction(db, policy.companyId, policy.scopeId, false);
