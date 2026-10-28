@@ -8,7 +8,7 @@ import { GIT_EXPIRATION_BUDGETS, GitExpirationBudgetExceeded, InspectionBudget, 
   type InspectionBudgetHooks, type InspectionBudgetPeaks } from "./git-expiration-budget.js";
 import { inspectLockedGitExpirationCandidate, gitExpirationSkipReason, gitExpirationSelectionFilter, isGitExpirationCandidate,
   LIVE_EXECUTION_WORKSPACE_STATUSES, pathExists, withAnonymousGitFallback, type Workspace } from "./git-workspace-expiration-inspection.js";
-import { captureAfterIdentity, compareSelection, compareSides, gitExpirationEvidenceContract, missingEvidence, observeAfter, observeBefore,
+import { captureAfterIdentity, failedAfterIdentity, compareSelection, compareSides, gitExpirationEvidenceContract, missingEvidence, observeAfter, observeBefore,
   observeRowState, unlockedRowEvidence, type GitExpirationEvidenceContract, type GitExpirationRowEvidence, type GitExpirationRowSide,
   type Observation } from "./git-expiration-evidence.js";
 
@@ -176,7 +176,6 @@ export function readOnlyInspectionGitAuth(env: NodeJS.ProcessEnv = process.env):
 type RowInspection = {
   outcome: Promise<GitExpirationRoundRow>;
   released: Promise<void>;
-  /** Final row evidence, read once the row chain is released or the drain bound has passed. */
   evidence(row: GitExpirationRoundRow, drained: boolean): GitExpirationRowEvidence;
   budgetHit(): GitExpirationRoundBudgetHit | null;
   peaks(): Readonly<InspectionBudgetPeaks> | null;
@@ -199,7 +198,6 @@ function inspectRow(db: Db, workspace: Workspace, key: GitExpirationRoundKey, au
   const signal = budget.signal;
   let before: Awaited<ReturnType<typeof observeBefore>> | null = null;
   let after: Observation<GitExpirationRowSide> | null = null;
-  // Both locks are held here: the lifecycle lock was just taken inside the source lock.
   const onLocked = async (reread: { workspace: Workspace; updatedAtKey: string } | null) => {
     current = reread ? { state: "read", key: { updatedAt: reread.updatedAtKey, id: reread.workspace.id }, status: reread.workspace.status }
       : { state: "missing" };
@@ -209,10 +207,8 @@ function inspectRow(db: Db, workspace: Workspace, key: GitExpirationRoundKey, au
   const afterPhases = async (tx: Parameters<typeof inspectLockedGitExpirationCandidate>[0]) => {
     const locked = before as Awaited<ReturnType<typeof observeBefore>> | null;
     let identity: Awaited<ReturnType<typeof captureAfterIdentity>> = null;
-    // Phase A: children and budgeted reads, tracked by the row budget, before drain.
-    if (locked?.locations) identity = await captureAfterIdentity(locked.anchorRow, signal).catch(() => null);
+    if (locked?.locations) identity = await captureAfterIdentity(locked.anchorRow, signal).catch(failedAfterIdentity);
     await budget.drain();
-    // Phase B: one select and lstat of the fixed roles, after drain and before the locks unwind.
     if (!locked) return;
     after = await observeAfter(async () => (await tx.select({ workspace: executionWorkspaces, updatedAtKey: sql<string>`${executionWorkspaces.updatedAt}::text` })
       .from(executionWorkspaces).where(and(eq(executionWorkspaces.id, workspace.id), eq(executionWorkspaces.companyId, workspace.companyId))))[0] ?? null,
@@ -266,7 +262,8 @@ function inspectRow(db: Db, workspace: Workspace, key: GitExpirationRoundKey, au
     const locked = before as Awaited<ReturnType<typeof observeBefore>> | null;
     if (!locked) return unlockedRowEvidence(selectedRow, value.outcome === "lock_busy" ? "lock_busy"
       : value.outcome === "resource_limit" || signal.aborted ? "row_stopped" : "row_not_locked");
-    const afterSide: Observation<GitExpirationRowSide> = drained && after ? after : { state: "unavailable", reason: "undrained" };
+    const afterSide: Observation<GitExpirationRowSide> = !drained ? { state: "unavailable", reason: "undrained" }
+      : after ?? { state: "unavailable", reason: "row_stopped" };
     const selected = observeRowState(selectedRow);
     return { selected, before: locked.side, after: afterSide, drift: compareSides(locked.side, afterSide),
       selectionDrift: compareSelection(selected, locked.side) };
@@ -459,7 +456,6 @@ export async function inspectGitExpirationRound(options: GitExpirationRoundOptio
             break scan;
           }
           if (summary.drainIncomplete) { summary.stopReason = "resource_limit"; break scan; }
-          // Only a row that got both locks has a before side; stopped rows already broke out above.
           if (row.evidence.drift.state === "changed") { summary.stopReason = "protected_state_changed"; break scan; }
           if (row.evidence.before.state !== "unavailable" && missingEvidence(row.evidence).length) {
             summary.stopReason = "evidence_unavailable";

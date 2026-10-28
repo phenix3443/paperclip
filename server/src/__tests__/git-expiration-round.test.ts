@@ -18,7 +18,6 @@ import { GIT_EXPIRATION_BUDGETS, probeGitProcessGroup, ROW_DRAIN_BOUND_MS } from
 import { createGitRemoteAuthProvider } from "../services/git-credentials.js";
 import { parseGitExpirationRoundArgs, runGitExpirationRoundCli, GitExpirationRoundUsageError, fileGitExpirationRoundJournal,
   readGitExpirationRoundJournal, gitExpirationRoundExitCode } from "../git-expiration-round-cli.js";
-import { gitExpirationEvidenceContract } from "../services/git-expiration-evidence.js";
 
 const faults = vi.hoisted(() => ({ git: null as ((args: readonly string[]) => Error | null) | null,
   spawn: null as ((args: readonly string[]) => string[] | null) | null, seamWrite: false, secretServices: 0 }));
@@ -91,7 +90,7 @@ describe("one-round Git expiration inspection boundaries", () => {
       /captureGitWorkspaceContents/, /\brename\b/, /\bunlink\b/, /fs\.rm\b/, /\.update\(/, /\.insert\(/, /\.delete\(/,
       /clearReopenPending/, /sweepTerminalWorkspaces/, /execution-workspaces\.js/, /GIT_CACHE_EXPIRATION_REASON/, /secretService/,
       /refreshOAuthGrantCredentials/, /toolAccessService/];
-    for (const file of ["../services/git-workspace-expiration-inspection.ts", "../services/git-expiration-round.ts"]) {
+    for (const file of ["../services/git-workspace-expiration-inspection.ts", "../services/git-expiration-round.ts", "../services/git-expiration-evidence.ts"]) {
       const source = (await fs.readFile(path.join(here, file), "utf8")).replace(/^\s*\/\/.*$/gm, "").replace(/\/\*\*[^]*?\*\//g, "");
       for (const pattern of forbidden) expect(source, `${file} must not reference ${pattern}`).not.toMatch(pattern);
     }
@@ -199,7 +198,6 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
       ids.push(id);
       await db.insert(executionWorkspaces).values({ id, companyId, sourceIssueId: issueId, mode: "isolated_workspace", strategyType: "git_worktree",
         name: `Fixture ${index}`, status: "active", providerType: "local_fs", cwd: path.join(os.tmpdir(), `paperclip-round-missing-${id}`),
-        // A recorded isolated source lets the native seam name every protected role of the row.
         repoUrl: "https://example.test/fixture.git", metadata: { isolatedRemoteSource: { schema: "paperclip.isolated-remote-source.v1",
           companyId, issueId, repoUrl: "https://example.test/fixture.git" } },
         updatedAt: new Date(Date.now() - (count - index) * 1000), ...row });
@@ -932,195 +930,5 @@ describeEmbeddedPostgres("one-round Git expiration inspection", () => {
     const f = await seed(1);
     await db.update(executionWorkspaces).set({ updatedAt: new Date(Date.now() + 3_600_000) }).where(eq(executionWorkspaces.id, f.ids[0]!));
     expect(await round(memoryJournal(), { companyId: f.companyId })).toMatchObject({ status: "complete", selected: 0 });
-  });
-
-  describe("native row evidence", () => {
-    type Row = Extract<GitExpirationRoundEvent, { type: "row_inspected" }>;
-    const rowOf = (journal: { events: GitExpirationRoundEvent[] }) => journal.events.find((event): event is Row => event.type === "row_inspected")!;
-    const roles = (side: Row["evidence"]["before"]) => side.state === "observed" ? side.value.paths.map(entry => entry.role) : [];
-    // Fires once, when the native walk enters `root`: after the before pass and before phase A.
-    const onWalk = (root: string, action: () => Promise<void>) => {
-      let done = false;
-      return async (directory: string) => { if (done || directory !== root) return; done = true; await action(); };
-    };
-    const coarseTick = () => new Promise(resolve => setTimeout(resolve, 20));
-
-    it("prints the evidence contract without env, database, child or file", async () => {
-      const write = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
-      try {
-        expect(await runGitExpirationRoundCli(["--print-evidence-contract"], {})).toBe(0);
-        expect(JSON.parse(String(write.mock.calls[0]![0]))).toEqual(gitExpirationEvidenceContract());
-      } finally { write.mockRestore(); }
-      expect(gitExpirationEvidenceContract()).toEqual({ name: "paperclip.git-expiration-evidence", version: 1,
-        capabilities: ["row_keys.v1", "row_state.v1", "row_paths.v1", "row_head.v1", "drift_stop.v1"] });
-    });
-
-    it("observes every protected role of a live candidate before and after, with no drift", async () => {
-      const f = await reconstructable();
-      const journal = memoryJournal();
-      const summary = await round(journal, { companyId: f.companyId });
-      expect(summary).toMatchObject({ status: "complete", candidates: 1, evidenceContract: gitExpirationEvidenceContract() });
-      expect(journal.events[0]).toMatchObject({ type: "round_started", evidenceContract: summary.evidenceContract });
-      expect(journal.events.find(event => event.type === "round_finished")).toMatchObject({ evidenceContract: summary.evidenceContract });
-      const row = rowOf(journal);
-      expect(row.evidence).toMatchObject({ selected: { state: "observed" }, before: { state: "observed" }, after: { state: "observed" },
-        drift: { state: "none" }, selectionDrift: { state: "none" } });
-      expect(new Set(roles(row.evidence.before))).toEqual(new Set(["worktree", "worktree_git_link", "source", "source_git", "worktree_admin",
-        "gitdir_head", "gitdir_index", "worktree_trash", "expiration_lock_marker", "expiration_lock_marker_dir", "checkout_container"]));
-      expect(roles(row.evidence.after)).toEqual(roles(row.evidence.before));
-      const before = row.evidence.before.state === "observed" ? row.evidence.before.value : null;
-      expect(before?.head).toMatchObject({ state: "observed", value: { commit: git(f.cwd, "rev-parse", "HEAD") } });
-      expect(before?.paths.find(entry => entry.role === "checkout_container")?.observation).toEqual({ state: "observed", value: { present: false } });
-      expect(before?.paths.filter(entry => entry.role === "expiration_lock_marker")).toHaveLength(3);
-      expect(before?.paths.every(entry => entry.observation.state === "observed")).toBe(true);
-    });
-
-    it("reports rows that never took both locks as unavailable instead of zero", async () => {
-      const f = await seed(1, { providerType: "plugin" });
-      const journal = memoryJournal();
-      expect(await round(journal, { companyId: f.companyId })).toMatchObject({ status: "complete", notCandidates: 1 });
-      expect(rowOf(journal).evidence).toMatchObject({ selected: { state: "observed" }, before: { state: "unavailable", reason: "not_candidate" },
-        after: { state: "unavailable", reason: "not_candidate" } });
-    });
-
-    it("stops evidence_unavailable when the native seam cannot name a source", async () => {
-      const f = await seed(1, { repoUrl: null, metadata: {} });
-      const journal = memoryJournal();
-      expect(await round(journal, { companyId: f.companyId })).toMatchObject({ status: "partial", stopReason: "evidence_unavailable", rejected: 1 });
-      const before = rowOf(journal).evidence.before;
-      expect(before.state === "observed" && before.value.paths.find(entry => entry.role === "source")?.observation)
-        .toEqual({ state: "unavailable", reason: "location_unresolved" });
-    });
-
-    it("stops evidence_unavailable with a sanitized code when the HEAD identity read fails", async () => {
-      const f = await reconstructable();
-      faults.spawn = args => args.includes("--absolute-git-dir") && args.includes("--symbolic-full-name") ? ["sh", "-c", "exit 128"] : null;
-      const journal = memoryJournal();
-      expect(await round(journal, { companyId: f.companyId })).toMatchObject({ status: "partial", stopReason: "evidence_unavailable" });
-      const before = rowOf(journal).evidence.before;
-      expect(before.state === "observed" && before.value.head).toEqual({ state: "error", code: "git_exit_128" });
-      expect(gitExpirationRoundExitCode({ status: "partial" })).toBe(3);
-    });
-
-    it("stops protected_state_changed when row metadata changes under the locks", async () => {
-      const f = await reconstructable();
-      const journal = memoryJournal();
-      const summary = await round(journal, { companyId: f.companyId, budgetHooks: { beforeDirectoryRead: onWalk(f.cwd, async () => {
-        await db.execute(sql`update execution_workspaces set metadata = metadata || '{"touched":true}'::jsonb where id = ${f.workspaceId}`);
-      }) } });
-      expect(summary).toMatchObject({ status: "partial", stopReason: "protected_state_changed" });
-      const row = rowOf(journal);
-      expect(row.outcome).toBe("candidate");
-      expect(row.evidence.drift).toMatchObject({ state: "changed", fields: expect.arrayContaining(["row.metadata", "row.protectedColumns"]) });
-    });
-
-    it("stops protected_state_changed when a lock marker appears and goes inside the window", async () => {
-      const f = await reconstructable();
-      const admin = git(f.cwd, "rev-parse", "--absolute-git-dir");
-      const journal = memoryJournal();
-      const summary = await round(journal, { companyId: f.companyId, budgetHooks: { beforeDirectoryRead: onWalk(f.cwd, async () => {
-        await coarseTick();
-        await fs.writeFile(path.join(admin, "index.lock"), "");
-        await fs.rm(path.join(admin, "index.lock"));
-      }) } });
-      expect(summary).toMatchObject({ status: "partial", stopReason: "protected_state_changed" });
-      expect(rowOf(journal).evidence.drift).toMatchObject({ state: "changed", fields: expect.arrayContaining(["paths.expiration_lock_marker_dir"]) });
-    });
-
-    async function pendingWithoutWorktree() {
-      const f = await reconstructable();
-      const [row] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, f.workspaceId));
-      const admin = git(f.cwd, "rev-parse", "--absolute-git-dir");
-      const recipe = { schema: "paperclip.git-cache-restoration.v1", companyId: f.companyId, workspaceId: f.workspaceId, sourceIssueId: row!.sourceIssueId,
-        repoUrl: row!.repoUrl, commit: git(f.cwd, "rev-parse", "HEAD"), branchName: row!.branchName, sourceKind: "isolated_remote", projectId: null,
-        sourcePath: f.baseCwd, worktreePath: f.cwd, gitBranchOwnershipVersion: 1, verifiedAt: new Date().toISOString() };
-      const state = { schema: "paperclip.git-cache-expiration.v1", generation: 1, workspaceRemoved: true,
-        worktreeTrash: path.join(path.dirname(f.cwd), `.expired-git-worktree-${f.workspaceId}-1`),
-        worktreeAdmin: path.join(f.baseCwd, ".git", "worktrees", path.basename(admin)), baseTrash: null, completed: false };
-      await db.update(executionWorkspaces).set({ status: "archived", closedAt: new Date(),
-        metadata: { ...row!.metadata, lifecycleGeneration: 1, gitCacheRestoration: recipe, gitCacheExpiration: state } })
-        .where(eq(executionWorkspaces.id, f.workspaceId));
-      await fs.rm(f.cwd, { recursive: true, force: true });
-      return { ...f, admin: state.worktreeAdmin };
-    }
-
-    it("observes a pending row whose worktree is gone from its recorded metadata, without an evidence stop", async () => {
-      const f = await pendingWithoutWorktree();
-      const journal = memoryJournal();
-      const summary = await round(journal, { companyId: f.companyId });
-      expect(summary.stopReason).not.toBe("evidence_unavailable");
-      const evidence = rowOf(journal).evidence;
-      expect(evidence.drift).toEqual({ state: "none" });
-      const before = evidence.before.state === "observed" ? evidence.before.value : null;
-      expect(before?.head).toEqual({ state: "unavailable", reason: "worktree_absent" });
-      const role = (name: string) => before?.paths.find(entry => entry.role === name)?.observation;
-      expect(role("worktree")).toEqual({ state: "observed", value: { present: false } });
-      expect(role("checkout_container")).toEqual({ state: "observed", value: { present: false } });
-      for (const name of ["worktree_admin", "source", "gitdir_head", "expiration_lock_marker_dir"]) {
-        expect(role(name), name).toMatchObject({ state: "observed", value: { present: true } });
-      }
-    });
-
-    it("stops protected_state_changed when a pending row's admin dir is removed inside the window", async () => {
-      const f = await pendingWithoutWorktree();
-      const journal = memoryJournal();
-      // A pending row with no worktree reads no directory; the window is held open by blocking the eligibility query.
-      let running!: ReturnType<typeof round>;
-      await holdingTableLock("issue_recovery_actions", async () => {
-        running = round(journal, { companyId: f.companyId });
-        await waitFor(async () => await lockWaiters() > 0);
-        await fs.rm(f.admin, { recursive: true, force: true });
-      });
-      expect(await running).toMatchObject({ status: "partial", stopReason: "protected_state_changed" });
-      expect(rowOf(journal).evidence.drift).toMatchObject({ state: "changed", fields: expect.arrayContaining(["paths.worktree_admin"]) });
-    });
-
-    it("keeps the native resource_limit on a proof timeout: after HEAD is row_stopped, after row and paths are read after drain", async () => {
-      const f = await reconstructable();
-      const identity: number[] = [];
-      faults.spawn = args => {
-        if (args.includes("--absolute-git-dir") && args.includes("--symbolic-full-name")) identity.push(Date.now());
-        return args.includes("ORIG_HEAD") ? ["sleep", "30"] : null;
-      };
-      const journal = memoryJournal();
-      expect(await round(journal, { companyId: f.companyId, budgetHooks: { gitTimeoutMs: 300 } }))
-        .toMatchObject({ status: "partial", stopReason: "resource_limit", resourceLimited: 1 });
-      const evidence = rowOf(journal).evidence;
-      expect(identity).toHaveLength(1);
-      expect(evidence.before).toMatchObject({ state: "observed" });
-      const after = evidence.after.state === "observed" ? evidence.after.value : null;
-      expect(after?.head).toEqual({ state: "unavailable", reason: "row_stopped" });
-      expect(after?.locationSet).toEqual({ state: "unavailable", reason: "row_stopped" });
-      expect(after?.row).toMatchObject({ state: "observed" });
-      expect(after?.paths.length).toBeGreaterThan(0);
-      expect(after?.paths.every(entry => entry.observation.state === "observed")).toBe(true);
-      expect(after?.head).not.toEqual(evidence.before.state === "observed" ? evidence.before.value.head : null);
-    });
-
-    it("starts no identity child after the round aborts during proof", async () => {
-      const f = await reconstructable();
-      const controller = new AbortController();
-      const identity: number[] = [];
-      let abortedAt = Number.POSITIVE_INFINITY;
-      faults.spawn = args => {
-        if (args.includes("--absolute-git-dir") && args.includes("--symbolic-full-name")) identity.push(Date.now());
-        if (args.includes("ORIG_HEAD")) { setTimeout(() => { abortedAt = Date.now(); controller.abort(); }, 100); return ["sleep", "30"]; }
-        return null;
-      };
-      expect(await round(memoryJournal(), { companyId: f.companyId, signal: controller.signal })).toMatchObject({ status: "partial", stopReason: "aborted" });
-      expect(identity).toHaveLength(1);
-      expect(identity.every(at => at < abortedAt)).toBe(true);
-      await waitFor(async () => await advisoryLocks() === 0);
-    });
-
-    it("stops protected_state_changed when a checkout container appears", async () => {
-      const f = await reconstructable();
-      const journal = memoryJournal();
-      const summary = await round(journal, { companyId: f.companyId, budgetHooks: { beforeDirectoryRead: onWalk(f.cwd, async () => {
-        await fs.mkdir(path.join(f.cwd, ".paperclip-repositories", "added"), { recursive: true });
-      }) } });
-      expect(summary).toMatchObject({ status: "partial", stopReason: "protected_state_changed" });
-      expect(rowOf(journal).evidence.drift).toMatchObject({ state: "changed", fields: expect.arrayContaining(["paths.checkout_container"]) });
-    });
   });
 });

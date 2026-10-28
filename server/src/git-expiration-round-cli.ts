@@ -132,7 +132,6 @@ export function gitExpirationRoundExitCode(summary: { status: GitExpirationRound
 export const PRINT_EVIDENCE_CONTRACT_FLAG = "--print-evidence-contract";
 
 export async function runGitExpirationRoundCli(argv: string[], env: NodeJS.ProcessEnv): Promise<number> {
-  // Reads no environment, opens no database, spawns no child and writes no file.
   if (argv.length === 1 && argv[0] === PRINT_EVIDENCE_CONTRACT_FLAG) {
     process.stdout.write(`${JSON.stringify(gitExpirationEvidenceContract())}\n`);
     return 0;

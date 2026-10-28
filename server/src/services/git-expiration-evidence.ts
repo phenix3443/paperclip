@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { hash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { PROJECT_REPOSITORIES_DIR } from "@paperclipai/adapter-utils/git-workspace-sync";
@@ -11,7 +11,6 @@ import { gitWorktreeTrashPath, LIVE_EXECUTION_WORKSPACE_STATUSES, verifiedWorktr
 
 export const GIT_EXPIRATION_EVIDENCE_CONTRACT_NAME = "paperclip.git-expiration-evidence";
 export const GIT_EXPIRATION_EVIDENCE_CONTRACT_VERSION = 1;
-/** Capabilities this native artifact produces; a later slice appends its own. */
 export const GIT_EXPIRATION_EVIDENCE_CAPABILITIES = ["row_keys.v1", "row_state.v1", "row_paths.v1", "row_head.v1", "drift_stop.v1"] as const;
 
 export type GitExpirationEvidenceContract = { name: string; version: number; capabilities: string[] };
@@ -47,13 +46,12 @@ export function canonicalJson(value: unknown): string {
 }
 
 export function evidenceDigest(field: string, value: unknown) {
-  return createHash("sha256").update(`paperclip.git-expiration-evidence.v1\0${field}\0${canonicalJson(value)}`).digest("hex");
+  return hash("sha256", `paperclip.git-expiration-evidence.v1\0${field}\0${canonicalJson(value)}`, "hex");
 }
 
 const optionalDigest = (field: string, value: unknown) => value === undefined
   ? { present: false as const } : { present: true as const, digest: evidenceDigest(field, value) };
 
-/** Sanitized failure code: an errno name, a Git exit, or a fixed fallback. Messages and argv never enter evidence. */
 export function evidenceErrorCode(error: unknown): string {
   const code = (error as { code?: unknown } | null)?.code;
   if (typeof code === "number") return `git_exit_${code}`;
@@ -106,7 +104,6 @@ function stopped(signal: AbortSignal | undefined, error?: unknown) {
   return !!signal?.aborted || (error !== undefined && isInspectionStop(error, signal));
 }
 
-/** One bounded Git child that reads identity only; it is not a proof step. */
 export async function observeHead(worktree: string | null, signal?: AbortSignal): Promise<HeadRead> {
   if (!worktree) return { observation: unavailable("location_unresolved"), gitDir: null };
   if (signal?.aborted) return { observation: unavailable("row_stopped"), gitDir: null };
@@ -127,7 +124,6 @@ export async function observeHead(worktree: string | null, signal?: AbortSignal)
 }
 
 export type CheckoutIdentity = { name: string; branchName: string | null; gitDir: string | null };
-/** Identity of a live row that needs a child, a budgeted directory read or a realpath. Captured before drain only. */
 export type LiveIdentity = {
   head: Observation<HeadValue>;
   sourcePath: string | null;
@@ -152,7 +148,6 @@ function isLive(workspace: Workspace) {
   return LIVE_EXECUTION_WORKSPACE_STATUSES.includes(workspace.status);
 }
 
-/** Source candidates of a live row; `null` when a native validator rejects the recorded identity. */
 function liveSourcePaths(workspace: Workspace): string[] | null {
   let recorded: string | null;
   try { recorded = recordedIsolatedRemoteSource(workspace); } catch { return null; }
@@ -172,7 +167,7 @@ function pendingAnchor(workspace: Workspace): Anchor | null {
     recipe = readGitCacheRestoration(workspace);
   } catch {
     const bad = unavailable<string>("invalid_metadata");
-    return { sourcePaths: [], worktreePath: bad, markerSource: bad, worktreeAdmin: bad, branchName: null,
+    return { sourcePaths: null, worktreePath: bad, markerSource: bad, worktreeAdmin: bad, branchName: null,
       checkouts: unavailable("invalid_metadata"), worktreeTrash: bad, baseTrash: null };
   }
   if (!state || !recipe) return null;
@@ -201,7 +196,6 @@ function liveAnchor(workspace: Workspace, identity: LiveIdentity): Anchor {
   };
 }
 
-/** Reads every live-row anchor input that needs a child, a directory read or a realpath. */
 export async function captureLiveIdentity(workspace: Workspace, signal?: AbortSignal): Promise<LiveIdentity> {
   const worktree = workspace.cwd && (!workspace.providerRef || workspace.providerRef === workspace.cwd) ? workspace.cwd : null;
   const head = await observeHead(worktree, signal);
@@ -217,7 +211,6 @@ export async function captureLiveIdentity(workspace: Workspace, signal?: AbortSi
         sourcePath = candidate;
         break;
       } catch {
-        // The admin dir does not resolve under this candidate; try the next one.
       }
     }
   } else if (head.observation.state === "unavailable" && head.observation.reason === "row_stopped") return stop();
@@ -329,7 +322,6 @@ function entryType(stat: import("node:fs").BigIntStats) {
   return "other";
 }
 
-/** `lstat` only: no child, no directory read and no budget, so it is safe after drain. */
 export async function observeProtectedPaths(locations: ReadonlyArray<Location>): Promise<PathEntry[]> {
   const entries: PathEntry[] = [];
   for (const location of locations) {
@@ -372,7 +364,6 @@ export type GitExpirationRowEvidence = {
 
 type ReadRow = { workspace: Workspace; updatedAtKey: string } | null;
 
-/** The before side, read in one pass right after both locks. Its location list is fixed and reused for after. */
 export async function observeBefore(current: ReadRow, snapshot: Workspace, signal?: AbortSignal) {
   if (signal?.aborted) return { side: unavailable<GitExpirationRowSide>("row_stopped"), locations: null, anchorRow: current?.workspace ?? snapshot };
   const workspace = current?.workspace ?? snapshot;
@@ -392,7 +383,11 @@ export async function observeBefore(current: ReadRow, snapshot: Workspace, signa
   return { side: observed<GitExpirationRowSide>({ row, head, locationSet: locationSet(anchor), paths }), locations, anchorRow: workspace };
 }
 
-/** Phase A: every after step that needs a child or a budgeted read. Runs before drain and only while the row signal is live. */
+export function failedAfterIdentity(error: unknown): { head: Observation<HeadValue>; identity: LiveIdentity } {
+  const code = evidenceErrorCode(error);
+  return { head: failed(code), identity: { head: failed(code), sourcePath: null, worktreeAdmin: failed(code), checkouts: failed(code) } };
+}
+
 export async function captureAfterIdentity(anchorRow: Workspace, signal: AbortSignal): Promise<{ head: Observation<HeadValue>; identity: LiveIdentity | null } | null> {
   if (signal.aborted) return null;
   const pending = pendingAnchor(anchorRow);
@@ -404,10 +399,6 @@ export async function captureAfterIdentity(anchorRow: Workspace, signal: AbortSi
   return { head: identity.head, identity };
 }
 
-/**
- * Phase B: the fixed reads after drain. `reread` is the one select in the lifecycle transaction; a deleted row names
- * its locations from `anchorRow`, as the before side did.
- */
 export async function observeAfter(reread: () => Promise<ReadRow>, anchorRow: Workspace, locations: ReadonlyArray<Location>,
   phaseA: { head: Observation<HeadValue>; identity: LiveIdentity | null } | null): Promise<Observation<GitExpirationRowSide>> {
   let current: ReadRow;
@@ -492,7 +483,6 @@ export function compareSelection(selected: Observation<RowStateValue>, before: O
   return fields.length ? { state: "changed", fields } : { state: "none" };
 }
 
-/** Not-observed parts of a locked row, except a legitimately absent worktree. */
 export function missingEvidence(evidence: GitExpirationRowEvidence): string[] {
   const missing: string[] = [];
   for (const [name, side] of [["before", evidence.before], ["after", evidence.after]] as const) {

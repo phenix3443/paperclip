@@ -27,7 +27,6 @@ export async function allocatedBytes(target: string, shouldContinue: () => boole
   return bytes;
 }
 
-/** The worktree admin dir must be the source's own `worktrees/<name>` entry, by path and by realpath. */
 export async function verifiedWorktreeAdmin(sourcePath: string, rawAdmin: string) {
   const worktreeAdmin = path.join(sourcePath, ".git", "worktrees", path.basename(rawAdmin));
   const canonicalAdmin = path.join(await fs.realpath(sourcePath), ".git", "worktrees", path.basename(rawAdmin));
