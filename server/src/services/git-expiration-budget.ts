@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { execFile, spawn } from "node:child_process";
-import type { Dirent } from "node:fs";
+import type { Dir, Dirent } from "node:fs";
 import fs from "node:fs/promises";
 
 export const GIT_EXPIRATION_BUDGETS = Object.freeze({
@@ -172,7 +172,14 @@ export async function readBoundedDirectory(directory: string, signal?: AbortSign
   const budget = currentInspectionBudget();
   const entries: Dirent[] = [];
   await budget?.beforeDirectoryRead(directory);
-  for await (const entry of await fs.opendir(directory)) {
+  let dir: Dir;
+  try {
+    dir = await fs.opendir(directory);
+  } catch (error) {
+    if (error instanceof Error) Error.captureStackTrace(error);
+    throw error;
+  }
+  for await (const entry of dir) {
     signal?.throwIfAborted();
     budget?.countEntry();
     entries.push(entry);

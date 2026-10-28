@@ -258,7 +258,7 @@ function OrganizationIssues({
       participantAgentId ?? "__all__",
       "workspace",
       workspaceIdFilter ?? "__all__",
-      "compact",
+      streamlinedUiEnabled ? "index" : "compact",
       "with-routine-executions",
       showAgentCreatedTasks,
       "infinite",
@@ -267,6 +267,7 @@ function OrganizationIssues({
     ],
     queryFn: ({ pageParam, signal }) => issuesApi.listCompact(selectedCompanyId!, {
       status: statusFilter || undefined,
+      projection: streamlinedUiEnabled ? "index" : undefined,
       participantAgentId,
       workspaceId: workspaceIdFilter,
       includeRoutineExecutions: true,

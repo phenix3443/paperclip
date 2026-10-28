@@ -98,10 +98,10 @@ async function reentryContext(db: Db, run: Run, from: Context, visited: Readonly
   for (let depth = 0; current; depth += 1) {
     if (depth >= MAX_FOREIGN_ANCESTORS || seen.has(current.id)) return undefined;
     seen.add(current.id);
-    const [owner] = await db.select({ issueId: boundRunIssueIdSql() }).from(heartbeatRuns)
+    const [owner] = await db.select({ issueId: boundRunIssueIdSql(), agentId: heartbeatRuns.agentId }).from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.id, current.runId), eq(heartbeatRuns.companyId, run.companyId))).limit(1);
     if (!owner) return undefined;
-    if (owner.issueId === issueId) return current;
+    if (owner.issueId === issueId) return owner.agentId === run.agentId ? current : undefined;
     if (!current.parentContextId) return null;
     [current] = await db.select().from(runIdentityContexts).where(and(
       eq(runIdentityContexts.id, current.parentContextId),
