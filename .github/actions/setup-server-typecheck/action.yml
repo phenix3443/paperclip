@@ -1,0 +1,57 @@
+name: Set up the server type check
+description: >-
+  Install the workspace, prepare the server's build inputs, and compute the
+  cache prefix for the server source project's tsc build state
+  (server/node_modules/.cache/typecheck). Fork-only (phenix3443/paperclip).
+inputs:
+  cache-namespace:
+    description: Leading part of the cache prefix, e.g. server-tsc-src-v1.
+    required: true
+outputs:
+  tsc-version:
+    description: Version reported by the installed tsc, e.g. 7.0.2.
+    value: ${{ steps.prefix.outputs.tsc-version }}
+  cache-prefix:
+    description: Cache key prefix; entries are <prefix>-<full commit SHA>.
+    value: ${{ steps.prefix.outputs.cache-prefix }}
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+      with:
+        node-version: 24
+        package-manager-cache: false
+
+    - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+      with:
+        version: 9.15.4
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        if ! pnpm install --frozen-lockfile; then
+          pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
+          pnpm install --frozen-lockfile
+        fi
+
+    - name: Prepare the server's build inputs
+      shell: bash
+      working-directory: server
+      run: |
+        pnpm run prepare:runner-vendor
+        pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
+
+    - name: Compute the cache prefix
+      id: prefix
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.cache-namespace }}
+      run: |
+        set -euo pipefail
+        version="$(pnpm --dir server exec tsc --version | awk '{print $NF}')"
+        [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || { echo "unexpected tsc --version: $version" >&2; exit 1; }
+        config="$(cat tsconfig.base.json server/tsconfig.json server/tsconfig.src.json | sha256sum | cut -c1-16)"
+        prefix="${NAMESPACE}-${RUNNER_OS}-${RUNNER_ARCH}-tsc${version}-${config}"
+        echo "tsc-version=$version" >> "$GITHUB_OUTPUT"
+        echo "cache-prefix=$prefix" >> "$GITHUB_OUTPUT"
+        echo "tsc $version, cache prefix $prefix"
