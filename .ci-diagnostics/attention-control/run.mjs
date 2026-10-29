@@ -85,7 +85,9 @@ for (const line of output.replace(/\x1b\[[0-9;]*m/g, "").split("\n")) {
   try {
     const event = JSON.parse(line.slice("[attention-control] ".length));
     assert.ok(["postgres-version", "wait-sample", "observation-error", "sampler-deadline", "delete-start", "delete-end"].includes(event.event));
-    assert.ok(Number.isFinite(event.elapsedMs) && Number.isInteger(event.hook));
+    assert.ok(Number.isFinite(event.elapsedMs) && event.elapsedMs >= 0 && Number.isInteger(event.hook) && event.hook > 0);
+    if (event.durationMs != null) assert.ok(Number.isFinite(event.durationMs) && event.durationMs >= 0);
+    if (event.truncated != null) assert.equal(typeof event.truncated, "boolean");
     if (event.operation != null) assert.ok(operationNames.has(event.operation));
     if (event.version != null) assert.match(event.version, /^\d+(?:\.\d+)*$/);
     const allowed = ["event", "hook", "elapsedMs", "operation", "version", "durationMs", "truncated", "locks"];
