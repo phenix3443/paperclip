@@ -34,8 +34,13 @@ jobs:
         with:
           version: 9.15.4
 
+      # Same fallback as pr-trusted.yml when the checked-in lockfile is stale.
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: |
+          if ! pnpm install --frozen-lockfile; then
+            pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
+            pnpm install --frozen-lockfile
+          fi
 
       # The same preparation the server's typecheck script runs before tsc.
       - name: Prepare the server's build inputs
