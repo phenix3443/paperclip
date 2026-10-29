@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "composite": true,
+    "emitDeclarationOnly": true,
+    "declarationMap": false,
+    "sourceMap": false,
+    "outDir": "node_modules/.cache/typecheck/src",
+    "tsBuildInfoFile": "node_modules/.cache/typecheck/src.tsbuildinfo"
+  },
+  "exclude": ["src/__tests__", "src/**/__tests__", "src/**/*.test.ts"]
+}
