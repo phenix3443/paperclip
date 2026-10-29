@@ -1737,6 +1737,37 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 
+  describe("blocked cancellation", () => {
+    beforeEach(() => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked" }));
+      mockIssueService.getDependencyReadiness.mockResolvedValue({
+        unresolvedBlockerCount: 2,
+        unresolvedBlockerIssueIds: [recoveryActionId, ownerRunId],
+      });
+      mockAgentService.getById.mockImplementation(async (id: string) =>
+        id === peerAgentId
+          ? makeAgent(peerAgentId, { role: "cto" })
+          : makeAgent(ownerAgentId, { reportsTo: peerAgentId }));
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+        allowed: true,
+        action: input.action,
+        reason: "allow_explicit_grant",
+        explanation: "Allowed by management grant.",
+      }));
+    });
+
+    it("allows a non-assignee CTO to cancel with unfinished dependencies", async () => {
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`).send({ status: "cancelled" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.status).toBe("cancelled");
+      expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+        action: "tasks:manage_active_checkouts",
+      }));
+    });
+  });
+
   it.each([
     ["done", "todo", 403, "Agent cannot request follow-up for another agent's issue"],
     ["cancelled", "todo", 409, "Cancelled issues must be restored through the dedicated restore flow"],
