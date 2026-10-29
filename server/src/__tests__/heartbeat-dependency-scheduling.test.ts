@@ -188,6 +188,76 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     await tempDb?.cleanup();
   });
 
+  it("parks a durable dependency input without consuming it or rewriting an unchanged hold", async () => {
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), blockerId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Dependency ownership", issuePrefix: `D${companyId.slice(0, 6)}`,
+      requireBoardApprovalForNewAgents: false, defaultResponsibleUserId: "responsible-user" });
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "responsible-user", status: "active", membershipRole: "member" });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Dependency owner", role: "engineer", status: "paused",
+      adapterType: "codex_local", adapterConfig: {}, permissions: {}, runtimeConfig: { heartbeat: { wakeOnDemand: true } } });
+    await db.insert(issues).values([
+      { id: issueId, companyId, title: "Dependent", status: "todo", assigneeAgentId: agentId, responsibleUserId: "responsible-user" },
+      { id: blockerId, companyId, title: "Completed blocker", status: "done", responsibleUserId: "responsible-user" },
+    ]);
+    const runId = randomUUID(), contractId = randomUUID(), resultId = randomUUID(), assessmentId = randomUUID(), decisionId = randomUUID();
+    await db.insert(completionContracts).values({ id: contractId, companyId, issueId: blockerId, revision: 1,
+      schemaVersion: "paperclip.completion-contract.v1", policyVersion: "test", risk: "standard", completionAuthority: "server_arbiter",
+      incompleteCriteriaPolicy: "preserve_non_terminal", contractJson: {}, canonicalSha256: contractId, createdByActorType: "system", createdByActorId: "test" });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "succeeded", invocationSource: "automation",
+      nativeIssueId: blockerId, completionContractId: contractId });
+    await db.insert(nativeRunResults).values({ id: resultId, companyId, issueId: blockerId, runId,
+      completionContractId: contractId, serverFingerprint: resultId, schemaStatus: "accepted", resultJson: {}, canonicalSha256: resultId });
+    await db.insert(workAssessments).values({ id: assessmentId, companyId, issueId: blockerId, runId, contractId, resultId,
+      triggerKind: "turn_finished", triggerActorCompanyId: companyId, priorIssueStatus: "in_progress", priorStatusVersion: 0,
+      policyVersion: "test", assessmentJson: {}, inputDigest: assessmentId });
+    await db.insert(statusDecisions).values({ id: decisionId, companyId, issueId: blockerId, runId, assessmentId, decisionVersion: 1,
+      policyVersion: "test", fromStatus: "in_progress", toStatus: "done", reasonCode: "completed", decisionJson: {},
+      decisionDigest: decisionId, applicationState: "applied", appliedAt: new Date() });
+    const [intent] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation", triggerDetail: "system",
+      reason: "issue_blockers_resolved", requestedByActorType: "system", requestedByActorId: "native-status-committer",
+      idempotencyKey: `issue_blockers_resolved:${issueId}:${blockerId}`, payload: { issueId, taskId: issueId, resolvedBlockerIssueId: blockerId,
+        blockerIssueIds: [blockerId], _paperclipWakeContext: { issueId, taskId: issueId, source: "native_status_decision" } } }).returning();
+    await db.insert(statusDecisionEffects).values({ companyId, issueId: blockerId, decisionId, ordinal: 0, effectKind: "dependency_wake",
+      targetType: "agent_wakeup_request", targetId: intent!.id, idempotencyKey: `effect:${decisionId}`,
+      payload: { dependentIssueId: issueId, resolvedBlockerIssueId: blockerId }, deliveryState: "delivered" });
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
+    const parked = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+    expect(parked).toHaveLength(1);
+    expect(parked[0]).toMatchObject({ id: intent!.id, status: "deferred_issue_execution", runId: null, claimedAt: null });
+    expect(parked[0]!.payload?._paperclipDependencyAdmission).toMatchObject({ version: 1 });
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toEqual(parked);
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+        summary: "Dependency input delivered.", provider: "test", model: "test-model" };
+    });
+    const other = createDb(tempDb!.connectionString);
+    const otherHeartbeat = heartbeatService(other);
+    try {
+      await db.update(agents).set({ status: "idle" }).where(eq(agents.id, agentId));
+      await Promise.all([heartbeat.dispatchPendingNativeStatusWakeups({ companyId }),
+        otherHeartbeat.dispatchPendingNativeStatusWakeups({ companyId })]);
+      await heartbeat.drainActiveRunExecutions();
+      await otherHeartbeat.drainActiveRunExecutions();
+      const rows = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+      expect(rows, JSON.stringify(rows.map(row => ({ id: row.id, reason: row.reason, actor: row.requestedByActorId, runId: row.runId, status: row.status })))).toHaveLength(2);
+      const original = rows.find(row => row.id === intent!.id)!;
+      const receipt = rows.find(row => row.id !== intent!.id)!;
+      expect(original).toMatchObject({ status: "coalesced", runId: receipt.runId });
+      expect(receipt.id).toBe((parked[0]!.payload!._paperclipDependencyAdmission as { receiptId: string }).receiptId);
+      expect(receipt.runId).not.toBeNull();
+      expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+      await Promise.all([heartbeat.dispatchPendingNativeStatusWakeups({ companyId }),
+        otherHeartbeat.dispatchPendingNativeStatusWakeups({ companyId })]);
+      expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toEqual(rows);
+    } finally {
+      await other.$client.end();
+    }
+  });
+
   it("delivers a revised native child completion after the running parent blocks", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

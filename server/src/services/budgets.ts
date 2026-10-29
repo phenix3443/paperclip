@@ -195,6 +195,16 @@ export async function policyBlocks(db: Db, policy: PolicyRow) {
   return observedBlocks(policy, await computeObservedSpend(db, policy));
 }
 
+export async function observeInvocationBudgetBlock(db: Db, input: {
+  companyId: string; agentId: string; projectId: string | null;
+}) {
+  const policies = await db.select().from(budgetPolicies).where(and(eq(budgetPolicies.companyId, input.companyId),
+    budgetPoliciesForRun(input.companyId, input.agentId, input.projectId)));
+  const observations = await computeObservedSpends(db, policies);
+  return policies.some((policy, index) => observedBlocks(policy, observations[index])
+    || (policy.isActive && policy.hardStopEnabled && policy.amount > 0 && observations[index].recoveringRunCount > 0));
+}
+
 /** Supplemental handoff check after authoritative accounting admission commits.
  * Read only: the caller can hold issue/run ownership, so this must never take
  * the company lock, reconcile holds, or deliver effects. A later concurrent
