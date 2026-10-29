@@ -6,6 +6,9 @@ import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
+import { readReport } from "./reporter.mjs";
+import { validateSnapshot } from "./snapshot.mjs";
+
 const control = dirname(fileURLToPath(import.meta.url));
 const source = resolve(process.argv[2]);
 const evidence = resolve(process.argv[3]);
@@ -44,6 +47,7 @@ mkdirSync(evidence, { recursive: true });
 const metadata = { target, actualCheckout: git("rev-parse", "HEAD"), files: manifest.files,
   manifestSha256: hash(readFileSync(join(control, "manifest.json"))), patchSha256: hash(observationPatch),
   observerSha256: hash(readFileSync(join(control, "observe-cleanup.mjs"))),
+  collectorSha256: Object.fromEntries(["run.mjs", "reporter.mjs", "snapshot.mjs"].map((name) => [name, hash(readFileSync(join(control, name)))])),
   workflowSha256: process.env.CONTROL_WORKFLOW_SHA256, controlRevision: process.env.CONTROL_REVISION,
   node: process.version, cache: { policy: "disabled", hit: false, fallback: false }, databaseSelection: "isolated embedded PostgreSQL",
   runner: Object.fromEntries(["ImageOS", "ImageVersion", "RUNNER_OS", "RUNNER_ARCH", "RUNNER_NAME"].map((key) => [key, process.env[key] ?? null])),
@@ -64,17 +68,18 @@ metadata.embeddedPostgres = versionOf("embedded-postgres", join(source, "package
 metadata.postgresDriver = versionOf("postgres", join(source, "packages/db"));
 metadata.pnpm = spawnSync("pnpm", ["--version"], { cwd: source, encoding: "utf8" }).stdout.trim();
 assert.equal(metadata.pnpm, "9.15.4");
+assert.equal(metadata.vitest, "5.0.3");
 writeFileSync(join(evidence, "environment.json"), JSON.stringify(metadata, null, 2));
 git("apply", "--unidiff-zero", join(control, "observation.patch"));
 const observerPath = join(source, ".ci-diagnostics/attention-control");
 mkdirSync(observerPath, { recursive: true });
-writeFileSync(join(observerPath, "observe-cleanup.mjs"), readFileSync(join(control, "observe-cleanup.mjs")));
+for (const name of ["observe-cleanup.mjs", "snapshot.mjs", "reporter.mjs"]) writeFileSync(join(observerPath, name), readFileSync(join(control, name)));
 const root = realpathSync(mkdtempSync(join(process.env.RUNNER_TEMP, "attention-control-")));
 const env = { ...process.env, NODE_ENV: "test", PAPERCLIP_TEST_HOST_HOME: process.env.PAPERCLIP_TEST_HOST_HOME ?? join(process.env.HOME, ".paperclip"),
-  PAPERCLIP_HOME: join(root, "h"), PAPERCLIP_CONFIG: join(root, "h/config.json"), PAPERCLIP_INSTANCE_ID: `vt-${process.pid}-1`, TMPDIR: join(root, "t") };
+  PAPERCLIP_HOME: join(root, "h"), PAPERCLIP_CONFIG: join(root, "h/config.json"), PAPERCLIP_INSTANCE_ID: `vt-${process.pid}-1`, TMPDIR: join(root, "t"), ATTENTION_REPORT_PATH: join(evidence, "typed-report.json"), ATTENTION_MANIFEST_PATH: join(control, "manifest.json") };
 mkdirSync(env.PAPERCLIP_HOME, { recursive: true }); mkdirSync(env.TMPDIR, { recursive: true });
 const args = ["exec", "vitest", "run", "--project", "@paperclipai/server", "--exclude", "**/dist/**", "--pool=forks", "--isolate", "--fileParallelism", "--maxWorkers=2", ...manifest.files,
-  "--reporter=default", "--reporter=json"];
+  "--reporter=default", `--reporter=${join(observerPath, "reporter.mjs")}`];
 writeFileSync(join(evidence, "command.json"), JSON.stringify(["pnpm", ...args], null, 2));
 const result = spawnSync("timeout", ["--signal=TERM", "--kill-after=15s", "900s", "pnpm", ...args], { cwd: source, env, encoding: "utf8", maxBuffer: 100 * 1024 * 1024 });
 const output = (result.stdout ?? "") + (result.stderr ?? "");
@@ -90,19 +95,13 @@ for (const line of output.replace(/\x1b\[[0-9;]*m/g, "").split("\n")) {
     if (event.truncated != null) assert.equal(typeof event.truncated, "boolean");
     if (event.operation != null) assert.ok(operationNames.has(event.operation));
     if (event.version != null) assert.match(event.version, /^\d+(?:\.\d+)*$/);
-    const allowed = ["event", "hook", "elapsedMs", "operation", "version", "durationMs", "truncated", "locks"];
+    const allowed = ["event", "hook", "elapsedMs", "operation", "version", "durationMs", "truncated", "snapshot"];
     assert.ok(Object.keys(event).every((key) => allowed.includes(key)));
-    if (event.locks != null) {
-      assert.ok(Array.isArray(event.locks) && event.locks.length <= 200);
-      const lockKeys = ["pid", "state", "wait_event_type", "wait_event", "blockers", "locktype", "mode", "granted", "relation", "transactionid"];
-      for (const row of event.locks) {
-        assert.ok(Object.keys(row).every((key) => lockKeys.includes(key)));
-        assert.ok(Number.isInteger(row.pid));
-        assert.ok(Array.isArray(row.blockers) && row.blockers.every(Number.isInteger));
-        for (const key of ["relation", "transactionid"]) if (row[key] != null) assert.match(row[key], /^\d+$/);
-        assert.ok(row.granted == null || typeof row.granted === "boolean");
-        for (const key of ["state", "wait_event_type", "wait_event", "locktype", "mode"]) if (row[key] != null) assert.match(row[key], /^[A-Za-z0-9_ ()-]+$/);
-      }
+    if (event.event === "wait-sample") {
+      const { snapshot } = event;
+      assert.ok(snapshot && Object.keys(snapshot).every((key) => ["total", "returned", "lockGroupTotal", "lockGroupReturned", "missingBlockers", "complete", "records"].includes(key)));
+      const verified = validateSnapshot({ total: snapshot.total, records: snapshot.records });
+      assert.deepEqual(snapshot, verified);
     }
     events.push(event);
   } catch { events.push({ event: "observation-error" }); }
@@ -110,22 +109,11 @@ for (const line of output.replace(/\x1b\[[0-9;]*m/g, "").split("\n")) {
 writeFileSync(join(evidence, "observations.ndjson"), events.map((event) => JSON.stringify(event)).join("\n") + "\n");
 writeFileSync(join(evidence, "output-redaction.json"), JSON.stringify({ stdoutLines: (result.stdout ?? "").split("\n").length, stderrLines: (result.stderr ?? "").split("\n").length, policy: "Unrestricted test console output and failure messages are omitted; only typed result metadata and allowlisted observation events are retained." }));
 writeFileSync(join(evidence, "exit.json"), JSON.stringify({ status: result.status, signal: result.signal, timedOut: result.status === 124, spawnError: Boolean(result.error) }));
-let valid = false;
-try {
-  const stdout = result.stdout ?? "";
-  const matches = [...stdout.matchAll(/\{\s*"numTotalTestSuites"\s*:/g)];
-  assert.ok(matches.length, "JSON reporter output missing");
-  const reportText = stdout.slice(matches.at(-1).index);
-  const report = JSON.parse(reportText.slice(0, reportText.lastIndexOf("}") + 1));
-  const actual = report.testResults.map((entry) => entry.name.replace(`${source}/`, "")).sort();
-  assert.deepEqual(actual, [...manifest.files].sort(), "Actual test inventory differs");
-  const safeReport = report.testResults.map((entry) => ({ file: entry.name.replace(`${source}/`, ""), status: entry.status,
-    tests: entry.assertionResults.map((test, index) => ({ index, status: test.status, duration: test.duration,
-      failure: test.failureMessages?.length ? (test.failureMessages.some((message) => message.includes("Hook timed out in 30000ms")) ? "hook-timeout-30000ms" : "redacted-test-failure") : null })) }));
-  writeFileSync(join(evidence, "results.json"), JSON.stringify(safeReport, null, 2));
-  assert.ok(events.some((event) => event.event === "postgres-version"));
-  assert.ok(!events.some((event) => event.event === "observation-error" || event.truncated), "Observation failed or was truncated");
-  valid = true;
-} catch { writeFileSync(join(evidence, "incomplete-evidence.txt"), "Result inventory, PostgreSQL version or observation evidence could not be verified. Do not treat as a controlled sample.\n"); }
+const collected = readReport(env.ATTENTION_REPORT_PATH, manifest.files);
+writeFileSync(join(evidence, "collection.json"), JSON.stringify({ code: collected.code, moduleCount: collected.report?.modules.length ?? collected.moduleCount ?? null, expectedModuleCount: manifest.files.length }));
+if (collected.report) writeFileSync(join(evidence, "results.json"), JSON.stringify(collected.report, null, 2));
+const valid = collected.code === "complete" && events.some((event) => event.event === "postgres-version")
+  && !events.some((event) => event.event === "observation-error" || event.event === "sampler-deadline" || (event.event === "wait-sample" && !event.snapshot.complete));
+if (!valid) writeFileSync(join(evidence, "incomplete-evidence.txt"), "Typed inventory or complete PostgreSQL observation evidence could not be verified. Do not treat as a controlled sample.\n");
 writeFileSync(join(evidence, "test-root-retention.json"), JSON.stringify({ root, policy: "Retain until GitHub-hosted runner disposal; child termination is not inferred from the top-level exit." }));
-process.exit(valid ? result.status ?? 1 : 1);
+process.exit(valid && collected.report.reason === "passed" && collected.report.unhandledErrors === 0 ? result.status ?? 1 : 1);

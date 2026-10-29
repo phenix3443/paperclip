@@ -1,12 +1,6 @@
 import { performance } from "node:perf_hooks";
 
-const columns = ["pid", "state", "wait_event_type", "wait_event", "blockers", "locktype", "mode", "granted", "relation", "transactionid"];
-const locks = `select a.pid, a.state, a.wait_event_type, a.wait_event,
-  pg_blocking_pids(a.pid) as blockers, l.locktype, l.mode, l.granted,
-  l.relation::text as relation, l.transactionid::text as transactionid
-  from pg_stat_activity a left join pg_locks l on l.pid = a.pid
-  where a.datname = current_database() and a.pid <> pg_backend_pid()
-  order by a.pid, l.locktype, l.mode limit 200`;
+import { snapshotSql, validateSnapshot } from "./snapshot.mjs";
 
 let sequence = 0;
 
@@ -40,9 +34,9 @@ export function observeCleanup(openClient) {
     try {
       await ready;
       if (closed || !connection || current !== operation) return;
-      const rows = await connection.unsafe(locks);
-      emit("wait-sample", { operation: operation.name, truncated: rows.length === 200,
-        locks: rows.map((row) => Object.fromEntries(columns.map((key) => [key, row[key] ?? null]))) });
+      const [raw] = await connection.unsafe(snapshotSql);
+      const snapshot = validateSnapshot(raw);
+      emit("wait-sample", { operation: operation.name, snapshot });
     } catch { failure(); }
     finally { busy = false; }
   };
