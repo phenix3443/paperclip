@@ -1,0 +1,94 @@
+name: Attention cleanup control
+
+on:
+  workflow_dispatch:
+    inputs:
+      approved_revision:
+        description: Independently approved full diagnostic commit SHA
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: attention-cleanup-control
+  cancel-in-progress: false
+
+jobs:
+  sample:
+    if: >-
+      github.repository == 'phenix3443/paperclip' &&
+      github.ref == 'refs/heads/chore/attention-cleanup-control' &&
+      inputs.approved_revision == github.sha
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - name: base
+            ref: 31b927e3013a8a4b3266854b740cf40a24753788
+          - name: candidate
+            ref: eb961a44f695ffb6a571fd90428e5607ac25107d
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    steps:
+      - name: Checkout exact diagnostic revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
+      - name: Checkout exact sample
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ matrix.ref }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set Node version
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24.22.1
+          package-manager-cache: false
+      - name: Set pnpm version
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86
+        with:
+          version: 9.15.4
+          run_install: false
+      - name: Validate targets and observation patch
+        env:
+          SAMPLE_SHA: ${{ matrix.ref }}
+        run: >-
+          node ../control/.ci-diagnostics/attention-control/run.mjs
+          "$PWD" "$GITHUB_WORKSPACE/evidence" "$SAMPLE_SHA" --validate
+      - name: Install exact dependencies without cache fallback
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/evidence"
+          node --version > "$GITHUB_WORKSPACE/evidence/node-version.txt"
+          pnpm --version > "$GITHUB_WORKSPACE/evidence/pnpm-version.txt"
+          pnpm install --frozen-lockfile 2>&1 | tee "$GITHUB_WORKSPACE/evidence/install.log"
+          pnpm run preflight:workspace-links 2>&1 | tee "$GITHUB_WORKSPACE/evidence/preflight.log"
+          pnpm --filter @paperclipai/plugin-sdk ensure-build-deps 2>&1 | tee "$GITHUB_WORKSPACE/evidence/build-deps.log"
+      - name: Run one fixed-manifest sample
+        env:
+          SAMPLE_SHA: ${{ matrix.ref }}
+          CONTROL_REVISION: ${{ github.sha }}
+        run: |
+          export CONTROL_WORKFLOW_SHA256="$(sha256sum ../control/.github/workflows/build-memory-compare.yml | cut -d ' ' -f 1)"
+          node ../control/.ci-diagnostics/attention-control/run.mjs "$PWD" "$GITHUB_WORKSPACE/evidence" "$SAMPLE_SHA"
+      - name: Preserve sample evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: attention-control-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            evidence/
+            control/.ci-diagnostics/attention-control/
+            control/.github/workflows/build-memory-compare.yml
+          if-no-files-found: error
+          retention-days: 14

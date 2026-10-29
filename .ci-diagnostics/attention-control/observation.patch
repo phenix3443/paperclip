@@ -1,0 +1,77 @@
+--- a/server/src/__tests__/attention-service.test.ts
++++ b/server/src/__tests__/attention-service.test.ts
+@@ -1,3 +1,4 @@
++import { observeCleanup } from "../../../.ci-diagnostics/attention-control/observe-cleanup.mjs";
+ import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
+ import { createAgentLifecycle } from "../services/agent-lifecycle.js";
+ import { randomUUID } from "node:crypto";
+@@ -70,35 +71,40 @@
+   }, 30_000);
+ 
+   afterEach(async () => {
+-    await db.delete(inboxDismissals);
+-    await db.delete(decisionArchiveNotificationOutbox);
+-    await db.delete(decisionRetention);
+-    await db.delete(decisionTriageEvents);
+-    await db.delete(decisionTriage);
+-    await db.delete(decisionQueueItems);
+-    await db.delete(decisionQueues);
+-    await db.delete(decisions);
+-    await db.delete(issueThreadInteractions);
+-    await db.delete(issueApprovals);
+-    await db.delete(issueAttachments);
+-    await db.delete(issueDocuments);
+-    await db.delete(heartbeatRunEvents);
+-    await db.delete(heartbeatRuns);
+-    await db.delete(budgetIncidents);
+-    await db.delete(budgetPolicies);
+-    await db.delete(joinRequests);
+-    await db.delete(invites);
+-    await db.delete(issueRecoveryActions);
+-    await db.delete(issueRelations);
+-    await db.delete(activityLog);
+-    await db.delete(approvals);
+-    await db.delete(issues);
+-    await db.delete(assets);
+-    await db.delete(documents);
+-    await db.delete(projectWorkspaces);
+-    await db.delete(projects);
+-    await db.delete(agents);
+-    await db.delete(companies);
++    const cleanup = observeCleanup(() => createDb(externalUrl ?? tempDb!.connectionString).$client);
++    try {
++      await cleanup.run("inboxDismissals", () => db.delete(inboxDismissals));
++      await cleanup.run("decisionArchiveNotificationOutbox", () => db.delete(decisionArchiveNotificationOutbox));
++      await cleanup.run("decisionRetention", () => db.delete(decisionRetention));
++      await cleanup.run("decisionTriageEvents", () => db.delete(decisionTriageEvents));
++      await cleanup.run("decisionTriage", () => db.delete(decisionTriage));
++      await cleanup.run("decisionQueueItems", () => db.delete(decisionQueueItems));
++      await cleanup.run("decisionQueues", () => db.delete(decisionQueues));
++      await cleanup.run("decisions", () => db.delete(decisions));
++      await cleanup.run("issueThreadInteractions", () => db.delete(issueThreadInteractions));
++      await cleanup.run("issueApprovals", () => db.delete(issueApprovals));
++      await cleanup.run("issueAttachments", () => db.delete(issueAttachments));
++      await cleanup.run("issueDocuments", () => db.delete(issueDocuments));
++      await cleanup.run("heartbeatRunEvents", () => db.delete(heartbeatRunEvents));
++      await cleanup.run("heartbeatRuns", () => db.delete(heartbeatRuns));
++      await cleanup.run("budgetIncidents", () => db.delete(budgetIncidents));
++      await cleanup.run("budgetPolicies", () => db.delete(budgetPolicies));
++      await cleanup.run("joinRequests", () => db.delete(joinRequests));
++      await cleanup.run("invites", () => db.delete(invites));
++      await cleanup.run("issueRecoveryActions", () => db.delete(issueRecoveryActions));
++      await cleanup.run("issueRelations", () => db.delete(issueRelations));
++      await cleanup.run("activityLog", () => db.delete(activityLog));
++      await cleanup.run("approvals", () => db.delete(approvals));
++      await cleanup.run("issues", () => db.delete(issues));
++      await cleanup.run("assets", () => db.delete(assets));
++      await cleanup.run("documents", () => db.delete(documents));
++      await cleanup.run("projectWorkspaces", () => db.delete(projectWorkspaces));
++      await cleanup.run("projects", () => db.delete(projects));
++      await cleanup.run("agents", () => db.delete(agents));
++      await cleanup.run("companies", () => db.delete(companies));
++    } finally {
++      await cleanup.close();
++    }
+   });
+ 
+   afterAll(async () => {
