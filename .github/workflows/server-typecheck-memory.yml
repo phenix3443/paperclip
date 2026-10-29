@@ -1,0 +1,92 @@
+# Measures the peak memory and wall time of the server type check in several
+# configurations, so a change to the server's compile units is judged on
+# numbers. Diagnostics only: every variant runs even when another fails, and
+# the results go to the job summary. Fork-only (phenix3443/paperclip).
+name: server-typecheck-memory
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/server-typecheck-memory.yml
+      - tsconfig.base.json
+      - server/tsconfig*.json
+      - server/package.json
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    if: github.repository == 'phenix3443/paperclip'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 9.15.4
+
+      # Same fallback as pr-trusted.yml when the checked-in lockfile is stale.
+      - name: Install dependencies
+        run: |
+          if ! pnpm install --frozen-lockfile; then
+            pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
+            pnpm install --frozen-lockfile
+          fi
+
+      # The same preparation the server's typecheck script runs before tsc.
+      - name: Prepare the server's build inputs
+        working-directory: server
+        run: |
+          pnpm run prepare:runner-vendor
+          pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
+
+      - name: Measure variants
+        working-directory: server
+        run: |
+          set +e -u
+          summary="$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Server typecheck: peak memory and time"
+            echo
+            echo "Runner: $(nproc) CPUs, $(free -g | awk '/Mem:/ {print $2}') GiB RAM. tsc $(pnpm exec tsc --version)"
+            echo
+            echo "| Variant | Command | Exit | Peak RSS (MiB) | Wall (s) |"
+            echo "|---|---|---|---|---|"
+          } >> "$summary"
+          measure() {
+            name="$1"; shift
+            # A variant named *-warm reuses the previous variant's project build output.
+            case "$name" in *-warm) ;; *) rm -rf node_modules/.cache/typecheck ;; esac
+            /usr/bin/time -f '%M %e' -o "$RUNNER_TEMP/time.txt" "$@" > "$RUNNER_TEMP/$name.log" 2>&1
+            code=$?
+            # GNU time prepends "Command exited with non-zero status N" on failure.
+            read -r rss wall < <(tail -n 1 "$RUNNER_TEMP/time.txt") || { rss=0; wall=0; }
+            row="| $name | \`$*\` | $code | $((rss / 1024)) | $wall |"
+            echo "$row" >> "$summary"
+            echo "RESULT $row"
+            echo "::group::$name (exit $code)"; tail -40 "$RUNNER_TEMP/$name.log"; echo "::endgroup::"
+          }
+          tsc="$(pnpm bin)/tsc"
+          measure current "$tsc" --noEmit
+          measure checkers-2 "$tsc" --noEmit --checkers 2
+          measure checkers-1 "$tsc" --noEmit --checkers 1
+          measure source-only "$tsc" -p tsconfig.build.json --noEmit --checkers 2
+          # Split: build the source project's declarations, then check the tests against them.
+          measure split-src-checkers-2 "$tsc" -b tsconfig.src.json --checkers 2
+          measure split-tests-checkers-2-warm "$tsc" -p tsconfig.tests.json --checkers 2
+          measure split-src-checkers-1 "$tsc" -b tsconfig.src.json --checkers 1
+          measure split-tests-checkers-1-warm "$tsc" -p tsconfig.tests.json --checkers 1
+          # An unchanged source project is only checked for staleness.
+          measure split-src-unchanged-warm "$tsc" -b tsconfig.src.json --checkers 1
+          # The server's typecheck script end to end, from a clean project cache.
+          measure typecheck-script pnpm run typecheck
