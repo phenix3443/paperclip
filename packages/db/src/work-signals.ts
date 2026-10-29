@@ -4,7 +4,7 @@ import { sql } from "drizzle-orm";
 // background timers, or driver query replay. Only opted-in transactions fetch
 // an XID, so unrelated transactions keep their existing SQL behavior.
 type Listener = (event: "intent" | "settled", hints?: ReadonlySet<string>) => void;
-type CommitCallback = () => void | Promise<void>;
+type CommitCallback = { recoveryTopic: string; notify: () => void | Promise<void> };
 type Transaction = { topics: Set<string>; hints: Map<string, Set<string>>; xid?: Promise<string>; uncertain: boolean; callbacks: CommitCallback[] };
 type Scope = { key: object; listeners: Map<string, Set<Listener>>; transactions: Set<Transaction>; root: Connection };
 type Context = { scope: Scope; transaction?: Transaction; callbacks?: CommitCallback[] };
@@ -50,6 +50,11 @@ function install(connection: Connection, context: Context) {
         // acquisition itself failed there cannot be a corresponding write.
         if (state.xid) state.uncertain = true;
         else context.scope.transactions.delete(state);
+        for (const { recoveryTopic } of state.callbacks) {
+          if (state.topics.has(recoveryTopic)) continue;
+          state.topics.add(recoveryTopic);
+          publish(context.scope, recoveryTopic, "intent");
+        }
       }
       throw error;
     } finally {
@@ -59,9 +64,9 @@ function install(connection: Connection, context: Context) {
 }
 
 function publishCommitted(state: Transaction) {
-  for (const callback of state.callbacks.splice(0)) {
+  for (const { notify } of state.callbacks.splice(0)) {
     try {
-      void Promise.resolve(callback()).catch(error => process.emitWarning(`Database commit callback failed: ${String(error)}`));
+      void Promise.resolve(notify()).catch(error => process.emitWarning(`Database commit callback failed: ${String(error)}`));
     } catch (error) { process.emitWarning(`Database commit callback failed: ${String(error)}`); }
   }
 }
@@ -77,14 +82,11 @@ async function registerTransaction(connection: object, context: Context) {
   catch (error) { state.xid = undefined; throw error; }
 }
 
-/** Await inside the transaction, before the mutation. Callbacks are process-local
- * hints, run outside DB locks, and never replayed after failure. An uncertain
- * outcome requires reconcileDatabaseWork on the root owner; no timer is added. */
-export async function afterDatabaseCommit(connection: object, callback: CommitCallback): Promise<void> {
+export async function afterDatabaseCommit(connection: object, recoveryTopic: string, notify: CommitCallback["notify"]): Promise<void> {
   const context = contexts.get(connection);
   if (!context?.transaction || !context.callbacks) throw new Error("Database commit callbacks require a createDb transaction");
   await registerTransaction(connection, context);
-  context.callbacks.push(callback);
+  context.callbacks.push({ recoveryTopic, notify });
 }
 
 /** Await BEFORE the queue write, on its transaction. Nested transactions work. */
@@ -124,7 +126,15 @@ export async function reconcileDatabaseWork(owner: object, topic?: string): Prom
     if (!rows.length || ![null, "committed", "aborted"].includes(rows[0].status)) {
       throw new Error("Unexpected database transaction status");
     }
-    if (rows[0].status === null && state.callbacks.length) throw new Error("Database commit outcome unavailable; callbacks remain pending");
+    if (rows[0].status === null && state.callbacks.length) {
+      const topics = [...state.topics];
+      state.topics.clear();
+      for (const affected of topics) publish(scope, affected, "settled", state.hints.get(affected));
+      state.hints.clear();
+      if (topic === undefined) throw new Error("Database commit outcome unavailable; callbacks remain pending");
+      if (topics.length) process.emitWarning("Database commit outcome unavailable; callbacks remain pending");
+      continue;
+    }
     if (!scope.transactions.delete(state)) continue;
     if (rows[0].status === "committed") publishCommitted(state);
     else state.callbacks.length = 0;

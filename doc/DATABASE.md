@@ -1254,7 +1254,7 @@ retain the idle hold and schedule another attempt. Work signals never replay
 queries or convert a failed database operation into success.
 
 For a hint that must distinguish commit from rollback, await
-`afterDatabaseCommit(tx, callback)` before the mutation. Successful savepoints
+`afterDatabaseCommit(tx, existingRecoveryTopic, callback)` before the mutation. Successful savepoints
 transfer their callbacks to their parent; rolled-back savepoints discard theirs.
 Callbacks run only after the outer transaction is confirmed committed, outside
 its locks. Callback failures are reported without changing the transaction's
@@ -1264,14 +1264,17 @@ permission to execute work. Accounting activity publication uses this contract
 even when its transaction is nested in a caller-owned transaction.
 
 Registration requires an instrumented `createDb` transaction and fetches the
-same transaction ID as work signals; it creates no topic, subscription or timer.
-On a lost transaction response, the owning recovery path must call
-`reconcileDatabaseWork(owner)` (without a topic to include callback-only work).
-`databaseWorkPending(owner)` includes these unresolved transactions. A committed
+same transaction ID as work signals; it creates no new topic, subscription or timer.
+Normal success does not signal the recovery queue. A failed transaction signals
+the supplied existing topic so its coordinator owns transaction reconciliation.
+Accounting uses the existing cost-accounting owner. `databaseWorkPending(owner)`
+includes all unresolved transactions. A committed
 outcome invokes each retained callback once in this process; aborted discards
-it. An unavailable (`NULL`) outcome retains callbacks and reports an error,
-because it cannot prove commit. Existing topic-only reconciliation still accepts
-`NULL` and scans its durable queue as before. Process exit loses callbacks;
+it. An unavailable (`NULL`) outcome retains callbacks and reports a warning,
+because it cannot prove commit. It settles the topics so they can scan their
+durable queues as before, without a recurring unknown-callback retry. A root
+`reconcileDatabaseWork(owner)` without a topic reports the unresolved callback
+as an error for explicit repair. Process exit loses callbacks;
 startup recovery must reconstruct work from durable rows. These hooks alone
 do not guarantee automatic dependency delivery.
 

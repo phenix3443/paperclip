@@ -20,13 +20,13 @@ const support = await getEmbeddedPostgresTestSupport();
   it("runs a committed callback once outside the outer transaction and discards rolled-back savepoints", async () => {
     const callbacks: string[] = [];
     await db.transaction(async tx => {
-      await workSignals.afterDatabaseCommit(tx, () => { callbacks.push("outer"); });
+      await workSignals.afterDatabaseCommit(tx, "commit-test", () => { callbacks.push("outer"); });
       await tx.transaction(async nested => {
-        await workSignals.afterDatabaseCommit(nested, () => { callbacks.push("nested"); });
+        await workSignals.afterDatabaseCommit(nested, "commit-test", () => { callbacks.push("nested"); });
         await nested.execute(sql`insert into work_signal_test values ('commit-callback')`);
       });
       await expect(tx.transaction(async nested => {
-        await workSignals.afterDatabaseCommit(nested, () => { callbacks.push("rolled-back"); });
+        await workSignals.afterDatabaseCommit(nested, "commit-test", () => { callbacks.push("rolled-back"); });
         throw new Error("discard savepoint");
       })).rejects.toThrow("discard savepoint");
       expect(callbacks).toEqual([]);
@@ -62,7 +62,7 @@ const support = await getEmbeddedPostgresTestSupport();
   it("reconciles a rollback without leaving a permanent pending flag", async () => {
     const callback = vi.fn();
     await expect(db.transaction(async tx => {
-      await workSignals.afterDatabaseCommit(tx, callback);
+      await workSignals.afterDatabaseCommit(tx, "commit-test", callback);
       await signalDatabaseWork(tx, "rollback");
       await tx.execute(sql`insert into work_signal_test values ('rollback')`);
       throw new Error("abort");
@@ -142,7 +142,7 @@ const support = await getEmbeddedPostgresTestSupport();
     });
     try {
       await expect(owner.transaction(async tx => {
-        await workSignals.afterDatabaseCommit(tx, callback);
+        await workSignals.afterDatabaseCommit(tx, "commit-test", callback);
         await signalDatabaseWork(tx, topic, "connection-late");
         await tx.execute(sql`insert into work_signal_test values (${topic})`);
       })).rejects.toThrow("lost transaction response");
@@ -189,7 +189,7 @@ const support = await getEmbeddedPostgresTestSupport();
   it("runs dedicated-pool commit callbacks after their writes become visible", async () => {
     let readCommitted: Promise<unknown> | undefined;
     await withDedicatedDbConnection(db, dedicated => dedicated.transaction(async tx => {
-      await workSignals.afterDatabaseCommit(tx, () => {
+      await workSignals.afterDatabaseCommit(tx, "commit-test", () => {
         readCommitted = db.execute(sql`select * from work_signal_test where id = 'dedicated-callback'`);
       });
       await tx.execute(sql`insert into work_signal_test values ('dedicated-callback')`);
@@ -209,6 +209,40 @@ const support = await getEmbeddedPostgresTestSupport();
 });
 
 describe("work signal query boundaries", () => {
+  it("wakes the existing recovery owner only on failed callback transactions and preserves legacy NULL settlement", async () => {
+    const execute = vi.fn(async () => [{ xid: "75", status: null }]);
+    let fail = false;
+    const connection = installDatabaseWorkSignals({ execute, transaction: async (callback: any) => {
+      const result = await callback({ execute, transaction: async () => {} });
+      if (fail) throw new Error("lost commit response");
+      return result;
+    } });
+    const recovered = vi.fn();
+    const events: string[] = [];
+    const unsubscribe = subscribeDatabaseWork(connection, "existing-owner", event => events.push(event));
+    const warn = vi.spyOn(process, "emitWarning").mockImplementation(() => {});
+    try {
+      await connection.transaction(async (tx: object) => {
+        await workSignals.afterDatabaseCommit(tx, "existing-owner", recovered);
+      });
+      expect(events).toEqual([]);
+      expect(recovered).toHaveBeenCalledOnce();
+      recovered.mockClear();
+      fail = true;
+      await expect(connection.transaction(async (tx: object) => {
+        await workSignals.afterDatabaseCommit(tx, "existing-owner", recovered);
+      })).rejects.toThrow("lost commit response");
+      expect(events).toEqual(["intent", "settled"]);
+      expect(databaseWorkPending(connection, "existing-owner")).toBe(true);
+      await reconcileDatabaseWork(connection, "existing-owner");
+      expect(events).toEqual(["intent", "settled", "settled"]);
+      expect(databaseWorkPending(connection, "existing-owner")).toBe(false);
+      expect(databaseWorkPending(connection)).toBe(true);
+      expect(recovered).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledOnce();
+    } finally { unsubscribe(); warn.mockRestore(); }
+  });
+
   it("retains callbacks when the commit outcome is unknown and never guesses committed", async () => {
     let status: string | null = null;
     const execute = vi.fn(async () => [{ xid: "73", status }]);
@@ -218,7 +252,7 @@ describe("work signal query boundaries", () => {
     } });
     const committed = vi.fn();
     await expect(connection.transaction(async (tx: object) => {
-      await workSignals.afterDatabaseCommit(tx, committed);
+      await workSignals.afterDatabaseCommit(tx, "commit-test", committed);
     })).rejects.toThrow("lost commit response");
     await expect(reconcileDatabaseWork(connection)).rejects.toThrow("commit outcome unavailable");
     expect(databaseWorkPending(connection)).toBe(true);
@@ -236,9 +270,9 @@ describe("work signal query boundaries", () => {
     const last = vi.fn();
     try {
       await expect(connection.transaction(async (tx: object) => {
-        await workSignals.afterDatabaseCommit(tx, () => { throw new Error("sync callback failed"); });
-        await workSignals.afterDatabaseCommit(tx, async () => { throw new Error("async callback failed"); });
-        await workSignals.afterDatabaseCommit(tx, last);
+        await workSignals.afterDatabaseCommit(tx, "commit-test", () => { throw new Error("sync callback failed"); });
+        await workSignals.afterDatabaseCommit(tx, "commit-test", async () => { throw new Error("async callback failed"); });
+        await workSignals.afterDatabaseCommit(tx, "commit-test", last);
         return 23;
       })).resolves.toBe(23);
       expect(last).toHaveBeenCalledOnce();
