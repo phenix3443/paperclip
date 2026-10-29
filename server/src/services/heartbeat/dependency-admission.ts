@@ -1,8 +1,17 @@
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { and, eq, isNull, sql } from "drizzle-orm";
-import { agentWakeupRequests, issues, statusDecisionEffects, statusDecisions, type Db } from "@paperclipai/db";
+import { agents, companies, heartbeatRuns, agentWakeupRequests, issues, statusDecisionEffects, statusDecisions, type Db } from "@paperclipai/db";
 import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
+import { evaluateAgentInvokability } from "../agent-invokability.js";
+import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";
+import { isHeartbeatWakeOnDemandEnabled } from "../heartbeat-policy.js";
+import { parseIssueExecutionState } from "../issue-execution-policy.js";
+import { observeInvocationBudgetBlock } from "../budgets.js";
+import { getExecutionBlocker } from "../execution-blocker.js";
+import { issueService } from "../issues.js";
+import { issueTreeControlService } from "../issue-tree-control.js";
+import { authorizationService, type AuthorizationResource } from "../authorization.js";
 
 type Wake = typeof agentWakeupRequests.$inferSelect;
 const markerKey = "_paperclipDependencyAdmission";
@@ -24,7 +33,10 @@ export type DependencyClaim = { intent: Wake; reservation: Reservation; receipt:
 export type DependencyOutcome =
   | { kind: "admitted"; runId: string }
   | { kind: "waiting"; gate: string }
-  | { kind: "retired"; reason: string };
+  | { kind: "retired"; reason: string }
+  | { kind: "retryableFailure"; error: string };
+
+type Eligibility = { kind: "eligible" } | Extract<DependencyOutcome, { kind: "waiting" | "retired" }>;
 
 export class DependencyAdmissionHeld extends Error {
   constructor(readonly gate: string) { super(gate); }
@@ -82,15 +94,58 @@ function matchesReceipt(row: Wake, intent: Wake, binding: Reservation) {
   if (row.id !== binding.receiptId || row.companyId !== intent.companyId || row.agentId !== intent.agentId
     || row.source !== intent.source || row.reason !== intent.reason || row.triggerDetail !== intent.triggerDetail
     || row.idempotencyKey !== intent.idempotencyKey || row.requestedByActorType !== "system"
-    || row.requestedByActorId !== `native-status-wake-dispatch:${intent.id}`) return false;
+    || row.requestedByActorId !== `native-status-wake-dispatch:${intent.id}`
+    || (row.payload?._paperclipWakeContext as Record<string, unknown> | undefined)?.nativeStatusWakeIntentId !== intent.id) return false;
   return Object.entries(binding.inputPayload).every(([key, value]) => key === "_paperclipWakeContext"
     ? Object.entries(value as Record<string, unknown>).every(([name, field]) =>
         isDeepStrictEqual((row.payload?.[key] as Record<string, unknown> | undefined)?.[name], field))
     : isDeepStrictEqual(row.payload?.[key], value));
 }
 
-export function createDependencyAdmission(db: Db) {
+export function createDependencyAdmission(db: Db, schedulingGate: () => Promise<string | null>) {
+  async function inspect(queryDb: Db, row: Wake): Promise<Eligibility> {
+    const [company] = await queryDb.select().from(companies).where(eq(companies.id, row.companyId));
+    const [target] = await queryDb.select().from(issues).where(and(eq(issues.companyId, row.companyId),
+      sql`${issues.id}::text = ${row.payload?.issueId}`));
+    const companyAgents = await queryDb.select().from(agents).where(eq(agents.companyId, row.companyId));
+    const agent = companyAgents.find(value => value.id === row.agentId);
+    if (!company || company.status === "archived" || !target || !agent || agent.status === "terminated"
+      || target.assigneeAgentId !== row.agentId || ["done", "cancelled"].includes(target.status))
+      return { kind: "retired", reason: "Dependency target is no longer eligible" };
+    const scheduling = await schedulingGate();
+    if (scheduling) return { kind: "waiting", gate: scheduling };
+    if (company.status !== "active") return { kind: "waiting", gate: "company_pause" };
+    if (isAgentAwaitingSetup(agent)) return { kind: "waiting", gate: "agent_setup" };
+    if (!evaluateAgentInvokability(agent, companyAgents).invokable) return { kind: "waiting", gate: "agent_invokability" };
+    if (!isHeartbeatWakeOnDemandEnabled(agent)) return { kind: "waiting", gate: "wake_policy" };
+    if (await observeInvocationBudgetBlock(queryDb, { companyId: row.companyId, agentId: row.agentId, projectId: target.projectId }))
+      return { kind: "waiting", gate: "budget" };
+    if (!target.responsibleUserId) return { kind: "waiting", gate: "responsible_user_unresolved" };
+    const access = authorizationService(queryDb);
+    const actor = { type: "agent" as const, agentId: row.agentId, companyId: row.companyId,
+      onBehalfOfUserId: target.responsibleUserId, source: "agent_key" as const };
+    const resources: AuthorizationResource[] = [{ type: "issue", companyId: row.companyId, issueId: target.id }];
+    if (target.projectId) resources.push({ type: "project", companyId: row.companyId, projectId: target.projectId });
+    for (const resource of resources) {
+      const decision = await access.decide({ actor, resource, action: resource.type === "issue" ? "issue:read" : "project:read" });
+      if (!decision.allowed) return { kind: "waiting", gate: "responsible_user_authority" };
+    }
+    if (parseIssueExecutionState(target.executionState)?.status === "pending") return { kind: "waiting", gate: "review" };
+    if (target.checkoutRunId) return { kind: "waiting", gate: "checkout" };
+    if ((await issueService(queryDb).listDependencyReadiness(row.companyId, [target.id])).get(target.id)?.isDependencyReady === false)
+      return { kind: "waiting", gate: "dependency" };
+    if (await issueTreeControlService(queryDb).getActivePauseHoldGate(row.companyId, target.id))
+      return { kind: "waiting", gate: "subtree_pause" };
+    if (await getExecutionBlocker(queryDb, row.companyId, target.id)) return { kind: "waiting", gate: "execution_recovery" };
+    const [active] = await queryDb.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, row.companyId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${target.id}`,
+      sql`${heartbeatRuns.status} in ('queued', 'running', 'scheduled_retry')`)).limit(1);
+    return active ? { kind: "waiting", gate: "active_execution" } : { kind: "eligible" };
+  }
+
   async function lockInput(tx: Db, row: Wake) {
+    await tx.select({ id: companies.id }).from(companies).where(eq(companies.id, row.companyId)).for("share");
+    await tx.select({ id: agents.id }).from(agents).where(and(eq(agents.companyId, row.companyId), eq(agents.id, row.agentId))).for("share");
     await tx.select({ id: issues.id }).from(issues).where(and(eq(issues.companyId, row.companyId),
       sql`${issues.id}::text = ${row.payload?.issueId}`)).for("update");
     return tx.select().from(agentWakeupRequests).where(observed(row)).for("update").then(rows => rows[0] ?? null);
@@ -99,10 +154,22 @@ export function createDependencyAdmission(db: Db) {
   async function receiptFor(tx: Db, row: Wake, binding: Reservation) {
     const [receipt] = await tx.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, binding.receiptId));
     if (receipt && !matchesReceipt(receipt, row, binding)) throw new Error("Dependency receipt binding conflicts with durable input");
+    if (receipt?.runId) {
+      const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, row.companyId),
+        eq(heartbeatRuns.agentId, row.agentId), eq(heartbeatRuns.id, receipt.runId)));
+      if (!run || run.wakeupRequestId !== receipt.id || run.contextSnapshot?.issueId !== binding.issueId
+        || (run.nativeIssueId !== null && run.nativeIssueId !== binding.issueId))
+        throw new Error("Dependency receipt run binding conflicts with durable input");
+    }
     return receipt ?? null;
   }
 
-  async function prepare(row: Wake, gate: string | null, staleClaimMs: number): Promise<DependencyClaim | null> {
+  async function prepare(row: Wake, staleClaimMs: number): Promise<DependencyClaim | null> {
+    if (row.status === "claimed" && row.claimedAt && Date.now() - row.claimedAt.getTime() < staleClaimMs) return null;
+    const observation = await inspect(db, row);
+    const reserved = reservation(row);
+    if (observation.kind === "waiting" && reserved && ["deferred_issue_execution", "coalesced"].includes(row.status)
+      && !(await receiptFor(db, row, reserved))?.runId) return null;
     return db.transaction(async transaction => {
       const tx = transaction as unknown as Db;
       const current = await lockInput(tx, row);
@@ -138,16 +205,25 @@ export function createDependencyAdmission(db: Db) {
       }
       const receipt = await receiptFor(tx, current, binding);
       if (receipt?.runId) {
-        await tx.update(agentWakeupRequests).set({ status: "coalesced", runId: receipt.runId,
+        await tx.update(agentWakeupRequests).set({ status: "completed", runId: receipt.runId,
           payload: { ...current.payload, [markerKey]: binding }, finishedAt: receipt.finishedAt ?? new Date(), updatedAt: new Date() })
           .where(observed(current));
         return null;
       }
-      if (gate) {
+      if (receipt && receipt.status !== "deferred_issue_execution") throw new Error("Dependency receipt without a run requires explicit repair");
+      const eligibility = await inspect(tx, current);
+      if (eligibility.kind === "retired") {
+        if (receipt) await tx.update(agentWakeupRequests).set({ status: "skipped", error: eligibility.reason,
+          finishedAt: new Date(), updatedAt: new Date() }).where(observed(receipt));
+        await tx.update(agentWakeupRequests).set({ status: "skipped", error: eligibility.reason,
+          payload: { ...current.payload, [markerKey]: binding }, finishedAt: new Date(), updatedAt: new Date() }).where(observed(current));
+        return null;
+      }
+      if (eligibility.kind === "waiting") {
         const status = receipt ? "coalesced" : "deferred_issue_execution";
         if (current.status !== status || !reservation(current)) {
           await tx.update(agentWakeupRequests).set({ status,
-            payload: { ...current.payload, [markerKey]: binding }, error: gate, updatedAt: new Date() }).where(observed(current));
+            payload: { ...current.payload, [markerKey]: binding }, error: eligibility.gate, updatedAt: new Date() }).where(observed(current));
         }
         return null;
       }
@@ -171,18 +247,26 @@ export function createDependencyAdmission(db: Db) {
     const receipt = await authorize(tx, claim);
     const runId = receipt?.runId ?? (outcome.kind === "admitted" ? outcome.runId : null);
     await tx.update(agentWakeupRequests).set({
-      status: runId || receipt?.status === "deferred_issue_execution" ? "coalesced"
-        : outcome.kind === "retired" ? "skipped" : "deferred_issue_execution",
+      status: runId ? "completed" : receipt?.status === "deferred_issue_execution" ? "coalesced"
+        : outcome.kind === "retired" ? "skipped" : outcome.kind === "retryableFailure" ? "queued" : "deferred_issue_execution",
       runId, finishedAt: runId || outcome.kind === "retired" ? new Date() : null,
-      error: outcome.kind === "waiting" ? outcome.gate : outcome.kind === "retired" ? outcome.reason : null,
+      error: outcome.kind === "waiting" ? outcome.gate : outcome.kind === "retired" ? outcome.reason
+        : outcome.kind === "retryableFailure" ? outcome.error.slice(0, 1000) : null,
       updatedAt: new Date(),
     }).where(observed(claim.intent));
   }
 
-  return { prepare, authorize, settle };
+  async function promoteReceipt(tx: Db, claim: DependencyClaim, receipt: Wake) {
+    await authorize(tx, claim);
+    const [promoted] = await tx.update(agentWakeupRequests).set({ status: "queued", error: null, updatedAt: new Date() })
+      .where(observed(receipt)).returning();
+    return promoted;
+  }
+
+  return { prepare, authorize, settle, inspect, promoteReceipt };
 }
 
-export async function isVerifiedDependencyRun(db: Db, run: { id: string; companyId: string; agentId: string; wakeupRequestId: string | null }) {
+export async function isVerifiedDependencyRun(db: Db, run: typeof heartbeatRuns.$inferSelect) {
   if (!run.wakeupRequestId) return false;
   const [receipt] = await db.select().from(agentWakeupRequests).where(and(
     eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.id, run.wakeupRequestId),
@@ -192,6 +276,13 @@ export async function isVerifiedDependencyRun(db: Db, run: { id: string; company
   const [intent] = await db.select().from(agentWakeupRequests).where(and(
     eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.id, intentId)));
   if (!intent) return false;
-  const binding = reservation(intent);
-  return Boolean(binding && matchesReceipt(receipt, intent, binding) && await provenance(db, intent));
+  const origin = await provenance(db, intent);
+  if (!origin) return false;
+  const binding = reservation(intent) ?? (intent.payload?.[markerKey] ? null : {
+    version: 1 as const, receiptId: receipt.id, companyId: intent.companyId, agentId: intent.agentId,
+    issueId: String(intent.payload?.issueId), intentId: intent.id, effectId: origin.id,
+    idempotencyKey: intent.idempotencyKey, triggerDetail: intent.triggerDetail, inputPayload: inputPayload(intent),
+  });
+  return Boolean(binding && matchesReceipt(receipt, intent, binding) && run.contextSnapshot?.issueId === binding.issueId
+    && (run.nativeIssueId === null || run.nativeIssueId === binding.issueId));
 }
