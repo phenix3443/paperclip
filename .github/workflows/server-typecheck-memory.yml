@@ -67,7 +67,8 @@ jobs:
             rm -rf node_modules/.cache/typecheck
             /usr/bin/time -f '%M %e' -o "$RUNNER_TEMP/time.txt" "$@" > "$RUNNER_TEMP/$name.log" 2>&1
             code=$?
-            read -r rss wall < "$RUNNER_TEMP/time.txt" || { rss=0; wall=0; }
+            # GNU time prepends "Command exited with non-zero status N" on failure.
+            read -r rss wall < <(tail -n 1 "$RUNNER_TEMP/time.txt") || { rss=0; wall=0; }
             row="| $name | \`$*\` | $code | $((rss / 1024)) | $wall |"
             echo "$row" >> "$summary"
             echo "RESULT $row"
