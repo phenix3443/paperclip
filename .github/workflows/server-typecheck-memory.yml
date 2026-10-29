@@ -80,9 +80,10 @@ jobs:
           measure checkers-2 "$tsc" --noEmit --checkers 2
           measure checkers-1 "$tsc" --noEmit --checkers 1
           measure source-only "$tsc" -p tsconfig.build.json --noEmit --checkers 2
-          measure split-build "$tsc" -b tsconfig.tests.json
-          measure split-build-checkers-2 "$tsc" -b tsconfig.tests.json --checkers 2
-          measure split-build-checkers-1 "$tsc" -b tsconfig.tests.json --checkers 1
-          # The two phases on their own: the source project, then the test project against its output.
+          # Split: build the source project's declarations, then check the tests against them.
           measure split-src-checkers-2 "$tsc" -b tsconfig.src.json --checkers 2
-          measure split-tests-checkers-2-warm "$tsc" -b tsconfig.tests.json --checkers 2
+          measure split-tests-checkers-2-warm "$tsc" -p tsconfig.tests.json --checkers 2
+          measure split-src-checkers-1 "$tsc" -b tsconfig.src.json --checkers 1
+          measure split-tests-checkers-1-warm "$tsc" -p tsconfig.tests.json --checkers 1
+          # An unchanged source project is only checked for staleness.
+          measure split-src-unchanged-warm "$tsc" -b tsconfig.src.json --checkers 1
