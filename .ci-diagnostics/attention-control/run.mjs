@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
-import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -74,19 +74,56 @@ const env = { ...process.env, NODE_ENV: "test", PAPERCLIP_TEST_HOST_HOME: proces
   PAPERCLIP_HOME: join(root, "h"), PAPERCLIP_CONFIG: join(root, "h/config.json"), PAPERCLIP_INSTANCE_ID: `vt-${process.pid}-1`, TMPDIR: join(root, "t") };
 mkdirSync(env.PAPERCLIP_HOME, { recursive: true }); mkdirSync(env.TMPDIR, { recursive: true });
 const args = ["exec", "vitest", "run", "--project", "@paperclipai/server", "--exclude", "**/dist/**", "--pool=forks", "--isolate", "--fileParallelism", "--maxWorkers=2", ...manifest.files,
-  "--reporter=default", "--reporter=json", `--outputFile=${join(evidence, "results.json")}`];
+  "--reporter=default", "--reporter=json"];
 writeFileSync(join(evidence, "command.json"), JSON.stringify(["pnpm", ...args], null, 2));
 const result = spawnSync("timeout", ["--signal=TERM", "--kill-after=15s", "900s", "pnpm", ...args], { cwd: source, env, encoding: "utf8", maxBuffer: 100 * 1024 * 1024 });
-writeFileSync(join(evidence, "vitest.log"), (result.stdout ?? "") + (result.stderr ?? ""));
+const output = (result.stdout ?? "") + (result.stderr ?? "");
+const operationNames = new Set([...observationPatch.toString().matchAll(/cleanup.run\("(\w+)"/g)].map((match) => match[1]));
+const events = [];
+for (const line of output.replace(/\x1b\[[0-9;]*m/g, "").split("\n")) {
+  if (!line.startsWith("[attention-control] ")) continue;
+  try {
+    const event = JSON.parse(line.slice("[attention-control] ".length));
+    assert.ok(["postgres-version", "wait-sample", "observation-error", "sampler-deadline", "delete-start", "delete-end"].includes(event.event));
+    assert.ok(Number.isFinite(event.elapsedMs) && Number.isInteger(event.hook));
+    if (event.operation != null) assert.ok(operationNames.has(event.operation));
+    if (event.version != null) assert.match(event.version, /^\d+(?:\.\d+)*$/);
+    const allowed = ["event", "hook", "elapsedMs", "operation", "version", "durationMs", "truncated", "locks"];
+    assert.ok(Object.keys(event).every((key) => allowed.includes(key)));
+    if (event.locks != null) {
+      assert.ok(Array.isArray(event.locks) && event.locks.length <= 200);
+      const lockKeys = ["pid", "state", "wait_event_type", "wait_event", "blockers", "locktype", "mode", "granted", "relation", "transactionid"];
+      for (const row of event.locks) {
+        assert.ok(Object.keys(row).every((key) => lockKeys.includes(key)));
+        assert.ok(Number.isInteger(row.pid));
+        assert.ok(Array.isArray(row.blockers) && row.blockers.every(Number.isInteger));
+        for (const key of ["relation", "transactionid"]) if (row[key] != null) assert.match(row[key], /^\d+$/);
+        assert.ok(row.granted == null || typeof row.granted === "boolean");
+        for (const key of ["state", "wait_event_type", "wait_event", "locktype", "mode"]) if (row[key] != null) assert.match(row[key], /^[A-Za-z0-9_ ()-]+$/);
+      }
+    }
+    events.push(event);
+  } catch { events.push({ event: "observation-error" }); }
+}
+writeFileSync(join(evidence, "observations.ndjson"), events.map((event) => JSON.stringify(event)).join("\n") + "\n");
+writeFileSync(join(evidence, "output-redaction.json"), JSON.stringify({ stdoutLines: (result.stdout ?? "").split("\n").length, stderrLines: (result.stderr ?? "").split("\n").length, policy: "Unrestricted test console output and failure messages are omitted; only typed result metadata and allowlisted observation events are retained." }));
 writeFileSync(join(evidence, "exit.json"), JSON.stringify({ status: result.status, signal: result.signal, timedOut: result.status === 124, spawnError: Boolean(result.error) }));
 let valid = false;
 try {
-  const report = JSON.parse(readFileSync(join(evidence, "results.json"), "utf8"));
+  const stdout = result.stdout ?? "";
+  const matches = [...stdout.matchAll(/\{\s*"numTotalTestSuites"\s*:/g)];
+  assert.ok(matches.length, "JSON reporter output missing");
+  const reportText = stdout.slice(matches.at(-1).index);
+  const report = JSON.parse(reportText.slice(0, reportText.lastIndexOf("}") + 1));
   const actual = report.testResults.map((entry) => entry.name.replace(`${source}/`, "")).sort();
   assert.deepEqual(actual, [...manifest.files].sort(), "Actual test inventory differs");
-  assert.match(result.stdout, /\[attention-control\].*postgres-version/);
-  assert.ok(!result.stdout.includes('"event":"observation-error"'), "Observation failed");
+  const safeReport = report.testResults.map((entry) => ({ file: entry.name.replace(`${source}/`, ""), status: entry.status,
+    tests: entry.assertionResults.map((test, index) => ({ index, status: test.status, duration: test.duration,
+      failure: test.failureMessages?.length ? (test.failureMessages.some((message) => message.includes("Hook timed out in 30000ms")) ? "hook-timeout-30000ms" : "redacted-test-failure") : null })) }));
+  writeFileSync(join(evidence, "results.json"), JSON.stringify(safeReport, null, 2));
+  assert.ok(events.some((event) => event.event === "postgres-version"));
+  assert.ok(!events.some((event) => event.event === "observation-error" || event.truncated), "Observation failed or was truncated");
   valid = true;
 } catch { writeFileSync(join(evidence, "incomplete-evidence.txt"), "Result inventory, PostgreSQL version or observation evidence could not be verified. Do not treat as a controlled sample.\n"); }
-rmSync(root, { recursive: true, force: true });
+writeFileSync(join(evidence, "test-root-retention.json"), JSON.stringify({ root, policy: "Retain until GitHub-hosted runner disposal; child termination is not inferred from the top-level exit." }));
 process.exit(valid ? result.status ?? 1 : 1);

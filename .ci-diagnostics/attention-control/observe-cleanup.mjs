@@ -53,7 +53,7 @@ export function observeCleanup(openClient) {
     closed = true;
     clearInterval(interval);
     clearTimeout(deadline);
-    closing = client.end({ timeout: 1 }).catch(failure);
+    closing = Promise.resolve().then(() => client.end({ timeout: 1 })).catch(failure);
     return closing;
   };
   const deadline = setTimeout(() => { emit("sampler-deadline"); void close(); }, 29000);
