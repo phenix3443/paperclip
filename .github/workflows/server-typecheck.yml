@@ -1,0 +1,73 @@
+# Type-checks the server (source project, then colocated tests) on every PR
+# into develop and every develop push. The source project's tsc build state is
+# cached: only develop pushes write it, from a cold build; PRs restore it read
+# only. A restored cache only changes how much work tsc does, never whether the
+# check runs. Plan: doc/plans/2026-10-29-server-source-ci-cache.md.
+# Fork-only (phenix3443/paperclip).
+name: server-typecheck
+
+on:
+  pull_request:
+    branches: [develop]
+  push:
+    branches: [develop]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: server-typecheck-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  server-typecheck:
+    if: github.repository == 'phenix3443/paperclip'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - id: setup
+        uses: ./.github/actions/setup-server-typecheck
+        with:
+          cache-namespace: server-tsc-src-v1
+
+      # PRs only. Exact hit on the base commit's entry first, then the newest
+      # develop entry built by the same compiler and config.
+      - name: Restore the source project's build state (read only)
+        if: github.event_name == 'pull_request'
+        id: restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: server/node_modules/.cache/typecheck
+          key: ${{ steps.setup.outputs.cache-prefix }}-${{ github.event.pull_request.base.sha }}
+          restore-keys: ${{ steps.setup.outputs.cache-prefix }}-
+
+      # Restored files must be older than every input, so tsc hashes every
+      # source file instead of trusting timestamps. This only adds work.
+      - name: Age the restored build state
+        if: steps.restore.outputs.cache-matched-key != ''
+        env:
+          CACHE_HIT: ${{ steps.restore.outputs.cache-hit }}
+          MATCHED_KEY: ${{ steps.restore.outputs.cache-matched-key }}
+        run: |
+          echo "cache-hit=$CACHE_HIT matched-key=$MATCHED_KEY"
+          find server/node_modules/.cache/typecheck -exec touch -h -d '2000-01-01T00:00:00Z' {} +
+
+      # Always runs; its exit code alone decides the job.
+      - name: Type-check the server
+        run: pnpm --filter @paperclipai/server typecheck
+
+      - name: Save the source project's build state
+        if: >-
+          success() &&
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/develop' &&
+          github.repository == 'phenix3443/paperclip'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: server/node_modules/.cache/typecheck
+          key: ${{ steps.setup.outputs.cache-prefix }}-${{ github.sha }}
