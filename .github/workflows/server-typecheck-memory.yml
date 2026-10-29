@@ -10,6 +10,7 @@ on:
       - .github/workflows/server-typecheck-memory.yml
       - tsconfig.base.json
       - server/tsconfig*.json
+      - server/package.json
   workflow_dispatch:
 
 permissions:
@@ -87,3 +88,5 @@ jobs:
           measure split-tests-checkers-1-warm "$tsc" -p tsconfig.tests.json --checkers 1
           # An unchanged source project is only checked for staleness.
           measure split-src-unchanged-warm "$tsc" -b tsconfig.src.json --checkers 1
+          # The server's typecheck script end to end, from a clean project cache.
+          measure typecheck-script pnpm run typecheck
