@@ -405,7 +405,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     expect(mockAdapterExecute).not.toHaveBeenCalled();
   });
 
-  it("keeps a historical run-linked dependency out of generic local-child replay", async () => {
+  it.each(["verified", "missing_provenance", "corrupt_reservation", "other_native"])("keeps a historical %s run-linked dependency out of generic local-child replay", async proof => {
     const f = await seedDependency("idle"), receiptId = randomUUID(), runId = randomUUID();
     await db.insert(agentWakeupRequests).values({ id: receiptId, companyId: f.companyId, agentId: f.agentId,
       source: "automation", triggerDetail: "system", reason: "issue_blockers_resolved", status: "claimed",
@@ -420,16 +420,139 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     await db.update(agentWakeupRequests).set({ runId, status: "completed" }).where(eq(agentWakeupRequests.id, f.intent.id));
     await db.update(agentWakeupRequests).set({ runId }).where(eq(agentWakeupRequests.id, receiptId));
     await db.update(issues).set({ executionRunId: runId, status: "in_progress" }).where(eq(issues.id, f.issueId));
+    if (proof === "missing_provenance") await db.delete(statusDecisionEffects).where(eq(statusDecisionEffects.targetId, f.intent.id));
+    if (proof === "corrupt_reservation") await db.update(agentWakeupRequests).set({
+      payload: { ...f.intent.payload, _paperclipDependencyAdmission: { version: 1, intentId: randomUUID() } },
+    }).where(eq(agentWakeupRequests.id, f.intent.id));
+    if (proof === "other_native") {
+      await db.update(agentWakeupRequests).set({ reason: "issue_status_changed" }).where(inArray(agentWakeupRequests.id, [f.intent.id, receiptId]));
+      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, nativeStatusWakeIntentId: f.intent.id,
+        wakeReason: "issue_status_changed" } }).where(eq(heartbeatRuns.id, runId));
+    }
     await heartbeat.reapOrphanedRuns({ staleThresholdMs: 0 });
     await heartbeat.drainActiveRunExecutions();
     const rows = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId));
     expect(rows).toHaveLength(2);
     expect(rows.find(row => row.id === runId)).toMatchObject({ status: "failed", errorCode: "process_lost",
-      resultJson: { processLossDiagnostic: { retryEligible: false } } });
+      resultJson: { processLossDiagnostic: { retryEligible: proof === "other_native" } } });
     const [original] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.intent.id));
     expect(original).toMatchObject({ status: "completed", runId });
     expect(mockAdapterExecute).not.toHaveBeenCalled();
   }, 20_000);
+
+  it.each(["running", "failed", "succeeded"].flatMap(runStatus => [false, true].map(scopeValid => ({ runStatus, scopeValid }))))(
+    "preserves historical $runStatus ownership with authoritative issue match=$scopeValid", async ({ runStatus, scopeValid }) => {
+    const f = await seedDependency();
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    const [parked] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.intent.id));
+    const receiptId = (parked!.payload!._paperclipDependencyAdmission as { receiptId: string }).receiptId;
+    const runId = randomUUID();
+    await db.insert(agentWakeupRequests).values({ id: receiptId, companyId: f.companyId, agentId: f.agentId,
+      source: "automation", triggerDetail: "system", reason: "issue_blockers_resolved", status: "claimed",
+      requestedByActorType: "system", requestedByActorId: `native-status-wake-dispatch:${f.intent.id}`,
+      idempotencyKey: f.intent.idempotencyKey, payload: { ...f.intent.payload,
+        _paperclipWakeContext: { ...f.intent.payload!._paperclipWakeContext as object, nativeStatusWakeIntentId: f.intent.id } } });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.agentId, status: runStatus,
+      invocationSource: "automation", wakeupRequestId: receiptId, scopeKind: "issue", issueId: scopeValid ? f.issueId : f.blockerId,
+      contextSnapshot: { issueId: f.issueId, nativeStatusWakeIntentId: f.intent.id, wakeReason: "issue_blockers_resolved" } });
+    await db.update(agentWakeupRequests).set({ runId }).where(eq(agentWakeupRequests.id, receiptId));
+    const before = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    const after = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+    if (scopeValid) {
+      expect(after).toHaveLength(2);
+      expect(after.find(row => row.id === f.intent.id)).toMatchObject({ status: "completed", runId });
+      expect(after.find(row => row.id === receiptId)).toMatchObject({ runId });
+      await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toEqual(after);
+    } else expect(after).toEqual(before);
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+    await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, runId));
+  });
+
+  it.each(["restore", "cancel", "pause", "revoke"])("revalidates a %s change between observation and admission locks", async change => {
+    const f = await seedDependency("idle");
+    if (change === "restore") await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, f.issueId));
+    const other = createDb(tempDb!.connectionString);
+    let release!: () => void, entered!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const observed = new Promise<void>(resolve => { entered = resolve; });
+    const transaction = db.transaction.bind(db);
+    let intercept = true;
+    const spy = vi.spyOn(db, "transaction").mockImplementation(async (callback, config) => {
+      if (intercept) { intercept = false; entered(); await held; }
+      return transaction(callback, config);
+    });
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await other.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Restored before lock.", provider: "test", model: "test-model" };
+    });
+    const dispatch = heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    try {
+      await observed;
+      if (change === "restore") await other.update(issues).set({ status: "todo" }).where(eq(issues.id, f.issueId));
+      if (change === "cancel") await other.update(issues).set({ status: "cancelled" }).where(eq(issues.id, f.issueId));
+      if (change === "pause") await other.update(agents).set({ status: "paused" }).where(eq(agents.id, f.agentId));
+      if (change === "revoke") await other.update(companyMemberships).set({ status: "inactive" }).where(eq(companyMemberships.companyId, f.companyId));
+      release(); await dispatch; await heartbeat.drainActiveRunExecutions();
+      const rows = await other.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      expect(rows.find(row => row.id === f.intent.id)).toMatchObject({ status: change === "restore" ? "completed" : change === "cancel" ? "skipped" : "deferred_issue_execution" });
+      expect(mockAdapterExecute).toHaveBeenCalledTimes(change === "restore" ? 1 : 0);
+      if (change !== "restore") expect(rows[0]).toMatchObject({ claimedAt: null, runId: null });
+      await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+      expect(await other.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toEqual(rows);
+    } finally {
+      release(); await dispatch; spy.mockRestore(); await other.$client.end();
+    }
+  }, 15_000);
+
+  it.each(["valid", "forged_target", "superseded_claim"])("fences terminal receipt recovery with %s evidence", async evidence => {
+    const f = await seedDependency();
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    const [parked] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.intent.id));
+    const receiptId = (parked!.payload!._paperclipDependencyAdmission as { receiptId: string }).receiptId;
+    const runId = randomUUID(), claimedAt = new Date(1000);
+    await db.insert(agentWakeupRequests).values({ id: receiptId, companyId: f.companyId, agentId: f.agentId,
+      source: "automation", triggerDetail: "system", reason: "issue_blockers_resolved", status: "claimed", claimedAt,
+      requestedByActorType: "system", requestedByActorId: `native-status-wake-dispatch:${f.intent.id}`,
+      idempotencyKey: f.intent.idempotencyKey, payload: { ...f.intent.payload,
+        issueId: evidence === "forged_target" ? f.blockerId : f.issueId,
+        _paperclipWakeContext: { ...f.intent.payload!._paperclipWakeContext as object, nativeStatusWakeIntentId: f.intent.id } } });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.agentId, status: "succeeded",
+      invocationSource: "automation", wakeupRequestId: receiptId, scopeKind: "issue", issueId: f.issueId,
+      finishedAt: new Date(2000), resultJson: { summary: "Persisted result" }, contextSnapshot: { issueId: f.issueId } });
+    await db.update(agentWakeupRequests).set({ runId }).where(eq(agentWakeupRequests.id, receiptId));
+    await db.update(agentWakeupRequests).set({ runId, status: "completed" }).where(eq(agentWakeupRequests.id, f.intent.id));
+    const before = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+    const other = createDb(tempDb!.connectionString), otherHeartbeat = heartbeatService(other);
+    const transaction = db.transaction.bind(db);
+    let intercept = true;
+    const spy = vi.spyOn(db, "transaction").mockImplementation(async (callback, config) => {
+      if (intercept && evidence === "superseded_claim") {
+        intercept = false;
+        await other.update(agentWakeupRequests).set({ claimedAt: new Date(3000) }).where(eq(agentWakeupRequests.id, receiptId));
+      }
+      return transaction(callback, config);
+    });
+    try {
+      if (evidence === "superseded_claim") {
+        await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+        const [stale] = await other.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receiptId));
+        expect(stale).toMatchObject({ status: "claimed", claimedAt: new Date(3000) });
+      }
+      await Promise.all([heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId }), otherHeartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId })]);
+      const after = await other.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      if (evidence === "forged_target") expect(after).toEqual(before);
+      else {
+        expect(after.find(row => row.id === receiptId)).toMatchObject({ status: "completed", runId,
+          claimedAt: evidence === "superseded_claim" ? new Date(3000) : claimedAt, finishedAt: new Date(2000) });
+        expect(after.find(row => row.id === f.intent.id)).toEqual(before.find(row => row.id === f.intent.id));
+      }
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
+      await otherHeartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+      expect(await other.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toEqual(after);
+    } finally { spy.mockRestore(); await other.$client.end(); }
+  });
 
   it("retains the real native completion producer input through a pause", async () => {
     const f = await seedDependency("paused", true);

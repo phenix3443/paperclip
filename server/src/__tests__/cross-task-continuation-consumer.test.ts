@@ -494,16 +494,16 @@ describeEmbeddedPostgres("cross-task continuation intent consumer", () => {
     expect(await f.runsFor()).toHaveLength(0);
   });
 
-  it("status committer, same path: a receipt deferred by a recovery hold is promoted as the same row to one run once the hold is resolved", async () => {
+  it("non-dependency status committer, same path: a receipt deferred by a recovery hold is promoted as the same row to one run once the hold is resolved", async () => {
     const { companyId, agentId, issueId } = await seedTarget();
     await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
     await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issueId, kind: "active_run_watchdog",
       ownerType: "board", returnOwnerAgentId: agentId, cause: LEGACY_RECOVERY_CAUSE, fingerprint: `sc:${issueId}`,
       evidence: {}, nextAction: "Reconcile stopped work" });
     const [statusIntent] = await db.insert(agentWakeupRequests).values({
-      companyId, agentId, source: "automation", triggerDetail: "system", reason: "issue_blockers_resolved",
+      companyId, agentId, source: "automation", triggerDetail: "system", reason: "issue_children_completed",
       requestedByActorType: "system", requestedByActorId: "native-status-committer",
-      idempotencyKey: `native-dependency:${issueId}`,
+      idempotencyKey: `native-child:${issueId}`,
       payload: { issueId, taskId: issueId, _paperclipWakeContext: { issueId, taskId: issueId } },
     }).returning();
     await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
@@ -511,7 +511,7 @@ describeEmbeddedPostgres("cross-task continuation intent consumer", () => {
       eq(agentWakeupRequests.requestedByActorId, `native-status-wake-dispatch:${statusIntent!.id}`));
     const [deferred, ...extra] = await statusReceipts();
     expect(extra).toHaveLength(0);
-    expect(deferred).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    expect(deferred, JSON.stringify(deferred)).toMatchObject({ status: "deferred_issue_execution", runId: null });
     expect(await heartbeat.dispatchPendingNativeStatusWakeups({ companyId })).toMatchObject({ promoted: 0 });
 
     await issueRecoveryActionService(db).resolveActiveForIssue({ companyId, sourceIssueId: issueId, status: "resolved", outcome: "restored" } as never);
@@ -536,16 +536,16 @@ describeEmbeddedPostgres("cross-task continuation intent consumer", () => {
     expect(await dispatchReceipts(held.intent.id)).toMatchObject([{ status: "deferred_issue_execution", runId: null }]);
   });
 
-  it("the worker counts an unblocked native status receipt as pending, and is quiet again once it is promoted", async () => {
+  it("the worker counts an unblocked non-dependency native status receipt as pending, and is quiet again once it is promoted", async () => {
     const { companyId, agentId, issueId } = await seedTarget();
     await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
     await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issueId, kind: "active_run_watchdog",
       ownerType: "board", returnOwnerAgentId: agentId, cause: LEGACY_RECOVERY_CAUSE, fingerprint: `sc-worker:${issueId}`,
       evidence: {}, nextAction: "Reconcile stopped work" });
     await db.insert(agentWakeupRequests).values({
-      companyId, agentId, source: "automation", triggerDetail: "system", reason: "issue_blockers_resolved",
+      companyId, agentId, source: "automation", triggerDetail: "system", reason: "issue_children_completed",
       requestedByActorType: "system", requestedByActorId: "native-status-committer",
-      idempotencyKey: `native-dependency:${issueId}`,
+      idempotencyKey: `native-child:${issueId}`,
       payload: { issueId, taskId: issueId, _paperclipWakeContext: { issueId, taskId: issueId } },
     });
     await heartbeat.dispatchPendingNativeStatusWakeups({ companyId });
@@ -566,7 +566,7 @@ describeEmbeddedPostgres("cross-task continuation intent consumer", () => {
     expect(await dispatchReceipts(intent.id)).toHaveLength(0);
   });
 
-  it("keeps the native status committer on its own dispatch identity", async () => {
+  it("keeps the non-dependency native status committer on its own dispatch identity", async () => {
     const { companyId, agentId, issueId } = await seedTarget();
     await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
     const [statusIntent] = await db.insert(agentWakeupRequests).values({
@@ -574,10 +574,10 @@ describeEmbeddedPostgres("cross-task continuation intent consumer", () => {
       agentId,
       source: "automation",
       triggerDetail: "system",
-      reason: "issue_blockers_resolved",
+      reason: "issue_children_completed",
       requestedByActorType: "system",
       requestedByActorId: "native-status-committer",
-      idempotencyKey: `native-dependency:${issueId}`,
+      idempotencyKey: `native-child:${issueId}`,
       payload: { issueId, taskId: issueId, _paperclipWakeContext: { issueId, taskId: issueId } },
     }).returning();
 
@@ -587,7 +587,7 @@ describeEmbeddedPostgres("cross-task continuation intent consumer", () => {
       sql`${agentWakeupRequests.requestedByActorId} = ${`native-status-wake-dispatch:${statusIntent!.id}`}`,
     );
     expect(receipts).toHaveLength(1);
-    expect(receipts[0]!.idempotencyKey).toBe(`native-dependency:${issueId}`);
+    expect(receipts[0]!.idempotencyKey).toBe(`native-child:${issueId}`);
   });
 
   async function startNewConversation(f: { companyId: string; agentId: string; issueId: string }) {
@@ -619,12 +619,12 @@ describeEmbeddedPostgres("cross-task continuation intent consumer", () => {
     }
   });
 
-  it("a native status receipt released by a newer /new boundary is settled by the conversation wake rule without a run, and the worker goes quiet", async () => {
+  it("a non-dependency native status receipt released by a newer /new boundary is settled by the conversation wake rule without a run, and the worker goes quiet", async () => {
     const f = await deferUnderRecoveryHold();
     await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
     await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "automation",
-      triggerDetail: "system", reason: "issue_blockers_resolved", requestedByActorType: "system",
-      requestedByActorId: "native-status-committer", idempotencyKey: `native-dependency:${f.issueId}`,
+      triggerDetail: "system", reason: "issue_children_completed", requestedByActorType: "system",
+      requestedByActorId: "native-status-committer", idempotencyKey: `native-child:${f.issueId}`,
       payload: { issueId: f.issueId, taskId: f.issueId, _paperclipWakeContext: { issueId: f.issueId, taskId: f.issueId } } });
     await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
     const receipts = await db.select().from(agentWakeupRequests)

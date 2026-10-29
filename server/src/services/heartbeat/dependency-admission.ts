@@ -114,6 +114,14 @@ function matchesReceipt(row: Wake, intent: Wake, binding: Reservation) {
     : isDeepStrictEqual(row.payload?.[key], value));
 }
 
+function matchesRun(run: typeof heartbeatRuns.$inferSelect, receipt: Wake, binding: Reservation) {
+  return run.id === receipt.runId && run.wakeupRequestId === receipt.id
+    && run.companyId === binding.companyId && run.agentId === binding.agentId
+    && run.contextSnapshot?.issueId === binding.issueId
+    && (run.nativeIssueId === null || run.nativeIssueId === binding.issueId)
+    && (run.scopeKind === "issue" ? run.issueId === binding.issueId : run.issueId === null);
+}
+
 export function createDependencyAdmission(db: Db, schedulingGate: () => Promise<string | null>) {
   async function inspect(queryDb: Db, row: Wake): Promise<Eligibility> {
     const [company] = await queryDb.select().from(companies).where(eq(companies.id, row.companyId));
@@ -169,8 +177,7 @@ export function createDependencyAdmission(db: Db, schedulingGate: () => Promise<
     if (receipt?.runId) {
       const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, row.companyId),
         eq(heartbeatRuns.agentId, row.agentId), eq(heartbeatRuns.id, receipt.runId)));
-      if (!run || run.wakeupRequestId !== receipt.id || run.contextSnapshot?.issueId !== binding.issueId
-        || (run.nativeIssueId !== null && run.nativeIssueId !== binding.issueId))
+      if (!run || !matchesRun(run, receipt, binding))
         throw new Error("Dependency receipt run binding conflicts with durable input");
     }
     return receipt ?? null;
@@ -303,16 +310,20 @@ export function createDependencyAdmission(db: Db, schedulingGate: () => Promise<
   return { prepare, authorize, settle, inspect, promoteReceipt, recoverReceipt };
 }
 
-export async function isVerifiedDependencyRun(db: Db, run: typeof heartbeatRuns.$inferSelect) {
-  if (!run.wakeupRequestId) return false;
+export async function allowsDependencyProcessLossRetry(db: Db, run: typeof heartbeatRuns.$inferSelect, preDispatchProof: boolean) {
+  const nativeIntentId = run.contextSnapshot?.nativeStatusWakeIntentId;
+  const dependencyHint = typeof nativeIntentId === "string" && run.contextSnapshot?.wakeReason === "issue_blockers_resolved";
+  if (!run.wakeupRequestId) return !dependencyHint;
   const [receipt] = await db.select().from(agentWakeupRequests).where(and(
     eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.id, run.wakeupRequestId),
-    eq(agentWakeupRequests.agentId, run.agentId), eq(agentWakeupRequests.runId, run.id)));
+    eq(agentWakeupRequests.agentId, run.agentId)));
   const intentId = receipt?.requestedByActorId?.match(/^native-status-wake-dispatch:([0-9a-f-]{36})$/)?.[1];
-  if (!receipt || !intentId) return false;
-  const [intent] = await db.select().from(agentWakeupRequests).where(and(
-    eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.id, intentId)));
-  if (!intent) return false;
+  const [intent] = intentId ? await db.select().from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.id, intentId))) : [];
+  const dependencyLineage = dependencyHint || intent?.reason === "issue_blockers_resolved"
+    || (receipt?.reason === "issue_blockers_resolved" && receipt.requestedByActorId?.startsWith("native-status-wake-dispatch:"));
+  if (!dependencyLineage) return true;
+  if (!preDispatchProof || !receipt || !intent || receipt.runId !== run.id) return false;
   const origin = await provenance(db, intent);
   if (!origin) return false;
   const binding = reservation(intent) ?? (intent.payload?.[markerKey] ? null : {
@@ -320,6 +331,5 @@ export async function isVerifiedDependencyRun(db: Db, run: typeof heartbeatRuns.
     issueId: String(intent.payload?.issueId), intentId: intent.id, effectId: origin.id,
     idempotencyKey: intent.idempotencyKey, triggerDetail: intent.triggerDetail, inputPayload: inputPayload(intent),
   });
-  return Boolean(binding && matchesReceipt(receipt, intent, binding) && run.contextSnapshot?.issueId === binding.issueId
-    && (run.nativeIssueId === null || run.nativeIssueId === binding.issueId));
+  return Boolean(binding && matchesReceipt(receipt, intent, binding) && matchesRun(run, receipt, binding));
 }

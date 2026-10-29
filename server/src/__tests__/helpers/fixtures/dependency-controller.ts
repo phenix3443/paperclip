@@ -11,7 +11,6 @@ try {
   if (mode === "recover") {
     await service.reapOrphanedRuns({ staleThresholdMs: 0 });
     console.info("DEPENDENCY_RECOVERY_STATE", JSON.stringify(await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, result: heartbeatRuns.resultJson, retryOf: heartbeatRuns.retryOfRunId, stage: heartbeatRuns.executionStage, retryAt: heartbeatRuns.scheduledRetryAt }).from(heartbeatRuns).where(eq(heartbeatRuns.companyId, process.env.PAPERCLIP_TEST_CONTROLLER_COMPANY_ID!))));
-    // Elapse only this fixture company's existing retry delay; preserve all admission gates.
     if (process.env.PAPERCLIP_TEST_ELAPSE_RETRY_DELAY === "true") {
       await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(0) }).where(and(
         eq(heartbeatRuns.companyId, process.env.PAPERCLIP_TEST_CONTROLLER_COMPANY_ID!), eq(heartbeatRuns.status, "scheduled_retry")));

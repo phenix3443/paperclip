@@ -1,5 +1,5 @@
 import { pendingCleanupDeadlineSql } from "../environment-cleanup-state.js";
-import { isVerifiedDependencyRun } from "./dependency-admission.js";
+import { allowsDependencyProcessLossRetry } from "./dependency-admission.js";
 import { writeEnvironmentCleanup } from "../environment-cleanup-notifications.js";
 import { startNativeSessionExecutionLeaseRenewal, type NativeExecutionLeaseRenewal } from "../native-runtime/native-execution-lease.js";
 import type { WorkspaceWorkers } from "../plugin-workspaces.js";
@@ -2585,7 +2585,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         !revokedState.processPid &&
         !revokedState.processGroupId;
       const shouldRetry =
-        (!(await isVerifiedDependencyRun(db, run)) || restartInterruptedBeforeDispatch) &&
+        (await allowsDependencyProcessLossRetry(db, run, restartInterruptedBeforeDispatch)) &&
         !await pendingCaseHandoffForRun(db, run.id, run.companyId) &&
         (run.processLossRetryCount ?? 0) < 1 &&
         ((tracksLegacyLocalChild &&
