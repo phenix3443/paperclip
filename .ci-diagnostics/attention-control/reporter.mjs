@@ -26,7 +26,7 @@ export default class SafeReporter {
       code = verdict.code;
       writeFileSync(output, JSON.stringify(verdict.code === 'complete' ? { code, moduleCount, report } : { code, moduleCount }));
     } catch {
-      try { writeFileSync(output, JSON.stringify({ code, moduleCount })); } catch { /* The runner classifies missing output. */ }
+      try { writeFileSync(output, JSON.stringify({ code, moduleCount })); } catch {}
     }
   }
 }

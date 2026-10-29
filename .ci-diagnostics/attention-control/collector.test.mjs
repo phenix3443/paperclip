@@ -96,3 +96,15 @@ test('query failure remains a safe observation error and the connection closes',
     assert.ok(!JSON.stringify(events).includes('SECRET'));
   } finally { console.log = old; }
 });
+test('coverage refuses invisible blockers, excessive PIDs and unknown fields', () => {
+  assert.equal(validateSnapshot({ total: 1, records: [row(101, [0])] }).complete, false);
+  assert.equal(validateSnapshot({ total: 129, records: [row(101)] }).complete, false);
+  assert.throws(() => validateSnapshot({ total: 1, records: [{ ...row(101), state: null }] }));
+  assert.throws(() => validateSnapshot({ total: 1, records: [{ ...row(101), lockGroups: [{ ...row(101).lockGroups[0], query: 'SECRET' }] }] }));
+});
+test('ingestion rejects unrecognized or inconsistent typed reports', () => fixture((path) => {
+  writeFileSync(path, JSON.stringify({ code: 'complete', moduleCount: 1, report: { schema: 1, reason: 'passed', unhandledErrors: 0, modules: [], unexpected: 'SECRET' } }));
+  assert.equal(readReport(path, [file]).code, 'invalid-structure');
+  writeFileSync(path, JSON.stringify({ code: 'unexpected SECRET', moduleCount: 0 }));
+  assert.equal(readReport(path, [file]).code, 'invalid-structure');
+}));

@@ -57,8 +57,8 @@ test('real PostgreSQL retains blocker coverage with over 200 locks on a PID', as
     assert.equal(new Set(old.rows.map((row) => row.pid)).size, 1);
     await holder.query('rollback');await waiting;
   } finally {
-    for (const client of clients) await client.end();
-    await pg.stop();
+    try { await Promise.allSettled(clients.map((client) => client.end())); }
+    finally { await pg.stop(); }
     rmSync(root, { recursive: true, force: true });
   }
 });
