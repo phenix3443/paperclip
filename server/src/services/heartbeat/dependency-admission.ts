@@ -122,7 +122,8 @@ function matchesRun(run: typeof heartbeatRuns.$inferSelect, receipt: Wake, bindi
     && (run.scopeKind === "issue" ? run.issueId === binding.issueId : run.issueId === null);
 }
 
-export function createDependencyAdmission(db: Db, schedulingGate: () => Promise<string | null>) {
+export function createDependencyAdmission(db: Db, schedulingGate: () => Promise<string | null>,
+  policyGate: (queryDb: Db, agent: typeof agents.$inferSelect) => Promise<string | null>) {
   async function inspect(queryDb: Db, row: Wake): Promise<Eligibility> {
     const [company] = await queryDb.select().from(companies).where(eq(companies.id, row.companyId));
     const [target] = await queryDb.select().from(issues).where(and(eq(issues.companyId, row.companyId),
@@ -138,6 +139,8 @@ export function createDependencyAdmission(db: Db, schedulingGate: () => Promise<
     if (isAgentAwaitingSetup(agent)) return { kind: "waiting", gate: "agent_setup" };
     if (!evaluateAgentInvokability(agent, companyAgents).invokable) return { kind: "waiting", gate: "agent_invokability" };
     if (!isHeartbeatWakeOnDemandEnabled(agent)) return { kind: "waiting", gate: "wake_policy" };
+    const policyBlock = await policyGate(queryDb, agent);
+    if (policyBlock) return { kind: "waiting", gate: policyBlock };
     if (await observeInvocationBudgetBlock(queryDb, { companyId: row.companyId, agentId: row.agentId, projectId: target.projectId }))
       return { kind: "waiting", gate: "budget" };
     if (!target.responsibleUserId) return { kind: "waiting", gate: "responsible_user_unresolved" };
@@ -323,7 +326,8 @@ export async function allowsDependencyProcessLossRetry(db: Db, run: typeof heart
   const dependencyLineage = dependencyHint || intent?.reason === "issue_blockers_resolved"
     || (receipt?.reason === "issue_blockers_resolved" && receipt.requestedByActorId?.startsWith("native-status-wake-dispatch:"));
   if (!dependencyLineage) return true;
-  if (!preDispatchProof || !receipt || !intent || receipt.runId !== run.id) return false;
+  if (!preDispatchProof || !receipt || !intent || receipt.runId !== run.id
+    || (intent.runId !== null && intent.runId !== run.id)) return false;
   const origin = await provenance(db, intent);
   if (!origin) return false;
   const binding = reservation(intent) ?? (intent.payload?.[markerKey] ? null : {

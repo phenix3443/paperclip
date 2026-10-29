@@ -405,7 +405,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     expect(mockAdapterExecute).not.toHaveBeenCalled();
   });
 
-  it.each(["verified", "missing_provenance", "corrupt_reservation", "other_native"])("keeps a historical %s run-linked dependency out of generic local-child replay", async proof => {
+  it.each(["verified", "missing_provenance", "corrupt_reservation", "other_native", "conflicting_run"])("keeps a historical %s run-linked dependency out of generic local-child replay", async proof => {
     const f = await seedDependency("idle"), receiptId = randomUUID(), runId = randomUUID();
     await db.insert(agentWakeupRequests).values({ id: receiptId, companyId: f.companyId, agentId: f.agentId,
       source: "automation", triggerDetail: "system", reason: "issue_blockers_resolved", status: "claimed",
@@ -416,10 +416,15 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       invocationSource: "automation", triggerDetail: "system", wakeupRequestId: receiptId,
       contextSnapshot: { issueId: f.issueId, nativeStatusWakeIntentId: f.intent.id, wakeReason: "issue_blockers_resolved" },
       runtimeMode: "legacy", controllerBootId: randomUUID(), controllerLeaseExpiresAt: new Date(0), executionStage: "dispatching",
-      processPid: 2_147_483_647, startedAt: new Date(0), updatedAt: new Date(0) });
+      processPid: proof === "conflicting_run" ? null : 2_147_483_647, startedAt: new Date(0), updatedAt: new Date(0) });
     await db.update(agentWakeupRequests).set({ runId, status: "completed" }).where(eq(agentWakeupRequests.id, f.intent.id));
     await db.update(agentWakeupRequests).set({ runId }).where(eq(agentWakeupRequests.id, receiptId));
     await db.update(issues).set({ executionRunId: runId, status: "in_progress" }).where(eq(issues.id, f.issueId));
+    if (proof === "conflicting_run") {
+      await db.update(heartbeatRuns).set({ executionStage: "preparing" }).where(eq(heartbeatRuns.id, runId));      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, f.issueId));
+
+      await db.update(agentWakeupRequests).set({ runId: f.runId }).where(eq(agentWakeupRequests.id, f.intent.id));
+    }
     if (proof === "missing_provenance") await db.delete(statusDecisionEffects).where(eq(statusDecisionEffects.targetId, f.intent.id));
     if (proof === "corrupt_reservation") await db.update(agentWakeupRequests).set({
       payload: { ...f.intent.payload, _paperclipDependencyAdmission: { version: 1, intentId: randomUUID() } },
@@ -432,11 +437,11 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     await heartbeat.reapOrphanedRuns({ staleThresholdMs: 0 });
     await heartbeat.drainActiveRunExecutions();
     const rows = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId));
-    expect(rows).toHaveLength(2);
+    expect(rows, JSON.stringify(rows.map(row => ({ id: row.id, status: row.status, reason: row.contextSnapshot?.wakeReason, retryOf: row.retryOfRunId })))).toHaveLength(2);
     expect(rows.find(row => row.id === runId)).toMatchObject({ status: "failed", errorCode: "process_lost",
       resultJson: { processLossDiagnostic: { retryEligible: proof === "other_native" } } });
     const [original] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.intent.id));
-    expect(original).toMatchObject({ status: "completed", runId });
+    expect(original).toMatchObject({ status: "completed", runId: proof === "conflicting_run" ? f.runId : runId });
     expect(mockAdapterExecute).not.toHaveBeenCalled();
   }, 20_000);
 
@@ -625,6 +630,18 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     expect(delivered!.payload!._paperclipDependencyAdmission).toEqual(binding);
     expect(delivered!.runId).not.toBeNull();
     expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["maxDailyRuns", "maxDailyCostCents"])("keeps unchanged %s policy holds quiet before a claim", async limit => {
+    const f = await seedDependency("idle");
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: true, [limit]: 0 } } }).where(eq(agents.id, f.agentId));
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    const parked = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+    expect(parked).toHaveLength(1);
+    expect(parked[0]).toMatchObject({ id: f.intent.id, status: "deferred_issue_execution", claimedAt: null, runId: null });
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toEqual(parked);
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
   });
 
   it("keeps an actual positive project budget hold quiet and reuses its input after legal release", async () => {

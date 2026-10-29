@@ -2216,7 +2216,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
   const dependencyAdmission = createDependencyAdmission(db, async () => {
     if ((await getSchedulingSuppression()).suppressed) return "operational_suppression";
     return await getWorktreeExecutionCutoff() ? "worktree_cutoff" : null;
-  });
+  }, async (queryDb, agent) => (await getHeartbeatDailyCapBlock(agent, parseHeartbeatPolicy(agent), {}, queryDb))?.reason ?? null);
 
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string, reviewerIntent?: typeof agentWakeupRequests.$inferSelect, monitorAdmission?: IssueMonitorAdmission, dependencyClaim?: DependencyClaim) {
     if (hasReviewerAssignmentContinuation(opts.payload) || hasReviewerAssignmentContinuation(opts.contextSnapshot)) {
