@@ -1,9 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { companies, createDb, type Db } from "@paperclipai/db";
+import { companies, createDb, databaseWorkPending, type Db } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { withAccountingTransaction } from "../services/accounting-transaction.js";
+import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
+import { registerCostAccountingWork } from "../services/budget-enforcement-worker.js";
 
 const publication = vi.hoisted(() => vi.fn());
 vi.mock("../services/activity-log.js", () => ({ publishActivity: publication }));
@@ -60,5 +62,28 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(publication).not.toHaveBeenCalled();
     });
     expect(publication.mock.calls.map(([value]) => value.payload.action)).toEqual(["kept"]);
+  });
+
+  it("reconciles failed callback-only work through the existing accounting coordinator", async () => {
+    const companyId = await fixture();
+    const errors = vi.fn();
+    const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: errors });
+    const reconcile = vi.fn(async () => {});
+    const worker = registerCostAccountingWork(db, coordinator, reconcile);
+    try {
+      await worker.ready;
+      reconcile.mockClear();
+      await expect(withAccountingTransaction(db, companyId, async (_tx, publications) => {
+        publications.push({ companyId, payload: { action: "discarded" }, pluginEvent: null });
+        throw new Error("rollback callback-only work");
+      })).rejects.toThrow("rollback callback-only work");
+      await vi.waitFor(() => {
+        expect(databaseWorkPending(db)).toBe(false);
+        expect(reconcile).toHaveBeenCalled();
+      });
+      expect(publication).not.toHaveBeenCalled();
+      expect(errors).not.toHaveBeenCalled();
+      expect(coordinator.nextWakeAt()).toBeNull();
+    } finally { worker.stop(); await coordinator.stop(); }
   });
 });

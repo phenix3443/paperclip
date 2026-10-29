@@ -3,6 +3,7 @@ import { afterDatabaseCommit, companies, type Db } from "@paperclipai/db";
 import { publishActivity, type ActivityPublication } from "./activity-log.js";
 import { notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
+import { DELIVERY_QUEUES } from "./delivery-work-notifications.js";
 import { withBudgetSpan } from "./budget-tracing.js";
 
 /** Serialize ledger and budget mutations in one company. Always acquire this
@@ -15,7 +16,7 @@ export async function withAccountingTransaction<T>(db: Db, companyId: string, wo
     const [company] = await withBudgetSpan("budget.accounting.lock_wait", () => tx.select({ id: companies.id }).from(companies)
       .where(eq(companies.id, companyId)).for("no key update"));
     if (!company) throw notFound("Company not found");
-    await afterDatabaseCommit(tx, () => publishAccountingActivities(companyId, publications));
+    await afterDatabaseCommit(tx, DELIVERY_QUEUES.accounting, () => publishAccountingActivities(companyId, publications));
     return work(tx, publications);
   }));
 }
