@@ -111,14 +111,17 @@ const support = await getEmbeddedPostgresTestSupport();
     const observed = new Proxy(db, { get(target, key) {
       if (key !== "transaction") return Reflect.get(target, key);
       return (...args: Parameters<typeof db.transaction>) => target.transaction(async tx => {
-        const fail = (transaction: typeof tx): typeof tx => new Proxy(transaction, { get(current, field) {
-          if (fault === "identity" && field === "transaction") return (...nested: Parameters<typeof tx.transaction>) => current.transaction(n => nested[0](fail(n)), nested[1]);
-          if (fault === "identity" && field === "insert") return (table: unknown) => {
-            if (table === runIdentityContexts) throw new Error("synthetic identity settlement failure");
-            return Reflect.apply(current.insert, current, [table]);
-          };
-          return Reflect.get(current, field);
-        } });
+        const fail = (transaction: typeof tx): typeof tx => {
+          if (fault === "identity") {
+            const nestedTransaction = transaction.transaction.bind(transaction), insert = transaction.insert.bind(transaction);
+            transaction.transaction = (callback, options) => nestedTransaction(child => callback(fail(child)), options);
+            transaction.insert = table => {
+              if (table === runIdentityContexts) throw new Error("synthetic identity settlement failure");
+              return insert(table);
+            };
+          }
+          return transaction;
+        };
         const value = await args[0](fail(tx));
         if (fault === "settlement" && value && typeof value === "object" && "kind" in value && value.kind === "queued") throw new Error("synthetic outer settlement failure");
         return value;

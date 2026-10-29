@@ -129,24 +129,20 @@ const support = await getEmbeddedPostgresTestSupport();
     const failing = new Proxy(db, { get(target, key) {
       if (key !== "transaction") return Reflect.get(target, key);
       return (...args: Parameters<typeof db.transaction>) => target.transaction(async tx => {
-        const observed = new Proxy(tx, { get(transaction, field) {
-          if (fault === "admission" && field === "insert") return (table: unknown) => {
-            if (table === heartbeatRuns) { injected = true; throw new Error("synthetic admission failure"); }
-            return Reflect.apply(transaction.insert, transaction, [table]);
+        const insert = tx.insert.bind(tx), update = tx.update.bind(tx);
+        if (fault === "admission") tx.insert = table => {
+          if (table === heartbeatRuns) { injected = true; throw new Error("synthetic admission failure"); }
+          return insert(table);
+        };
+        if (fault === "consumption") tx.update = table => {
+          const builder = update(table), set = builder.set.bind(builder);
+          builder.set = patch => {
+            if (table === issues && "monitorNextCheckAt" in patch && patch.monitorNextCheckAt === null) { injected = true; throw new Error("synthetic consumption failure"); }
+            return set(patch);
           };
-          if (fault === "consumption" && field === "update") return (table: unknown) => {
-            const update = Reflect.apply(transaction.update, transaction, [table]);
-            return new Proxy(update, { get(builder, method) {
-              if (method !== "set") return Reflect.get(builder, method);
-              return (patch: Record<string, unknown>) => {
-                if (table === issues && patch.monitorNextCheckAt === null) { injected = true; throw new Error("synthetic consumption failure"); }
-                return Reflect.apply(builder.set, builder, [patch]);
-              };
-            } });
-          };
-          return Reflect.get(transaction, field);
-        } });
-        const value = await args[0](observed);
+          return builder;
+        };
+        const value = await args[0](tx);
         if (fault === "settlement" && value && typeof value === "object" && "kind" in value && value.kind === "queued") {
           injected = true; throw new Error("synthetic settlement failure");
         }
@@ -388,24 +384,20 @@ const support = await getEmbeddedPostgresTestSupport();
     const failing = new Proxy(db, { get(target, key) {
       if (key !== "transaction") return Reflect.get(target, key);
       return (...args: Parameters<typeof db.transaction>) => target.transaction(async tx => {
-        const observed = new Proxy(tx, { get(transaction, field) {
-          if (fault === "admission" && field === "insert") return (table: unknown) => {
-            if (table === heartbeatRuns) { injected = true; throw new Error("synthetic quota admission failure"); }
-            return Reflect.apply(transaction.insert, transaction, [table]);
+        const insert = tx.insert.bind(tx), update = tx.update.bind(tx);
+        if (fault === "admission") tx.insert = table => {
+          if (table === heartbeatRuns) { injected = true; throw new Error("synthetic quota admission failure"); }
+          return insert(table);
+        };
+        if (fault === "consumption") tx.update = table => {
+          const builder = update(table), set = builder.set.bind(builder);
+          builder.set = patch => {
+            if (table === issues && "monitorNextCheckAt" in patch && patch.monitorNextCheckAt === null) { injected = true; throw new Error("synthetic quota consumption failure"); }
+            return set(patch);
           };
-          if (fault === "consumption" && field === "update") return (table: unknown) => {
-            const update = Reflect.apply(transaction.update, transaction, [table]);
-            return new Proxy(update, { get(builder, method) {
-              if (method !== "set") return Reflect.get(builder, method);
-              return (patch: Record<string, unknown>) => {
-                if (table === issues && patch.monitorNextCheckAt === null) { injected = true; throw new Error("synthetic quota consumption failure"); }
-                return Reflect.apply(builder.set, builder, [patch]);
-              };
-            } });
-          };
-          return Reflect.get(transaction, field);
-        } });
-        const value = await args[0](observed);
+          return builder;
+        };
+        const value = await args[0](tx);
         if (fault === "settlement" && value && typeof value === "object" && "outcome" in value && value.outcome === "scheduled") {
           injected = true; throw new Error("synthetic quota settlement failure");
         }
@@ -551,15 +543,15 @@ const support = await getEmbeddedPostgresTestSupport();
     const failing = new Proxy(db, { get(target, key) {
       if (key !== "transaction") return Reflect.get(target, key);
       return (...args: Parameters<typeof db.transaction>) => target.transaction(tx => {
-        const observed = (transaction: typeof tx): typeof tx => new Proxy(transaction, { get(current, field) {
-          if (field === "transaction") return (...nested: Parameters<typeof tx.transaction>) =>
-            current.transaction(child => nested[0](observed(child)), nested[1]);
-          if (field === "insert") return (table: unknown) => {
+        const observed = (transaction: typeof tx): typeof tx => {
+          const nestedTransaction = transaction.transaction.bind(transaction), insert = transaction.insert.bind(transaction);
+          transaction.transaction = (callback, options) => nestedTransaction(child => callback(observed(child)), options);
+          transaction.insert = table => {
             if (table === activityLog) { injected = true; throw new Error("synthetic quota installation storage failure"); }
-            return Reflect.apply(current.insert, current, [table]);
+            return insert(table);
           };
-          return Reflect.get(current, field);
-        } });
+          return transaction;
+        };
         return args[0](observed(tx));
       }, args[1]);
     } });
