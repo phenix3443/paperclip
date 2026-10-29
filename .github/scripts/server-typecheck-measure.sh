@@ -1,8 +1,9 @@
-# Helpers for server-typecheck-cache-measure.yml, sourced by its run steps.
+# Helpers for server-typecheck-cache-measure.yml, sourced by its run steps,
+# which run with set +e: the helpers read exit codes themselves.
 # Expects SCENARIO, TSC_VERSION, CACHE_HIT, MATCHED_KEY, CACHE_DIR, HEAD_SHA
 # and RUN_URL in the environment.
 
-header() {
+write_header() {
   {
     echo "## server typecheck cache: $SCENARIO"
     echo
@@ -25,7 +26,7 @@ measure() {
   # GNU time prepends "Command exited with non-zero status N" on failure.
   read -r rss wall < <(tail -n 1 "$RUNNER_TEMP/time.txt") || { rss=0; wall=0; }
   local cmd="$*"
-  cmd="${cmd//$PWD\/server\/node_modules\/.bin\//}"
+  cmd="${cmd//"$PWD/server/node_modules/.bin/"/}"
   echo "| $SCENARIO | $phase | \`$cmd\` | $code | $((rss / 1024)) | $wall | $CACHE_HIT | $MATCHED_KEY | $TSC_VERSION | $HEAD_SHA | $RUN_URL |" | tee -a "$GITHUB_STEP_SUMMARY"
   echo "::group::$phase (exit $code)"; tail -60 "$log"; echo "::endgroup::"
   return "$code"
@@ -47,7 +48,7 @@ status_reason() {
 }
 
 # The source and tests phases of the server's typecheck script, measured separately.
-phases() {
+measure_phases() {
   local tsc
   tsc="$(cd server && pnpm bin)/tsc"
   status_reason
@@ -66,8 +67,8 @@ show_edit() {
   } >> "$GITHUB_STEP_SUMMARY"
 }
 
-# edit <file> <line>: appends one line to a file in the runner workspace only.
-edit() {
+# append_line <file> <line>: appends one line to a file in the runner workspace only.
+append_line() {
   local before
   before="$(git diff --stat)"
   printf '\n%s\n' "$2" >> "$1"
