@@ -15054,13 +15054,13 @@ export function issueRoutes(
       if (
         req.actor.source !== "mcp_oauth" && !assigneeWillChange &&
         terminalizingIssue &&
-        existing.assigneeAgentId
+        (existing.assigneeAgentId || plainBlockedCancellation)
       ) {
-        const goalStopAction = await stopRunnerGoalForOwnershipChange({
+        const goalStopAction = existing.assigneeAgentId ? await stopRunnerGoalForOwnershipChange({
           companyId: existing.companyId,
           issueId: existing.id,
           agentId: existing.assigneeAgentId,
-        });
+        }) : null;
         const runToStopForTerminalization = goalStopAction || plainBlockedCancellation
           ? await resolveActiveIssueRun(existing)
           : null;

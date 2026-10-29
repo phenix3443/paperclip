@@ -72,18 +72,20 @@ const support = await getEmbeddedPostgresTestSupport();
     const failure = outcome === "failure";
     const f = await fixture();
     const child: ChildProcess = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
-    const run = outcome === "self-stop" ? f.actorRun : (await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: f.owner.id,
-      status: "running", runtimeMode: "legacy", runtimeModeResolvedAt: new Date(), contextSnapshot: { issueId: f.issue.id } }).returning())[0];
-    await db.update(issues).set({ executionRunId: run.id, ...(outcome === "self-stop" ? { assigneeAgentId: f.manager.id } : {}) }).where(eq(issues.id, f.issue.id));
-    runningProcesses.set(run.id, { child, graceSec: 1, processGroupId: null });
-    const actual = await vi.importActual<typeof import("../services/local-service-supervisor.js")>("../services/local-service-supervisor.js");
-    vi.mocked(terminateLocalService).mockImplementationOnce(async (...args) => {
-      expect((await issueService(db).getById(f.issue.id))?.status).toBe("blocked");
-      if (failure) throw new Error("Controlled termination failure");
-      await actual.terminateLocalService(...args);
-      if (outcome === "concurrent") await db.update(issues).set({ executionPolicy: { ...f.policy, maxReviewRounds: 4 } }).where(eq(issues.id, f.issue.id));
-    });
+    let stoppedRunId: string | null = null;
     try {
+      const run = outcome === "self-stop" ? f.actorRun : (await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: f.owner.id,
+        status: "running", runtimeMode: "legacy", runtimeModeResolvedAt: new Date(), contextSnapshot: { issueId: f.issue.id } }).returning())[0];
+      await db.update(issues).set({ executionRunId: run.id, ...(outcome === "self-stop" ? { assigneeAgentId: f.manager.id } : {}) }).where(eq(issues.id, f.issue.id));
+      stoppedRunId = run.id;
+      runningProcesses.set(run.id, { child, graceSec: 1, processGroupId: null });
+      const actual = await vi.importActual<typeof import("../services/local-service-supervisor.js")>("../services/local-service-supervisor.js");
+      vi.mocked(terminateLocalService).mockImplementationOnce(async (...args) => {
+        expect((await issueService(db).getById(f.issue.id))?.status).toBe("blocked");
+        if (failure) throw new Error("Controlled termination failure");
+        await actual.terminateLocalService(...args);
+        if (outcome === "concurrent") await db.update(issues).set({ executionPolicy: { ...f.policy, maxReviewRounds: 4 } }).where(eq(issues.id, f.issue.id));
+      });
       const res = await request(f.app).patch(`/api/issues/${f.issue.id}`).send({ status: "cancelled", comment: "Stop synthetic process" });
       const committed = outcome === "confirmed" || outcome === "self-stop";
       expect(res.status, JSON.stringify(res.body)).toBe(failure ? 500 : committed ? 200 : 409);
@@ -92,7 +94,7 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(terminateLocalService).toHaveBeenCalled();
       if (!failure) expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
     } finally {
-      runningProcesses.delete(run.id);
+      if (stoppedRunId) runningProcesses.delete(stoppedRunId);
       if (child.exitCode === null && child.signalCode === null) {
         const exited = new Promise<void>(resolve => child.once("exit", () => resolve()));
         child.kill("SIGKILL"); await exited;

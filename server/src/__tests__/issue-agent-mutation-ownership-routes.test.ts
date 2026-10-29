@@ -1886,6 +1886,35 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockLogActivity.mock.calls.some(([, input]) => input.action === "issue.updated")).toBe(false);
     });
 
+    it.each([false, true])("rejects a pending workflow before Stop; actor is participant=%s", async participant => {
+      const reviewer = participant ? peerAgentId : ownerAgentId;
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", executionRunId: ownerRunId,
+        executionPolicy: { stages: [{ id: recoveryActionId, type: "review", approvalsNeeded: 1,
+          participants: [{ id: issueId, type: "agent", agentId: reviewer }] }] },
+        executionState: { status: "pending", currentStageId: recoveryActionId, currentStageIndex: 0,
+          currentStageType: "review", currentParticipant: { type: "agent", agentId: reviewer },
+          returnAssignee: { type: "agent", agentId: participant ? ownerAgentId : peerAgentId },
+          completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null, changesRequestedCount: 1 },
+      }));
+      const res = await request(await createApp(peerActor())).patch(`/api/issues/${issueId}`)
+        .send({ status: "cancelled", comment: "Cancel" });
+      expect([409, 422], JSON.stringify(res.body)).toContain(res.status);
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+      expect(mockRunnerGoalService.act).not.toHaveBeenCalled();
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("requires Stop for a board cancellation even after assignment was cleared", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: null, executionRunId: ownerRunId }));
+      mockHeartbeatService.getRun.mockResolvedValue({ id: ownerRunId, companyId, agentId: ownerAgentId,
+        status: "running", contextSnapshot: { issueId } });
+      mockHeartbeatService.cancelRun.mockRejectedValue(new Error("Stop failed"));
+      const res = await request(await createApp(boardActor())).patch(`/api/issues/${issueId}`).send({ status: "cancelled" });
+      expect(res.status).toBe(500);
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledTimes(1);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
     it("allows a non-assignee CTO to cancel with unfinished dependencies", async () => {
       const res = await request(await createApp(peerActor()))
         .patch(`/api/issues/${issueId}`).send({ status: "cancelled" });
