@@ -44,6 +44,12 @@ const support = await getEmbeddedPostgresTestSupport();
     const errors: unknown[] = [];
     const coordinators = [one, two].map(() => createDeliveryWorkCoordinator({ owner: db,
       canRun: () => true, onError: error => errors.push(error) }));
+    let participants = 0, releaseBarrier!: () => void;
+    const barrier = new Promise<void>(resolve => { releaseBarrier = resolve; });
+    const startTogether = async () => {
+      if (++participants === 4) releaseBarrier();
+      await barrier;
+    };
     const read = async () => (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.receipt.id)))[0];
     const successors = () => db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.agentId, f.agentId),
       sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${f.issueId}`));
@@ -68,19 +74,22 @@ const support = await getEmbeddedPostgresTestSupport();
         requestedByActorType: "user", requestedByActorId: "board", payload: { issueId: f.issueId, commentId: comment.id,
           _paperclipWakeContext: { issueId: f.issueId, wakeReason: "issue_comment_mentioned", wakeCommentIds: [comment.id] } },
       }).returning();
-      await Promise.all([one.resumeQueuedRuns(), two.resumeQueuedRuns(),
-        ...[first, ...malformed].map(row => one.resumeQueuedCommentInterrupt(f.companyId, row.id))]);
+      await Promise.all([first, ...malformed].map(row => one.resumeQueuedCommentInterrupt(f.companyId, row.id)));
       expect(await read()).toEqual(first);
       for (const row of malformed) expect((await db.select().from(agentWakeupRequests)
         .where(eq(agentWakeupRequests.id, row.id)))[0]).toEqual(row);
+      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, ordinary.id)))[0])
+        .toMatchObject({ status: "deferred_issue_execution", runId: null });
+      await Promise.all([one, two].map((service, index) => registerExecutionControlWork(coordinators[index], [{
+        queue: DELIVERY_QUEUES.executionContinuation,
+        run: async () => { await startTogether(); await service.reconcileReviewerAssignments(); },
+        next: executionControlSchedule(db).continuation,
+      }]).ready).concat([one, two].map(async service => { await startTogether(); await service.resumeQueuedRuns(); })));
+      expect(participants).toBeGreaterThanOrEqual(4);
       const [promoted] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, ordinary.id));
       expect(promoted).toMatchObject({ status: "queued", runId: expect.any(String) });
       const [ordinaryRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, promoted.runId!));
       expect(ordinaryRun).toMatchObject({ agentId: otherId, status: "queued", startedAt: null });
-      await Promise.all([one, two].map((service, index) => registerExecutionControlWork(coordinators[index], [{
-        queue: DELIVERY_QUEUES.executionContinuation, run: service.reconcileReviewerAssignments,
-        next: executionControlSchedule(db).continuation,
-      }]).ready).concat([one.resumeQueuedRuns(), two.resumeQueuedRuns()]));
       expect(await read()).toEqual(first);
       expect(await successors()).toEqual([]);
       expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0].executionRunId).toBeNull();
@@ -115,6 +124,7 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(await executionControlSchedule(db).continuation()).toBeNull();
       expect(errors).toEqual([]);
     } finally {
+      releaseBarrier();
       await Promise.all(coordinators.map(coordinator => coordinator.stop()));
       await lifecycle.stop();
       await Promise.all([one.drainActiveRunExecutions(), two.drainActiveRunExecutions()]);
