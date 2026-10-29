@@ -1,5 +1,5 @@
 import { eq } from "drizzle-orm";
-import { companies, type Db } from "@paperclipai/db";
+import { afterDatabaseCommit, companies, type Db } from "@paperclipai/db";
 import { publishActivity, type ActivityPublication } from "./activity-log.js";
 import { notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -10,15 +10,14 @@ import { withBudgetSpan } from "./budget-tracing.js";
  * NO KEY UPDATE permits FK KEY SHARE locks held by recovery callers. */
 export async function withAccountingTransaction<T>(db: Db, companyId: string, work: (tx: Db, publications: ActivityPublication[]) => Promise<T>): Promise<T> {
   const publications: ActivityPublication[] = [];
-  const result = await withBudgetSpan("budget.accounting.transaction", () => db.transaction(async (transaction) => {
+  return withBudgetSpan("budget.accounting.transaction", () => db.transaction(async (transaction) => {
     const tx = transaction as unknown as Db;
     const [company] = await withBudgetSpan("budget.accounting.lock_wait", () => tx.select({ id: companies.id }).from(companies)
       .where(eq(companies.id, companyId)).for("no key update"));
     if (!company) throw notFound("Company not found");
+    await afterDatabaseCommit(tx, () => publishAccountingActivities(companyId, publications));
     return work(tx, publications);
   }));
-  publishAccountingActivities(companyId, publications);
-  return result;
 }
 
 /** Consistent operator reports must not wait for or delay accounting writers.

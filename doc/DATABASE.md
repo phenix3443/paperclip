@@ -1253,6 +1253,28 @@ The existing durable queue supplies the work in either case. Probe failures
 retain the idle hold and schedule another attempt. Work signals never replay
 queries or convert a failed database operation into success.
 
+For a hint that must distinguish commit from rollback, await
+`afterDatabaseCommit(tx, callback)` before the mutation. Successful savepoints
+transfer their callbacks to their parent; rolled-back savepoints discard theirs.
+Callbacks run only after the outer transaction is confirmed committed, outside
+its locks. Callback failures are reported without changing the transaction's
+result; asynchronous callbacks are started but not awaited by the transaction.
+Use them for notifications backed by durable state, not durable effects or
+permission to execute work. Accounting activity publication uses this contract
+even when its transaction is nested in a caller-owned transaction.
+
+Registration requires an instrumented `createDb` transaction and fetches the
+same transaction ID as work signals; it creates no topic, subscription or timer.
+On a lost transaction response, the owning recovery path must call
+`reconcileDatabaseWork(owner)` (without a topic to include callback-only work).
+`databaseWorkPending(owner)` includes these unresolved transactions. A committed
+outcome invokes each retained callback once in this process; aborted discards
+it. An unavailable (`NULL`) outcome retains callbacks and reports an error,
+because it cannot prove commit. Existing topic-only reconciliation still accepts
+`NULL` and scans its durable queue as before. Process exit loses callbacks;
+startup recovery must reconstruct work from durable rows. These hooks alone
+do not guarantee automatic dependency delivery.
+
 This uses PostgreSQL's transaction-information functions (this path requires
 PostgreSQL 14+; embedded PostgreSQL uses 18). See the
 [PostgreSQL transaction information documentation](https://www.postgresql.org/docs/18/functions-info.html#FUNCTIONS-PG-SNAPSHOT).
