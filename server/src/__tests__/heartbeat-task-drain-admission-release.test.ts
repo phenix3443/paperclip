@@ -490,21 +490,15 @@ describeEmbeddedPostgres("heartbeat task-drain admission release", () => {
         if (prop !== "transaction") return Reflect.get(target, prop, receiver);
         return (fn: (tx: unknown) => Promise<unknown>) => {
           return target.transaction((tx) => {
-            const txProxy = new Proxy(tx as object, {
-              get(txTarget, txProp, txReceiver) {
-                if (txProp === "update") {
-                  return (table: unknown) => {
-                    if (!injected && armed() && table === failingTable) {
-                      injected = true;
-                      throw new Error("simulated transactional write failure");
-                    }
-                    return (txTarget as any).update(table);
-                  };
-                }
-                return Reflect.get(txTarget, txProp, txReceiver);
-              },
-            });
-            return fn(txProxy);
+            const update = tx.update.bind(tx);
+            tx.update = table => {
+              if (!injected && armed() && table === failingTable) {
+                injected = true;
+                throw new Error("simulated transactional write failure");
+              }
+              return update(table);
+            };
+            return fn(tx);
           });
         };
       },

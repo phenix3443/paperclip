@@ -1253,6 +1253,37 @@ The existing durable queue supplies the work in either case. Probe failures
 retain the idle hold and schedule another attempt. Work signals never replay
 queries or convert a failed database operation into success.
 
+For a hint that must distinguish commit from rollback, await
+`afterDatabaseCommit(tx, existingRecoveryTopic, callback)` before the mutation. Successful savepoints
+transfer their callbacks to their parent; rolled-back savepoints discard theirs.
+Callbacks run only after the outer transaction is confirmed committed, outside
+its locks. Callback failures are reported without changing the transaction's
+result; asynchronous callbacks are started but not awaited by the transaction.
+Use them for notifications backed by durable state, not durable effects or
+permission to execute work. Accounting activity publication uses this contract
+even when its transaction is nested in a caller-owned transaction.
+
+Registration requires an instrumented `createDb` transaction and fetches the
+same transaction ID as work signals; it creates no new topic, subscription or timer.
+Normal success does not signal the recovery queue. A failed transaction signals
+the supplied existing topic so its coordinator owns transaction reconciliation.
+Accounting uses the existing cost-accounting owner. `databaseWorkPending(owner)`
+includes all unresolved transactions. A committed
+outcome invokes each retained callback once in this process; aborted discards
+it. An unavailable (`NULL`) outcome retains callbacks and reports a warning,
+because it cannot prove commit. It settles the topics so they can scan their
+durable queues as before, without a recurring unknown-callback retry. A root
+`reconcileDatabaseWork(owner)` without a topic reports the unresolved callback
+as an error for explicit repair. Process exit loses callbacks;
+startup recovery must reconstruct work from durable rows. These hooks alone
+do not guarantee automatic dependency delivery.
+
+Transaction instrumentation is associated with the transaction object's identity.
+Tests that observe queries or inject failures must preserve that object, for
+example by wrapping its methods instead of passing a replacement proxy to the
+callback. Database stubs that exercise accounting transactions must install the
+work-signal lifecycle and supply a distinct transaction object.
+
 This uses PostgreSQL's transaction-information functions (this path requires
 PostgreSQL 14+; embedded PostgreSQL uses 18). See the
 [PostgreSQL transaction information documentation](https://www.postgresql.org/docs/18/functions-info.html#FUNCTIONS-PG-SNAPSHOT).
