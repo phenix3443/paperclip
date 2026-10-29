@@ -57,12 +57,12 @@ jobs:
           CACHE_HIT: 'n/a'
           MATCHED_KEY: 'none'
         run: |
-          set -uo pipefail
+          set +e -uo pipefail
           test ! -e "$CACHE_DIR" || { echo "cache dir exists before a cold build" >&2; exit 1; }
           source .github/scripts/server-typecheck-measure.sh
           header
           phases || exit 1
-          echo "Entry size: $(du -sb "$CACHE_DIR" | cut -f1) bytes, $(find "$CACHE_DIR" -type f | wc -l) files" >> "$GITHUB_STEP_SUMMARY"
+          echo "Entry size: $(du -sb "$CACHE_DIR" | cut -f1) bytes, $(find "$CACHE_DIR" -type f | wc -l) files" | tee -a "$GITHUB_STEP_SUMMARY"
 
       # The colocated tests are checked as fully as by the single-project
       # tsconfig.json: its program is exactly the source project plus the
@@ -77,7 +77,7 @@ jobs:
           { list tsconfig.src.json; list tsconfig.tests.json; } | sort -u > "$RUNNER_TEMP/split.txt"
           single=$(wc -l < "$RUNNER_TEMP/single.txt"); split=$(wc -l < "$RUNNER_TEMP/split.txt")
           tests=$(grep -c '\.test\.ts$' "$RUNNER_TEMP/single.txt" || true)
-          echo "Coverage: tsconfig.json $single server/src files ($tests *.test.ts); src+tests $split" >> "$GITHUB_STEP_SUMMARY"
+          echo "Coverage: tsconfig.json $single server/src files ($tests *.test.ts); src+tests $split" | tee -a "$GITHUB_STEP_SUMMARY"
           if ! diff "$RUNNER_TEMP/single.txt" "$RUNNER_TEMP/split.txt"; then
             echo "src+tests projects do not cover the same files as tsconfig.json" >&2
             exit 1
@@ -132,7 +132,7 @@ jobs:
           CACHE_HIT: ${{ steps.restore.outputs.cache-hit }}
           MATCHED_KEY: ${{ steps.restore.outputs.cache-matched-key }}
         run: |
-          set -uo pipefail
+          set +e -uo pipefail
           source .github/scripts/server-typecheck-measure.sh
           header
           case "$SCENARIO" in

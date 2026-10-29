@@ -26,7 +26,7 @@ measure() {
   read -r rss wall < <(tail -n 1 "$RUNNER_TEMP/time.txt") || { rss=0; wall=0; }
   local cmd="$*"
   cmd="${cmd//$PWD\/server\/node_modules\/.bin\//}"
-  echo "| $SCENARIO | $phase | \`$cmd\` | $code | $((rss / 1024)) | $wall | $CACHE_HIT | $MATCHED_KEY | $TSC_VERSION | $HEAD_SHA | $RUN_URL |" >> "$GITHUB_STEP_SUMMARY"
+  echo "| $SCENARIO | $phase | \`$cmd\` | $code | $((rss / 1024)) | $wall | $CACHE_HIT | $MATCHED_KEY | $TSC_VERSION | $HEAD_SHA | $RUN_URL |" | tee -a "$GITHUB_STEP_SUMMARY"
   echo "::group::$phase (exit $code)"; tail -60 "$log"; echo "::endgroup::"
   return "$code"
 }
@@ -92,5 +92,5 @@ expect_failure() {
     echo "PROBE FAILED: exit $code but no error reported in $1" | tee -a "$GITHUB_STEP_SUMMARY" >&2
     return 1
   fi
-  echo "Probe passed: exit $code, error reported in \`$1\`." >> "$GITHUB_STEP_SUMMARY"
+  echo "Probe passed: exit $code, error reported in \`$1\`." | tee -a "$GITHUB_STEP_SUMMARY"
 }
