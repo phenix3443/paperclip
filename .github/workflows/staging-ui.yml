@@ -6,13 +6,18 @@ name: staging-ui
 on:
   push:
     branches-ignore: [master]
+  # staging.py dispatches this from develop for a commit whose branch lacks this workflow.
   workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit or branch to build
+        required: true
 
 permissions:
   contents: read
 
 concurrency:
-  group: staging-ui-${{ github.sha }}
+  group: staging-ui-${{ inputs.ref || github.sha }}
   cancel-in-progress: false
 
 jobs:
@@ -23,7 +28,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
+
+      - name: Resolve the built commit
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
@@ -45,7 +55,7 @@ jobs:
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: staging-ui-${{ github.sha }}
+          name: staging-ui-${{ steps.commit.outputs.sha }}
           path: ui/dist
           retention-days: 7
           if-no-files-found: error
