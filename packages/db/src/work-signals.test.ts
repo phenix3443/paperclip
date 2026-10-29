@@ -173,7 +173,9 @@ const support = await getEmbeddedPostgresTestSupport();
   });
 
   it("recovers after a real backend disconnect without replaying the queue write", async () => {
+    const callback = vi.fn();
     await expect(db.transaction(async tx => {
+      await workSignals.afterDatabaseCommit(tx, "disconnect", callback);
       await signalDatabaseWork(tx, "disconnect");
       await tx.execute(sql`insert into work_signal_test values ('disconnect')`);
       const [{ pid }] = await tx.execute(sql`select pg_backend_pid() as pid`);
@@ -182,6 +184,7 @@ const support = await getEmbeddedPostgresTestSupport();
     })).rejects.toThrow();
     await reconcileDatabaseWork(db, "disconnect");
     expect(databaseWorkPending(db, "disconnect")).toBe(false);
+    expect(callback).not.toHaveBeenCalled();
     expect(await db.execute(sql`select * from work_signal_test where id = 'disconnect'`)).toHaveLength(0);
   });
 
@@ -210,6 +213,43 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await readCommitted).toHaveLength(1);
   });
 
+  it("discards callbacks from a successful inner savepoint when its parent rolls back", async () => {
+    const callbacks: string[] = [];
+    await db.transaction(async outer => {
+      await workSignals.afterDatabaseCommit(outer, "commit-test", () => { callbacks.push("outer"); });
+      await expect(outer.transaction(async parent => {
+        await parent.transaction(async inner => {
+          await workSignals.afterDatabaseCommit(inner, "commit-test", () => { callbacks.push("discarded"); });
+        });
+        throw new Error("parent rollback");
+      })).rejects.toThrow("parent rollback");
+      await outer.transaction(async sibling => {
+        await workSignals.afterDatabaseCommit(sibling, "commit-test", () => { callbacks.push("sibling"); });
+      });
+      expect(callbacks).toEqual([]);
+    });
+    expect(callbacks).toEqual(["outer", "sibling"]);
+    expect(databaseWorkPending(db)).toBe(false);
+  });
+
+  it("does not hold transaction locks while an asynchronous commit callback is pending", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const completed = vi.fn();
+    try {
+      await db.transaction(async tx => {
+        await workSignals.afterDatabaseCommit(tx, "commit-test", async () => { await gate; completed(); });
+        await tx.execute(sql`insert into work_signal_test values ('async-callback')`);
+      });
+      await db.transaction(async tx => {
+        await tx.execute(sql`set local lock_timeout = '500ms'`);
+        await tx.execute(sql`update work_signal_test set id = 'async-callback-updated' where id = 'async-callback'`);
+      });
+      expect(completed).not.toHaveBeenCalled();
+    } finally { release(); }
+    await vi.waitFor(() => expect(completed).toHaveBeenCalledOnce());
+  });
+
   it("never changes transaction success because a listener throws", async () => {
     const warn = vi.spyOn(process, "emitWarning").mockImplementation(() => {});
     const unsubscribe = subscribeDatabaseWork(db, "listener", () => { throw new Error("listener"); });
@@ -221,6 +261,40 @@ const support = await getEmbeddedPostgresTestSupport();
 });
 
 describe("work signal query boundaries", () => {
+  it("retains commit callbacks after a status probe failure and recovers once", async () => {
+    const execute = vi.fn().mockResolvedValueOnce([{ xid: "76" }])
+      .mockRejectedValueOnce(new Error("probe disconnected"))
+      .mockResolvedValue([{ status: "committed" }]);
+    const connection = installDatabaseWorkSignals({ execute, transaction: async (callback: any) => {
+      await callback({ execute, transaction: async () => {} });
+      throw new Error("lost commit response");
+    } });
+    const committed = vi.fn();
+    await expect(connection.transaction(async (tx: object) => {
+      await workSignals.afterDatabaseCommit(tx, "existing-owner", committed);
+    })).rejects.toThrow("lost commit response");
+    await expect(reconcileDatabaseWork(connection, "existing-owner")).rejects.toThrow("probe disconnected");
+    expect(databaseWorkPending(connection, "existing-owner")).toBe(true);
+    expect(committed).not.toHaveBeenCalled();
+    await reconcileDatabaseWork(connection, "existing-owner");
+    await reconcileDatabaseWork(connection, "existing-owner");
+    expect(committed).toHaveBeenCalledOnce();
+    expect(databaseWorkPending(connection)).toBe(false);
+  });
+
+  it("prevents a mutation when commit callback registration fails", async () => {
+    const execute = vi.fn().mockRejectedValue(new Error("registration disconnected"));
+    const connection = installDatabaseWorkSignals({ execute, transaction: async (callback: any) => callback({ execute, transaction: async () => {} }) });
+    const write = vi.fn();
+    const committed = vi.fn();
+    await expect(connection.transaction(async (tx: object) => {
+      await workSignals.afterDatabaseCommit(tx, "existing-owner", committed);
+      write();
+    })).rejects.toThrow("registration disconnected");
+    expect(write).not.toHaveBeenCalled();
+    expect(committed).not.toHaveBeenCalled();
+    expect(databaseWorkPending(connection)).toBe(false);
+  });
   it("wakes the existing recovery owner only on failed callback transactions and preserves legacy NULL settlement", async () => {
     const execute = vi.fn(async () => [{ xid: "75", status: null }]);
     let fail = false;
