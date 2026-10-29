@@ -1756,6 +1756,28 @@ describe("agent issue mutation checkout ownership", () => {
       }));
     });
 
+    it("does not commit cancellation when an active run cannot stop without a runner goal", async () => {
+      mockIssueService.getDependencyReadiness.mockResolvedValue({
+        unresolvedBlockerCount: 0,
+        unresolvedBlockerIssueIds: [],
+      });
+      mockIssueService.getById.mockResolvedValue(makeIssue({
+        status: "blocked", executionRunId: ownerRunId,
+      }));
+      mockHeartbeatService.getRun.mockResolvedValue({
+        id: ownerRunId, companyId, agentId: ownerAgentId, status: "running",
+        contextSnapshot: { issueId },
+      });
+      mockHeartbeatService.cancelRun.mockRejectedValue(new Error("Termination has not been verified"));
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`).send({ status: "cancelled" });
+
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(ownerRunId);
+      expect.soft(res.status, JSON.stringify(res.body)).toBe(500);
+      expect.soft(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
     it("allows a non-assignee CTO to cancel with unfinished dependencies", async () => {
       const res = await request(await createApp(peerActor()))
         .patch(`/api/issues/${issueId}`).send({ status: "cancelled" });
