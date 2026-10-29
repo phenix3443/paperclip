@@ -52,7 +52,7 @@ jobs:
       - name: Measure variants
         working-directory: server
         run: |
-          set -u
+          set +e -u
           summary="$GITHUB_STEP_SUMMARY"
           {
             echo "## Server typecheck: peak memory and time"
@@ -68,7 +68,9 @@ jobs:
             /usr/bin/time -f '%M %e' -o "$RUNNER_TEMP/time.txt" "$@" > "$RUNNER_TEMP/$name.log" 2>&1
             code=$?
             read -r rss wall < "$RUNNER_TEMP/time.txt" || { rss=0; wall=0; }
-            echo "| $name | \`$*\` | $code | $((rss / 1024)) | $wall |" >> "$summary"
+            row="| $name | \`$*\` | $code | $((rss / 1024)) | $wall |"
+            echo "$row" >> "$summary"
+            echo "RESULT $row"
             echo "::group::$name (exit $code)"; tail -40 "$RUNNER_TEMP/$name.log"; echo "::endgroup::"
           }
           tsc="$(pnpm bin)/tsc"
