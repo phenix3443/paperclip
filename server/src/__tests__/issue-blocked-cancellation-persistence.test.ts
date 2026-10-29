@@ -53,7 +53,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const actual = issueServices.issueService;
     const factory = vi.spyOn(issueServices, "issueService").mockImplementation((...args) => {
       const service = actual(...args);
-      return { ...service, getById: async (...input) => {
+      return { ...service, getById: async (...input: Parameters<typeof service.getById>) => {
         const row = await service.getById(...input);
         const pending = barrier.afterRead;
         barrier.afterRead = null;
@@ -149,7 +149,13 @@ const support = await getEmbeddedPostgresTestSupport();
       await writer;
       await rejected;
       expect(await issueService(db).getById(f.issue.id)).toMatchObject({ status: "blocked", executionState: changed });
-    } finally { dispatched(); clearTimeout(deadline!); await writer; db.$client.options.debug = previousDebug; await competitor.$client.end(); }
+    } finally {
+      dispatched(); clearTimeout(deadline!);
+      try { await writer; } finally {
+        db.$client.options.debug = previousDebug;
+        await competitor.$client.end();
+      }
+    }
   });
 
   it.each(["missing", "wrong", "other-request", "exact"])("keeps stopped-run authority with a %s receipt", async receipt => {
