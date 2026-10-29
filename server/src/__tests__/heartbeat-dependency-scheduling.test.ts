@@ -3,6 +3,10 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   costEvents,
+  budgetPolicies,
+  budgetIncidents,
+  approvals,
+  projects,
   activityLog,
   agents,
   agentRuntimeState,
@@ -38,8 +42,9 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
-import { commitNativeStatusDecision } from "../services/native-runtime/status-decision-committer.js";
-import { NATIVE_STATUS_ARBITER_POLICY_VERSION } from "../services/native-runtime/status-arbiter.js";
+import { seedNativeDependency } from "./helpers/native-dependency-fixture.js";
+import { budgetService } from "../services/budgets.js";
+import { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
 import { runningProcesses } from "../adapters/index.ts";
 
 const mockAdapterExecute = vi.hoisted(() =>
@@ -162,6 +167,10 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     await db.delete(heartbeatRunEvents);
     await db.delete(activityLog);
     await db.delete(costEvents);
+    await db.delete(budgetIncidents);
+    await db.delete(budgetPolicies);
+    await db.delete(approvals);
+    await db.delete(projects);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
@@ -190,56 +199,7 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     await tempDb?.cleanup();
   });
 
-  async function seedDependency(agentStatus = "paused", nativeProducer = false) {
-    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), blockerId = randomUUID();
-    await db.insert(companies).values({ id: companyId, name: "Dependency ownership", issuePrefix: `D${companyId.slice(0, 6)}`,
-      requireBoardApprovalForNewAgents: false, defaultResponsibleUserId: "responsible-user" });
-    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "responsible-user", status: "active", membershipRole: "member" });
-    await db.insert(agents).values({ id: agentId, companyId, name: "Dependency owner", role: "engineer", status: agentStatus,
-      adapterType: "codex_local", adapterConfig: {}, permissions: {}, runtimeConfig: { heartbeat: { wakeOnDemand: true } } });
-    await db.insert(issues).values([
-      { id: issueId, companyId, title: "Dependent", status: "todo", assigneeAgentId: agentId, responsibleUserId: "responsible-user" },
-      { id: blockerId, companyId, title: "Completed blocker", status: "done", responsibleUserId: "responsible-user" },
-    ]);
-    const runId = randomUUID(), contractId = randomUUID(), resultId = randomUUID(), assessmentId = randomUUID(), decisionId = randomUUID();
-    await db.insert(completionContracts).values({ id: contractId, companyId, issueId: blockerId, revision: 1,
-      schemaVersion: "paperclip.completion-contract.v1", policyVersion: "test", risk: "standard", completionAuthority: "server_arbiter",
-      incompleteCriteriaPolicy: "preserve_non_terminal", contractJson: {}, canonicalSha256: contractId, createdByActorType: "system", createdByActorId: "test" });
-    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "succeeded", invocationSource: "automation",
-      nativeIssueId: blockerId, completionContractId: contractId });
-    await db.insert(nativeRunResults).values({ id: resultId, companyId, issueId: blockerId, runId,
-      completionContractId: contractId, serverFingerprint: resultId, schemaStatus: "accepted", resultJson: {}, canonicalSha256: resultId });
-    await db.insert(workAssessments).values({ id: assessmentId, companyId, issueId: blockerId, runId, contractId, resultId,
-      triggerKind: "turn_finished", triggerActorCompanyId: companyId, priorIssueStatus: "in_progress", priorStatusVersion: 0,
-      policyVersion: "test", assessmentJson: {}, inputDigest: assessmentId });
-    if (nativeProducer) {
-      await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, blockerId));
-      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, issueId));
-      await db.insert(issueRelations).values({ companyId, issueId: blockerId, relatedIssueId: issueId, type: "blocks" });
-      await db.insert(nativeRunFinalizations).values({ companyId, issueId: blockerId, runId, phase: "assessed", resultId, assessmentId });
-      const [prior] = await db.select().from(issues).where(eq(issues.id, blockerId));
-      await db.update(workAssessments).set({ priorIssueStatus: prior!.status, priorStatusVersion: Number(prior!.statusVersion) }).where(eq(workAssessments.id, assessmentId));
-      await commitNativeStatusDecision({ db, companyId, issueId: blockerId, runId, assessmentId,
-        priorStatus: prior!.status, priorStatusVersion: Number(prior!.statusVersion), priorDecisionId: prior!.lastStatusDecisionId,
-        decision: { policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION, statusAction: "done", toStatus: "done",
-          reasonCode: "completion_criteria_satisfied", unblockDescriptor: null, effects: [] } });
-      const [intent] = await db.select().from(agentWakeupRequests).where(and(
-        eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.reason, "issue_blockers_resolved")));
-      expect(intent).toBeDefined();
-      return { companyId, agentId, issueId, blockerId, runId, intent: intent! };
-    }
-    await db.insert(statusDecisions).values({ id: decisionId, companyId, issueId: blockerId, runId, assessmentId, decisionVersion: 1,
-      policyVersion: "test", fromStatus: "in_progress", toStatus: "done", reasonCode: "completed", decisionJson: {},
-      decisionDigest: decisionId, applicationState: "applied", appliedAt: new Date() });
-    const [intent] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation", triggerDetail: "system",
-      reason: "issue_blockers_resolved", requestedByActorType: "system", requestedByActorId: "native-status-committer",
-      idempotencyKey: `issue_blockers_resolved:${issueId}:${blockerId}`, payload: { issueId, taskId: issueId, resolvedBlockerIssueId: blockerId,
-        blockerIssueIds: [blockerId], _paperclipWakeContext: { issueId, taskId: issueId, source: "native_status_decision" } } }).returning();
-    await db.insert(statusDecisionEffects).values({ companyId, issueId: blockerId, decisionId, ordinal: 0, effectKind: "dependency_wake",
-      targetType: "agent_wakeup_request", targetId: intent!.id, idempotencyKey: `effect:${decisionId}`,
-      payload: { dependentIssueId: issueId, resolvedBlockerIssueId: blockerId }, deliveryState: "delivered" });
-    return { companyId, agentId, issueId, blockerId, runId, intent: intent! };
-  }
+  const seedDependency = (status = "paused", nativeProducer = false) => seedNativeDependency(db, status, nativeProducer);
 
   it("parks a durable dependency input without consuming it or rewriting an unchanged hold", async () => {
     const { companyId, agentId, issueId, intent } = await seedDependency();
@@ -518,6 +478,81 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     expect(retired.every(row => row.status === "skipped" && row.runId === null)).toBe(true);
     await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
     expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toEqual(retired);
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+  });
+
+  it("keeps one provenance binding when repeated native effects reference the same intent", async () => {
+    const f = await seedDependency();
+    const [effect] = await db.select().from(statusDecisionEffects).where(eq(statusDecisionEffects.targetId, f.intent.id));
+    await db.insert(statusDecisionEffects).values({ ...effect!, id: randomUUID(), ordinal: 1, idempotencyKey: randomUUID() });
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    const [parked] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.intent.id));
+    expect(parked).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    const binding = parked!.payload!._paperclipDependencyAdmission;
+    await db.insert(statusDecisionEffects).values({ ...effect!, id: randomUUID(), ordinal: 2,
+      idempotencyKey: randomUUID(), createdAt: new Date(0) });
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Repeated effects delivered once.", provider: "test", model: "test-model" };
+    });
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, f.agentId));
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    await heartbeat.drainActiveRunExecutions();
+    const [delivered] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.intent.id));
+    expect(delivered!.payload!._paperclipDependencyAdmission).toEqual(binding);
+    expect(delivered!.runId).not.toBeNull();
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps an actual positive project budget hold quiet and reuses its input after legal release", async () => {
+    const f = await seedDependency("idle"), projectId = randomUUID();
+    await db.insert(projects).values({ id: projectId, companyId: f.companyId, name: "Budget dependency", status: "in_progress" });
+    await db.update(issues).set({ projectId }).where(eq(issues.id, f.issueId));
+    const budgets = budgetService(db);
+    await budgets.upsertPolicy(f.companyId, { scopeType: "project", scopeId: projectId, amount: 100, windowKind: "lifetime" }, "responsible-user");
+    const [cost] = await db.insert(costEvents).values({ companyId: f.companyId, agentId: f.agentId, projectId,
+      provider: "openai", biller: "openai", billingType: "metered_api", model: "test-model", costCents: 125,
+      inputTokens: 100, cachedInputTokens: 0, outputTokens: 20, occurredAt: new Date() }).returning();
+    await budgets.evaluateCostEvent(cost!);
+    expect((await db.select().from(projects).where(eq(projects.id, projectId)))[0]).toMatchObject({ pauseReason: "budget" });
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    const parked = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+    expect(parked).toHaveLength(1);
+    expect(parked[0]).toMatchObject({ id: f.intent.id, status: "deferred_issue_execution", runId: null, claimedAt: null });
+    const policy = await db.select().from(budgetPolicies).where(eq(budgetPolicies.companyId, f.companyId));
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toEqual(parked);
+    expect(await db.select().from(budgetPolicies).where(eq(budgetPolicies.companyId, f.companyId))).toEqual(policy);
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+    await budgets.upsertPolicy(f.companyId, { scopeType: "project", scopeId: projectId, amount: 200, windowKind: "lifetime" }, "responsible-user");
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Budget release delivered.", provider: "test", model: "test-model" };
+    });
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    await heartbeat.drainActiveRunExecutions();
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+    const rows = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+    expect(rows).toHaveLength(2);
+    expect(rows.find(row => row.id === f.intent.id)).toMatchObject({ status: "completed" });
+  });
+
+  it("does not turn a dependency input into pending review authority", async () => {
+    const f = await seedDependency("idle"), executorId = randomUUID();
+    await db.insert(agents).values({ id: executorId, companyId: f.companyId, name: "Review executor", role: "engineer",
+      status: "idle", adapterType: "http", adapterConfig: {} });
+    const policy = normalizeIssueExecutionPolicy({ mode: "normal", commentRequired: true, stages: [{ type: "review",
+      participants: [{ type: "agent", agentId: f.agentId }], approvalsNeeded: 1 }] });
+    const [task] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    const transition = applyIssueExecutionPolicyTransition({ issue: { ...task!, assigneeAgentId: executorId }, policy,
+      previousPolicy: null, requestedStatus: "done", requestedAssigneePatch: {}, actor: { agentId: executorId, userId: null },
+      allowBoardOverride: false, commentBody: "Ready for independent review." });
+    await db.update(issues).set({ ...transition.patch, executionPolicy: policy }).where(eq(issues.id, f.issueId));
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    const before = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+    expect(before[0]).toMatchObject({ status: "deferred_issue_execution", error: "review", runId: null });
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toEqual(before);
     expect(mockAdapterExecute).not.toHaveBeenCalled();
   });
 

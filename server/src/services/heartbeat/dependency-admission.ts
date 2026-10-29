@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import { and, eq, isNull, sql } from "drizzle-orm";
+import { and, asc, eq, exists, inArray, isNotNull, isNull, like, sql } from "drizzle-orm";
 import { agents, companies, heartbeatRuns, agentWakeupRequests, issues, statusDecisionEffects, statusDecisions, type Db } from "@paperclipai/db";
 import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { evaluateAgentInvokability } from "../agent-invokability.js";
@@ -15,6 +15,16 @@ import { authorizationService, type AuthorizationResource } from "../authorizati
 
 type Wake = typeof agentWakeupRequests.$inferSelect;
 const markerKey = "_paperclipDependencyAdmission";
+const terminalRunStatuses = ["succeeded", "failed", "cancelled", "timed_out", "interrupted"];
+
+export function pendingDependencyReceiptResults(db: Db) {
+  return and(eq(agentWakeupRequests.reason, "issue_blockers_resolved"),
+    like(agentWakeupRequests.requestedByActorId, "native-status-wake-dispatch:%"),
+    inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution"]),
+    isNotNull(agentWakeupRequests.runId), exists(db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.id, agentWakeupRequests.runId), eq(heartbeatRuns.companyId, agentWakeupRequests.companyId),
+      eq(heartbeatRuns.agentId, agentWakeupRequests.agentId), inArray(heartbeatRuns.status, terminalRunStatuses)))));
+}
 
 type Reservation = {
   version: 1;
@@ -71,7 +81,7 @@ function observed(row: Wake) {
     sql`${agentWakeupRequests.triggerDetail} is not distinct from ${row.triggerDetail}`,
     sql`${agentWakeupRequests.requestedByActorType} is not distinct from ${row.requestedByActorType}`,
     sql`${agentWakeupRequests.requestedByActorId} is not distinct from ${row.requestedByActorId}`,
-    eq(agentWakeupRequests.status, row.status), isNull(agentWakeupRequests.runId),
+    eq(agentWakeupRequests.status, row.status), row.runId ? eq(agentWakeupRequests.runId, row.runId) : isNull(agentWakeupRequests.runId),
     row.claimedAt ? eq(agentWakeupRequests.claimedAt, row.claimedAt) : isNull(agentWakeupRequests.claimedAt),
     sql`${agentWakeupRequests.payload} = ${JSON.stringify(row.payload)}::jsonb`);
 }
@@ -84,10 +94,12 @@ async function provenance(db: Db, row: Wake) {
     .where(and(eq(statusDecisionEffects.companyId, row.companyId),
       eq(statusDecisionEffects.effectKind, "dependency_wake"), eq(statusDecisionEffects.targetType, "agent_wakeup_request"),
       eq(statusDecisionEffects.targetId, row.id),
+      reservation(row) ? eq(statusDecisionEffects.id, reservation(row)!.effectId) : undefined,
       sql`${statusDecisionEffects.payload}->>'dependentIssueId' = ${row.payload.issueId}`,
       sql`${statusDecisionEffects.payload}->>'resolvedBlockerIssueId' = ${row.payload.resolvedBlockerIssueId}`,
-      sql`${statusDecisionEffects.issueId}::text = ${row.payload.resolvedBlockerIssueId}`)).limit(2);
-  return effects.length === 1 ? effects[0] : null;
+      sql`${statusDecisionEffects.issueId}::text = ${row.payload.resolvedBlockerIssueId}`))
+    .orderBy(asc(statusDecisionEffects.createdAt), asc(statusDecisionEffects.id)).limit(1);
+  return effects[0] ?? null;
 }
 
 function matchesReceipt(row: Wake, intent: Wake, binding: Reservation) {
@@ -263,7 +275,32 @@ export function createDependencyAdmission(db: Db, schedulingGate: () => Promise<
     return promoted;
   }
 
-  return { prepare, authorize, settle, inspect, promoteReceipt };
+  async function recoverReceipt(candidate: Wake) {
+    const intentId = candidate.requestedByActorId?.match(/^native-status-wake-dispatch:([0-9a-f-]{36})$/)?.[1];
+    const runId = candidate.runId;
+    if (!intentId || !runId) return false;
+    return db.transaction(async transaction => {
+      const tx = transaction as unknown as Db;
+      const [initial] = await tx.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, candidate.companyId),
+        eq(agentWakeupRequests.id, intentId)));
+      const intent = initial && await lockInput(tx, initial);
+      if (!intent || !await provenance(tx, intent)) return false;
+      const binding = reservation(intent);
+      if (!binding || (intent.runId !== null && intent.runId !== runId)) return false;
+      const [current] = await tx.select().from(agentWakeupRequests).where(observed(candidate)).for("update");
+      if (!current) return false;
+      const receipt = await receiptFor(tx, intent, binding);
+      if (!receipt || receipt.id !== candidate.id || receipt.runId !== runId) return false;
+      const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, candidate.companyId),
+        eq(heartbeatRuns.id, runId), inArray(heartbeatRuns.status, terminalRunStatuses)));
+      if (!run) return false;
+      const [settled] = await tx.update(agentWakeupRequests).set({ status: run.status === "succeeded" ? "completed" : run.status,
+        finishedAt: run.finishedAt, error: run.error, updatedAt: new Date() }).where(observed(current)).returning({ id: agentWakeupRequests.id });
+      return Boolean(settled);
+    });
+  }
+
+  return { prepare, authorize, settle, inspect, promoteReceipt, recoverReceipt };
 }
 
 export async function isVerifiedDependencyRun(db: Db, run: typeof heartbeatRuns.$inferSelect) {

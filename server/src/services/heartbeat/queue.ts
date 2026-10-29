@@ -1,5 +1,5 @@
 import { settleNewReviewRunIdentity, settleReviewRunClaimIdentity } from "../run-identity.js";
-import { createDependencyAdmission, DependencyAdmissionHeld, type DependencyClaim } from "./dependency-admission.js";
+import { createDependencyAdmission, DependencyAdmissionHeld, pendingDependencyReceiptResults, type DependencyClaim } from "./dependency-admission.js";
 import type { IssueMonitorAdmission } from "./scheduling.js";
 import { parseIssueExecutionState } from "../issue-execution-policy.js";
 import { admitReviewerIntent, consumeReviewerIntent, reconcileReviewerAssignments, reviewerAssignmentGeneration } from "./reviewer-assignment-continuation.js";
@@ -5014,6 +5014,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             ? eq(agentWakeupRequests.companyId, input.companyId)
             : undefined,
           eq(agentWakeupRequests.requestedByActorType, "system"),
+          or(and(
           inArray(agentWakeupRequests.requestedByActorId, [
             "native-status-committer",
             CROSS_TASK_CONTINUATION_COMMITTER_ID,
@@ -5023,6 +5024,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             inArray(agentWakeupRequests.status, ["deferred_issue_execution", "coalesced", "skipped"]),
           )),
           isNull(agentWakeupRequests.runId),
+          ), pendingDependencyReceiptResults(db)),
         ),
       )
       .orderBy(asc(agentWakeupRequests.requestedAt))
@@ -5037,6 +5039,15 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     >();
 
     for (const candidate of candidates) {
+      if (candidate.runId) {
+        try {
+          if (await dependencyAdmission.recoverReceipt(candidate)) recovered += 1;
+        } catch (error) {
+          logger.warn({ err: error, wakeupRequestId: candidate.id }, "Dependency result receipt requires reconciliation");
+        }
+        continue;
+      }
+
       if (candidate.reason === ISSUE_BLOCKERS_RESOLVED_WAKE_REASON && candidate.requestedByActorId === "native-status-committer") {
         const payload = parseObject(candidate.payload);
         let claim: DependencyClaim | null = null;
