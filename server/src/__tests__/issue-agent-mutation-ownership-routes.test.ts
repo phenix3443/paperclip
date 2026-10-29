@@ -382,7 +382,10 @@ function createRunContextDb(
   };
   const buildQuery = (selection: Record<string, unknown>, chatBindingQuery = false, settledRecoveryQuery = false) => {
     const whereResult = {
-      orderBy: vi.fn(async () => []),
+      orderBy: vi.fn(() => ({
+        then: async (resolve: (rows: unknown[]) => unknown) => resolve([]),
+        limit: vi.fn(async () => []),
+      })),
       limit: vi.fn(() => ({
         then: async (resolve: (limitedRows: unknown[]) => unknown) => resolve(await rowsForSelection(selection, chatBindingQuery, settledRecoveryQuery)),
         for: vi.fn(() => ({
@@ -1736,6 +1739,37 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.update).toHaveBeenCalled();
     expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
+
+  it.each([false, true])("rejects pending cancellation workflow; participant=%s", async participant => {
+    const reviewer = participant ? ownerAgentId : peerAgentId;
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", executionRunId: ownerRunId,
+      executionPolicy: { stages: [{ id: recoveryActionId, type: "review", approvalsNeeded: 1,
+        participants: [{ id: issueId, type: "agent", agentId: reviewer }] }] },
+      executionState: { status: "pending", currentStageId: recoveryActionId, currentStageIndex: 0,
+        currentStageType: "review", currentParticipant: { type: "agent", agentId: reviewer },
+        returnAssignee: { type: "agent", agentId: ownerAgentId }, completedStageIds: [],
+        lastDecisionId: null, lastDecisionOutcome: null, changesRequestedCount: 1 },
+    }));
+    const res = await request(createApp(ownerActor())).patch(`/api/issues/${issueId}`)
+      .send({ status: "cancelled", comment: "Cancel" });
+    expect([409, 422], JSON.stringify(res.body)).toContain(res.status);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    expect(mockRunnerGoalService.act).not.toHaveBeenCalled();
+  });
+
+  it.each([{}, { comment: "Cancel" }, { resume: false }, { title: "Unchanged" }, { unknown: true }])(
+    "limits cancellation snapshots to strict raw input: %j", async extra => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked" }));
+      const res = await request(createApp(ownerActor())).patch(`/api/issues/${issueId}`)
+        .send({ status: "cancelled", ...extra });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      const guarded = Object.keys(extra).every(key => key === "comment");
+      expect(mockIssueService.update.mock.calls[0][1].expectedExecutionPolicyTransition)
+        .toEqual(guarded ? expect.any(String) : undefined);
+      if (guarded) expect(mockIssueService.update.mock.calls[0][1].expectedExecutionPolicy).toBeNull();
+    },
+  );
 
   it.each([
     ["done", "todo", 403, "Agent cannot request follow-up for another agent's issue"],

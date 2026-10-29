@@ -173,6 +173,7 @@ import {
 } from "./native-runtime/native-chat-review-presentation.js";
 import {
   applyIssueExecutionPolicyTransition,
+  executionPolicyTransitionInputFingerprint,
   buildInitialIssueMonitorFields,
   normalizeIssueExecutionPolicy,
 } from "./issue-execution-policy.js";
@@ -11006,6 +11007,7 @@ export function issueService(db: Db) {
         companyGuard?: string;
         workspaceSelectionActor?: AuthorizationActor;
         expectedExecutionPolicy?: typeof issues.$inferInsert.executionPolicy;
+        expectedExecutionPolicyTransition?: string;
         expectedStatusVersion?: number;
       },
       dbOrTx: any = db,
@@ -11057,6 +11059,7 @@ export function issueService(db: Db) {
         companyGuard,
         workspaceSelectionActor,
         expectedExecutionPolicy,
+        expectedExecutionPolicyTransition,
         expectedStatusVersion,
         ...issueData
       } = data;
@@ -11318,6 +11321,12 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        if (expectedExecutionPolicyTransition !== undefined &&
+            executionPolicyTransitionInputFingerprint(receiptExisting) !== expectedExecutionPolicyTransition) {
+          throw conflict("The task workflow changed. Read the task again before cancelling.", {
+            code: "execution_policy_transition_changed",
+          });
+        }
         if (issueData.executionPolicy !== undefined) assertQualityReviewPolicyMutation({ previousPolicy: receiptExisting.executionPolicy, nextPolicy: issueData.executionPolicy, actorAgentId, actorUserId });
         if ((patch.status ?? receiptExisting.status) === "done" &&
             (receiptExisting.status !== "done" || issueData.executionPolicy !== undefined)) {

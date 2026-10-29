@@ -463,6 +463,11 @@ Invariants:
 - accepting a fresh `request_confirmation` for the current issue's `plan` revision changes `work_mode = planning` to `work_mode = standard` in the same transaction as the accepted interaction; the existing agent-return transition also moves an eligible `in_review` issue to `todo` without changing its agent owner
 - while a restrictive review policy is stored, changing it requires an actor who is allowed by that row-locked policy
 - the transition into `in_review` and its requester activity record commit atomically, including transitions without an explicit review-interaction binding
+- a blocked cancellation containing only `status` and optional `comment` rejects stale
+  workflow inputs under the persistence row lock, including null policy/state and
+  assignment or monitor changes; its effective workflow target must remain cancelled
+- this cancellation guard preserves run-write authority and dependency readiness;
+  it does not change Stop sequencing or guarantee pre-commit Stop without a runner goal
 - terminal states: `done | cancelled`
 
 ## 7.7 `issue_comments`

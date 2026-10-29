@@ -335,6 +335,7 @@ import {
 } from "../services/company-search-rate-limit.js";
 import {
   applyIssueExecutionPolicyTransition,
+  executionPolicyTransitionInputFingerprint,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
@@ -13838,7 +13839,9 @@ export function issueRoutes(
 
   router.patch(
     "/issues/:id",
-    (req, _res, next) => {
+    (req, res, next) => {
+      res.locals.plainCancellationRequested = req.body?.status === "cancelled" &&
+        Object.keys(req.body).every(key => key === "status" || key === "comment");
       if (req.body?.expectedStatusVersion !== undefined && (
         req.body.status !== "todo" ||
         Object.keys(req.body).some(key => key !== "status" && key !== "expectedStatusVersion")
@@ -13928,6 +13931,7 @@ export function issueRoutes(
       const actor = getActorInfo(req);
       const isClosed = isClosedIssueStatus(existing.status);
       const isBlocked = existing.status === "blocked";
+      const plainBlockedCancellation = isBlocked && res.locals.plainCancellationRequested === true;
       const normalizedAssigneeAgentId =
         await normalizeIssueAssigneeAgentReference(
           existing.companyId,
@@ -14366,6 +14370,9 @@ export function issueRoutes(
         throw unprocessable("Snapshot-guarded policy updates cannot change task status or ownership");
       }
       Object.assign(updateFields, transition.patch);
+      if (plainBlockedCancellation && updateFields.status !== "cancelled") {
+        throw conflict("The execution workflow changed the requested cancellation");
+      }
 
       const nextStatus = updateFields.status ?? existing.status;
       if (updateFields.unblockDescriptor && nextStatus !== "blocked") {
@@ -14699,7 +14706,9 @@ export function issueRoutes(
       const issueUpdateData = {
         ...updateFields,
         workspaceSelectionActor: req.actor,
-        expectedExecutionPolicy,
+        expectedExecutionPolicy: plainBlockedCancellation ? existing.executionPolicy ?? null : expectedExecutionPolicy,
+        expectedExecutionPolicyTransition: plainBlockedCancellation
+          ? executionPolicyTransitionInputFingerprint(existing) : undefined,
         expectedStatusVersion,
         actorAgentId: actor.agentId ?? null,
         actorRunId: actor.agentId ? actor.runId : null,
