@@ -1,8 +1,3 @@
-# Helpers for server-typecheck-cache-measure.yml, sourced by its run steps,
-# which run with set +e: the helpers read exit codes themselves.
-# Expects SCENARIO, TSC_VERSION, CACHE_HIT, MATCHED_KEY, CACHE_DIR, HEAD_SHA
-# and RUN_URL in the environment.
-
 write_header() {
   {
     echo "## server typecheck cache: $SCENARIO"
@@ -16,14 +11,11 @@ write_header() {
   } >> "$GITHUB_STEP_SUMMARY"
 }
 
-# measure <phase> <command...>: runs the command in server/ under GNU time and
-# appends one evidence row. Returns the command's exit code.
 measure() {
   local phase="$1"; shift
   local log="$RUNNER_TEMP/$SCENARIO-$phase.log" code rss wall
   (cd server && /usr/bin/time -f '%M %e' -o "$RUNNER_TEMP/time.txt" "$@") > "$log" 2>&1
   code=$?
-  # GNU time prepends "Command exited with non-zero status N" on failure.
   read -r rss wall < <(tail -n 1 "$RUNNER_TEMP/time.txt") || { rss=0; wall=0; }
   local cmd="$*"
   cmd="${cmd//"$PWD/server/node_modules/.bin/"/}"
@@ -32,7 +24,6 @@ measure() {
   return "$code"
 }
 
-# Records why tsc -b considers the source project out of date.
 status_reason() {
   local out
   out="$(cd server && "$(pnpm bin)/tsc" -b tsconfig.src.json --verbose --dry 2>&1)"
@@ -47,7 +38,6 @@ status_reason() {
   } >> "$GITHUB_STEP_SUMMARY"
 }
 
-# The source and tests phases of the server's typecheck script, measured separately.
 measure_phases() {
   local tsc
   tsc="$(cd server && pnpm bin)/tsc"
@@ -67,7 +57,6 @@ show_edit() {
   } >> "$GITHUB_STEP_SUMMARY"
 }
 
-# append_line <file> <line>: appends one line to a file in the runner workspace only.
 append_line() {
   local before
   before="$(git diff --stat)"
@@ -75,8 +64,6 @@ append_line() {
   show_edit "$before"
 }
 
-# expect_failure <file>: the full typecheck command must exit non-zero and
-# report an error in <file> (relative to server/).
 expect_failure() {
   status_reason
   local log="$RUNNER_TEMP/$SCENARIO-typecheck.log"
@@ -86,7 +73,6 @@ expect_failure() {
     echo "PROBE FAILED: typecheck exited 0 with an injected type error" | tee -a "$GITHUB_STEP_SUMMARY" >&2
     return 1
   fi
-  # Accepts both "file(line,col): error" and "file:line:col - error".
   local file_re="${1//./\\.}"
   if ! sed 's/\x1b\[[0-9;]*m//g' "$log" \
       | grep -E "(^|[ /])$file_re(\([0-9]+,[0-9]+\)|:[0-9]+:[0-9]+).*error"; then

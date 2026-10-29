@@ -26,7 +26,6 @@ runs:
       with:
         version: 9.15.4
 
-    # Same fallback as pr-trusted.yml when the checked-in lockfile is stale.
     - name: Install dependencies
       shell: bash
       run: |
@@ -35,7 +34,6 @@ runs:
           pnpm install --frozen-lockfile
         fi
 
-    # The same preparation the server's typecheck script runs before tsc.
     - name: Prepare the server's build inputs
       shell: bash
       working-directory: server
@@ -43,9 +41,6 @@ runs:
         pnpm run prepare:runner-vendor
         pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
 
-    # The compiler version comes from the installed binary, not package.json,
-    # whose ^7.x range does not pin it. The config hash covers every tsconfig
-    # the source project extends; any change starts from a cold build.
     - name: Compute the cache prefix
       id: prefix
       shell: bash

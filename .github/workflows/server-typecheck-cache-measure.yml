@@ -1,13 +1,3 @@
-# Measures the server source project's tsc build cache on fresh runners: a
-# cold miss that writes a measurement entry, then an exact hit, partial hits
-# after one source edit, and probes that inject a type error after restoring,
-# which must fail. Measurement keys carry the run id, so production entries
-# (server-typecheck.yml) are never read or written here. Edits exist only in
-# the runner workspace and are never committed.
-# Runs on pull_request because workflow_dispatch only works once the file is
-# on develop; entries written here are scoped to the PR's merge ref.
-# Plan: doc/plans/2026-10-29-server-source-ci-cache.md.
-# Fork-only (phenix3443/paperclip).
 name: server-typecheck-cache-measure
 
 on:
@@ -28,7 +18,6 @@ permissions:
 env:
   CACHE_DIR: server/node_modules/.cache/typecheck
   CACHE_NAMESPACE: server-tsc-src-measure-v1-${{ github.run_id }}
-  # On pull_request runs github.sha is the test merge commit; both are recorded.
   HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
   RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
@@ -68,9 +57,6 @@ jobs:
           measure_phases || exit 1
           echo "Entry size: $(du -sb "$CACHE_DIR" | cut -f1) bytes, $(find "$CACHE_DIR" -type f | wc -l) files" | tee -a "$GITHUB_STEP_SUMMARY"
 
-      # The colocated tests are checked as fully as by the single-project
-      # tsconfig.json: its program is exactly the source project plus the
-      # tests project.
       - name: Check test coverage of the split
         working-directory: server
         run: |
@@ -125,7 +111,6 @@ jobs:
           key: ${{ needs.miss.outputs.cache-key }}
           fail-on-cache-miss: true
 
-      # Same aging as server-typecheck.yml.
       - name: Age the restored build state
         run: find "$CACHE_DIR" -exec touch -h -d '2000-01-01T00:00:00Z' {} +
 
@@ -143,21 +128,18 @@ jobs:
             hit)
               measure_phases || exit 1 ;;
             partial-body)
-              # A code change inside a function body: the declarations do not change.
               before="$(git diff --stat)"
               sed -i 's/PAPERCLIP_DISABLE_CWD_ENV_FILE !== "true"/PAPERCLIP_DISABLE_CWD_ENV_FILE !== "yes"/' server/src/env-file-policy.ts
               show_edit "$before"
               grep -q '!== "yes"' server/src/env-file-policy.ts || { echo "partial edit did not apply" >&2; exit 1; }
               measure_phases || exit 1 ;;
             partial-signature)
-              # One added export changes the file's declaration output.
               append_line server/src/sentry-run-failure-policy.ts 'export const __cacheProbeAdded = 1;'
               measure_phases || exit 1 ;;
             probe-direct)
               append_line server/src/env-file-policy.ts 'export const __cacheProbe: number = "x";'
               expect_failure src/env-file-policy.ts ;;
             probe-cross-file)
-              # A: the parameter type changes; B: the unchanged caller src/app.ts.
               before="$(git diff --stat)"
               sed -i 's/readBrandedStaticIndexHtml(uiDist: string)/readBrandedStaticIndexHtml(uiDist: number)/' server/src/static-index-html.ts
               show_edit "$before"
