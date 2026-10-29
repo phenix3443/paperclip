@@ -1,7 +1,7 @@
 import { settleNewReviewRunIdentity, settleReviewRunClaimIdentity } from "../run-identity.js";
 import type { IssueMonitorAdmission } from "./scheduling.js";
 import { parseIssueExecutionState } from "../issue-execution-policy.js";
-import { hasPendingReviewerAssignment, admitReviewerIntent, consumeReviewerIntent, adoptReviewerAssignmentIntents, reconcileReviewerAssignments, reviewerAssignmentGeneration } from "./reviewer-assignment-continuation.js";
+import { hasReleasedReviewerAssignment, admitReviewerIntent, consumeReviewerIntent, adoptReviewerAssignmentIntents, reconcileReviewerAssignments, reviewerAssignmentGeneration } from "./reviewer-assignment-continuation.js";
 import { hasReviewerAssignmentContinuation, ordinaryWakeRequestPredicate, ordinaryWakeRunPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { isAdmittedReconciliation, isGuardedReconciliationDelivery, lockReconciledDeliveryPrefix, recordReconciledDeliveryOutcome, revalidateReconciledDelivery } from "../execution-reconciliation-delivery.js";
 import { assertTaskRetryConversationAllowed, readTaskRetryIntent, readTaskRetryBoardMessageOrigin, retireSupersededTaskRetry, taskRetryMutationAllowed } from "../task-retry.js";
@@ -2941,7 +2941,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           if (!reviewerIntent && enrichedContextSnapshot.source === "issue.execution_stage" && !wakeCommentId) {
             const [pendingReviewIssue] = await tx.select().from(issues).where(and(eq(issues.companyId, agent.companyId), eq(issues.id, issueId!)));
             if (pendingReviewIssue && source === "assignment" && reason === "execution_review_requested" &&
-                await hasPendingReviewerAssignment(tx, pendingReviewIssue) &&
+                await hasReleasedReviewerAssignment(tx, pendingReviewIssue) &&
                 !await getExecutionBlocker(tx as unknown as Db, agent.companyId, issueId!)) return { kind: "deferred" as const };
           }
 

@@ -79,6 +79,41 @@ const support = await getEmbeddedPostgresTestSupport();
     await service.drainActiveRunExecutions();
   });
 
+  it.each(["recorded release", "stop proof without marker", "historical success", "cancelled before dispatch"])(
+    "delivers an unblocked Board handoff once from a source with %s", async shape => {
+      const f = await seedReviewerIntent(db, false, undefined, shape === "recorded release");
+      if (shape === "historical success") await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "succeeded",
+        errorCode: null, startedAt: new Date(Date.now() - 1000), resultJson: null }).where(eq(heartbeatRuns.id, f.source.id));
+      if (shape === "cancelled before dispatch") await db.update(heartbeatRuns).set({ resultJson: null })
+        .where(eq(heartbeatRuns.id, f.source.id));
+      await db.update(issues).set({ status: "in_progress", assigneeAgentId: f.source.agentId, executionState: null })
+        .where(eq(issues.id, f.issueId));
+      await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+      const after = await issueService(db).update(f.issueId, { status: "in_review", assigneeAgentId: f.agentId,
+        executionState: f.issue.executionState, actorUserId: "board", executionHandoffRunId: f.source.id });
+      const service = heartbeatService(db), { c, start } = coordinator(service);
+      const wake = () => service.wakeup(f.agentId, { source: "assignment", reason: "execution_review_requested",
+        triggerDetail: "system", requestedByActorType: "user", requestedByActorId: "board", payload: { issueId: f.issueId },
+        contextSnapshot: { issueId: f.issueId, source: "issue.execution_stage" } });
+      try {
+        await wake();
+        await start();
+        await wake();
+        await service.reconcileReviewerAssignments();
+        const runs = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.agentId, f.agentId),
+          sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${f.issueId}`));
+        expect(runs).toHaveLength(1);
+        expect(await receipts(f)).toMatchObject([{ status: "coalesced", runId: runs[0].id, error: null }]);
+        expect(await executionControlSchedule(db).continuation()).toBeNull();
+        const current = await issueService(db).getById(f.issueId);
+        expect(current?.executionState).toEqual(after?.executionState);
+        expect(current?.executionPolicy).toEqual(after?.executionPolicy);
+        expect(current?.responsibleUserId).toBe("board");
+        const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.source.id));
+        if (shape !== "recorded release") expect(source.resultJson?.executionReleased).toBeUndefined();
+      } finally { await c.stop(); await service.drainActiveRunExecutions(); }
+    });
+
   it("actual cross-agent executor cleanup wakes the original reviewer exactly once", async () => {
     const f = await seed();
     await db.update(agents).set({ adapterConfig: { command: process.execPath, args: ["-e", "setInterval(()=>{},1000)"] } })

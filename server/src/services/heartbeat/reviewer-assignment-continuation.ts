@@ -113,11 +113,16 @@ export async function produceReviewerAssignmentTransition(tx: IntentDb, before: 
     requestedByActorType: input.actorType, requestedByActorId: input.actorId });
 }
 
-export async function hasPendingReviewerAssignment(tx: IntentDb, task: typeof issues.$inferSelect) {
-  const [row] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(unfinished(),
+export async function hasReleasedReviewerAssignment(tx: IntentDb, task: typeof issues.$inferSelect) {
+  const [row] = await tx.select().from(agentWakeupRequests).where(and(unfinished(),
     eq(agentWakeupRequests.companyId, task.companyId), sql`${agentWakeupRequests.payload}->>'issueId' = ${task.id}`,
     sql`${agentWakeupRequests.payload}->${KEY}->'immutable'->>'generation' = ${reviewerAssignmentGeneration(task)}`)).limit(1);
-  return Boolean(row);
+  const intent = row && readIntent(row);
+  if (!intent) return false;
+  const [source] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, task.companyId),
+    eq(heartbeatRuns.id, intent.immutable.sourceRunId)));
+  return Boolean(source && sourceMatches(source, task, intent.immutable.sourceAgentId) &&
+    await hasRecordedRunExecutionRelease(tx as Db, source, task.id));
 }
 
 function unfinished() {
