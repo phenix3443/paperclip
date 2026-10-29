@@ -64,7 +64,8 @@ jobs:
           } >> "$summary"
           measure() {
             name="$1"; shift
-            rm -rf node_modules/.cache/typecheck
+            # A variant named *-warm reuses the previous variant's project build output.
+            case "$name" in *-warm) ;; *) rm -rf node_modules/.cache/typecheck ;; esac
             /usr/bin/time -f '%M %e' -o "$RUNNER_TEMP/time.txt" "$@" > "$RUNNER_TEMP/$name.log" 2>&1
             code=$?
             # GNU time prepends "Command exited with non-zero status N" on failure.
@@ -81,3 +82,7 @@ jobs:
           measure source-only "$tsc" -p tsconfig.build.json --noEmit --checkers 2
           measure split-build "$tsc" -b tsconfig.tests.json
           measure split-build-checkers-2 "$tsc" -b tsconfig.tests.json --checkers 2
+          measure split-build-checkers-1 "$tsc" -b tsconfig.tests.json --checkers 1
+          # The two phases on their own: the source project, then the test project against its output.
+          measure split-src-checkers-2 "$tsc" -b tsconfig.src.json --checkers 2
+          measure split-tests-checkers-2-warm "$tsc" -b tsconfig.tests.json --checkers 2
