@@ -73,6 +73,18 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(callback).not.toHaveBeenCalled();
   });
 
+  it("drops empty bookkeeping when a nested callback rollback aborts its parent", async () => {
+    const callback = vi.fn();
+    await expect(db.transaction(async tx => {
+      await tx.transaction(async nested => {
+        await workSignals.afterDatabaseCommit(nested, "commit-test", callback);
+        throw new Error("nested abort propagates");
+      });
+    })).rejects.toThrow("nested abort propagates");
+    expect(callback).not.toHaveBeenCalled();
+    expect(databaseWorkPending(db)).toBe(false);
+  });
+
   it("coalesces scoped hints and publishes them only when the outer transaction settles", async () => {
     const settled: string[][] = [];
     const unsubscribe = subscribeDatabaseWork(db, "scoped", (event, hints) => {

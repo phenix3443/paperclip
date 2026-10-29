@@ -48,7 +48,7 @@ function install(connection: Connection, context: Context) {
       if (!context.transaction) {
         // An XID is known before the first opted-in write can execute. If
         // acquisition itself failed there cannot be a corresponding write.
-        if (state.xid) state.uncertain = true;
+        if (state.xid && (state.topics.size || state.callbacks.length)) state.uncertain = true;
         else context.scope.transactions.delete(state);
         for (const { recoveryTopic } of state.callbacks) {
           if (state.topics.has(recoveryTopic)) continue;
