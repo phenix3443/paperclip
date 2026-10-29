@@ -31,7 +31,7 @@ assert.ok(!manifest.files.some((file) => file.includes("issue-blocked-cancellati
 const observationPatch = readFileSync(join(control, "observation.patch"));
 const original = "server/src/__tests__/attention-service.test.ts";
 assert.equal(git("rev-parse", `${manifest.base}:${original}`), git("rev-parse", `${manifest.candidate}:${original}`));
-git("apply", "--check", join(control, "observation.patch"));
+git("apply", "--unidiff-zero", "--check", join(control, "observation.patch"));
 if (validateOnly) {
   console.log(JSON.stringify({ target, files: 103, manifestSha256: hash(readFileSync(join(control, "manifest.json"))), patchSha256: hash(observationPatch) }));
   process.exit(0);
@@ -65,7 +65,7 @@ metadata.postgresDriver = versionOf("postgres", join(source, "packages/db"));
 metadata.pnpm = spawnSync("pnpm", ["--version"], { cwd: source, encoding: "utf8" }).stdout.trim();
 assert.equal(metadata.pnpm, "9.15.4");
 writeFileSync(join(evidence, "environment.json"), JSON.stringify(metadata, null, 2));
-git("apply", join(control, "observation.patch"));
+git("apply", "--unidiff-zero", join(control, "observation.patch"));
 const observerPath = join(source, ".ci-diagnostics/attention-control");
 mkdirSync(observerPath, { recursive: true });
 writeFileSync(join(observerPath, "observe-cleanup.mjs"), readFileSync(join(control, "observe-cleanup.mjs")));
