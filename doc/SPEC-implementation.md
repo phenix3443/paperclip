@@ -751,6 +751,15 @@ Side effects:
 - entering `done` sets `completed_at`
 - entering `cancelled` sets `cancelled_at`
 
+An authorized explicit `blocked -> cancelled` PATCH containing only `status` and
+an optional plain `comment` bypasses dependency readiness alone. Extra submitted
+fields, including no-op controls, retain the ordinary gates. The request keeps
+all mutation, low-trust, pause, recovery and review checks. Any required active
+run must be confirmed cancelled before the task update, including without a
+runner goal. A failed or unconfirmed Stop prevents cancellation and its success
+comment/audit. A later guarded database rejection can leave a stopped run with an
+uncancelled task; it returns failure. Dependencies and review history remain.
+
 V1 non-terminal liveness rule:
 
 - agent-owned `todo`, `in_progress`, `in_review`, and `blocked` issues must have a live execution path, an explicit waiting path, or an explicit recovery path

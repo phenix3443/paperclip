@@ -150,6 +150,13 @@ creating another wake. The [monitor regression](../../server/src/services/native
 and [scheduler regression](../../server/src/services/heartbeat/scheduling.test.ts)
 cover these boundaries with PostgreSQL.
 
+API regression: An authorized manager can cancel a blocked synthetic task with
+unfinished dependencies using only status and optional comment. Verify retained
+assignment, dependencies and review history. Required active-run Stop must finish
+before cancellation; failed Stop or a later policy conflict returns failure.
+The [persistence/process fixture](../../server/src/__tests__/issue-blocked-cancellation-persistence.test.ts)
+exercises this boundary locally. No deployed task cancellation is claimed.
+
 Manual: Add an ordinary Board comment while a task retry is queued or running.
 Confirm that the same execution keeps working and receives the saved message,
 without a second executor or an implicit move to Todo. Repeat with a parked retry
