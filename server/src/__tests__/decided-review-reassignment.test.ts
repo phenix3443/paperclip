@@ -886,14 +886,71 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     ));
   }
 
+  async function parkedCommentReceipts(f: Fixture, commentId: string) {
+    return db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
+      eq(agentWakeupRequests.agentId, f.reviewerId), eq(agentWakeupRequests.reason, "issue_commented"),
+      sql`${agentWakeupRequests.payload}->>'issueId' = ${f.issueId}`,
+      sql`${agentWakeupRequests.payload}->>'commentId' = ${commentId}`));
+  }
+
+  it("does not mistake an intent for the parked comment before its transaction commits", async () => {
+    const b = await heldBase();
+    const key = 1652789;
+    const gate = await db.$client.reserve();
+    let unlocked = false;
+    let commentId: string | undefined;
+    const unlock = async () => {
+      if (!unlocked) { await gate`select pg_advisory_unlock(${key})`; unlocked = true; }
+    };
+    await gate`select pg_advisory_lock(${key})`;
+    try {
+      await db.execute(sql.raw(`CREATE FUNCTION test_park_comment() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN PERFORM pg_advisory_xact_lock(${key}); RETURN NEW; END $$`));
+      await db.execute(sql.raw(`CREATE TRIGGER test_park_comment BEFORE INSERT ON agent_wakeup_requests
+        FOR EACH ROW WHEN (NEW.company_id = '${b.f.companyId}'::uuid AND NEW.agent_id = '${b.f.reviewerId}'::uuid
+          AND NEW.reason = 'issue_commented' AND NEW.payload->>'issueId' = '${b.f.issueId}')
+        EXECUTE FUNCTION test_park_comment()`));
+      const comment = await request(app({ type: "agent", source: "agent_key", companyId: b.f.companyId,
+        agentId: b.f.authorId, runId: b.authorRunId })).post(`/api/issues/${b.f.issueId}/comments`)
+        .send({ body: "Wait for this exact comment receipt." });
+      expect(comment.status, JSON.stringify(comment.body)).toBe(201);
+      commentId = comment.body.id;
+      await waitFor(async () => (await db.execute(sql`select 1 from pg_locks where locktype = 'advisory'
+        and objid = ${key} and not granted`)).length === 1, 5_000, "comment insert at the barrier");
+      const visible = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, b.f.reviewerId));
+      const intent = visible.find(row => Object.hasOwn(row.payload ?? {}, "_paperclipReviewerAssignmentContinuation"));
+      expect(intent).toMatchObject({ status: "deferred_issue_execution" });
+      expect(visible.filter(row => row.status === "deferred_issue_execution").map(row => row.id)).toContain(intent!.id);
+      const ready = (await parkedCommentReceipts(b.f, commentId!)).filter(row => row.status === "deferred_issue_execution");
+      expect(ready).toHaveLength(0);
+      await unlock();
+      await waitFor(async () => (await parkedCommentReceipts(b.f, commentId!)).length === 1, 5_000, "the exact comment commit");
+      const [parked] = await parkedCommentReceipts(b.f, commentId!);
+      expect(parked).toMatchObject({ companyId: b.f.companyId, agentId: b.f.reviewerId, reason: "issue_commented",
+        status: "deferred_issue_execution", payload: { issueId: b.f.issueId, commentId } });
+      await b.releaseLease();
+    } finally {
+      try {
+        await unlock();
+        if (commentId) await waitFor(async () => (await db.select().from(agentWakeupRequests).where(and(
+          eq(agentWakeupRequests.agentId, b.f.reviewerId), eq(agentWakeupRequests.reason, "issue_commented"),
+          sql`${agentWakeupRequests.payload}->>'commentId' = ${commentId}`))).length === 1, 5_000, "comment admission to settle");
+      } finally {
+        try {
+          await db.execute(sql`DROP TRIGGER IF EXISTS test_park_comment ON ${agentWakeupRequests}`);
+          await db.execute(sql`DROP FUNCTION IF EXISTS test_park_comment()`);
+        } finally { gate.release(); }
+      }
+    }
+  }, 60_000);
+
   it("admits one successor when every entry path races, folding a parked comment into it", async () => {
     const b = await heldBase();
     const comment = await request(app({ type: "agent", source: "agent_key", companyId: b.f.companyId, agentId: b.f.authorId, runId: b.authorRunId }))
       .post(`/api/issues/${b.f.issueId}/comments`).send({ body: "One more note for the reviewer." });
     expect(comment.status, JSON.stringify(comment.body)).toBe(201);
-    await waitFor(async () => (await db.select().from(agentWakeupRequests).where(and(
-      eq(agentWakeupRequests.agentId, b.f.reviewerId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
-    ))).length === 1, 5_000, "the parked comment wake");
+    await waitFor(async () => (await parkedCommentReceipts(b.f, comment.body.id))
+      .filter(row => row.status === "deferred_issue_execution").length === 1, 5_000, "the parked comment wake");
     await b.releaseLease();
     const w2 = await authorReviewRequest(b.f);
     await Promise.all([heartbeat.wakeup(b.f.reviewerId, w2), heartbeat.resumeQueuedRuns(), scan(), scan(), pass(), pass()]);
@@ -905,9 +962,7 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
     expect((await db.select().from(activityLog).where(and(eq(activityLog.entityId, b.f.issueId),
       eq(activityLog.action, "issue.execution_recovery_settled"),
       sql`${activityLog.details}->>'continuation' = 'decided_review_reassignment'`)))).toHaveLength(1);
-    const [parked] = await db.select().from(agentWakeupRequests).where(and(
-      eq(agentWakeupRequests.agentId, b.f.reviewerId), eq(agentWakeupRequests.reason, "issue_commented"),
-    ));
+    const [parked] = await parkedCommentReceipts(b.f, comment.body.id);
     expect(parked).toMatchObject({ status: "coalesced", runId: successor.id });
     expect(successor.contextSnapshot?.wakeCommentIds).toContain(comment.body.id);
   }, 60_000);
