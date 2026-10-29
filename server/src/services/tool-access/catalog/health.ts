@@ -1,9 +1,12 @@
+import { writeToolConnectionHealthChange } from "../../tool-connection-health-notifications.js";
+import { connectionActorUserId } from "../actor.js";
 import { assertSupportedConnection } from "../connections/setup-policy.js";
 import { connectionSetupUrl, connectionReconnectUrl } from "../identifiers.js";
 import { createGitHubGrantContinuity } from "../github-grant-continuity.js";
 import { createToolRuntimeSlots } from "../runtime/slots.js";
 import type { ActorInfo } from "../types.js";
-import { isDaytonaConnection } from "../../daytona.js";
+import { nativeProviderCatalogFor } from "../../native-provider-catalogs.js";
+import { restConnectorFor } from "../../connectors/rest-registry.js";
 import { retainMcpConnectionFailure } from "../../mcp-connection-failure.js";
 import { isBrowserUseConnection } from "../../browser-use-client.js";
 import { and, asc, eq, isNull, lte, ne, or, sql } from "drizzle-orm";
@@ -45,7 +48,7 @@ export function createConnectionHealth(db: Db, { now, audit, getConnectionRow, d
     message: string | null,
   ) {
     const now = new Date();
-    const [updated] = await db
+    const [updated] = await writeToolConnectionHealthChange(db, connection, tx => tx
       .update(toolConnections)
       .set({
         healthStatus: status,
@@ -56,7 +59,7 @@ export function createConnectionHealth(db: Db, { now, audit, getConnectionRow, d
         updatedAt: now,
       })
       .where(eq(toolConnections.id, connection.id))
-      .returning();
+      .returning());
     if (connection.transport === "local_stdio") {
       await db
         .update(toolRuntimeSlots)
@@ -99,16 +102,16 @@ export function createConnectionHealth(db: Db, { now, audit, getConnectionRow, d
             ),
           );
         const actorGrant =
-          actor?.actorType === "user"
+          connectionActorUserId(actor)
             ? activeGrants.find(
                 (grant) =>
                   grant.kind === "user" &&
-                  grant.subjectUserId === actor.actorId,
+                  grant.subjectUserId === connectionActorUserId(actor),
               )
             : null;
         const grantsToCheck =
           connection.credentialPolicy === "per_user" &&
-          actor?.actorType === "user"
+          Boolean(connectionActorUserId(actor))
             ? actorGrant
               ? [actorGrant]
               : []
@@ -121,7 +124,7 @@ export function createConnectionHealth(db: Db, { now, audit, getConnectionRow, d
           });
         for (const grant of grantsToCheck)
           await refreshManagedGitHubGrantAccess(connection, grant, actor);
-      } else if (isBrowserUseConnection(connection) || isDaytonaConnection(connection)) {
+      } else if (isBrowserUseConnection(connection) || nativeProviderCatalogFor(connection) || restConnectorFor(connection)) {
         await discoverTools(connection, undefined, actor);
       } else if (isAgentMailConnection(connection)) {
         await validateAgentMailConnection(connection);
@@ -131,8 +134,8 @@ export function createConnectionHealth(db: Db, { now, audit, getConnectionRow, d
           connection.status === "draft" &&
           connection.authKind === "none" &&
           connection.credentialPolicy === "per_user" &&
-          actor?.actorType === "user" &&
-          actor.actorId === connection.createdByUserId;
+          Boolean(connectionActorUserId(actor)) &&
+          connectionActorUserId(actor) === connection.createdByUserId;
         const credentialHeaders =
           connection.credentialSource === "vercel_connect"
             ? await resolveCredentialHeaders(connection, actor, {
@@ -157,8 +160,10 @@ export function createConnectionHealth(db: Db, { now, audit, getConnectionRow, d
           : config.sourceTemplateKey === "github" &&
           oauth.connectorProfile === "github.code"
           ? "GitHub account, installation, and repository access are available."
-          : isDaytonaConnection(connection)
-            ? "Daytona API access is connected."
+          : restConnectorFor(connection)
+            ? `${restConnectorFor(connection)!.name} API access is connected.`
+          : nativeProviderCatalogFor(connection)
+            ? `${nativeProviderCatalogFor(connection)!.name} API access is connected.`
           : isBrowserUseConnection(connection)
             ? "Browser Use API key is connected."
           : isAgentMailConnection(connection)
@@ -202,12 +207,22 @@ export function createConnectionHealth(db: Db, { now, audit, getConnectionRow, d
         actor,
         details: { status: failure.status, transport: connection.transport },
       });
+      // Keep GitHub's recovery links so Refresh access can point at the exact
+      // installation page, such as the one with the Unsuspend button.
+      const githubRecovery =
+        failure.code === "github_installation_required" && error instanceof HttpError
+          ? {
+              installationUrl: asRecord(error.details).installationUrl,
+              managementUrl: asRecord(error.details).managementUrl,
+            }
+          : {};
       throw retainMcpConnectionFailure(error, new HttpError(healthFailureHttpStatus(failure), failure.message, {
         code: failure.code,
         connection: toConnection(updated),
         runtimeSlot,
         setupUrl: connectionSetupUrl(connection),
         reconnectUrl: connectionReconnectUrl(connection),
+        ...githubRecovery,
       }));
     }
   }

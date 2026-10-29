@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { createHash } from "node:crypto";
 import { and, eq, inArray, ne, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -29,6 +30,17 @@ type DispositionRepairIssue = Pick<
   | "executionState"
   | "monitorNextCheckAt"
 >;
+
+export const dispositionRepairIssueFields = {
+  id: issues.id,
+  companyId: issues.companyId,
+  status: issues.status,
+  assigneeAgentId: issues.assigneeAgentId,
+  assigneeUserId: issues.assigneeUserId,
+  executionPolicy: issues.executionPolicy,
+  executionState: issues.executionState,
+  monitorNextCheckAt: issues.monitorNextCheckAt,
+};
 
 export type DispositionRepairSourceState = {
   fingerprint: string;
@@ -178,7 +190,7 @@ export async function collectDispositionRepairSourceState(
         .from(agentWakeupRequests)
         .where(
           and(
-            eq(agentWakeupRequests.companyId, issue.companyId),
+            ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, issue.companyId),
             inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
             sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
             input.excludeWakeupRequestId

@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { connectionIntentService } from "./connection-intents.js";
 import { connectionContinuationPendingResponse, findSatisfiedToolConnection, satisfiedConnectionIntentService } from "./satisfied-connection-intents.js";
 import { isAiConnectionConfigurationFailure } from "./ai-auth-failure.js";
@@ -165,7 +166,8 @@ export function connectionIntentDeliveryService(db: Db, heartbeat: Pick<Heartbea
           eq(issueThreadInteractions.id, interactionId), eq(issueThreadInteractions.companyId, claimed.companyId),
           eq(issueThreadInteractions.issueId, loaded.issue.id))).for("update");
         if (!task || !card || card.status !== "expired" || card.result?.outcome !== "expired") return null;
-        const ready = await findSatisfiedToolConnection(tx as unknown as Db, task, { ...card, status: "pending" });
+        const ready = await findSatisfiedToolConnection(tx as unknown as Db, task, { ...card, status: "pending" }, undefined,
+          (card.result as { connectionId: string }).connectionId);
         if (!ready) return null;
         if (ready.id !== (card.result as { connectionId: string }).connectionId) {
           const previousConnectionId = (card.result as { connectionId: string }).connectionId;
@@ -194,7 +196,7 @@ export function connectionIntentDeliveryService(db: Db, heartbeat: Pick<Heartbea
     }
     if (!["in_progress", "in_review"].includes(loaded.issue.status)) return;
     const durableWake = () => db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
-      eq(agentWakeupRequests.companyId, claimed.companyId),
+      ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, claimed.companyId),
       eq(agentWakeupRequests.idempotencyKey, `connection-intent:${interactionId}:${interaction.status}`),
       notInArray(agentWakeupRequests.status, ["skipped", "failed", "cancelled"]),
     )).limit(1);

@@ -1,3 +1,4 @@
+import { notifyChatConnectionHealth } from "../connection-health-notifications.js";
 import { isOutboundAttachmentHydrationError, isOutboundAttachmentValidationError } from "../outbound-attachments.js";
 
 import type { EndpointRow, DbTransaction, LifecycleRuntimeFence } from "../runtime-types.js";
@@ -197,6 +198,7 @@ export function createChatPublicationFailures(db: Db, options: PublicationFailur
             updatedAt: new Date(),
           })
           .where(eq(chatEndpoints.id, currentEndpoint.id));
+        await notifyChatConnectionHealth(tx, currentEndpoint);
         await tx
           .update(toolConnections)
           .set({

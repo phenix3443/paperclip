@@ -15,6 +15,7 @@ const mockIssueService = vi.hoisted(() => ({
   getRelationSummaries: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
+  getDependencyReadiness: vi.fn(async () => ({ unresolvedBlockerCount: 0, blockerIssueIds: [] })),
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({
@@ -1029,6 +1030,128 @@ describe("issue execution policy routes", () => {
     expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
   });
 
+  describe.each([1, 2])("board status holds with changesRequestedCount %i", (count) => {
+    function heldReviewIssue(status: string) {
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [
+          {
+            id: "11111111-1111-4111-8111-111111111111",
+            type: "review",
+            participants: [{ type: "agent", agentId: "33333333-3333-4333-8333-333333333333" }],
+          },
+        ],
+      })!;
+      return {
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        companyId: "company-1",
+        status,
+        assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+        assigneeUserId: null,
+        createdByUserId: "local-board",
+        identifier: "PAP-1010",
+        title: "Held review",
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: "11111111-1111-4111-8111-111111111111",
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: "33333333-3333-4333-8333-333333333333" },
+          returnAssignee: { type: "agent", agentId: "44444444-4444-4444-8444-444444444444" },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: "changes_requested",
+          changesRequestedCount: count,
+        },
+      };
+    }
+
+    it("keeps the pending review state when a board user blocks the review", async () => {
+      const defaultWhere = mockDbSelectWhere.getMockImplementation()!;
+      const emptyRows = { then: (onFulfilled: (rows: unknown[]) => unknown) => Promise.resolve([]).then(onFulfilled) };
+      const where = (...args: unknown[]) => ({ ...(defaultWhere as (...a: unknown[]) => object)(...args), limit: () => emptyRows });
+      mockDbSelectFrom.mockImplementation(() => ({ where, innerJoin: () => ({ where }) }) as never);
+      const issue = heldReviewIssue("in_review");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ status: "blocked", unblockDescriptor: { owner: "board", action: "Restore the reviewer" } });
+
+      expect(res.status).toBe(200);
+      const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      expect(updatePatch.status).toBe("blocked");
+      expect(updatePatch).not.toHaveProperty("executionState");
+      expect(updatePatch.assigneeAgentId).toBeUndefined();
+    });
+
+    it("wakes the saved reviewer when the board restores the held review", async () => {
+      const issue = heldReviewIssue("blocked");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ status: "in_review" });
+
+      expect(res.status).toBe(200);
+      await vi.waitFor(() =>
+        expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+          "33333333-3333-4333-8333-333333333333",
+          expect.objectContaining({
+            reason: "execution_review_requested",
+            payload: expect.objectContaining({
+              issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+              executionStage: expect.objectContaining({ wakeRole: "reviewer" }),
+            }),
+          }),
+        ),
+      );
+    });
+
+    it("does not wake the reviewer on an unrelated edit to the held review", async () => {
+      const issue = heldReviewIssue("blocked");
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+
+      const res = await request(await createApp())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ title: "Held review, renamed" });
+
+      expect(res.status).toBe(200);
+      const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      expect(updatePatch).not.toHaveProperty("status");
+      expect(updatePatch).not.toHaveProperty("executionState");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+
+    it.each(["todo", "in_progress"])("rejects a board %s that would dissolve the held review", async (status) => {
+      const issue = heldReviewIssue("blocked");
+      mockIssueService.getById.mockResolvedValue(issue);
+
+      const res = await request(await createApp())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ status });
+
+      expect(res.status).toBe(422);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+  });
+
   it("keeps the review stage pending when a board user reassigns to an eligible participant", async () => {
     const policy = normalizeIssueExecutionPolicy({
       stages: [
@@ -1088,6 +1211,124 @@ describe("issue execution policy routes", () => {
       returnAssignee: { type: "agent", agentId: "44444444-4444-4444-8444-444444444444" },
     });
     expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+  });
+
+  describe("explicit executor reassignment during changes requested", () => {
+    const reviewerAgentId = "33333333-3333-4333-8333-333333333333";
+    const originalExecutorId = "44444444-4444-4444-8444-444444444444";
+    const currentAssigneeId = "66666666-6666-4666-8666-666666666666";
+    const replacementExecutorId = "77777777-7777-4777-8777-777777777777";
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [
+        {
+          id: "11111111-1111-4111-8111-111111111111",
+          type: "review",
+          participants: [{ type: "agent", agentId: reviewerAgentId }],
+        },
+      ],
+    })!;
+    const changesRequestedState = {
+      status: "changes_requested",
+      currentStageId: "11111111-1111-4111-8111-111111111111",
+      currentStageIndex: 0,
+      currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: reviewerAgentId, userId: null },
+      returnAssignee: { type: "agent", agentId: originalExecutorId, userId: null },
+      reviewRequest: null,
+      completedStageIds: [],
+      lastDecisionId: "88888888-8888-4888-8888-888888888888",
+      lastDecisionOutcome: "changes_requested",
+      monitor: null,
+      changesRequestedCount: 2,
+    };
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "blocked",
+      assigneeAgentId: currentAssigneeId,
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      responsibleUserId: "local-board",
+      executionRunId: "99999999-9999-4999-8999-999999999999",
+      identifier: "PAP-1011",
+      title: "Reassigned rework",
+      executionPolicy: policy,
+      executionState: changesRequestedState,
+    };
+
+    beforeEach(() => {
+      mockIssueService.getById.mockResolvedValue(issue);
+      mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+        ...issue,
+        ...patch,
+        updatedAt: new Date(),
+      }));
+    });
+
+    it("rebinds the stored return executor in the authorized assignment update", async () => {
+      const res = await request(await createApp())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ assigneeAgentId: replacementExecutorId });
+
+      expect(res.status).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalledTimes(1);
+      const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+      expect(updatePatch.assigneeAgentId).toBe(replacementExecutorId);
+      expect(updatePatch.status).toBeUndefined();
+      expect(updatePatch.executionPolicy).toBeUndefined();
+      expect(updatePatch.executionState).toEqual({
+        ...changesRequestedState,
+        returnAssignee: { type: "agent", agentId: replacementExecutorId, userId: null },
+      });
+    });
+
+    it("rejects an agent without assignment permission before changing the return executor", async () => {
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: reviewerAgentId,
+        companyId: "company-1",
+        runId: "55555555-5555-4555-8555-555555555555",
+      }))
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ assigneeAgentId: replacementExecutorId });
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toContain("tasks:assign");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("rejects a cross-company actor before changing the return executor", async () => {
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: replacementExecutorId,
+        companyId: "company-2",
+        runId: null,
+      }))
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ assigneeAgentId: replacementExecutorId });
+
+      expect(res.status).toBe(404);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("keeps the return executor when the active run cannot be stopped for reassignment", async () => {
+      mockHeartbeatService.getRun.mockResolvedValueOnce({
+        id: issue.executionRunId,
+        status: "running",
+        agentId: currentAssigneeId,
+        companyId: "company-1",
+        contextSnapshot: { issueId: issue.id },
+      } as never);
+      mockHeartbeatService.cancelRun.mockResolvedValueOnce(null);
+
+      const res = await request(await createApp())
+        .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        .send({ assigneeAgentId: replacementExecutorId });
+
+      expect(res.status).toBe(409);
+      expect(res.body.details?.code ?? res.body.code).toBe("runner_goal_reassignment_stop_unconfirmed");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
   });
 
   it("dissolves the review when a board user reassigns an in_review task to a non-participant", async () => {

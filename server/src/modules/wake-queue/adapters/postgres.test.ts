@@ -1,6 +1,8 @@
 import { instanceSettingsService } from "../../../services/instance-settings.js";
-import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { randomBytes, randomUUID } from "node:crypto";
+import { eq, sql } from "drizzle-orm";
+import { lockAdmissionRows } from "../../../services/execution-reconciliation-admission.js";
+import { hasReviewerAssignmentContinuation, ordinaryWakeRequestPredicate, ordinaryWakeRequestSql } from "../receipt-namespace.js";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { Db } from "@paperclipai/db";
 import {
@@ -176,6 +178,154 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     });
     return id;
   }
+
+  function recordReleaseRunReads() {
+    const rows: unknown[][] = [];
+    function recordSelects<T extends Pick<Db, "select">>(executor: T): T {
+      return new Proxy(executor, { get(target, key) {
+        if (key !== "select") return Reflect.get(target, key);
+        return (...fields: Parameters<Db["select"]>) => {
+          const builder = target.select(...fields), from = builder.from.bind(builder);
+          builder.from = ((...args: Parameters<typeof from>) => {
+            const query = from(...args);
+            if (args[0] === heartbeatRuns) {
+              const execute = query.execute.bind(query);
+              query.execute = async (...executeArgs: Parameters<typeof execute>) => {
+                const result = await execute(...executeArgs); rows.push(result); return result;
+              };
+            }
+            return query;
+          }) as typeof builder.from;
+          return builder;
+        };
+      }});
+    }
+    const transaction: Db["transaction"] = (callback, config) =>
+      db.transaction(tx => callback(recordSelects(tx)), config);
+    const recorded = new Proxy(db, { get(target, key) {
+      return key === "transaction" ? transaction : Reflect.get(target, key);
+    }});
+    return { recorded, rows };
+  }
+
+  it.each(["legacy", "native"])("keeps %s in-flight work and every recovery receipt while omitting output from release reads", async runtimeMode => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent({ companyId });
+    const issueId = await seedIssue({ companyId, assigneeAgentId: agentId });
+    const runId = await seedRun({ companyId, agentId, status: "running", contextSnapshot: { issueId } });
+    const wakeId = await seedDeferredWake({ companyId, agentId, issueId });
+    const payload = randomBytes(512 * 1024).toString("base64");
+    const evidence = { cancellation: { source: "queued_message", expected: true, initiator: { type: "system" }, reason: "Fixture", recordedAt: "2020-01-01T00:00:00Z" },
+      workspaceRestoreFailure: "restore_unsafe_archive", workspaceRestoreRecovery: { schema: "paperclip.workspace-restore-recovery.v1", leaseIds: [randomUUID()] },
+      nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId, companyId, issueId },
+      executionCancellation: { state: "acknowledged" }, executionRecovery: { kind: "interrupted", providerStopped: true },
+      configurationIncomplete: { reason: "workspace_unavailable" }, unknownFutureReceipt: { retained: true } };
+    await db.update(heartbeatRuns).set({ runtimeMode,
+      ...(runtimeMode === "native" ? { runnerProfileJson: { savedInput: payload }, stdoutExcerpt: payload, stderrExcerpt: payload,
+        contextSnapshot: { issueId, paperclipWake: { savedTask: payload }, paperclipTaskMarkdown: payload } } : {}),
+      resultJson: { ...evidence, stdout: payload.repeat(3), stderr: payload } }).where(eq(heartbeatRuns.id, runId));
+    await db.update(issues).set({ executionRunId: runId, checkoutRunId: runId }).where(eq(issues.id, issueId));
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+    const { recorded, rows } = recordReleaseRunReads();
+    const result = await createPostgresWakeQueueAdapter(recorded, stubDeps).withIssueExecutionLock(
+      { companyId, runId, now: new Date(), resumeStrandedQueue: true },
+      async () => { throw new Error("in-flight work must not drain"); },
+    );
+    expect(result.outcome.kind).toBe("released");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toEqual([{ ...run, resultJson: evidence,
+      ...(runtimeMode === "native" ? { runnerProfileJson: null, stdoutExcerpt: null, stderrExcerpt: null,
+        contextSnapshot: { issueId } } : {}) }]);
+    expect(result.run.contextSnapshot).toEqual({ issueId });
+    expect(Buffer.byteLength(JSON.stringify(rows))).toBeLessThan(8 * 1024);
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]).toEqual(run);
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]).toEqual(issue);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId)))[0]).toEqual(wake);
+  });
+
+  it.each([null, ["stdout", { stderr: "array evidence" }], "scalar", 42].map(result => ({ result })))("preserves non-object result evidence $result during release", async ({ result }) => {
+    const companyId = await seedCompany(), agentId = await seedAgent({ companyId });
+    const runId = await seedRun({ companyId, agentId, status: "running" });
+    await db.update(heartbeatRuns).set({ resultJson: result as Record<string, unknown> | null }).where(eq(heartbeatRuns.id, runId));
+    const { recorded, rows } = recordReleaseRunReads();
+    await createPostgresWakeQueueAdapter(recorded, stubDeps).withIssueExecutionLock(
+      { companyId, runId, now: new Date(), resumeStrandedQueue: true },
+      async () => { throw new Error("in-flight work must not drain"); },
+    );
+    expect(rows).toHaveLength(1);
+    expect((rows[0][0] as typeof heartbeatRuns.$inferSelect).resultJson).toEqual(result);
+  });
+
+  it.each([null, "invalid", { version: 99 }, { version: 1 }])(
+    "leaves reserved receipts intact while ordinary deferred work drains (%j)", async namespace => {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent({ companyId });
+      const issueId = await seedIssue({ companyId, assigneeAgentId: agentId });
+      const runId = await seedRun({ companyId, agentId, status: "succeeded", contextSnapshot: { issueId } });
+      await db.update(heartbeatRuns).set({ finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+      const reservedId = await seedDeferredWake({ companyId, agentId, issueId,
+        payload: { _paperclipReviewerAssignmentContinuation: namespace },
+      });
+      await db.update(agentWakeupRequests).set({ requestedAt: new Date(0) }).where(eq(agentWakeupRequests.id, reservedId));
+      const ordinaryId = await seedDeferredWake({ companyId, agentId, issueId,
+        payload: { _paperclipWakeContext: { issueId, wakeReason: "issue_assigned" } },
+      });
+      const [reserved] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, reservedId));
+      const release = createReleaseIssueExecution({ issueLock: createPostgresWakeQueueAdapter(db, stubDeps),
+        recovery: { escalateStrandedAssignedIssue: async () => undefined, escalateStrandedRecoveryIssueInPlace: async () => undefined },
+      });
+      await release({ companyId, runId, now: new Date(), suppressImmediateRecovery: true, resumeStrandedQueue: true });
+      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, reservedId)))[0]).toEqual(reserved);
+      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, ordinaryId)))[0])
+        .toMatchObject({ status: "queued", runId: expect.any(String) });
+    },
+  );
+
+  it("keeps reserved rows out of reconciliation admission while ordinary wakes still block", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent({ companyId });
+    const issueId = await seedIssue({ companyId, assigneeAgentId: agentId });
+    const runId = await seedRun({ companyId, agentId, contextSnapshot: { issueId } });
+    await seedDeferredWake({ companyId, agentId, issueId, payload: { _paperclipReviewerAssignmentContinuation: null } });
+    const read = () => db.transaction(tx => lockAdmissionRows(tx, { companyId, issueId, runId }));
+    expect((await read()).wakes).toEqual([]);
+    const ordinaryId = await seedDeferredWake({ companyId, agentId, issueId });
+    expect((await read()).wakes).toEqual([{ id: ordinaryId, status: "deferred_issue_execution" }]);
+  });
+
+  it.each([null, {}, { _paperclipReviewerAssignmentContinuation: null },
+    { _paperclipReviewerAssignmentContinuation: false }, { _paperclipReviewerAssignmentContinuation: { version: 99 } },
+    "_paperclipReviewerAssignmentContinuation", ["_paperclipReviewerAssignmentContinuation"],
+  ])("classifies namespace presence equally in PostgreSQL and memory (%j)", async payload => {
+    const result = await db.execute(sql`select ${ordinaryWakeRequestPredicate(sql`${JSON.stringify(payload)}::jsonb`)} as ordinary`);
+    expect(result[0].ordinary).toBe(!hasReviewerAssignmentContinuation(payload));
+    const literal = await db.execute(sql`select ${sql.raw(ordinaryWakeRequestSql("receipt"))} as ordinary
+      from (values (${JSON.stringify(payload)}::jsonb)) as receipt(payload)`);
+    expect(literal[0].ordinary).toBe(result[0].ordinary);
+  });
+
+  it("fences already selected receipt IDs at every deferred mutation", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent({ companyId });
+    const issueId = await seedIssue({ companyId, assigneeAgentId: agentId });
+    const runId = await seedRun({ companyId, agentId, status: "succeeded", contextSnapshot: { issueId } });
+    await db.update(heartbeatRuns).set({ finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+    const wakeId = await seedDeferredWake({ companyId, agentId, issueId, payload: { _paperclipReviewerAssignmentContinuation: null } });
+    const [original] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+    await createPostgresWakeQueueAdapter(db, stubDeps).withIssueExecutionLock(
+      { companyId, runId, now: new Date(), resumeStrandedQueue: true }, async (_, { transaction }) => {
+        const input = { companyId, wakeId, now: new Date() };
+        expect(await transaction.cancelDeferredWake({ ...input, reason: "generic cancellation" })).toBe(false);
+        expect(await transaction.failDeferredWake(input)).toBe(false);
+        expect(await transaction.normalizeDeferredWakeCommentIds({ ...input, payload: {}, liveCommentIds: [] })).toBeNull();
+        expect(await transaction.claimDeferredWakeForPromotion(input)).toBe(false);
+        return { outcome: { kind: "released" }, postCommitEffects: [] };
+      },
+    );
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId)))[0]).toEqual(original);
+  });
 
   it.each(["assignee", "mentioned"])("preserves a paused recipient's accepted message until resume (%s)", async kind => {
     const companyId = await seedCompany();

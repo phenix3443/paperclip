@@ -80,11 +80,20 @@ jobs:
           version: 9.15.4
           run_install: false
 
+      - name: Fetch trusted migration mirror
+        id: migration-mirror
+        env:
+          MIRROR_URL: https://github.com/${{ github.repository }}.git
+        run: |
+          git fetch --no-tags --force "$MIRROR_URL" +refs/heads/master:refs/paperclip-ci/trusted-master
+          echo "sha=$(git rev-parse refs/paperclip-ci/trusted-master^{commit})" >> "$GITHUB_OUTPUT"
+
       - name: Validate migration ordering against target branch
         run: >-
           node .github/scripts/check-pr-migration-order.mjs
           "${{ github.event.pull_request.base.sha }}"
           "${{ github.event.pull_request.head.sha }}"
+          "${{ steps.migration-mirror.outputs.sha }}"
 
       - name: Validate Dockerfile deps stage
         run: |
@@ -116,7 +125,7 @@ jobs:
         run: node "$CI_NODE_TEST" ./scripts/__tests__/e2e-shard.test.mjs
 
       - name: Test release verify workflow wiring
-        run: node "$CI_NODE_TEST" ./scripts/__tests__/release-verify-workflow.test.mjs ./scripts/__tests__/prepare-runner-release-image.test.mjs ./scripts/cloud-source-verification.test.mjs ./scripts/standard-image-contract.test.mjs
+        run: node "$CI_NODE_TEST" ./scripts/__tests__/release-verify-workflow.test.mjs ./scripts/__tests__/eval-schedule-monitor.test.mjs ./scripts/__tests__/prepare-runner-release-image.test.mjs ./scripts/cloud-source-verification.test.mjs ./scripts/standard-image-contract.test.mjs
 
       - name: Test standalone package build concurrency
         run: node "$CI_NODE_TEST" ./scripts/__tests__/build-standalone-concurrency.test.mjs

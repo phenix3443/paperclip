@@ -77,6 +77,9 @@ Use an owned provider fixture for failure states; record any actual provider usa
 - Restore an archived company through `/companies` → its menu → **Unarchive**.
   Archiving pauses eligible agents and cancels active runs; restoration handles
   agents paused specifically for company archival.
+  Archive also retires unfinished reviewer assignment intent with its saved
+  context and reason. Unarchive does not replay it. Service/PostgreSQL coverage:
+  [retirement tests](../../server/src/__tests__/heartbeat-reviewer-intent-retirement.test.ts).
 
 - Package presence does not prove a runnable imported company; credentials and environment bindings need separate verification.
 - Company deletion is a distinct gated operation; do not use it as the archive test.

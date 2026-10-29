@@ -1,6 +1,7 @@
 import { enableRunFailureReporting } from "./helpers/run-failure-reporting.js";
 import { EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { agentExecutionsHaveStopped } from "../services/agent-execution-stop.js";
+import { createSystemRecovery } from "../services/system-recovery-state.js";
 import * as conversationContinuation from "../services/conversation-continuation.js";
 import { classifyEnvironmentCapabilities, environmentRuntimeService } from "../services/environment-runtime.js";
 import * as workspaceRuntime from "../services/workspace-runtime.js";
@@ -2687,6 +2688,32 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, hold.id)))[0])
       .toMatchObject({ status: "resolved", resolutionNote: "source_terminal" });
     await heartbeat.drainActiveRunExecutions();
+  });
+
+  it("resolves stale recovery on terminal tasks unless system recovery is still in flight", async () => {
+    const f = await seedRunFixture({ runStatus: "failed" });
+    const seedTerminalAction = async (action: Partial<typeof issueRecoveryActions.$inferInsert>) => {
+      const [issue] = await db.insert(issues).values({ companyId: f.companyId, title: "Closed recovery source",
+        status: "done", completedAt: new Date(), assigneeAgentId: f.agentId }).returning();
+      const [row] = await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: issue.id,
+        kind: "active_run_watchdog", status: "active", ownerType: "agent", ownerAgentId: f.agentId,
+        cause: "native_finalization_error", fingerprint: randomUUID(), evidence: { runId: f.runId },
+        nextAction: "Resume the native run.", ...action }).returning();
+      return row;
+    };
+    const agentNative = await seedTerminalAction({ wakePolicy: { kind: "resume_native_run", runId: f.runId } });
+    const systemEscalated = await seedTerminalAction({ status: "escalated", ownerType: "system", ownerAgentId: null });
+    const systemInFlight = await seedTerminalAction({ ownerType: "system", ownerAgentId: null,
+      evidence: { runId: f.runId, systemRecovery: createSystemRecovery(f.runId) } });
+
+    await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    for (const action of [agentNative, systemEscalated]) {
+      expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id)))[0])
+        .toMatchObject({ status: "resolved", outcome: "restored", resolutionNote: "source_terminal" });
+    }
+    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, systemInFlight.id)))[0])
+      .toMatchObject({ status: "active", resolvedAt: null });
   });
 
   it.each(["settled", "rejected", "late_callback", "provider_transport_failed"] as const)(
@@ -11858,6 +11885,115 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue?.assigneeAgentId).toBe(agentId);
   });
 
+  it.each([
+    { label: "first review run", retryReason: null },
+    { label: "review recovery retry", retryReason: "execution_review_participant_recovery" },
+  ])("leaves a pending review whose done blocker is still finalizing untouched after the $label", async ({ retryReason }) => {
+    const { companyId, agentId, issueId, runId } = await seedInReviewParticipantRunFixture(
+      retryReason ? { wakeReason: retryReason, retryReason } : undefined,
+    );
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    const blockerIssueId = randomUUID();
+    await db.insert(projects).values({ id: projectId, companyId, name: "Finalize wait project", status: "in_progress" });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId, companyId, projectId, name: "Finalize wait workspace", sourceType: "git_worktree",
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId, companyId, projectId, projectWorkspaceId, mode: "isolated_workspace",
+      strategyType: "git_worktree", name: "Finalize wait execution workspace", providerType: "git_worktree",
+    });
+    const [issuePrefixRow] = await db.select({ identifier: issues.identifier }).from(issues).where(eq(issues.id, issueId));
+    await db.insert(issues).values({
+      id: blockerIssueId, companyId, projectId, title: "Done blocker still syncing back", status: "done",
+      priority: "medium", executionWorkspaceId, issueNumber: 2,
+      identifier: issuePrefixRow!.identifier!.replace(/-1$/, "-2"),
+    });
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db.insert(issueRelations).values({ companyId, issueId: blockerIssueId, relatedIssueId: issueId, type: "blocks" });
+      return {
+        exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+        summary: "Review run ended while a blocker was finalizing.", provider: "test", model: "test-model",
+      };
+    });
+    await db.insert(workspaceOperations).values({
+      companyId, executionWorkspaceId, issueId: blockerIssueId, phase: "adapter_execute", status: "succeeded",
+      startedAt: new Date(Date.now() - 60_000),
+    });
+    const [seeded] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await waitForValue(async () => {
+      const [row] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      return row && row.status !== "queued" && row.status !== "running" ? row : null;
+    }, 8_000);
+    await heartbeat.drainActiveRunExecutions();
+
+    const recoveryRuns = (await selectRecoveryRunsByAgent(agentId)).filter(
+      (row) => row.id !== runId &&
+        (row.contextSnapshot as Record<string, unknown> | null)?.retryReason === "execution_review_participant_recovery",
+    );
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+    expect(recoveryRuns).toEqual([]);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toEqual([]);
+    const [issue] = await db
+      .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId, executionState: issues.executionState })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(issue).toEqual({ status: "in_review", assigneeAgentId: agentId, executionState: seeded!.executionState });
+  });
+
+  it.each([
+    { label: "first review run", retryReason: null },
+    { label: "review recovery retry", retryReason: "execution_review_participant_recovery" },
+  ])("keeps the sweep from retrying or escalating a pending review whose done blocker is still finalizing after the $label", async ({ retryReason }) => {
+    const { companyId, agentId, issueId, runId, wakeupRequestId } = await seedInReviewParticipantRunFixture(
+      retryReason ? { wakeReason: retryReason, retryReason } : undefined,
+    );
+    const finishedAt = new Date("2026-03-19T00:05:00.000Z");
+    await db.update(heartbeatRuns).set({ status: "failed", errorCode: "adapter_failed", runtimeMode: "native", startedAt: new Date("2026-03-19T00:00:00.000Z"), finishedAt, updatedAt: finishedAt })
+      .where(eq(heartbeatRuns.id, runId));
+    await db.update(agentWakeupRequests).set({ status: "failed", finishedAt, updatedAt: finishedAt })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+    const blockerIssueId = randomUUID();
+    await db.insert(projects).values({ id: projectId, companyId, name: "Finalize wait project", status: "in_progress" });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId, companyId, projectId, name: "Finalize wait workspace", sourceType: "git_worktree",
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId, companyId, projectId, projectWorkspaceId, mode: "isolated_workspace",
+      strategyType: "git_worktree", name: "Finalize wait execution workspace", providerType: "git_worktree",
+    });
+    const [issuePrefixRow] = await db.select({ identifier: issues.identifier }).from(issues).where(eq(issues.id, issueId));
+    await db.insert(issues).values({
+      id: blockerIssueId, companyId, projectId, title: "Done blocker still syncing back", status: "done",
+      priority: "medium", executionWorkspaceId, issueNumber: 2,
+      identifier: issuePrefixRow!.identifier!.replace(/-1$/, "-2"),
+    });
+    await db.insert(issueRelations).values({ companyId, issueId: blockerIssueId, relatedIssueId: issueId, type: "blocks" });
+    await db.insert(workspaceOperations).values({
+      companyId, executionWorkspaceId, issueId: blockerIssueId, phase: "adapter_execute", status: "succeeded",
+      startedAt: new Date(Date.now() - 60_000),
+    });
+    const [seeded] = await db.select({ executionState: issues.executionState }).from(issues).where(eq(issues.id, issueId));
+
+    const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({ reviewParticipantRequeued: 0, escalated: 0 });
+    expect((await selectRecoveryRunsByAgent(agentId)).filter((row) => row.id !== runId)).toEqual([]);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toEqual([]);
+    const [issue] = await db
+      .select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId, executionState: issues.executionState })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    expect(issue).toEqual({ status: "in_review", assigneeAgentId: agentId, executionState: seeded!.executionState });
+  });
+
   it("retries a pending execution-review participant once before blocking with a recovery action", async () => {
     const { companyId, agentId, issueId, runId, stageId } =
       await seedInReviewParticipantRunFixture();
@@ -16941,6 +17077,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     "comment",
     "wake",
     "run",
+    "run_context",
+    "run_metadata",
     "attention",
   ] as const)(
     "does not clobber a newer %s while native blocker repair waits on the issue lock",
@@ -17015,6 +17153,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
             continuationPolicy: "wake_assignee",
             payload: { version: 1, questions: [] },
           });
+        if (change === "run_context")
+          await tx.update(heartbeatRuns).set({
+            contextSnapshot: sql`jsonb_set(${heartbeatRuns.contextSnapshot}, '{paperclipTaskMarkdown}', '"Changed execution instructions"'::jsonb)`,
+          }).where(eq(heartbeatRuns.id, runId));
+        if (change === "run_metadata")
+          await tx.update(heartbeatRuns).set({ stdoutExcerpt: "Late execution output" }).where(eq(heartbeatRuns.id, runId));
         [snapshot] = await tx
           .select()
           .from(issues)
@@ -17058,6 +17202,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           ),
       ).toHaveLength(0);
       expect(mockAdapterExecute).not.toHaveBeenCalled();
+      if (change === "run_context" || change === "run_metadata") {
+        expect((await heartbeat.reconcileStrandedAssignedIssues()).escalated).toBe(1);
+        expect(mockAdapterExecute).not.toHaveBeenCalled();
+      }
     },
   );
 

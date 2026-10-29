@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { FAST_RESPONSE_AGENT_GUIDANCE, fastResponseHistoryBody } from "@paperclipai/shared";
 import {
   persistActivity,
@@ -95,6 +96,8 @@ Before handing off work, inspect available projects and repositories. Every task
 Create ordinary assigned tasks, never subtasks of this conversation. Give each task a clear outcome, context, acceptance criteria, project, and appropriate assignee. Use create_task with initialPlan to copy the relevant plan into the new task before execution starts. If using the HTTP API directly, POST /api/companies/{companyId}/issues with projectId, assigneeAgentId, status: "todo", initialPlan containing the relevant plan Markdown, and an idempotencyKey; omit parentId. Putting a plan in description does not create the task's plan document. Verify the new task's plan document before claiming the handoff is complete. Preserve the original plan here. Carry forward only the remaining execution steps, not completed planning, approval, project creation, or task creation steps. Include the source conversation ID, approved plan revision ID, and accepted interaction ID so the worker can verify the recorded approval. State the approved scope and what is already done; do not claim the new plan document has its own approval. The worker should execute that authorized scope, and ask again only if scope changes or another applicable gate requires it. When splitting work, include the relevant part of the plan in each task. Create and link each task before claiming it exists.
 
 For review or follow-up tasks, include the existing source materials the assignee needs, not just task identifiers or a rubric. Read the source task's saved documents and comments, then copy the relevant existing content into the handoff or attach resources the recipient can actually read. A new task's tools may only expose its own documents and history. Supplying existing source material is coordination, not creating the assigned deliverable.
+
+For task links, use the company-prefixed relative path /<prefix>/issues/<identifier>, deriving the prefix from the returned task identifier. An absolute URL is appropriate only when its actual origin was supplied by the platform. Never invent a hostname for a Paperclip link.
 
 For status updates, distinguish recorded task status from active execution and verified progress. Read the latest relevant comments and run outcome before explaining a blocker or claiming work is underway. Use the advertised API tools for another task's details when needed. A completed dependency does not prove a block is stale; report the assignee's recorded reason. Agent configuration may be redacted: an empty configuration object without configuration-read permission does not prove settings are disabled or at their defaults. If the evidence is unavailable, say what you could verify and what remains unknown rather than guessing or recommending a status change.
 
@@ -282,7 +285,7 @@ export async function prepareConversationTurn(
 /** Finalizers only park a turn with a durable response, interaction, or processed /new. */
 export async function settleConversationTurn(
   db: Db,
-  run: typeof heartbeatRuns.$inferSelect,
+  run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "status" | "contextSnapshot">,
 ) {
   if (run.status !== "succeeded") return false;
   const context = run.contextSnapshot ?? {};
@@ -291,7 +294,12 @@ export async function settleConversationTurn(
   let publication: ActivityPublication | null = null;
   const settled = await db.transaction(async (tx) => {
     const [issue] = await tx
-      .select()
+      .select({
+        id: issues.id, companyId: issues.companyId, status: issues.status,
+        conversationAgentId: issues.conversationAgentId, conversationUserId: issues.conversationUserId,
+        conversationState: issues.conversationState, conversationSessionGeneration: issues.conversationSessionGeneration,
+        executionRunId: issues.executionRunId,
+      })
       .from(issues)
       .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
       .for("update");
@@ -344,7 +352,7 @@ export async function settleConversationTurn(
     const [wake] =
       typeof wakeId === "string"
         ? await tx
-            .select()
+            .select({ id: issueComments.id })
             .from(issueComments)
             .where(eq(issueComments.id, wakeId))
         : [];
@@ -405,6 +413,26 @@ export async function settleConversationTurn(
   });
   if (publication) publishActivity(publication);
   return settled;
+}
+
+export async function settleConversationTurnForRun(
+  db: Db,
+  companyId: string,
+  runId: string,
+) {
+  const [run] = await db.select({
+    id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, status: heartbeatRuns.status,
+    contextSnapshot: sql<Record<string, unknown> | null>`case when jsonb_typeof(${heartbeatRuns.contextSnapshot}) = 'object'
+      then jsonb_build_object(
+        'issueId', ${heartbeatRuns.contextSnapshot}->'issueId',
+        'conversationReset', ${heartbeatRuns.contextSnapshot}->'conversationReset',
+        'conversationSessionGeneration', ${heartbeatRuns.contextSnapshot}->'conversationSessionGeneration',
+        'conversationReplyBoundaryCommentId', ${heartbeatRuns.contextSnapshot}->'conversationReplyBoundaryCommentId',
+        'wakeCommentId', ${heartbeatRuns.contextSnapshot}->'wakeCommentId',
+        'commentId', ${heartbeatRuns.contextSnapshot}->'commentId'
+      ) else null end`,
+  }).from(heartbeatRuns).where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId)));
+  return run ? settleConversationTurn(db, run) : false;
 }
 
 /** Fresh provider context uses only messages in this session, up to this turn. */
@@ -484,7 +512,7 @@ export async function undeliveredConversationComments(
         eq(issueComments.issueId, issueId),
         isNull(issueComments.deletedAt),
         sql`${issueComments.clientRequestId} is not null`,
-        sql`not exists (select 1 from ${agentWakeupRequests} where ${agentWakeupRequests.companyId} = ${companyId}
+        sql`not exists (select 1 from ${agentWakeupRequests} where ${ordinaryWakeRequestPredicate()} and ${agentWakeupRequests.companyId} = ${companyId}
       and ${agentWakeupRequests.idempotencyKey} = 'conversation-comment:' || ${issueComments.id}::text)`,
       ),
     )

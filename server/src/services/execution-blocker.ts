@@ -1,3 +1,4 @@
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { isPreDispatchReviewWait } from "./pre-dispatch-review-wait.js";
 import { preDispatchExecutionWaitRecoveryActionPredicate } from "./pre-dispatch-execution-wait.js";
 import { and, desc, eq, exists, gt, inArray, isNotNull, lte, not, or, sql } from "drizzle-orm";
@@ -13,6 +14,57 @@ import { unreconciledNativeExportPredicate } from "./native-runtime/native-works
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { readNativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
 import { hasVerifiedWorkspaceRepair, workspaceRecoveryDisplay } from "./workspace-recovery-receipt.js";
+
+const blockerContextKeys = ["issueId", "taskId", "source", "connectionIntentResolution",
+  "interactionKind", "interactionStatus", "mutation", "interactionId"] as const;
+const blockerProfileKeys = ["adapterDispatch", "nativeExecutionInput", "nativeWorkspaceSync"] as const;
+const blockerContextColumn = sql<Record<string, unknown> | null>`case
+  when ${heartbeatRuns.contextSnapshot} is null then null else (
+    select coalesce(jsonb_object_agg(field.key, field.value), '{}'::jsonb)
+    from jsonb_each(case when jsonb_typeof(${heartbeatRuns.contextSnapshot}) = 'object'
+      then ${heartbeatRuns.contextSnapshot} else '{}'::jsonb end) as field(key, value)
+    where field.key in (${sql.join(blockerContextKeys.map(key => sql`${key}`), sql`, `)})
+  ) end`;
+const blockerProfileColumn = sql<Record<string, unknown> | null>`case
+  when ${heartbeatRuns.runnerProfileJson} is null then null else (
+    select coalesce(jsonb_object_agg(field.key, case field.key
+      when 'adapterDispatch' then jsonb_build_object('adapterType', field.value->'adapterType')
+      when 'nativeExecutionInput' then case when jsonb_typeof(field.value) = 'object' then (
+        select coalesce(jsonb_object_agg(input_field.key, input_field.value), '{}'::jsonb)
+        from jsonb_each(field.value) as input_field(key, value)
+        where input_field.key in ('schema', 'binding', 'provider', 'workspace')
+      ) else field.value end
+      else field.value end), '{}'::jsonb)
+    from jsonb_each(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object'
+      then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) as field(key, value)
+    where field.key in (${sql.join(blockerProfileKeys.map(key => sql`${key}`), sql`, `)})
+  ) end`;
+const blockerRunFields = {
+  id: heartbeatRuns.id,
+  companyId: heartbeatRuns.companyId,
+  agentId: heartbeatRuns.agentId,
+  status: heartbeatRuns.status,
+  startedAt: heartbeatRuns.startedAt,
+  finishedAt: heartbeatRuns.finishedAt,
+  error: heartbeatRuns.error,
+  errorCode: heartbeatRuns.errorCode,
+  issueId: heartbeatRuns.issueId,
+  nativeIssueId: heartbeatRuns.nativeIssueId,
+  nativeSessionId: heartbeatRuns.nativeSessionId,
+  runtimeMode: heartbeatRuns.runtimeMode,
+  runtimeModeResolvedAt: heartbeatRuns.runtimeModeResolvedAt,
+  driverKind: heartbeatRuns.driverKind,
+  processPid: heartbeatRuns.processPid,
+  processGroupId: heartbeatRuns.processGroupId,
+  processStartedAt: heartbeatRuns.processStartedAt,
+  sessionIdAfter: heartbeatRuns.sessionIdAfter,
+  controllerBootId: heartbeatRuns.controllerBootId,
+  controllerLeaseExpiresAt: heartbeatRuns.controllerLeaseExpiresAt,
+  executionStage: heartbeatRuns.executionStage,
+  resultJson: heartbeatRuns.resultJson,
+  contextSnapshot: blockerContextColumn,
+  runnerProfileJson: blockerProfileColumn,
+};
 
 export async function hasPendingRunCleanup(db: Db, companyId: string, runId: string): Promise<boolean> {
   const [state] = await db.execute<{ pending: boolean }>(sql`SELECT
@@ -80,6 +132,13 @@ export function issueHasRecoveryActionExecutionBlocker(db: Db) {
   )));
 }
 
+export function nativeExecutionRecoveryActionPredicate() {
+  return sql`exists (select 1 from ${heartbeatRuns}
+    where ${heartbeatRuns.companyId} = ${issueRecoveryActions.companyId}
+      and ${heartbeatRuns.id}::text = coalesce(${issueRecoveryActions.evidence}->>'runId', ${issueRecoveryActions.evidence}->>'sourceRunId')
+      and ${heartbeatRuns.runtimeMode} = 'native')`;
+}
+
 export async function getExecutionBlocker(db: Db, companyId: string, issueId: string, options?: { conversationResetCommentId?: string | null }): Promise<ExecutionBlocker | null> {
   const [conversation] = await db.select({ agentId: issues.conversationAgentId,
     boundaryId: issues.conversationBoundaryCommentId, status: issues.status,
@@ -116,12 +175,12 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     eq(issueRecoveryActions.companyId, companyId),
     eq(issueRecoveryActions.sourceIssueId, issueId),
     executionBlockerPredicate(),
-    boundary ? gt(issueRecoveryActions.createdAt, boundary.createdAt) : undefined,
+    boundary ? or(gt(issueRecoveryActions.createdAt, boundary.createdAt), nativeExecutionRecoveryActionPredicate()) : undefined,
   )).orderBy(desc(issueRecoveryActions.updatedAt), desc(issueRecoveryActions.id)).limit(1);
   if (!action) return null;
   const parsedRunId = z.string().guid().safeParse(action.evidence.runId ?? action.evidence.sourceRunId);
   const runId = parsedRunId.success ? parsedRunId.data : null;
-  const [run] = runId ? await db.select().from(heartbeatRuns).where(and(
+  const [run] = runId ? await db.select(blockerRunFields).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId),
   )).limit(1) : [];
   const withoutWorkspace = Boolean(run?.driverKind === "grok_bot_mcp" && nativeRunHasNoWorkspaceAccess(run));
@@ -140,7 +199,7 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
   const reconstructionPending = Boolean((action.evidence.executionReconciliation as { workspaceReconstruction?: unknown } | undefined)?.workspaceReconstruction
     && action.evidence.continuationDelivery === "pending");
   const queue = await db.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
-    eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+    ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
     sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
   ));
   const savedIds = [...new Set(queue.flatMap(entry => {

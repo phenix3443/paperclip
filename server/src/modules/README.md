@@ -30,6 +30,16 @@ that entry point, never a file inside `domain/`, `application/`, or
 `pnpm check:module-boundaries` enforces these rules for production source
 files. It also checks access to the company deletion entry point below.
 
+## Wake receipt classification
+
+`wake-queue/receipt-namespace.ts` is a separate public entry point for SQL and
+in-memory receipt classification. Consumers that only classify receipts import
+it directly, so read-only query construction does not load queue command
+composition, concrete adapters, or the services those adapters use. Queue
+commands still use `wake-queue/index.ts`; the classification entry point must
+not import it. The queue module retains classification ownership, and its
+domain, application and adapter internals remain private.
+
 ## Company deletion
 
 The existing company deletion service owns the database transaction and deletion

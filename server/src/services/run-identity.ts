@@ -1,4 +1,7 @@
-import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
+import { issueExecutionGeneration } from "./issue-execution-policy.js";
+import { readTaskRetryIntent, readTaskRetryBoardMessageOrigin } from "./task-retry.js";
+import { and, asc, desc, eq, getTableColumns, inArray, isNull, sql } from "drizzle-orm";
+import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import {
   agentWakeupRequests,
   heartbeatRuns,
@@ -10,7 +13,7 @@ import {
   type Db,
 } from "@paperclipai/db";
 import { conflict, forbidden } from "../errors.js";
-import { boundRunIssueId } from "./run-task-binding.js";
+import { boundRunIssueId, runTaskContextColumn } from "./run-task-binding.js";
 import { isUuidLike } from "@paperclipai/shared";
 import { queuedCommentIdsFromRunContext, queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 
@@ -20,7 +23,7 @@ export async function explicitOperatorRunIdentity(
   run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId" | "contextSnapshot" | "wakeupRequestId">,
 ) {
   const [request] = run.wakeupRequestId ? await executor.select().from(agentWakeupRequests).where(and(
-    eq(agentWakeupRequests.id, run.wakeupRequestId), eq(agentWakeupRequests.companyId, run.companyId),
+    ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, run.wakeupRequestId), eq(agentWakeupRequests.companyId, run.companyId),
     eq(agentWakeupRequests.agentId, run.agentId), eq(agentWakeupRequests.runId, run.id),
   )) : [];
   if (request?.payload?.manualUserWake === true) {
@@ -38,7 +41,7 @@ export async function explicitOperatorRunIdentity(
     throw forbidden("Queued-message interrupt authority is unavailable");
   }
   const [receipt] = await executor.select().from(agentWakeupRequests).where(and(
-    eq(agentWakeupRequests.id, queueId), eq(agentWakeupRequests.companyId, run.companyId),
+    ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, queueId), eq(agentWakeupRequests.companyId, run.companyId),
     eq(agentWakeupRequests.agentId, run.agentId), eq(agentWakeupRequests.runId, run.id),
     eq(agentWakeupRequests.status, "coalesced"),
   ));
@@ -72,7 +75,7 @@ async function lockIdentityTask(
 ) {
   const [run] = await executor
     .select({
-      contextSnapshot: heartbeatRuns.contextSnapshot,
+      contextSnapshot: runTaskContextColumn,
       nativeIssueId: heartbeatRuns.nativeIssueId,
       issueId: heartbeatRuns.issueId,
     })
@@ -150,7 +153,11 @@ async function activate(executor: Executor, context: RunIdentityContext) {
         eq(heartbeatRuns.companyId, context.companyId),
       ),
     )
-    .returning();
+    .returning({
+      nativeIssueId: heartbeatRuns.nativeIssueId,
+      issueId: heartbeatRuns.issueId,
+      contextSnapshot: runTaskContextColumn,
+    });
   const issueId = run ? boundRunIssueId(run) : null;
   if (typeof issueId === "string")
     await executor
@@ -159,6 +166,93 @@ async function activate(executor: Executor, context: RunIdentityContext) {
       .where(
         and(eq(issues.id, issueId), eq(issues.companyId, context.companyId)),
       );
+}
+
+function identityString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+export function runIdentityInitializationInput(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "retryOfRunId" | "triggerDetail">,
+  context: Record<string, unknown>,
+  task: Pick<typeof issues.$inferSelect, "id" | "continuationIdentityContextId" | "originIdentityContextId"> | null,
+  responsibleUserId: string | null,
+  retryMessages = false,
+) {
+  const retry = run.retryOfRunId || context.retryOfRunId;
+  const ids = queuedCommentIdsFromRunContext(context);
+  return {
+    companyId: run.companyId, runId: run.id, responsibleUserId,
+    issueId: task?.id ?? identityString(context.issueId),
+    interactionId: identityString(context.interactionId),
+    messageIds: retry && !retryMessages ? [] : ids.length ? ids
+      : Array.isArray(context.wakeCommentIds) ? context.wakeCommentIds.filter((id): id is string => typeof id === "string")
+      : identityString(context.wakeCommentId) ? [String(context.wakeCommentId)] : [],
+    parentContextId: retry ? null : (identityString(context.originIdentityContextId)
+      ?? (run.triggerDetail === "manual" || context.parentRunId ? null
+        : task?.continuationIdentityContextId ?? task?.originIdentityContextId)),
+    parentRunId: run.retryOfRunId ?? identityString(context.retryOfRunId) ?? identityString(context.parentRunId),
+    cause: identityString(context.executionIdentityCause) ?? identityString(context.wakeReason) ?? "dispatch",
+  };
+}
+
+export async function settleNewReviewRunIdentity(tx: Db, run: typeof heartbeatRuns.$inferSelect, retryMessages = false) {
+  const issueId = boundRunIssueId(run);
+  const [task] = issueId ? await tx.select().from(issues).where(and(
+    eq(issues.id, issueId), eq(issues.companyId, run.companyId))).for("no key update") : [];
+  if (!task || run.status !== "queued" || run.activeIdentityContextId || run.contextSnapshot?.reviewerAssignmentGeneration)
+    throw forbidden("New review identity admission is unavailable");
+  if (task.responsibleUserId !== null) return task;
+  const identity = await initializeRunIdentity(tx, runIdentityInitializationInput(
+    run, run.contextSnapshot ?? {}, task, run.responsibleUserId, retryMessages));
+  if (identity.responsibleUserId) await tx.update(issues).set({ responsibleUserId: identity.responsibleUserId, updatedAt: new Date() })
+    .where(and(eq(issues.id, task.id), eq(issues.companyId, run.companyId), isNull(issues.responsibleUserId)));
+  const [settled] = await tx.select().from(issues).where(and(eq(issues.id, task.id), eq(issues.companyId, run.companyId)));
+  return settled!;
+}
+
+async function appendIdentityMessages(
+  tx: Db,
+  input: Parameters<typeof initializeRunIdentity>[1],
+  current: RunIdentityContext,
+  operatorIdentity: Awaited<ReturnType<typeof explicitOperatorRunIdentity>>,
+) {
+  const ids = [...new Set(input.messageIds ?? [])];
+  const comments = ids.length && input.issueId ? await tx.select().from(issueComments).where(and(
+    eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId), inArray(issueComments.id, ids))) : [];
+  for (const id of ids) {
+    const comment = comments.find(c => c.id === id);
+    if (!comment?.authorUserId) continue;
+    current = await append(tx, { companyId: input.companyId, runId: input.runId,
+      responsibleUserId: operatorIdentity?.actorId ?? comment.authorUserId, messageId: id,
+      parentContextId: current.id, cause: operatorIdentity?.cause ?? "instruction", correlationId: `message:${id}` });
+  }
+  return current;
+}
+
+export async function settleReviewRunClaimIdentity(tx: Db, run: typeof heartbeatRuns.$inferSelect, previousStartedAt: Date | null) {
+  if (!run.activeIdentityContextId || typeof run.contextSnapshot?.reviewerAssignmentGeneration !== "string") return run;
+  const issueId = boundRunIssueId(run);
+  const [task] = issueId ? await tx.select().from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId))) : [];
+  if (!task || issueExecutionGeneration(task) !== run.contextSnapshot.reviewerAssignmentGeneration)
+    throw conflict("The review submission changed while its identity was claimed");
+  const [identity] = await tx.select().from(runIdentityContexts).where(and(
+    eq(runIdentityContexts.id, run.activeIdentityContextId), eq(runIdentityContexts.companyId, run.companyId),
+    eq(runIdentityContexts.runId, run.id), eq(runIdentityContexts.status, "accepted")));
+  if (!identity) throw forbidden("The queued review identity is unavailable");
+  let current = identity;
+  if (previousStartedAt === null) {
+    const [origin] = await tx.select().from(runIdentityContexts).where(and(
+      eq(runIdentityContexts.companyId, run.companyId), eq(runIdentityContexts.runId, run.id),
+      eq(runIdentityContexts.correlationId, "dispatch"), eq(runIdentityContexts.status, "accepted")));
+    if (!origin) throw forbidden("The queued review origin identity is unavailable");
+    current = await appendIdentityMessages(tx,
+      runIdentityInitializationInput(run, run.contextSnapshot ?? {}, task, run.responsibleUserId), origin,
+      await explicitOperatorRunIdentity(tx, run));
+  }
+  if (previousStartedAt === null || current.id !== run.activeIdentityContextId || current.responsibleUserId !== run.responsibleUserId)
+    await activate(tx, current);
+  return (await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId))))[0]!;
 }
 
 /** Called only for newly dispatched runs. Historical rows are never backfilled. */
@@ -197,6 +291,39 @@ export async function initializeRunIdentity(
       return current!;
     }
     const operatorIdentity = await explicitOperatorRunIdentity(tx, run);
+    let retryOrigin: string | null = null;
+    const retryId = run.contextSnapshot?.taskRetryRequestId;
+    if (typeof retryId === "string") {
+      const [receipt] = await tx.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.id, retryId), eq(agentWakeupRequests.companyId, input.companyId),
+        eq(agentWakeupRequests.agentId, run.agentId)));
+      const retry = readTaskRetryIntent(receipt?.payload);
+      if (run.contextSnapshot?.boardMessageRetry === true || retry?.boardMessageOrigin) {
+        if (!retry?.boardMessageOrigin) throw forbidden("This saved message can no longer be retried safely. Send a new message on the task to continue from saved work.");
+        const [dispatch] = run.wakeupRequestId ? await tx.select().from(agentWakeupRequests).where(and(
+          eq(agentWakeupRequests.id, run.wakeupRequestId), eq(agentWakeupRequests.companyId, input.companyId),
+          eq(agentWakeupRequests.agentId, run.agentId), eq(agentWakeupRequests.runId, run.id),
+          eq(agentWakeupRequests.status, "claimed"), eq(agentWakeupRequests.reason, "task_retry"),
+          eq(agentWakeupRequests.idempotencyKey, `task-retry-dispatch:${receipt!.id}`),
+          eq(agentWakeupRequests.requestedByActorType, "user"), eq(agentWakeupRequests.requestedByActorId, retry.actorId))) : [];
+        const [task] = input.issueId ? await tx.select({ id: issues.id }).from(issues).where(and(
+          eq(issues.id, input.issueId), eq(issues.companyId, input.companyId), eq(issues.assigneeAgentId, run.agentId),
+          eq(issues.executionRunId, run.id))) : [];
+        const origin = input.issueId && run.status === "running" && task && dispatch &&
+          [run.issueId, run.nativeIssueId, run.contextSnapshot?.issueId, run.contextSnapshot?.taskId]
+            .every(id => id === null || id === undefined || id === input.issueId) && receipt!.runId === run.id && receipt!.status === "coalesced" &&
+          receipt!.reason === "task_retry" && receipt!.requestedByActorType === "user" &&
+          run.contextSnapshot?.previousRunId === retry.sourceRunId && retry.generationId === receipt!.id && !retry.chatActionId && !retry.canonicalIntentId &&
+          receipt!.payload?.issueId === input.issueId && retry.actorId === receipt!.requestedByActorId &&
+          await readTaskRetryBoardMessageOrigin(tx as unknown as Db, { companyId: input.companyId, issueId: input.issueId,
+            agentId: run.agentId, sourceRunId: retry.sourceRunId, actorId: retry.actorId });
+        if (!origin || origin.commentId !== retry.boardMessageOrigin.commentId ||
+            origin.identityContextId !== retry.boardMessageOrigin.identityContextId) {
+          throw forbidden("This saved message can no longer be retried safely. Send a new message on the task to continue from saved work.");
+        }
+        retryOrigin = origin.identityContextId;
+      }
+    }
     const [parent] = input.parentRunId
       ? await tx
           .select()
@@ -222,7 +349,7 @@ export async function initializeRunIdentity(
             )
         : [];
     const parentId = operatorIdentity ? null : (
-      interaction?.sourceIdentityContextId ?? input.parentContextId ?? parent?.activeIdentityContextId
+      retryOrigin ?? interaction?.sourceIdentityContextId ?? input.parentContextId ?? parent?.activeIdentityContextId
     );
     const [origin] = parentId
       ? await tx
@@ -247,34 +374,7 @@ export async function initializeRunIdentity(
         operatorIdentity ? operatorIdentity.cause : origin?.cause === "company_default" ? "company_default" : input.cause,
       correlationId: "dispatch",
     });
-    const ids = [...new Set(input.messageIds ?? [])];
-    const comments =
-      ids.length && input.issueId
-        ? await tx
-            .select()
-            .from(issueComments)
-            .where(
-              and(
-                eq(issueComments.companyId, input.companyId),
-                eq(issueComments.issueId, input.issueId),
-                inArray(issueComments.id, ids),
-              ),
-            )
-        : [];
-    for (const id of ids) {
-      const comment = comments.find((c) => c.id === id);
-      if (!comment?.authorUserId) continue;
-      current = await append(tx, {
-        companyId: input.companyId,
-        runId: input.runId,
-        responsibleUserId: operatorIdentity?.actorId ?? comment.authorUserId,
-        messageId: id,
-        parentContextId: current.id,
-        cause: operatorIdentity?.cause ?? "instruction",
-        correlationId: `message:${id}`,
-      });
-    }
-    return current;
+    return appendIdentityMessages(tx as unknown as Db, input, current, operatorIdentity);
   });
 }
 
@@ -427,15 +527,80 @@ export async function acceptSteeredIdentity(
   if (accepted) await activate(executor, accepted);
 }
 
-export async function captureRunIdentity(
+const runIdentityFields = {
+  id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
+  status: heartbeatRuns.status, responsibleUserId: heartbeatRuns.responsibleUserId,
+  activeIdentityContextId: heartbeatRuns.activeIdentityContextId,
+};
+
+export const runIdentityTaskFields = {
+  ...runIdentityFields, nativeIssueId: heartbeatRuns.nativeIssueId, issueId: heartbeatRuns.issueId,
+  wakeupRequestId: heartbeatRuns.wakeupRequestId,
+  contextSnapshot: sql<Record<string, unknown> | null>`case when jsonb_typeof(${heartbeatRuns.contextSnapshot}) = 'object'
+    then jsonb_build_object('issueId', ${heartbeatRuns.contextSnapshot}->'issueId',
+      'taskId', ${heartbeatRuns.contextSnapshot}->'taskId',
+      'conversationSessionGeneration', ${heartbeatRuns.contextSnapshot}->'conversationSessionGeneration',
+      'paperclipSkillTest', ${heartbeatRuns.contextSnapshot}->'paperclipSkillTest') else null end`,
+};
+
+export const runIdentityBrokerFields = {
+  ...runIdentityFields, invocationSource: heartbeatRuns.invocationSource,
+  contextSnapshot: sql<Record<string, unknown> | null>`case when jsonb_typeof(${heartbeatRuns.contextSnapshot}) = 'object'
+    then jsonb_build_object('issueId', ${heartbeatRuns.contextSnapshot}->'issueId',
+      'projectId', ${heartbeatRuns.contextSnapshot}->'projectId', 'routineId', ${heartbeatRuns.contextSnapshot}->'routineId',
+      'responsibleUserId', ${heartbeatRuns.contextSnapshot}->'responsibleUserId',
+      'responsible_user_id', ${heartbeatRuns.contextSnapshot}->'responsible_user_id',
+      'paperclipIssue', case when jsonb_typeof(${heartbeatRuns.contextSnapshot}->'paperclipIssue') = 'object'
+        then jsonb_build_object('id', ${heartbeatRuns.contextSnapshot}->'paperclipIssue'->'id',
+          'projectId', ${heartbeatRuns.contextSnapshot}->'paperclipIssue'->'projectId',
+          'responsibleUserId', ${heartbeatRuns.contextSnapshot}->'paperclipIssue'->'responsibleUserId',
+          'responsible_user_id', ${heartbeatRuns.contextSnapshot}->'paperclipIssue'->'responsible_user_id') else null end)
+    else null end`,
+};
+
+const runIdentityProjectFields = {
+  ...runIdentityTaskFields, runtimeMode: heartbeatRuns.runtimeMode,
+  runnerProfileJson: sql<Record<string, unknown> | null>`case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object'
+    then case when ${heartbeatRuns.runnerProfileJson} ? 'nativeExecutionInput'
+      then jsonb_build_object('nativeExecutionInput', ${heartbeatRuns.runnerProfileJson}->'nativeExecutionInput')
+      else '{}'::jsonb end else null end`,
+};
+
+type FullIdentityRun = typeof heartbeatRuns.$inferSelect;
+type IdentityRun = Pick<FullIdentityRun, keyof typeof runIdentityFields>;
+type TaskIdentityRun = Pick<FullIdentityRun, keyof typeof runIdentityTaskFields>;
+type BrokerIdentityRun = Pick<FullIdentityRun, keyof typeof runIdentityBrokerFields>;
+type ProjectIdentityRun = Pick<FullIdentityRun, keyof typeof runIdentityProjectFields>;
+export type RunIdentityReadScope = "github_credentials" | "request_authentication" | "identity" | "task_authorization" | "token_broker" | "project_execution";
+export type RunIdentityCapture<Scope extends RunIdentityReadScope | undefined = undefined> = {
+  run: Scope extends "identity" ? IdentityRun : Scope extends "task_authorization" ? TaskIdentityRun :
+    Scope extends "token_broker" ? BrokerIdentityRun : Scope extends "project_execution" ? ProjectIdentityRun : FullIdentityRun;
+  context: RunIdentityContext | null;
+};
+
+export async function captureRunIdentity<Scope extends RunIdentityReadScope | undefined = undefined>(
   db: Db,
   input: { companyId: string; runId: string; agentId: string },
-) {
+  options?: { readScope: Scope },
+): Promise<RunIdentityCapture<Scope>> {
   // Lock acquisition serializes with steering delivery and its durable acknowledgement.
   return db.transaction(async (tx) => {
     await lockIdentityTask(tx, input.companyId, input.runId);
     const [run] = await tx
-      .select()
+      .select(options?.readScope === "identity" ? runIdentityFields :
+        options?.readScope === "task_authorization" ? runIdentityTaskFields :
+        options?.readScope === "token_broker" ? runIdentityBrokerFields :
+        options?.readScope === "project_execution" ? runIdentityProjectFields :
+        options?.readScope === "github_credentials" || options?.readScope === "request_authentication" ? {
+        ...getTableColumns(heartbeatRuns),
+        contextSnapshot: sql<Record<string, unknown> | null>`case when jsonb_typeof(${heartbeatRuns.contextSnapshot}) = 'object'
+          then jsonb_build_object('issueId', ${heartbeatRuns.contextSnapshot}->'issueId',
+            'taskId', ${heartbeatRuns.contextSnapshot}->'taskId', 'projectId', ${heartbeatRuns.contextSnapshot}->'projectId',
+            'executionPolicy', ${heartbeatRuns.contextSnapshot}->'executionPolicy') else null end`,
+        runnerProfileJson: sql<Record<string, unknown> | null>`null`,
+        resultJson: sql<Record<string, unknown> | null>`null`,
+        stdoutExcerpt: sql<string | null>`null`, stderrExcerpt: sql<string | null>`null`,
+      } : getTableColumns(heartbeatRuns))
       .from(heartbeatRuns)
       .where(
         and(
@@ -480,8 +645,45 @@ export async function captureRunIdentity(
             ),
           )
       : [];
-    return { run, context: context ?? null };
+    return { run, context: context ?? null } as RunIdentityCapture<Scope>;
   });
+}
+
+export async function readRunIdentityContext(
+  db: Db,
+  input: { companyId: string; runId: string; agentId: string },
+) {
+  const [run] = await db
+    .select({ id: heartbeatRuns.id, activeIdentityContextId: heartbeatRuns.activeIdentityContextId })
+    .from(heartbeatRuns)
+    .where(
+      and(
+        eq(heartbeatRuns.id, input.runId),
+        eq(heartbeatRuns.companyId, input.companyId),
+        eq(heartbeatRuns.agentId, input.agentId),
+      ),
+    );
+  if (!run) return { settled: true as const, context: null };
+  const [pending] = await db
+    .select()
+    .from(runIdentityContexts)
+    .where(and(eq(runIdentityContexts.runId, run.id), eq(runIdentityContexts.status, "pending")))
+    .limit(1);
+  if (pending)
+    return await storedSteeringAcknowledgement(db, pending)
+      ? { settled: true as const, context: pending }
+      : { settled: false as const };
+  if (!run.activeIdentityContextId) return { settled: true as const, context: null };
+  const [context] = await db
+    .select()
+    .from(runIdentityContexts)
+    .where(
+      and(
+        eq(runIdentityContexts.id, run.activeIdentityContextId),
+        eq(runIdentityContexts.runId, run.id),
+      ),
+    );
+  return { settled: true as const, context: context ?? null };
 }
 
 export async function listRunIdentityContexts(

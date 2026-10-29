@@ -178,6 +178,23 @@ describeEmbeddedPostgres("heartbeat queued-run claim isolation", () => {
       .then((rows) => rows[0] ?? null);
   }
 
+  it("leaves a queued run linked to a reserved receipt untouched while ordinary work advances", async () => {
+    const { companyId, agentId } = await insertAgent();
+    const reserved = await insertQueuedRun(companyId, agentId, {
+      requestedByActorType: "user", requestedByActorId: "board-user",
+      payload: { manualUserWake: true, _paperclipReviewerAssignmentContinuation: null },
+    }, new Date(0));
+    await db.update(heartbeatRuns).set({ responsibleUserId: "board-user" }).where(sql`${heartbeatRuns.id} = ${reserved.runId}`);
+    const [beforeRun] = await db.select().from(heartbeatRuns).where(sql`${heartbeatRuns.id} = ${reserved.runId}`);
+    const [beforeWake] = await db.select().from(agentWakeupRequests).where(sql`${agentWakeupRequests.id} = ${reserved.wakeupRequestId}`);
+    const ordinary = await insertClaimableRun(companyId, agentId);
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+    expect((await db.select().from(heartbeatRuns).where(sql`${heartbeatRuns.id} = ${reserved.runId}`))[0]).toEqual(beforeRun);
+    expect((await db.select().from(agentWakeupRequests).where(sql`${agentWakeupRequests.id} = ${reserved.wakeupRequestId}`))[0]).toEqual(beforeWake);
+    expect(await runStatus(ordinary.runId)).not.toMatchObject({ status: "queued" });
+  });
+
   it("cancels a queued run whose claim is rejected instead of failing recovery", async () => {
     const { companyId, agentId } = await insertAgent();
     const { runId, wakeupRequestId } = await insertUnverifiableInterruptRun(companyId, agentId);
