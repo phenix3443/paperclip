@@ -382,7 +382,7 @@ function createRunContextDb(
   };
   const buildQuery = (selection: Record<string, unknown>, chatBindingQuery = false, settledRecoveryQuery = false) => {
     const whereResult = {
-      orderBy: vi.fn(async () => []),
+      orderBy: vi.fn(() => ({ limit: vi.fn(async () => []), then: async (resolve: (rows: unknown[]) => unknown) => resolve([]) })),
       limit: vi.fn(() => ({
         then: async (resolve: (limitedRows: unknown[]) => unknown) => resolve(await rowsForSelection(selection, chatBindingQuery, settledRecoveryQuery)),
         for: vi.fn(() => ({
@@ -493,6 +493,8 @@ describe("agent issue mutation checkout ownership", () => {
     // by an earlier test.
     routeModules.value.__clearIssueListResponseCacheForTests();
     vi.clearAllMocks();
+    mockRunnerGoalService.projection.mockReset().mockResolvedValue(null);
+    mockRunnerGoalService.act.mockReset();
     mockIssueTreeControlService.getActivePauseHoldGate.mockReset().mockResolvedValue(null);
     mockChatRunRetries.prepareFailedChatRunRetry.mockReset();
     mockChatRunRetries.processFailedChatRunRetry.mockReset();
@@ -1773,9 +1775,115 @@ describe("agent issue mutation checkout ownership", () => {
       const res = await request(await createApp(peerActor()))
         .patch(`/api/issues/${issueId}`).send({ status: "cancelled" });
 
-      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(ownerRunId);
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(ownerRunId,
+        "Cancelled before issue terminalization", expect.objectContaining({ errorCode: "issue_terminalized" }));
       expect.soft(res.status, JSON.stringify(res.body)).toBe(500);
       expect.soft(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+
+    it.each([false, true])("preserves history with comment=%s", async withComment => {
+      const policy = { mode: "normal", stages: [], commentRequired: true, maxReviewRounds: 3 };
+      const history = { status: "completed", completedStageIds: [recoveryActionId],
+        lastDecisionId: recoveryActionId, lastDecisionOutcome: "approved", changesRequestedCount: 2 };
+      const original = makeIssue({ status: "blocked", executionPolicy: policy, executionState: history,
+        blockedByIssueIds: [recoveryActionId, ownerRunId] });
+      mockIssueService.getById.mockResolvedValue(original);
+      mockIssueService.update.mockImplementation(async (_id, patch) => ({ ...original, ...patch }));
+      const res = await request(await createApp(peerActor())).patch(`/api/issues/${issueId}`)
+        .send({ status: "cancelled", ...(withComment ? { comment: "Stop this work" } : {}) });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body).toMatchObject({ status: "cancelled", assigneeAgentId: ownerAgentId,
+        executionPolicy: policy, executionState: history, blockedByIssueIds: [recoveryActionId, ownerRunId] });
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+      expect(mockIssueService.addComment).toHaveBeenCalledTimes(withComment ? 1 : 0);
+    });
+
+    it.each([false, true].flatMap(ready => [false, true].flatMap(goal =>
+      ["confirmed", "throw", "null", "running"].map(outcome => ({ ready, goal, outcome })))))
+    ("requires confirmed Stop: $ready readiness / $goal goal / $outcome", async ({ ready, goal, outcome }) => {
+      mockIssueService.getDependencyReadiness.mockResolvedValue({ unresolvedBlockerCount: ready ? 0 : 2,
+        unresolvedBlockerIssueIds: ready ? [] : [recoveryActionId, ownerRunId] });
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", executionRunId: ownerRunId }));
+      mockHeartbeatService.getRun.mockResolvedValue({ id: ownerRunId, companyId, agentId: ownerAgentId,
+        status: "running", contextSnapshot: { issueId } });
+      mockRunnerGoalService.projection.mockReset().mockResolvedValue(null);
+      if (goal) mockRunnerGoalService.projection
+        .mockResolvedValueOnce({ goal: { status: "running" }, pendingAction: null,
+          revision: 1, capability: { actions: ["pause"] } })
+        .mockResolvedValue({ goal: { status: "paused" }, pendingAction: null });
+      if (outcome === "throw") mockHeartbeatService.cancelRun.mockRejectedValue(new Error("Stop failed"));
+      else mockHeartbeatService.cancelRun.mockResolvedValue(outcome === "null" ? null : {
+        id: ownerRunId, companyId, agentId: ownerAgentId, status: outcome === "confirmed" ? "cancelled" : "running" });
+      const res = await request(await createApp(peerActor())).patch(`/api/issues/${issueId}`)
+        .send({ status: "cancelled", comment: "Stop this work" });
+      expect(res.status, JSON.stringify(res.body)).toBe(outcome === "confirmed" ? 200 : outcome === "throw" ? 500 : 409);
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledTimes(1);
+      if (outcome === "confirmed") {
+        expect(mockIssueService.update).toHaveBeenCalledTimes(1);
+        expect(mockHeartbeatService.cancelRun.mock.invocationCallOrder[0])
+          .toBeLessThan(mockIssueService.update.mock.invocationCallOrder[0]);
+      } else {
+        expect(mockIssueService.update).not.toHaveBeenCalled();
+        expect(mockIssueService.addComment).not.toHaveBeenCalled();
+        expect(mockLogActivity.mock.calls.some(([, input]) => input.action === "issue.updated")).toBe(false);
+        expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+      }
+      mockRunnerGoalService.projection.mockReset().mockResolvedValue(null);
+    });
+
+    it.each([{ resume: false }, { reopen: false }, { interrupt: false }, { title: "Owned active issue" },
+      { assigneeAgentId: ownerAgentId }, { blockedByIssueIds: [] }, { executionPolicy: null },
+      { attachmentIds: [] }, { unknownField: "stripped by validation" }])
+    ("does not exempt extra submitted fields %j", async extra => {
+      mockAgentService.resolveByReference.mockResolvedValue({ ambiguous: false, agent: makeAgent(ownerAgentId) });
+      const res = await request(await createApp(peerActor())).patch(`/api/issues/${issueId}`)
+        .send({ status: "cancelled", comment: "Stop", ...extra });
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.error).toBe("Issue follow-up blocked by unresolved blockers");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    });
+
+    it.each(["todo", "in_progress", "done"])("does not exempt blocked -> %s", async status => {
+      const res = await request(await createApp(peerActor())).patch(`/api/issues/${issueId}`).send({ status });
+      expect(res.status).toBe(409);
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it.each(["grant", "pause", "recovery", "low-trust"])("refuses %s before stopping", async gate => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", executionRunId: ownerRunId }));
+      if (gate === "grant" || gate === "recovery") mockAccessService.decide.mockImplementation(async ({ action }) => ({
+        allowed: action !== "tasks:manage_active_checkouts", reason: "allow_explicit_grant" }));
+      if (gate === "low-trust") mockAgentService.getById.mockImplementation(async id => makeAgent(id, { permissions: {
+        trustPreset: "low_trust_review", authorizationPolicy: { trustBoundary: { mode: "low_trust_review",
+          companyId, rootIssueId: issueId, issueIds: [issueId], projectIds: [], allowedAgentIds: [ownerAgentId] } },
+      } }));
+      if (gate === "pause") mockIssueTreeControlService.getActivePauseHoldGate.mockResolvedValue({ holdId: "hold", mode: "pause" });
+      if (gate === "recovery") mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+        id: recoveryActionId, ownerAgentId, status: "active" });
+      const res = await request(await createApp(peerActor())).patch(`/api/issues/${issueId}`).send({ status: "cancelled" });
+      expect([403, 409]).toContain(res.status);
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("correlates self Stop and reports a rejected guarded commit without success", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", executionRunId: ownerRunId }));
+      mockHeartbeatService.getRun.mockResolvedValue({ id: ownerRunId, companyId, agentId: ownerAgentId,
+        status: "running", contextSnapshot: { issueId } });
+      mockHeartbeatService.cancelRun.mockResolvedValue({ id: ownerRunId, status: "cancelled" });
+      const { HttpError: CurrentHttpError } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
+      mockIssueService.update.mockRejectedValue(new CurrentHttpError(409, "Concurrent policy change"));
+      const res = await request(await createApp(ownerActor())).patch(`/api/issues/${issueId}`)
+        .send({ status: "cancelled", comment: "Stop" });
+      expect(res.status).toBe(409);
+      const stopOptions = mockHeartbeatService.cancelRun.mock.calls[0][2];
+      expect(mockIssueService.update.mock.calls[0][1]).toMatchObject({ actorRunId: ownerRunId,
+        actorRunStopId: stopOptions.resultJson.issueMutationStopId });
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+      expect(mockLogActivity.mock.calls.some(([, input]) => input.action === "issue.updated")).toBe(false);
     });
 
     it("allows a non-assignee CTO to cancel with unfinished dependencies", async () => {

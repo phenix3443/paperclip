@@ -6965,7 +6965,7 @@ export function issueRoutes(
     req: Request,
     res: Response,
     issue: Parameters<typeof decideIssueAccess>[1],
-    options: { resumeIntent?: boolean } = {},
+    options: { resumeIntent?: boolean; skipDependencyReadiness?: boolean } = {},
   ) {
     if (
       await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)
@@ -7012,7 +7012,7 @@ export function issueRoutes(
       return false;
     }
 
-    if (issue.status === "blocked") {
+    if (issue.status === "blocked" && !options.skipDependencyReadiness) {
       const readiness = await svc.getDependencyReadiness(issue.id);
       if (readiness.unresolvedBlockerCount > 0) {
         res.status(409).json({
@@ -14246,7 +14246,9 @@ export function issueRoutes(
 
   router.patch(
     "/issues/:id",
-    (req, _res, next) => {
+    (req, res, next) => {
+      res.locals.plainCancellationRequested = req.body?.status === "cancelled" &&
+        Object.keys(req.body).every(key => key === "status" || key === "comment");
       if (req.body?.expectedStatusVersion !== undefined && (
         req.body.status !== "todo" ||
         Object.keys(req.body).some(key => key !== "status" && key !== "expectedStatusVersion")
@@ -14336,6 +14338,7 @@ export function issueRoutes(
       const actor = getActorInfo(req);
       const isClosed = isClosedIssueStatus(existing.status);
       const isBlocked = existing.status === "blocked";
+      const plainBlockedCancellation = isBlocked && res.locals.plainCancellationRequested === true;
       const normalizedAssigneeAgentId =
         await normalizeIssueAssigneeAgentReference(
           existing.companyId,
@@ -14524,7 +14527,9 @@ export function issueRoutes(
       if (
         resumeRequested !== true &&
         agentStatusTransitionRequiresResumeAuthority &&
-        !(await assertExplicitResumeIntentAllowed(req, res, existing))
+        !(await assertExplicitResumeIntentAllowed(req, res, existing, {
+          skipDependencyReadiness: plainBlockedCancellation,
+        }))
       ) {
         return;
       }
@@ -14781,6 +14786,9 @@ export function issueRoutes(
         throw unprocessable("Snapshot-guarded policy updates cannot change task status or ownership");
       }
       Object.assign(updateFields, transition.patch);
+      if (plainBlockedCancellation && updateFields.status !== "cancelled") {
+        throw conflict("The execution workflow changed the requested cancellation");
+      }
 
       const nextStatus = updateFields.status ?? existing.status;
       if (updateFields.unblockDescriptor && nextStatus !== "blocked") {
@@ -15053,10 +15061,10 @@ export function issueRoutes(
           issueId: existing.id,
           agentId: existing.assigneeAgentId,
         });
-        const runToStopForTerminalization = goalStopAction
+        const runToStopForTerminalization = goalStopAction || plainBlockedCancellation
           ? await resolveActiveIssueRun(existing)
           : null;
-        if (goalStopAction && runToStopForTerminalization) {
+        if (runToStopForTerminalization) {
           const cancelled = await heartbeat.cancelRun(
             runToStopForTerminalization.id,
             "Cancelled before issue terminalization",
