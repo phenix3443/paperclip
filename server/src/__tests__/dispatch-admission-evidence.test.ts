@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import { appendFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,6 +14,7 @@ import { createPluginEventBus } from "../services/plugin-event-bus.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { verifyDispatchEvidenceSource } from "./helpers/dispatch-evidence-source.js";
 import { issueTreeControlService } from "../services/issue-tree-control.js";
+import { reviewerAssignmentGeneration } from "../services/heartbeat/reviewer-assignment-continuation.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 
@@ -120,6 +124,35 @@ describe("isolated plugin wake admission evidence", () => {
     await evidence("simultaneous-queued-control", f.company.id, { request, first, second, providerStart: "absent" });
   });
 
+  it("reconciles a lost SDK response after the accepting worker process exits", async () => {
+    const f = await seed(), runChild = promisify(execFile);
+    const args = [fileURLToPath(new URL("../../../node_modules/vitest/vitest.mjs", import.meta.url)), "run",
+      "server/src/__tests__/helpers/dispatch-admission-process.test.ts", "--maxWorkers", "1"];
+    const options = { cwd: fileURLToPath(new URL("../../../", import.meta.url)), timeout: 90_000, maxBuffer: 4_000_000,
+      env: { ...process.env, DISPATCH_EVIDENCE_SDK_DATABASE_URL: database.connectionString,
+        DISPATCH_EVIDENCE_SDK_COMPANY_ID: f.company.id, DISPATCH_EVIDENCE_SDK_ISSUE_ID: f.issue.id } };
+    let crashed: { stdout: string; stderr: string; code: unknown } | undefined;
+    try { await runChild(process.execPath, args, { ...options, env: { ...options.env, DISPATCH_EVIDENCE_SDK_CRASH: "after-admission" } }); }
+    catch (error) {
+      const failure = error as { stdout: string; stderr: string; code: unknown };
+      crashed = { stdout: failure.stdout, stderr: failure.stderr, code: failure.code };
+    }
+    expect(crashed?.stdout).toContain("DISPATCH_SDK_ACCEPTED_RESPONSE_LOST");
+    const [receipt] = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.company.id),
+      eq(agentWakeupRequests.idempotencyKey, "synthetic:sdk-process-response-loss")));
+    expect(receipt.runId).toBeTruthy();
+    const restarted = await runChild(process.execPath, args, { ...options, env: { ...options.env, DISPATCH_EVIDENCE_SDK_CRASH: "none" } });
+    const line = restarted.stdout.split("\n").find(value => value.startsWith("DISPATCH_SDK_RESPONSE "));
+    expect(line).toBeTruthy();
+    const response: unknown = JSON.parse(line!.slice("DISPATCH_SDK_RESPONSE ".length));
+    expect(response).toEqual({ queued: true, runId: receipt.runId });
+    const queued = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.company.id), eq(heartbeatRuns.status, "queued")));
+    expect(queued).toHaveLength(1);
+    expect(queued[0]).toMatchObject({ id: receipt.runId, startedAt: null });
+    await evidence("sdk-process-response-loss-and-restart", f.company.id, { crashed, restarted, receipt, response,
+      providerStart: "absent; target held busy", restartScope: "independent Vitest worker processes over the same disposable PostgreSQL" });
+  }, 240_000);
+
   it.each(["scheduled_retry"])("characterizes matching SDK requests when the accepted task run is %s", async status => {
     const f = await seed(), service = host();
     const request = { companyId: f.company.id, issueId: f.issue.id, idempotencyKey: `synthetic:matching-${status}` };
@@ -212,6 +245,45 @@ describe("isolated plugin wake admission evidence", () => {
     expect(admitted).toMatchObject({ agentId: f.agent.id, status: "queued", startedAt: null });
   });
 
+  it("does not bind an ordinary SDK request to the pending review submission read before admission", async () => {
+    const f = await seed(), stageId = randomUUID();
+    const [author] = await db.insert(agents).values({ companyId: f.company.id, name: "Synthetic author", role: "engineer", adapterType: "process" }).returning();
+    const executionState = { status: "pending", currentStageId: stageId, currentStageIndex: 0, currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: f.agent.id }, returnAssignee: { type: "agent", agentId: author.id },
+      completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null, changesRequestedCount: 0,
+      reviewRequest: { instructions: "Review submission 1111111111111111111111111111111111111111" } };
+    await db.update(issues).set({ status: "in_review", executionState, executionPolicy: { mode: "normal", commentRequired: true,
+      stages: [{ id: stageId, type: "review", approvalsNeeded: 1, participants: [{ id: randomUUID(), type: "agent", agentId: f.agent.id }] }] } })
+      .where(eq(issues.id, f.issue.id));
+    const [before] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
+    const beforeGeneration = reviewerAssignmentGeneration(before);
+    let crossed = false;
+    const observed = new Proxy(db, { get(target, key) {
+      if (key !== "transaction") return Reflect.get(target, key);
+      const transaction: typeof db.transaction = async (callback, options) => {
+        if (!crossed) {
+          crossed = true;
+          await db.update(issues).set({ executionState: { ...executionState,
+            reviewRequest: { instructions: "Review submission 2222222222222222222222222222222222222222" } } })
+            .where(eq(issues.id, f.issue.id));
+        }
+        return target.transaction(callback, options);
+      };
+      return transaction;
+    } });
+    const request = { companyId: f.company.id, issueId: f.issue.id, idempotencyKey: "synthetic:review-submission-v1" };
+    const response = await host(observed).issues.requestWakeup(request);
+    const [after] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
+    expect(crossed).toBe(true);
+    expect(reviewerAssignmentGeneration(after)).not.toBe(beforeGeneration);
+    await evidence("sdk-pending-submission-race", f.company.id, { request, response, before,
+      beforeGeneration, afterGeneration: reviewerAssignmentGeneration(after), providerStart: "absent; reviewer held busy" });
+    expect(response.queued).toBe(true);
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, response.runId!));
+    expect(run).toMatchObject({ agentId: f.agent.id, status: "queued", startedAt: null });
+    expect(run.contextSnapshot).not.toHaveProperty("reviewerAssignmentGeneration", beforeGeneration);
+  });
+
   it.each(["cancelled", "paused", "blocker", "tree-hold", "recovery-hold"])("does not admit a task run through the %s gate", async gate => {
     const f = await seed(), service = host();
     if (gate === "cancelled") await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, f.issue.id));
@@ -235,7 +307,15 @@ describe("isolated plugin wake admission evidence", () => {
     await evidence(`admission-gate-${gate}`, f.company.id, { request, response, refusal, providerStart: "absent" });
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.company.id));
     expect(runs).toHaveLength(1);
-    if (["cancelled", "paused", "blocker"].includes(gate)) expect(refusal).toEqual(expect.any(String));
-    else expect(response).toEqual({ queued: false, runId: null });
+    const refusals: Record<string, string> = {
+      cancelled: "Issue is not wakeable in status: cancelled",
+      paused: "Agent is not invokable in its current state",
+      blocker: "Issue is blocked by unresolved blockers",
+    };
+    if (refusals[gate]) expect(refusal).toBe(refusals[gate]);
+    else {
+      expect(refusal).toBeUndefined();
+      expect(response).toEqual({ queued: false, runId: null });
+    }
   });
 });

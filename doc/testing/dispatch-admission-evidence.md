@@ -42,8 +42,9 @@ are separate observations.
 ## Reproduce
 
 Install the frozen dependencies in each source tree, then prepare the permitted
-SDK dependency artifacts. Copy the three evidence test files and
-`helpers/dispatch-evidence-source.ts` into the pinned tree at the same paths.
+SDK dependency artifacts. Copy the three evidence test files, `helpers/dispatch-evidence-source.ts`,
+`helpers/dispatch-release-process.test.ts` and
+`helpers/dispatch-admission-process.test.ts` into the pinned tree at the same paths.
 Run from the pinned tree:
 
 ```sh
@@ -89,7 +90,7 @@ pinned source only; it does not implement a recovery path.
 | D2 | HTTP reassign, then `resumeQueuedRuns`: the stale old queued run is cancelled by `issue_assignee_changed`. On the pin, the target receipt remains deferred with no run. | Existing release/admission owner defect on the pin; separately compare #219 in branch source. |
 | D3 | Ordinary user comment and native HTTP confirmation accept both retain their continuation context through real release. Eligible reviewer intent binds the original reviewer. A Node process marker proves the separate running control. | Positive controls; queued controls do not establish provider execution. |
 | D4 | Cancelled task, manual agent pause, unresolved dependency, subtree pause, and active execution recovery action admit no task run. A paused target's accepted payload survives release. | Legitimate gates; synthetic explicit source release after eligibility restoration is separate from automatic notification. |
-| D5 | Failure after native transactional work but before commit rolls back promotion. Lost committed response, reconstructed adapters and simultaneous duplicate release bind one successor. | Persistence/transaction control. An OS process-kill/restart is not exercised. |
+| D5 | Failure after native transactional work but before commit rolls back promotion. Lost committed response, reconstructed adapters and simultaneous duplicate release bind one successor. | Persistence/transaction control. An independent worker exits before release commit; a fresh worker promotes the same retained intent against the same isolated database. |
 | D6 | Two eligible issues for one company and one target agent drain under `maxConcurrentRuns=1`. Each original receipt binds a started successful run. | Bounded two-issue fairness control; no sustained-load claim. |
 
 The D2 owner is `heartbeat/queue.ts` stale dispatch cancellation, together with
@@ -114,13 +115,16 @@ admission, and real PostgreSQL. They do not use the SDK in-memory test harness.
 | Scheduled retry | A matching synthetic persisted retry row is recognized. Delivery of the timer itself is outside this assertion. |
 | Deferred | `queued:false/runId:null` is recorded separately from the persisted deferred request. The response alone does not prove retention. |
 | Terminal key redelivery | Two receipts with the same ordinary plugin key bind different admitted runs. Their terminal transition is synthetic; two provider executions are not claimed. The unique-key oracle fails. |
-| Response loss | A deliberate caller failure after native acceptance followed by host reconstruction associates the existing queued run. This does not prove a cross-process worker protocol. |
+| Response loss | Host reconstruction and a separate accepting-worker exit/restart scenario inspect the existing queued receipt. This tests native queued coalescing after process loss; it does not add a generic durable-key fence. |
 | Owner/submission race | A real owner and description update occurs between SDK preflight and the first native transaction. The obsolete agent can still receive a queued run. No expected-owner/submission argument exists in this SDK request. |
 
 Generic key uniqueness and expected-state SDK admission would be additional
 capabilities. This report does not classify their absence as an upstream bug.
-The owner/description barrier does not establish exact review-document revision
-binding; reviewer submission-generation checks below are a different contract.
+A second barrier updates the real pending reviewRequest between SDK preflight
+and native transaction admission. Its reviewer-assignment generation changes,
+yet the ordinary SDK wake queues without binding the prior generation. This is
+missing expected-submission admission, separate from the protected native
+reviewer-assignment intent. It is not a concurrent edit to a GitHub submission.
 Do not resend a wake based only on an unchanged ordinary key or a preflight read.
 
 ## Reviewer findings
@@ -137,8 +141,13 @@ when the reviewer becomes idle. A matching intent remains held during manual or
 unknown pause. Stale submission, return owner, participant, responsible user or
 decision retires the old intent without rewriting the changed turn or history.
 The eligible original-reviewer control binds one queued successor across two
-service instances. Existing verified pre-start-cancelled and decided-review
-reassignment controls are run separately at the same pin.
+service instances. An eligible legacy cancelled/issue_reassigned decided-review
+projection also continues through its existing native owner. Its retained receipt
+remains intact. A nine-case matrix exercises that owner with stale statusVersion,
+stage, decision, receipt source, action source, participant, return owner, assignee
+and unrelated resolved action. Each asserts its exact native refusal, no new run
+and unchanged task/history/actions. The verified pre-start-cancelled route
+positive control is run separately at the same pin.
 
 The missing resolved-hold continuation entry remains **missing capability**.
 `createReviewerAssignmentIntent` requires `in_review` and a matching executor
@@ -165,7 +174,7 @@ running control uses a real process barrier, and the deferred control uses a
 separate execution owner. These failures are not accepted as production bugs.
 
 No natural incident was replayed. No provider quota reset, live reviewer
-recovery, cross-process worker restart, automatic gate-release notification, or
+recovery, automatic gate-release notification, or
 exact SDK review-revision CAS is certified. Full typecheck/build and required
 broader checks belong to PR CI. Independent review must target the exact pushed
 test/report head before any merge; this evidence does not authorize deployment.

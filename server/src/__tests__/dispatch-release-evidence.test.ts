@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import { appendFile } from "node:fs/promises";
 import express from "express";
 import request from "supertest";
@@ -151,6 +154,35 @@ describe("isolated native release evidence", () => {
     await evidence("release-commit-fault-and-response-loss", f, { retainedBeforeCommit: retained, boundAfterRestart: bound,
       restartScope: "new native adapter instances over the same isolated database; process-kill restart not exercised" });
   });
+
+  it("recovers the same durable intent after a real release worker process exits before commit", async () => {
+    const f = await seed();
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.source.id));
+    const runChild = promisify(execFile);
+    const args = [fileURLToPath(new URL("../../../node_modules/vitest/vitest.mjs", import.meta.url)), "run",
+      "server/src/__tests__/helpers/dispatch-release-process.test.ts", "--maxWorkers", "1"];
+    const options = { cwd: fileURLToPath(new URL("../../../", import.meta.url)), timeout: 90_000, maxBuffer: 4_000_000,
+      env: { ...process.env, DISPATCH_EVIDENCE_CHILD_DATABASE_URL: database.connectionString,
+        DISPATCH_EVIDENCE_CHILD_COMPANY_ID: f.company.id, DISPATCH_EVIDENCE_CHILD_RUN_ID: f.source.id } };
+    let crashed: { stdout: string; stderr: string; code: unknown } | undefined;
+    try { await runChild(process.execPath, args, { ...options, env: { ...options.env, DISPATCH_EVIDENCE_CHILD_CRASH: "before-commit" } }); }
+    catch (error) {
+      const failure = error as { stdout: string; stderr: string; code: unknown };
+      crashed = { stdout: failure.stdout, stderr: failure.stderr, code: failure.code };
+    }
+    expect(crashed?.stdout).toContain("DISPATCH_CHILD_BEFORE_COMMIT");
+    const [retained] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wake.id));
+    expect(retained).toMatchObject({ status: "deferred_issue_execution", runId: null, payload: f.wake.payload });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.target.id))).toHaveLength(0);
+    const restarted = await runChild(process.execPath, args, { ...options, env: { ...options.env, DISPATCH_EVIDENCE_CHILD_CRASH: "none" } });
+    expect(restarted.stdout).toContain("DISPATCH_CHILD_AFTER_COMMIT");
+    const [after] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wake.id));
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.target.id));
+    expect(runs).toHaveLength(1);
+    expect(after.runId).toBe(runs[0].id);
+    await evidence("real-process-crash-and-restart", f, { crashed, restarted, receiptAfter: after,
+      restartScope: "independent Vitest worker processes exercise native release against the same disposable PostgreSQL" });
+  }, 240_000);
 
   it("drains two eligible issue queues for the same target in one native resume pass", async () => {
     const first = await seed();

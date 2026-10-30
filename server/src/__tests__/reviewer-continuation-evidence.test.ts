@@ -1,7 +1,8 @@
 import { appendFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { agents, agentWakeupRequests, authUsers, createDb, heartbeatRuns, issueExecutionDecisions, issueRecoveryActions, issues } from "@paperclipai/db";
+import { activityLog, agents, agentWakeupRequests, authUsers, createDb, heartbeatRuns, issueExecutionDecisions, issueRecoveryActions, issues } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { seedReviewerIntent } from "./helpers/reviewer-intent.js";
 import { heartbeatService } from "../services/heartbeat.js";
@@ -10,6 +11,7 @@ import { settleUnrecoverableExecutions } from "../services/execution-recovery-re
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { parseIssueExecutionState } from "../services/issue-execution-policy.js";
 import { verifyDispatchEvidenceSource } from "./helpers/dispatch-evidence-source.js";
+import { continueDecidedReviewReassignments, proveDecidedReviewContinuation } from "../services/decided-review-reassignment.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 
@@ -55,6 +57,7 @@ describe("isolated original reviewer continuation evidence", () => {
       preserved: await snapshot(f.issueId),
       issue: (await db.select().from(issues).where(eq(issues.id, f.issueId)))[0],
       actions: await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId)),
+      activities: await db.select().from(activityLog).where(eq(activityLog.entityId, f.issueId)),
       wakes: await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId)),
       runs: await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)) };
     await appendFile(process.env.DISPATCH_EVIDENCE_FILE, JSON.stringify(value) + "\n");
@@ -160,5 +163,86 @@ describe("isolated original reviewer continuation evidence", () => {
     expect(changedSnapshot.decisions).toEqual(before.decisions);
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(0);
     await evidence(`stale-reviewer-intent-${changed}`, f, { receiptBefore: receipt, receiptAfter: after });
+  });
+
+  async function retainedDecidedReview() {
+    const f = await seed(), now = Date.now();
+    const [reviewer] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "cancelled",
+      runtimeMode: "legacy", errorCode: "issue_reassigned", startedAt: new Date(now - 1000), finishedAt: new Date(now),
+      contextSnapshot: { issueId: f.issueId }, resultJson: { reassignmentStopConfirmed: true, issueMutationStopId: randomUUID(),
+        cancellation: { source: "control_plane", expected: true, initiator: { type: "agent", id: f.source.agentId } } } }).returning();
+    const before = await snapshot(f.issueId), state = parseIssueExecutionState(before.executionState)!;
+    await db.update(issueExecutionDecisions).set({ createdByRunId: reviewer.id, createdAt: new Date(now + 10) })
+      .where(eq(issueExecutionDecisions.id, state.lastDecisionId!));
+    await db.update(issues).set({ status: "blocked", statusVersion: f.issue.statusVersion + 1,
+      executionRunId: null, checkoutRunId: null }).where(eq(issues.id, f.issueId));
+    const [task] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    const reviewHoldBlock = { runId: reviewer.id, statusVersion: task.statusVersion, previousStatus: "in_review",
+      stageId: state.currentStageId, lastDecisionId: state.lastDecisionId };
+    const [action] = await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+      kind: "active_run_watchdog", status: "resolved", outcome: "blocked", ownerType: "board", returnOwnerAgentId: f.agentId,
+      cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${reviewer.id}`,
+      evidence: { runId: reviewer.id, reviewHoldBlock, automaticRecovery: { policy: "preserve_without_replay_v1", replay: "blocked" } },
+      nextAction: "Synthetic original reviewer evidence", resolvedAt: new Date() }).returning();
+    await db.insert(activityLog).values({ companyId: f.companyId, actorType: "agent", actorId: f.source.agentId,
+      agentId: f.source.agentId, runId: f.source.id, action: "issue.updated", entityType: "issue", entityId: f.issueId,
+      createdAt: new Date(now + 20), details: { status: "in_review", _previous: { status: "in_progress" },
+        changes: { executionState: { to: state } } } });
+    expect(await proveDecidedReviewContinuation(db, { task })).toMatchObject({ kind: "proved", shape: "blocked_projection" });
+    return { ...f, task, reviewer, action, reviewHoldBlock };
+  }
+
+  it("continues the eligible legacy decided-review projection through its existing native owner", async () => {
+    const f = await retainedDecidedReview(), before = await snapshot(f.issueId);
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running", contextSnapshot: {} });
+    const result = await continueDecidedReviewReassignments(db, heartbeatService(db).wakeup, { after: null, settling: new Map() });
+    expect(result.woken).toBe(1);
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId));
+    const queued = runs.filter(run => run.contextSnapshot?.issueId === f.issueId && run.status === "queued");
+    expect(queued).toHaveLength(1);
+    expect(queued[0]).toMatchObject({ startedAt: null, contextSnapshot: { decidedReviewContinuation: { sourceRunId: f.reviewer.id } } });
+    expect(await snapshot(f.issueId)).toEqual(before);
+    expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0].status).toBe("in_review");
+    const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.action.id));
+    expect(action.evidence.reviewHoldBlock).toEqual(f.reviewHoldBlock);
+    await evidence("legacy-decided-review-native-positive", f, { originalReceipt: f.reviewHoldBlock, continuation: result });
+  });
+
+  it.each(["statusVersion", "stage", "decision", "receipt-source", "action-source", "participant", "return-owner", "assignee", "foreign-action"])("refuses a retained review hold with mismatched %s through the native continuation pass", async mismatch => {
+    const f = await retainedDecidedReview();
+    const block = { ...f.reviewHoldBlock };
+    if (mismatch === "statusVersion") block.statusVersion++;
+    if (mismatch === "stage") block.stageId = randomUUID();
+    if (mismatch === "decision") block.lastDecisionId = randomUUID();
+    if (mismatch === "receipt-source") block.runId = f.source.id;
+    await db.update(issueRecoveryActions).set({ evidence: { ...f.action.evidence, reviewHoldBlock: block },
+      ...(mismatch === "action-source" ? { fingerprint: `legacy-execution:${f.source.id}`, evidence: {
+        ...f.action.evidence, runId: f.source.id, reviewHoldBlock: block } } : {}) })
+      .where(eq(issueRecoveryActions.id, f.action.id));
+    const state = parseIssueExecutionState(f.task.executionState)!;
+    if (mismatch === "participant") await db.update(issues).set({ executionState: { ...state,
+      currentParticipant: { type: "agent", agentId: f.source.agentId } } }).where(eq(issues.id, f.issueId));
+    if (mismatch === "return-owner") await db.update(issues).set({ executionState: { ...state,
+      returnAssignee: { type: "agent", agentId: f.agentId } } }).where(eq(issues.id, f.issueId));
+    if (mismatch === "assignee") await db.update(issues).set({ assigneeAgentId: f.source.agentId }).where(eq(issues.id, f.issueId));
+    if (mismatch === "foreign-action") await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+      kind: "active_run_watchdog", status: "resolved", outcome: "blocked", ownerType: "board", cause: "uncertain_provider_action",
+      fingerprint: `foreign:${randomUUID()}`, evidence: { runId: f.source.id, automaticRecovery: { replay: "blocked" } }, nextAction: "Unrelated synthetic hold" });
+    const [task] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    const proof = await proveDecidedReviewContinuation(db, { task });
+    const reasons: Record<string, string> = { statusVersion: "P4b_receipt_stale", stage: "P4b_receipt_stale",
+      decision: "P4b_receipt_stale", "receipt-source": "P4b_receipt_stale", "action-source": "P4b_no_receipt",
+      participant: "selector_decision_run_not_participant", "return-owner": "P5_no_resubmission",
+      assignee: "P4_assignee", "foreign-action": "P6_foreign_hold" };
+    expect(proof).toEqual({ kind: "hold", reason: reasons[mismatch] });
+    const before = await snapshot(f.issueId);
+    const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    expect(await continueDecidedReviewReassignments(db, heartbeatService(db).wakeup, { after: null, settling: new Map() }))
+      .toMatchObject({ woken: 0 });
+    expect(await snapshot(f.issueId)).toEqual(before);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId))).toEqual(actions);
+    expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0].status).toBe("blocked");
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).filter(run => run.status === "queued" || run.status === "running")).toHaveLength(0);
+    await evidence(`retained-review-hold-${mismatch}`, f, { proof, originalReceipt: f.reviewHoldBlock });
   });
 });
