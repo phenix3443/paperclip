@@ -2403,7 +2403,7 @@ export function Inbox() {
                     type="button"
                     variant="outline"
                     size="icon"
-                    className={cn("h-8 w-8 shrink-0", blockedGroupBy !== "none" && "bg-accent")}
+                    className="h-8 w-8 shrink-0" data-active={blockedGroupBy !== "none"}
                     title="Group"
                   >
                     <Layers className="h-3.5 w-3.5" />
@@ -2474,7 +2474,7 @@ export function Inbox() {
                 type="button"
                 variant="outline"
                 size="icon"
-                className={cn("hidden h-8 w-8 shrink-0 sm:inline-flex", nestingEnabled && "bg-accent")}
+                className="hidden h-8 w-8 shrink-0 sm:inline-flex" data-active={nestingEnabled} aria-pressed={nestingEnabled}
                 onClick={toggleNesting}
                 title={nestingEnabled ? "Disable parent-child nesting" : "Enable parent-child nesting"}
               >
@@ -2501,7 +2501,7 @@ export function Inbox() {
                     type="button"
                     variant="outline"
                     size="icon"
-                    className={cn("h-8 w-8 shrink-0", groupBy !== "none" && "bg-accent")}
+                    className="h-8 w-8 shrink-0" data-active={groupBy !== "none"}
                     title="Group"
                   >
                     <Layers className="h-3.5 w-3.5" />

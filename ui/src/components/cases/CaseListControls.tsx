@@ -53,7 +53,7 @@ export function CaseListControls({ filters, activeFilterCount, columns, onColumn
       </PopoverContent>
     </Popover>
     <Popover>
-      <PopoverTrigger asChild><Button variant="outline" size="icon" className={cn("h-8 w-8 shrink-0", groupBy !== "none" && "bg-accent")} aria-label="Group" title="Group"><Layers aria-hidden className="h-3.5 w-3.5" /></Button></PopoverTrigger>
+      <PopoverTrigger asChild><Button variant="outline" size="icon" className="h-8 w-8 shrink-0" data-active={groupBy !== "none"} aria-label="Group" title="Group"><Layers aria-hidden className="h-3.5 w-3.5" /></Button></PopoverTrigger>
       <PopoverContent align="end" className="w-44 p-2" aria-label="Group cases">
         {CASE_GROUP_OPTIONS.map(([value, label]) => <button key={value} type="button" aria-pressed={groupBy === value}
           className={cn("flex w-full items-center justify-between rounded-sm px-2 py-1.5 text-sm", groupBy === value ? "bg-accent/50 text-foreground" : "text-muted-foreground hover:bg-accent/50")}
