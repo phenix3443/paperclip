@@ -42,7 +42,11 @@ creates a hold; it does not change task statuses to a paused status.
 Automated: [dependency wakeups](../../server/src/__tests__/issue-dependency-wakeups-routes.test.ts) checks server behavior; visual relationship navigation remains a manual check. The [native queue suite](../../server/src/__tests__/heartbeat-dependency-scheduling.test.ts)
 includes frozen-periodic-recovery lifecycle/budget release, held-input paging,
 and release racing claim settlement. [Budget release commit tests](../../server/src/__tests__/budget-release-commit.test.ts)
-cover root/dedicated and nested commit/rollback. These fixtures do not prove a
+cover root/dedicated and nested commit/rollback, uncertain commit settlement,
+and notification failure. The queue suite also exercises override, UTC rollover,
+accounting correction/settlement, exact PostgreSQL cursors, and more than a page
+of mixed historical inputs. Queue generation tests cover settlement microtasks
+and retained work across stop/resume. These fixtures do not prove a
 live deployment or every policy/accounting variation.
 
 Manual: Block one task on another, finish the prerequisite, and observe the dependent task’s eligible continuation. Follow parent/child links back to the source request. Verify no duplicate run or false parent completion occurs.

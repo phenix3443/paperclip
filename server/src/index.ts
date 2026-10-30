@@ -2192,7 +2192,7 @@ async function startServerWithDatabaseTeardown(
     );
     embeddedPostgresSupervisor?.beginShutdown();
     heartbeatSchedulerStopped = true;
-    await stopDependencyReleaseNotifications();
+    await budget.workStep("dependency_release_drain", 10_000, stopDependencyReleaseNotifications);
     await taskDrainExpiryWork.stop();
     clearInterval(skillVersionRetentionInterval);
     clearTimeout(skillVersionRetentionStartup);

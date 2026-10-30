@@ -19,3 +19,10 @@ export function ordinaryWakeRunPredicate(wakeupRequestId: SQLWrapper, companyId:
       AND ${agentWakeupRequests.companyId} = ${companyId}
       AND NOT (${ordinaryWakeRequestPredicate()}))`;
 }
+
+export function nonDependencyPromotionPredicate() {
+  return sql`NOT COALESCE(${agentWakeupRequests.reason} = 'issue_blockers_resolved'
+    AND ${agentWakeupRequests.requestedByActorType} = 'system'
+    AND (${agentWakeupRequests.requestedByActorId} = 'native-status-committer'
+      OR ${agentWakeupRequests.requestedByActorId} LIKE 'native-status-wake-dispatch:%'), false)`;
+}

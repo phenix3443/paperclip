@@ -1267,7 +1267,11 @@ Budget-owned hold removal uses the same confirmed-commit contract. The root
 service subscribes once through `subscribeBudgetScopeRelease`; dedicated pools
 share that root scope. The budget owner emits company, agent, or project scope
 only after removing its own hold. The heartbeat queue rechecks current gates,
-coalesces active drains, and retains generations that arrive during settlement.
+coalesces overlapping active drains, and retains generations that arrive during settlement.
+Recovery pages retain PostgreSQL timestamp precision. A release takes a database
+watermark and visits that finite scope in bounded keyset pages, independent of
+the recovery cursor. Duplicate release signals share that drain. Unrelated scopes
+can make progress while a different scope is blocked.
 Lifecycle readiness enters that queue after existing queued-run resumption.
 Independent clients and lost notifications retain the existing durable recovery
 backstop; these callbacks are not cross-process delivery.

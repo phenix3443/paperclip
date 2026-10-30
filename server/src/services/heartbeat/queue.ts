@@ -1,4 +1,4 @@
-import { createNativeStatusDrain, nativeWakeScopeKey, type NativeWakeDispatchInput } from "./native-status-drain.js";
+import { createNativeStatusDrain, nativeWakeScopeKey, type NativeWakeDispatchInput, type NativeWakeCursor } from "./native-status-drain.js";
 import { settleNewReviewRunIdentity, settleReviewRunClaimIdentity } from "../run-identity.js";
 import { createDependencyAdmission, DependencyAdmissionHeld, pendingDependencyIntents, pendingDependencyReceiptResults, type DependencyClaim } from "./dependency-admission.js";
 import type { IssueMonitorAdmission } from "./scheduling.js";
@@ -79,6 +79,7 @@ import {
 import {
   and,
   asc,
+  getTableColumns,
   desc,
   eq,
   gt,
@@ -381,7 +382,6 @@ function readNonEmptyString(value: unknown): string | null {
 class MonitorAdmissionHeld extends Error {}
 
 /** Queue admission and dispatch share the service lifecycle callbacks and execution ownership. */
-type NativeWakeCursor = { requestedAt: Date; id: string };
 const nativeWakeCursors = new WeakMap<object, Map<string, NativeWakeCursor>>();
 
 export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDependencies) {
@@ -5033,14 +5033,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
   }
 
   async function releasePendingNativeStatusWakeups(input: NativeWakeDispatchInput) {
-    for (let page = 0; page < 5; page++) {
-      const result = await dispatchPendingNativeStatusWakeups(input);
-      if (result.scanned < 100) break;
-    }
+    const [watermark] = await db.execute<{ through: string }>(sql`select clock_timestamp()::text as through`);
+    return dispatchPendingNativeStatusWakeups({ ...input, releaseThrough: watermark!.through });
   }
 
   async function dispatchNativeStatusWakeupPage(
-    input: NativeWakeDispatchInput = {}, replayIds?: string[],
+    input: NativeWakeDispatchInput = {}, replayIds?: string[], releaseAfter?: NativeWakeCursor | null,
   ) {
     const now = new Date();
     const staleClaimMs = Math.max(1_000, input.staleClaimMs ?? 60_000);
@@ -5050,29 +5048,32 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     if (!cursors) nativeWakeCursors.set(scopeKey, cursors = new Map());
     const selectCandidates = async (kind: string, predicate: ReturnType<typeof and>) => {
       const key = `${nativeWakeScopeKey(input)}:${kind}`;
-      const cursor = replayIds ? undefined : cursors.get(key);
-      const rows = await db.select().from(agentWakeupRequests)
+      const cursor = replayIds || kind === "native" ? undefined : input.releaseThrough ? releaseAfter : cursors.get(key);
+      const rows = await db.select({ ...getTableColumns(agentWakeupRequests),
+        cursorTimestamp: sql<string>`${agentWakeupRequests.requestedAt}::text`.as("cursor_timestamp"),
+      }).from(agentWakeupRequests)
         .where(and(ordinaryWakeRequestPredicate(),
           input.companyId ? eq(agentWakeupRequests.companyId, input.companyId) : undefined,
           input.agentId ? eq(agentWakeupRequests.agentId, input.agentId) : undefined,
           input.projectId ? sql`exists (select 1 from ${issues} where ${issues.companyId} = ${agentWakeupRequests.companyId}
             and ${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId' and ${issues.projectId} = ${input.projectId}::uuid)` : undefined,
-          cursor ? sql`(${agentWakeupRequests.requestedAt}, ${agentWakeupRequests.id}) > (${cursor.requestedAt.toISOString()}::timestamptz, ${cursor.id}::uuid)` : undefined,
+          cursor ? sql`(${agentWakeupRequests.requestedAt}, ${agentWakeupRequests.id}) > (${cursor.requestedAt}::timestamptz, ${cursor.id}::uuid)` : undefined,
+          input.releaseThrough ? sql`${agentWakeupRequests.requestedAt} <= ${input.releaseThrough}::timestamptz` : undefined,
           replayIds ? inArray(agentWakeupRequests.id, replayIds) : undefined,
           eq(agentWakeupRequests.requestedByActorType, "system"), predicate))
-        .orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id)).limit(limit);
-      if (replayIds) return rows;
-      if (rows.length === limit) cursors.set(key, { requestedAt: rows.at(-1)!.requestedAt, id: rows.at(-1)!.id });
+        .orderBy(asc(agentWakeupRequests.requestedAt), ...(kind === "native" ? [] : [asc(agentWakeupRequests.id)])).limit(limit);
+      if (replayIds || input.releaseThrough || kind === "native") return rows;
+      if (rows.length === limit) cursors.set(key, { requestedAt: rows.at(-1)!.cursorTimestamp, id: rows.at(-1)!.id });
       else cursors.delete(key);
       return rows;
     };
-    const nativeIntents = replayIds ? [] : await selectCandidates("native", and(
+    const nativeIntents = replayIds || input.releaseThrough ? [] : await selectCandidates("native", and(
       inArray(agentWakeupRequests.requestedByActorId, ["native-status-committer", CROSS_TASK_CONTINUATION_COMMITTER_ID]),
       inArray(agentWakeupRequests.status, ["queued", "claimed"]), isNull(agentWakeupRequests.runId),
       or(sql`${agentWakeupRequests.reason} is distinct from ${ISSUE_BLOCKERS_RESOLVED_WAKE_REASON}`,
         sql`${agentWakeupRequests.requestedByActorId} is distinct from 'native-status-committer'`)));
     const dependencyIntents = await selectCandidates("dependency", pendingDependencyIntents(db));
-    const receiptResults = replayIds ? [] : await selectCandidates("results", pendingDependencyReceiptResults(db));
+    const receiptResults = replayIds || input.releaseThrough ? [] : await selectCandidates("results", pendingDependencyReceiptResults(db));
     const candidates = [...nativeIntents, ...dependencyIntents, ...receiptResults];
 
     let dispatched = 0;
@@ -5432,8 +5433,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       }
     }
 
-    const promoted = replayIds || input.agentId || input.projectId ? 0 : await promoteDeferredDispatchReceipts(input);
-    return { scanned: candidates.length, dispatched, recovered, deferred, promoted };
+    const promoted = replayIds || input.releaseThrough || input.agentId || input.projectId ? 0 : await promoteDeferredDispatchReceipts(input);
+    return { scanned: candidates.length, dispatched, recovered, deferred, promoted,
+      next: input.releaseThrough && dependencyIntents.length === limit
+        ? { requestedAt: dependencyIntents.at(-1)!.cursorTimestamp, id: dependencyIntents.at(-1)!.id } : null };
     } finally { releaseObservation(); }
   }
 

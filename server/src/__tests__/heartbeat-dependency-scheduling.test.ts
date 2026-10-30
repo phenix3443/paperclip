@@ -51,6 +51,8 @@ import { heartbeatService } from "../services/heartbeat.ts";
 import { seedNativeDependency } from "./helpers/native-dependency-fixture.js";
 import { logger } from "../middleware/logger.js";
 import { CROSS_TASK_CONTINUATION_COMMITTER_ID, crossTaskContinuationIntentKey } from "../services/cross-task-continuation.js";
+import { persistUsageReceipt, type UsageReceiptEnvelope } from "../services/usage-receipts.js";
+import { accountRunCost } from "../services/run-cost-accounting.js";
 import { budgetService, subscribeBudgetScopeRelease } from "../services/budgets.js";
 import { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
 import { runningProcesses } from "../adapters/index.ts";
@@ -104,8 +106,8 @@ async function ensureIssueRelationsTable(db: ReturnType<typeof createDb>) {
 }
 
 async function waitForCondition(fn: () => Promise<boolean>, timeoutMs = 3_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
     if (await fn()) return true;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
@@ -282,6 +284,40 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
   });
 
+  it("advances a keyset across PostgreSQL microsecond timestamps", async () => {
+    const fixtures = [];
+    for (let i = 0; i < 5; i++) fixtures.push(await seedNativeDependency(db, "paused", true));
+    fixtures.sort((a, b) => a.intent.id.localeCompare(b.intent.id));
+    const f = fixtures.at(-1)!;
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, f.agentId));
+    await db.update(agentWakeupRequests).set({ requestedAt: sql`'2026-01-01 00:00:00.123456+00'::timestamptz` })
+      .where(inArray(agentWakeupRequests.id, fixtures.map(f => f.intent.id)));
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+        summary: "Precise cursor delivered.", provider: "test", model: "test-model" };
+    });
+    for (let i = 0; i < 4; i++) await heartbeat.dispatchPendingNativeStatusWakeups({ limit: 2 });
+    expect(await waitForCondition(async () => mockAdapterExecute.mock.calls.length === 1)).toBe(true);
+    await heartbeat.drainActiveRunExecutions();
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+  });
+
+  it("a release revisits inputs before the recovery cursor with periodic recovery frozen", async () => {
+    const f = await seedNativeDependency(db, "paused", true);
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId, limit: 1 });
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, f.agentId));
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+        summary: "Wrapped release delivered.", provider: "test", model: "test-model" };
+    });
+    await heartbeat.releasePendingDependencyWakeups({ companyId: f.companyId, scopeType: "company", scopeId: f.companyId });
+    expect(await waitForCondition(async () => mockAdapterExecute.mock.calls.length === 1)).toBe(true);
+    await heartbeat.drainActiveRunExecutions();
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+  });
+
   it("does not lose a release before an in-flight claim settles into parking", async () => {
     const f = await seedNativeDependency(db, "idle", true);
     let entered!: () => void, release!: () => void;
@@ -345,6 +381,138 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       await budgetService(db).upsertPolicy(f.companyId, { ...input, isActive: false }, null);
       expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
     } finally { await worker.stop(); await stop(); await heartbeat.resumeQueuedRunsAfterDrain(); }
+  });
+
+  it.each(["override", "utc_window", "accounting_correction", "settlement"] as const)("automatically releases through the authoritative %s budget writer", async mode => {
+    const f = await seedNativeDependency(db, "idle", true);
+    const [project] = await db.insert(projects).values({ companyId: f.companyId, name: "Policy writer", status: "in_progress" }).returning();
+    await db.update(issues).set({ projectId: project!.id }).where(eq(issues.id, f.issueId));
+    const accountingRunId = randomUUID(), sourceId = randomUUID(), accountingAgentId = randomUUID();
+    const accounting = mode === "accounting_correction" || mode === "settlement";
+    const input = { scopeType: "project" as const, scopeId: project!.id, amount: 50,
+      windowKind: mode === "utc_window" ? "calendar_month_utc" as const : "lifetime" as const,
+      hardStopEnabled: true, notifyEnabled: false };
+    const receipt = (sequence: number, costUsd: number, complete: boolean): UsageReceiptEnvelope => ({
+      schema: "paperclip/accounting-receipt/v1", id: randomUUID(), companyId: f.companyId, runId: accountingRunId,
+      sourceId, sequence, receivedAt: new Date().toISOString(), adapterType: "process", receipt: {
+        complete, usageBasis: "per_run", provider: "test", biller: "test", model: "test",
+        billingType: "metered_api", costStatus: "reported", costUsd,
+      },
+    });
+    if (mode === "utc_window") {
+      const now = new Date();
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 15)));
+    }
+    if (accounting) {
+      await db.insert(agents).values({ id: accountingAgentId, companyId: f.companyId, name: "Accounting source", adapterType: "process" });
+      await db.insert(heartbeatRuns).values({ id: accountingRunId, companyId: f.companyId, agentId: accountingAgentId,
+        invocationSource: "on_demand", status: mode === "settlement" ? "cancelled" : "running", costAccountingPending: true,
+        usageJson: { accountingReceiptSourceId: sourceId, accountingReceiptSequence: 0, accountingReceiptReady: false,
+          ledgerScope: { projectId: project!.id } } });
+      if (mode === "accounting_correction") await persistUsageReceipt(db, receipt(1, 1, false));
+    } else await db.insert(costEvents).values({ companyId: f.companyId, agentId: f.agentId, projectId: project!.id,
+      provider: "test", model: "test", costCents: 100, occurredAt: new Date() });
+    await budgetService(db).upsertPolicy(f.companyId, input, null);
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+    if (mode === "utc_window") vi.useRealTimers();
+    const stop = heartbeat.startDependencyReleaseNotifications();
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+        summary: "Authoritative budget writer delivered.", provider: "test", model: "test-model" };
+    });
+    try {
+      if (mode === "override") {
+        const [incident] = await db.select().from(budgetIncidents).where(eq(budgetIncidents.companyId, f.companyId));
+        await budgetService(db).resolveIncident(f.companyId, incident!.id,
+          { action: "raise_budget_and_resume", amount: 200 }, "responsible-user");
+      } else if (mode === "utc_window") {
+        await budgetService(db).reconcilePolicies();
+      } else {
+        await persistUsageReceipt(db, receipt(mode === "accounting_correction" ? 2 : 1, 0.1, true));
+        if (mode === "settlement") {
+          expect(mockAdapterExecute).not.toHaveBeenCalled();
+          expect(await accountRunCost(db, accountingRunId)).toBe(true);
+        }
+      }
+      expect(await waitForCondition(async () => mockAdapterExecute.mock.calls.length === 1)).toBe(true);
+      await heartbeat.drainActiveRunExecutions();
+      expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+      if (accounting) {
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, accountingRunId));
+        await accountRunCost(db, accountingRunId);
+      }
+      await stop(); await heartbeat.resumeQueuedRunsAfterDrain();
+    }
+  });
+
+  it("bounded keysets cross a full page of held, invalid and legacy native history without stable writes", async () => {
+    const held = [];
+    for (let i = 0; i < 105; i++) {
+      const f = await seedNativeDependency(db, "paused", true);
+      held.push(f.intent.id);
+      if (i % 3 === 1) await db.delete(statusDecisionEffects).where(eq(statusDecisionEffects.targetId, f.intent.id));
+      if (i % 3 === 2) {
+        await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+          source: "automation", triggerDetail: "system", reason: "agent.not_invokable", status: "skipped", finishedAt: new Date(1000),
+          requestedByActorType: "system", requestedByActorId: `native-status-wake-dispatch:${f.intent.id}`,
+          idempotencyKey: `execution-wait:${f.intent.id}`, payload: { ...f.intent.payload,
+            _paperclipWakeContext: { ...f.intent.payload!._paperclipWakeContext, nativeStatusWakeIntentId: f.intent.id },
+            executionWait: { status: "paused", reason: "paused", requestedIdempotencyKey: f.intent.idempotencyKey } } });
+        await db.update(agentWakeupRequests).set({ status: "skipped", finishedAt: new Date(1000) }).where(eq(agentWakeupRequests.id, f.intent.id));
+      }
+    }
+    await db.update(agentWakeupRequests).set({ requestedAt: sql`'2000-01-01 00:00:00.000123+00'::timestamptz` })
+      .where(inArray(agentWakeupRequests.id, held));
+    const f = await seedNativeDependency(db, "idle", true);
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+        summary: "Mixed history delivered.", provider: "test", model: "test-model" };
+    });
+    await heartbeat.dispatchPendingNativeStatusWakeups({ limit: 100 });
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+    await heartbeat.dispatchPendingNativeStatusWakeups({ limit: 100 });
+    expect(await waitForCondition(async () => mockAdapterExecute.mock.calls.length === 1)).toBe(true);
+    await heartbeat.drainActiveRunExecutions();
+    const before = await db.select().from(agentWakeupRequests).orderBy(agentWakeupRequests.id);
+    const debug = db.$client.options.debug;
+    const writes: string[] = [];
+    db.$client.options.debug = (_connection, query) => { if (/^\s*(insert|update|delete)\b/i.test(query)) writes.push(query); };
+    try {
+      for (let i = 0; i < 4; i++) await heartbeat.dispatchPendingNativeStatusWakeups({ limit: 100 });
+      expect(writes).toEqual([]);
+      expect(await db.select().from(agentWakeupRequests).orderBy(agentWakeupRequests.id)).toEqual(before);
+      expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+    } finally { db.$client.options.debug = debug; }
+  }, 90_000);
+
+  it("a legal queued-run cancellation releases the original dependency checkout gate", async () => {
+    const f = await seedNativeDependency(db, "idle", true), ownerRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: ownerRunId, companyId: f.companyId, agentId: f.agentId,
+      invocationSource: "on_demand", status: "queued", contextSnapshot: { issueId: f.issueId } });
+    await db.update(issues).set({ checkoutRunId: ownerRunId, executionRunId: ownerRunId,
+      executionAgentNameKey: f.agentId, executionLockedAt: new Date() }).where(eq(issues.id, f.issueId));
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+        summary: "Checkout released.", provider: "test", model: "test-model" };
+    });
+    await heartbeat.cancelRun(ownerRunId);
+    expect(await waitForCondition(async () => mockAdapterExecute.mock.calls.length === 1)).toBe(true);
+    await heartbeat.drainActiveRunExecutions();
+    const [intent] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.intent.id));
+    expect(intent!.runId).not.toBeNull();
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, intent!.runId!));
+    expect(run!.wakeupRequestId).toBe((intent!.payload!._paperclipDependencyAdmission as { receiptId: string }).receiptId);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toHaveLength(2);
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
   });
 
   const seedDependency = (status = "paused", nativeProducer = false) => seedNativeDependency(db, status, nativeProducer);

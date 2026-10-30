@@ -1,4 +1,4 @@
-import { ordinaryWakeRequestPredicate } from "../receipt-namespace.js";
+import { ordinaryWakeRequestPredicate, nonDependencyPromotionPredicate } from "../receipt-namespace.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../../services/delivery-work-notifications.js";
 import { isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop } from "../../../services/acknowledged-native-stop.js";
 import { readRunCancellation } from "../../../services/run-cancellation.js";
@@ -232,7 +232,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           .from(agentWakeupRequests)
           .where(
             and(
-              ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, companyId),
+              ordinaryWakeRequestPredicate(), nonDependencyPromotionPredicate(), eq(agentWakeupRequests.companyId, companyId),
               eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
               excludedWakeIds?.length ? notInArray(agentWakeupRequests.id, excludedWakeIds) : undefined,
               sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
@@ -472,7 +472,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         })
         .where(
           and(
-            ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, wakeId),
+            ordinaryWakeRequestPredicate(), nonDependencyPromotionPredicate(), eq(agentWakeupRequests.id, wakeId),
             eq(agentWakeupRequests.companyId, companyId),
             eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
           ),

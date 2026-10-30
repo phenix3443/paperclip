@@ -1,7 +1,9 @@
+import { installDatabaseWorkSignals } from "@paperclipai/db/work-signals";
 import { randomUUID } from "node:crypto";
+import { drizzle } from "drizzle-orm/postgres-js";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { companies, projects, costEvents, agents, createDb, withDedicatedDbConnection, type Db } from "@paperclipai/db";
+import { companies, projects, costEvents, agents, createDb, reconcileDatabaseWork, databaseWorkPending, withDedicatedDbConnection, type Db } from "@paperclipai/db";
 import { budgetService, subscribeBudgetScopeRelease } from "../services/budgets.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
@@ -72,4 +74,49 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(f.listener).toHaveBeenCalledTimes(1);
     } finally { f.unsubscribe(); }
   });
+  it.each(["commit", "abort"])("retains an uncertain budget release until PostgreSQL confirms %s", async outcome => {
+    const f = await fixture();
+    const raw = drizzle(db.$client), transaction = raw.transaction.bind(raw);
+    let release!: () => void, wrote!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const written = new Promise<void>(resolve => { wrote = resolve; });
+    let serverDone: Promise<unknown> | undefined;
+    raw.transaction = ((callback: Parameters<typeof raw.transaction>[0]) => {
+      serverDone = transaction(async tx => {
+        const result = await callback(tx); wrote(); await gate;
+        if (outcome === "abort") throw new Error("late budget abort");
+        return result;
+      });
+      void serverDone.catch(() => {});
+      return written.then(() => { throw new Error("lost budget commit response"); });
+    }) as typeof raw.transaction;
+    const owner = installDatabaseWorkSignals(raw, db) as unknown as Db;
+    try {
+      await expect(f.raise(owner)).rejects.toThrow("lost budget commit response");
+      await reconcileDatabaseWork(db);
+      expect(databaseWorkPending(db)).toBe(true);
+      expect(f.listener).not.toHaveBeenCalled();
+      release(); await serverDone?.catch(() => {});
+      await reconcileDatabaseWork(db);
+      await reconcileDatabaseWork(db);
+      expect(f.listener).toHaveBeenCalledTimes(outcome === "commit" ? 1 : 0);
+      const [project] = await db.select().from(projects).where(eq(projects.id, f.projectId));
+      expect(project!.pauseReason).toBe(outcome === "commit" ? null : "budget");
+    } finally { release(); await serverDone?.catch(() => {}); f.unsubscribe(); }
+  });
+
+  it("a failed notification cannot roll back an actual budget hold removal", async () => {
+    const f = await fixture();
+    const warning = vi.spyOn(process, "emitWarning").mockImplementation(() => {});
+    f.listener.mockRejectedValueOnce(new Error("release notification lost"));
+    try {
+      await f.raise(db);
+      await vi.waitFor(() => expect(warning).toHaveBeenCalled());
+      const [project] = await db.select().from(projects).where(eq(projects.id, f.projectId));
+      expect(project!.pauseReason).toBeNull();
+      await f.raise(db);
+      expect(f.listener).toHaveBeenCalledTimes(1);
+    } finally { f.unsubscribe(); warning.mockRestore(); }
+  });
+
 });
