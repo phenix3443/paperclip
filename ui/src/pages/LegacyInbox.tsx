@@ -2382,6 +2382,16 @@ export function Inbox() {
           </div>
           {tab === "blocked" ? (
             <>
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                className="hidden h-8 w-8 shrink-0 sm:inline-flex" data-active={nestingEnabled} aria-pressed={nestingEnabled}
+                onClick={toggleNesting}
+                title={nestingEnabled ? "Disable parent-child nesting" : "Enable parent-child nesting"}
+              >
+                <ListTree className="h-3.5 w-3.5" />
+              </Button>
               <IssueFiltersPopover
                 presentation="legacy"
                 state={issueFilters}
@@ -2642,6 +2652,7 @@ export function Inbox() {
           showIdentifierColumn={visibleIssueColumnSet.has("id") && availableIssueColumnSet.has("id")}
           showUpdatedColumn={visibleIssueColumnSet.has("updated") && availableIssueColumnSet.has("updated")}
           showResponsibleColumn={visibleIssueColumnSet.has("assignee") && availableIssueColumnSet.has("assignee")}
+          nestingEnabled={nestingEnabled}
           renderIssueColumns={(issue: Issue, responsible: ReactNode) =>
             renderIssueTrailingColumns(issue, visibleTrailingIssueColumns.filter((column) => column !== "updated"), responsible)}
         />
