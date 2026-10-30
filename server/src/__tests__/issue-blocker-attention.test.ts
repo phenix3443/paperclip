@@ -815,6 +815,25 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     });
   });
 
+  it("names the addressee of a pending interaction as the owner", async () => {
+    const { companyId, agentId } = await createCompany("BIQ");
+    const toAgentId = await insertIssue({ companyId, identifier: "BIQ-1", title: "Question for an agent", status: "blocked", assigneeAgentId: agentId });
+    const toUserId = await insertIssue({ companyId, identifier: "BIQ-2", title: "Question for a user", status: "blocked", assigneeAgentId: agentId });
+    const toBoardId = await insertIssue({ companyId, identifier: "BIQ-3", title: "Confirmation for the board", status: "blocked", assigneeAgentId: agentId });
+    await db.insert(issueThreadInteractions).values([
+      { companyId, issueId: toAgentId, kind: "ask_user_questions", status: "pending", continuationPolicy: "wake_assignee", payload: { version: 1 }, addresseeAgentId: agentId },
+      { companyId, issueId: toUserId, kind: "ask_user_questions", status: "pending", continuationPolicy: "wake_assignee", payload: { version: 1 }, addresseeUserId: "user-1" },
+      { companyId, issueId: toBoardId, kind: "request_confirmation", status: "pending", continuationPolicy: "wake_assignee", payload: { version: 1 } },
+    ]);
+
+    const rows = await svc.list(companyId, { attention: "blocked" });
+    const attention = (id: string) => rows.find((row) => row.id === id)?.blockedInboxAttention;
+
+    expect(attention(toAgentId)).toMatchObject({ reason: "pending_agent_decision", owner: { type: "agent", agentId } });
+    expect(attention(toUserId)).toMatchObject({ reason: "pending_user_decision", owner: { type: "user", userId: "user-1" } });
+    expect(attention(toBoardId)).toMatchObject({ reason: "pending_board_decision", owner: { type: "board" } });
+  });
+
   it("flags a stalled chain whose next owner cannot run", async () => {
     const { companyId, agentId, pausedAgentId } = await createCompany("BCU");
     const issueId = await insertIssue({
