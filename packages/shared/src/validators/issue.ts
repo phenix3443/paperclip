@@ -80,6 +80,7 @@ export const issueBlockedInboxReasonSchema = z.enum([
   "missing_successful_run_disposition",
   "pending_board_decision",
   "pending_user_decision",
+  "pending_agent_decision",
   "external_owner_action",
   "open_recovery_issue",
 ]);

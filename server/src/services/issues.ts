@@ -5284,6 +5284,8 @@ type BlockedInboxInteractionRow = {
   issueId: string;
   kind: string;
   createdAt: Date;
+  addresseeAgentId: string | null;
+  addresseeUserId: string | null;
 };
 type BlockedInboxApprovalRow = {
   approvalId: string;
@@ -5640,6 +5642,19 @@ function compareBlockedInboxRows(
   return right.id.localeCompare(left.id);
 }
 
+/** Who must answer a pending interaction: its addressee when it names one, else the board. */
+function pendingInteractionOwner(
+  interaction: BlockedInboxInteractionRow,
+): IssueBlockedInboxOwner {
+  if (interaction.addresseeAgentId) {
+    return { type: "agent", agentId: interaction.addresseeAgentId, userId: null, label: null };
+  }
+  if (interaction.addresseeUserId) {
+    return { type: "user", agentId: null, userId: interaction.addresseeUserId, label: null };
+  }
+  return { type: "board", agentId: null, userId: null, label: "Board" };
+}
+
 function blockedChainOwner(
   row: IssueRow,
   terminalBlockerIssueId: string | null | undefined,
@@ -5678,9 +5693,9 @@ function blockedChainOwner(
     userId: null,
     label: "Board",
   };
-  if (interactionByIssueId.has(actor.id) || approvalByIssueId.has(actor.id)) {
-    return board;
-  }
+  const interaction = interactionByIssueId.get(actor.id);
+  if (interaction) return pendingInteractionOwner(interaction);
+  if (approvalByIssueId.has(actor.id)) return board;
   const hasMonitor = Boolean(
     actor.monitorNextCheckAt && actor.monitorNextCheckAt.getTime() > Date.now(),
   );
@@ -5879,6 +5894,8 @@ async function listIssueBlockedInboxAttentionMap(
             issueId: issueThreadInteractions.issueId,
             kind: issueThreadInteractions.kind,
             createdAt: issueThreadInteractions.createdAt,
+            addresseeAgentId: issueThreadInteractions.addresseeAgentId,
+            addresseeUserId: issueThreadInteractions.addresseeUserId,
           })
           .from(issueThreadInteractions)
           .where(
@@ -6171,28 +6188,28 @@ async function listIssueBlockedInboxAttentionMap(
 
     const interaction = interactionByIssueId.get(row.id);
     if (interaction) {
-      const isUserQuestion =
-        interaction.kind === "ask_user_questions" &&
-        Boolean(row.assigneeUserId);
+      const isQuestion = interaction.kind === "ask_user_questions";
+      const addressee = pendingInteractionOwner(interaction);
+      // An interaction without an addressee keeps the earlier rule: a question on a user-assigned issue is theirs.
+      const owner: IssueBlockedInboxOwner =
+        addressee.type === "board" && isQuestion && row.assigneeUserId
+          ? { type: "user", agentId: null, userId: row.assigneeUserId, label: null }
+          : addressee;
       result.set(
         row.id,
         attentionBase({
           state: "awaiting_decision",
-          reason: isUserQuestion
-            ? "pending_user_decision"
-            : "pending_board_decision",
+          reason:
+            owner.type === "agent"
+              ? "pending_agent_decision"
+              : owner.type === "user"
+                ? "pending_user_decision"
+                : "pending_board_decision",
           severity: "medium",
           stoppedSinceAt: interaction.createdAt,
-          owner: isUserQuestion
-            ? {
-                type: "user",
-                agentId: null,
-                userId: row.assigneeUserId,
-                label: null,
-              }
-            : { type: "board", agentId: null, userId: null, label: "Board" },
+          owner,
           action: {
-            label: isUserQuestion ? "Answer question" : "Answer confirmation",
+            label: isQuestion ? "Answer question" : "Answer confirmation",
             detail:
               "Respond to the pending issue-thread interaction so the assignee has a live next action.",
           },

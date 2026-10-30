@@ -96,6 +96,7 @@ describe("blockedInbox", () => {
     const reasons: IssueBlockedInboxReason[] = [
       "pending_board_decision",
       "pending_user_decision",
+      "pending_agent_decision",
       "missing_successful_run_disposition",
       "blocked_chain_stalled",
       "blocked_by_unassigned_issue",
