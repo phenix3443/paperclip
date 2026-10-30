@@ -16,6 +16,7 @@ export type BlockedReasonVariant =
 const VARIANT_BY_REASON: Record<IssueBlockedInboxReason, BlockedReasonVariant> = {
   pending_board_decision: "needs_decision",
   pending_user_decision: "needs_decision",
+  pending_agent_decision: "needs_decision",
   missing_successful_run_disposition: "needs_decision",
   blocked_chain_stalled: "stalled",
   blocked_by_unassigned_issue: "needs_attention",
@@ -49,6 +50,7 @@ export const BLOCKED_VARIANT_LABELS: Record<BlockedReasonVariant, string> = {
 const REASON_LABELS: Record<IssueBlockedInboxReason, string> = {
   pending_board_decision: "Pending board decision",
   pending_user_decision: "Pending user decision",
+  pending_agent_decision: "Pending agent decision",
   missing_successful_run_disposition: "Pick disposition",
   blocked_chain_stalled: "Blocked chain stalled",
   blocked_by_unassigned_issue: "Unassigned blocker",
@@ -106,13 +108,40 @@ export interface BlockedInboxIssueRow {
   stoppedAtMs: number | null;
 }
 
-export type BlockedInboxGroupBy = "blocker_type" | "none";
+export type BlockedInboxGroupBy = "none" | "blocker_type" | "responsible" | "project" | "workspace";
 export type BlockedInboxSort = "urgency" | "most_recent" | "longest_stopped";
 
 export const BLOCKED_GROUP_OPTIONS: readonly [BlockedInboxGroupBy, string][] = [
-  ["blocker_type", "Blocker type"],
   ["none", "None"],
+  ["blocker_type", "Blocker type"],
+  ["responsible", "Responsible"],
+  ["project", "Project"],
+  ["workspace", "Workspace"],
 ];
+
+/** Group options for the blocked inbox; Workspace needs isolated workspaces, like the other inbox tabs. */
+export function blockedInboxGroupOptions(isolatedWorkspacesEnabled: boolean): readonly [BlockedInboxGroupBy, string][] {
+  return BLOCKED_GROUP_OPTIONS.filter(([value]) => value !== "workspace" || isolatedWorkspacesEnabled);
+}
+
+export const BLOCKED_INBOX_GROUP_BY_KEY = "paperclip:inbox:blocked-group-by";
+
+export function loadBlockedInboxGroupBy(): BlockedInboxGroupBy {
+  try {
+    const raw = localStorage.getItem(BLOCKED_INBOX_GROUP_BY_KEY);
+    return BLOCKED_GROUP_OPTIONS.some(([value]) => value === raw) ? (raw as BlockedInboxGroupBy) : "none";
+  } catch {
+    return "none";
+  }
+}
+
+export function saveBlockedInboxGroupBy(groupBy: BlockedInboxGroupBy) {
+  try {
+    localStorage.setItem(BLOCKED_INBOX_GROUP_BY_KEY, groupBy);
+  } catch {
+    // Ignore localStorage failures.
+  }
+}
 
 export const BLOCKED_SORT_OPTIONS: readonly [BlockedInboxSort, string][] = [
   ["urgency", "Most urgent"],
@@ -121,9 +150,41 @@ export const BLOCKED_SORT_OPTIONS: readonly [BlockedInboxSort, string][] = [
 ];
 
 export interface BlockedInboxGroup {
-  variant: BlockedReasonVariant;
+  key: string;
   label: string;
   rows: BlockedInboxIssueRow[];
+  /** Set when grouped by blocker type. */
+  variant?: BlockedReasonVariant;
+}
+
+/** Resolves the group of a row for the Responsible, Project and Workspace groupings. */
+export interface BlockedInboxGroupResolvers {
+  ownerLabel?: (row: BlockedInboxIssueRow) => string | null;
+  projectName?: (projectId: string) => string | null;
+  workspaceGroup?: (issue: Issue) => { key: string; label: string };
+}
+
+const NO_GROUP_KEYS = new Set(["owner:unknown", "project:none", "workspace:none"]);
+
+function blockedRowGroup(
+  row: BlockedInboxIssueRow,
+  groupBy: Exclude<BlockedInboxGroupBy, "none" | "blocker_type">,
+  resolvers: BlockedInboxGroupResolvers,
+): { key: string; label: string } {
+  if (groupBy === "responsible") {
+    const owner = row.attention.owner;
+    const label = resolvers.ownerLabel?.(row) ?? null;
+    if (!label) return { key: "owner:unknown", label: "Unknown" };
+    if (owner.type === "agent" && owner.agentId) return { key: `owner:agent:${owner.agentId}`, label };
+    if (owner.type === "user" && owner.userId) return { key: `owner:user:${owner.userId}`, label };
+    return { key: `owner:${owner.type}:${label}`, label };
+  }
+  if (groupBy === "project") {
+    const projectId = row.issue.projectId;
+    if (!projectId) return { key: "project:none", label: "No project" };
+    return { key: `project:${projectId}`, label: resolvers.projectName?.(projectId) ?? "Unknown project" };
+  }
+  return resolvers.workspaceGroup?.(row.issue) ?? { key: "workspace:none", label: "No workspace" };
 }
 
 export function buildBlockedInboxRows(issues: readonly Issue[]): BlockedInboxIssueRow[] {
@@ -195,24 +256,84 @@ export function sortBlockedInboxRows(
   return [...rows].sort((a, b) => compareBlockedRows(a, b, sort));
 }
 
+/**
+ * Groups rows for the blocked inbox. Blocker type keeps the canonical variant order. The other groupings
+ * sort groups by label and put the catch-all group (Unknown, No project, No workspace) last.
+ * Rows keep the given sort inside each group.
+ */
 export function groupBlockedInboxRows(
   rows: readonly BlockedInboxIssueRow[],
   sort: BlockedInboxSort = "urgency",
+  groupBy: Exclude<BlockedInboxGroupBy, "none"> = "blocker_type",
+  resolvers: BlockedInboxGroupResolvers = {},
 ): BlockedInboxGroup[] {
-  const buckets = new Map<BlockedReasonVariant, BlockedInboxIssueRow[]>();
+  if (groupBy === "blocker_type") {
+    const buckets = new Map<BlockedReasonVariant, BlockedInboxIssueRow[]>();
+    for (const row of rows) {
+      const list = buckets.get(row.variant) ?? [];
+      list.push(row);
+      buckets.set(row.variant, list);
+    }
+    const groups: BlockedInboxGroup[] = [];
+    for (const variant of BLOCKED_REASON_VARIANT_ORDER) {
+      const list = buckets.get(variant);
+      if (!list || list.length === 0) continue;
+      const sorted = sortBlockedInboxRows(list, sort);
+      groups.push({ key: variant, variant, label: BLOCKED_VARIANT_LABELS[variant], rows: sorted });
+    }
+    return groups;
+  }
+
+  const buckets = new Map<string, { label: string; rows: BlockedInboxIssueRow[] }>();
   for (const row of rows) {
-    const list = buckets.get(row.variant) ?? [];
-    list.push(row);
-    buckets.set(row.variant, list);
+    const { key, label } = blockedRowGroup(row, groupBy, resolvers);
+    const bucket = buckets.get(key) ?? { label, rows: [] };
+    bucket.rows.push(row);
+    buckets.set(key, bucket);
   }
-  const groups: BlockedInboxGroup[] = [];
-  for (const variant of BLOCKED_REASON_VARIANT_ORDER) {
-    const list = buckets.get(variant);
-    if (!list || list.length === 0) continue;
-    const sorted = sortBlockedInboxRows(list, sort);
-    groups.push({ variant, label: BLOCKED_VARIANT_LABELS[variant], rows: sorted });
+  return [...buckets.entries()]
+    .sort(([aKey, a], [bKey, b]) => {
+      const catchAll = Number(NO_GROUP_KEYS.has(aKey)) - Number(NO_GROUP_KEYS.has(bKey));
+      if (catchAll !== 0) return catchAll;
+      return a.label.localeCompare(b.label) || aKey.localeCompare(bKey);
+    })
+    .map(([key, bucket]) => ({ key, label: bucket.label, rows: sortBlockedInboxRows(bucket.rows, sort) }));
+}
+
+export interface BlockedInboxTreeNode {
+  row: BlockedInboxIssueRow;
+  children: BlockedInboxTreeNode[];
+}
+
+/**
+ * Nests sorted rows under their parent issue when the parent is in the same list.
+ * Roots and each child list keep the input order. A row whose parent is absent stays a root.
+ * A parent cycle cannot hide rows: its members stay roots.
+ */
+export function nestBlockedInboxRows(rows: readonly BlockedInboxIssueRow[]): BlockedInboxTreeNode[] {
+  const byId = new Map(rows.map((row) => [row.issue.id, row]));
+  const parentOf = (row: BlockedInboxIssueRow): BlockedInboxIssueRow | null => {
+    const parentId = row.issue.parentId;
+    if (!parentId || parentId === row.issue.id) return null;
+    return byId.get(parentId) ?? null;
+  };
+  const inCycle = (row: BlockedInboxIssueRow): boolean => {
+    const seen = new Set<string>([row.issue.id]);
+    for (let parent = parentOf(row); parent; parent = parentOf(parent)) {
+      if (seen.has(parent.issue.id)) return true;
+      seen.add(parent.issue.id);
+    }
+    return false;
+  };
+  const nodes = new Map(rows.map((row) => [row.issue.id, { row, children: [] as BlockedInboxTreeNode[] }]));
+  const roots: BlockedInboxTreeNode[] = [];
+  for (const row of rows) {
+    const node = nodes.get(row.issue.id)!;
+    const parent = inCycle(row) ? null : parentOf(row);
+    if (parent) nodes.get(parent.issue.id)!.children.push(node);
+    else roots.push(node);
   }
-  return groups;
+  return roots;
 }
 
 export function blockedRowMatchesSearch(row: BlockedInboxIssueRow, query: string): boolean {

@@ -1278,6 +1278,12 @@ as an error for explicit repair. Process exit loses callbacks;
 startup recovery must reconstruct work from durable rows. These hooks alone
 do not guarantee automatic dependency delivery.
 
+Transaction instrumentation is associated with the transaction object's identity.
+Tests that observe queries or inject failures must preserve that object, for
+example by wrapping its methods instead of passing a replacement proxy to the
+callback. Database stubs that exercise accounting transactions must install the
+work-signal lifecycle and supply a distinct transaction object.
+
 This uses PostgreSQL's transaction-information functions (this path requires
 PostgreSQL 14+; embedded PostgreSQL uses 18). See the
 [PostgreSQL transaction information documentation](https://www.postgresql.org/docs/18/functions-info.html#FUNCTIONS-PG-SNAPSHOT).

@@ -680,7 +680,7 @@ describe("Inbox toolbar", () => {
     expect(container.querySelector('button[title="Group"]')).not.toBeNull();
     expect(container.querySelector('button[title="Columns"]')).not.toBeNull();
     expect(container.querySelector('button[title="Sort"]')).not.toBeNull();
-    expect(container.querySelector('button[title="Enable parent-child nesting"]')).toBeNull();
+    expect(container.querySelector('button[title$="parent-child nesting"]')).not.toBeNull();
     expect(container.textContent).not.toContain("Mark all as read");
 
     act(() => {
@@ -820,6 +820,42 @@ describe("Inbox toolbar", () => {
     await vi.waitFor(() => expect(container.textContent).toContain("Earlier task"));
 
     expect(container.querySelector('[data-testid="inbox-date-group"]')).toBeNull();
+
+    act(() => root.unmount());
+  });
+
+  it("hides the task status icon when the Status column is off", async () => {
+    routerMock.location.pathname = "/inbox/mine";
+    localStorage.setItem(
+      taskCollectionPreferencesStorageKey({
+        companyId: "company-1",
+        collectionKey: "inbox",
+      }),
+      JSON.stringify({
+        version: 1,
+        companyId: "company-1",
+        collectionKey: "inbox",
+        viewState: {},
+        columns: ["id", "updated"],
+      }),
+    );
+    apiMocks.issuesList.mockResolvedValue([createIssue({ title: "Statusless task" })]);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0, gcTime: 0 } },
+    });
+    const root = createRoot(container);
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <Inbox />
+        </QueryClientProvider>,
+      );
+    });
+    await vi.waitFor(() => expect(container.textContent).toContain("Statusless task"));
+
+    const taskRow = container.querySelector('[data-slot="task-row"]');
+    expect(taskRow?.querySelector('[data-testid="inbox-row-status-placeholder"]')).not.toBeNull();
 
     act(() => root.unmount());
   });

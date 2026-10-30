@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/postgres-js";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { companies, createDb, databaseWorkPending, type Db } from "@paperclipai/db";
+import { installDatabaseWorkSignals } from "@paperclipai/db/work-signals";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { withAccountingTransaction } from "../services/accounting-transaction.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
@@ -85,5 +87,58 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(errors).not.toHaveBeenCalled();
       expect(coordinator.nextWakeAt()).toBeNull();
     } finally { worker.stop(); await coordinator.stop(); }
+  });
+
+  it.each(["commit", "abort"])("recovers a late accounting %s through the existing coordinator", async outcome => {
+    const companyId = await fixture();
+    const raw = drizzle(db.$client);
+    const transaction = raw.transaction.bind(raw);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let wrote!: () => void;
+    const written = new Promise<void>(resolve => { wrote = resolve; });
+    let serverDone: Promise<unknown> | undefined;
+    raw.transaction = ((callback: Parameters<typeof raw.transaction>[0]) => {
+      serverDone = transaction(async tx => {
+        const result = await callback(tx);
+        wrote();
+        await gate;
+        if (outcome === "abort") throw new Error("late accounting abort");
+        return result;
+      });
+      void serverDone.catch(() => {});
+      return written.then(() => { throw new Error("lost accounting commit response"); });
+    }) as typeof raw.transaction;
+    const owner = installDatabaseWorkSignals(raw) as unknown as Db;
+    const errors = vi.fn();
+    const coordinator = createDeliveryWorkCoordinator({ owner, canRun: () => true, onError: errors });
+    const recovered = vi.fn(async () => {});
+    const worker = registerCostAccountingWork(owner, coordinator, recovered);
+    try {
+      await worker.ready;
+      recovered.mockClear();
+      await expect(withAccountingTransaction(owner, companyId, async (tx, publications) => {
+        await tx.update(companies).set({ name: "Late" }).where(eq(companies.id, companyId));
+        publications.push({ companyId, payload: { action: "late" }, pluginEvent: null });
+      })).rejects.toThrow("lost accounting commit response");
+      await vi.waitFor(() => expect(recovered).toHaveBeenCalled());
+      expect(databaseWorkPending(owner)).toBe(true);
+      expect(publication).not.toHaveBeenCalled();
+      const [before] = await db.select().from(companies).where(eq(companies.id, companyId));
+      expect(before.name).toBe("Before");
+      release();
+      await serverDone?.catch(() => {});
+      await vi.waitFor(() => expect(databaseWorkPending(owner)).toBe(false), { timeout: 8_000 });
+      expect(publication).toHaveBeenCalledTimes(outcome === "commit" ? 1 : 0);
+      const [after] = await db.select().from(companies).where(eq(companies.id, companyId));
+      expect(after.name).toBe(outcome === "commit" ? "Late" : "Before");
+      expect(errors).not.toHaveBeenCalled();
+      await vi.waitFor(() => expect(coordinator.nextWakeAt()).toBeNull());
+    } finally {
+      release();
+      await serverDone?.catch(() => {});
+      worker.stop();
+      await coordinator.stop();
+    }
   });
 });

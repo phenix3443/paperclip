@@ -1,0 +1,142 @@
+name: issue-read release evidence
+
+on:
+  pull_request:
+    branches: [develop]
+    paths:
+      - scripts/issue-read-release-gate/**
+      - server/src/__tests__/helpers/issue-read-release-probe.ts
+      - server/src/__tests__/issue-read-evidence-comparison.test.ts
+      - .github/workflows/issue-read-release-gate.yml
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: issue-read-evidence-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  paired-evidence:
+    if: github.repository == 'phenix3443/paperclip'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 9.15.4
+      - name: Verify candidate package identity and checksums
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence" "$RUNNER_TEMP/payload"
+          node --input-type=module <<'JS'
+          import fs from 'node:fs';
+          import { execFileSync } from 'node:child_process';
+          const m = JSON.parse(fs.readFileSync('scripts/issue-read-release-gate/manifest.json'));
+          execFileSync('git', ['merge-base', '--is-ancestor', m.upstreamMerge, m.candidate]);
+          const api = endpoint => JSON.parse(execFileSync('gh', ['api', `repos/phenix3443/paperclip/${endpoint}`], {encoding:'utf8'}));
+          const run = api(`actions/runs/${m.packageRunId}`);
+          if (run.head_sha !== m.candidate || run.event !== 'push' || run.head_branch !== 'develop' || run.conclusion !== 'success') throw Error('package run mismatch');
+          const artifact = api(`actions/artifacts/${m.packageArtifactId}`);
+          if (artifact.name !== m.packageArtifactName || artifact.expired || artifact.workflow_run.head_sha !== m.candidate) throw Error('artifact mismatch');
+          fs.writeFileSync(`${process.env.RUNNER_TEMP}/evidence/package-identity.json`, JSON.stringify({run, artifact}, null, 2));
+          execFileSync('gh', ['run', 'download', String(m.packageRunId), '--repo', 'phenix3443/paperclip', '--name', m.packageArtifactName, '--dir', `${process.env.RUNNER_TEMP}/payload`], {stdio:'inherit'});
+          JS
+          python3 - <<'PY'
+          import os, pathlib, json, hashlib
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'payload'
+          manifests = list(root.rglob('payload-packages.json'))
+          assert len(manifests) == 1, manifests
+          source = manifests[0]
+          payload = json.loads(source.read_text())
+          expected = json.loads(pathlib.Path('scripts/issue-read-release-gate/manifest.json').read_text())
+          assert payload['sha'] == expected['candidate']
+          assert payload['repo'] == 'phenix3443/paperclip'
+          for item in payload['files']:
+              file = (source.parent / item['file']).resolve()
+              assert file.is_relative_to(root.resolve())
+              assert hashlib.sha256(file.read_bytes()).hexdigest() == item['sha256']
+          (pathlib.Path(os.environ['RUNNER_TEMP']) / 'evidence' / 'payload-packages.json').write_text(json.dumps(payload, indent=2))
+          PY
+          rm -rf "$RUNNER_TEMP/payload"
+      - name: Run isolated baseline and candidate on the same runner
+        run: |
+          set -euo pipefail
+          evidence_source="$GITHUB_WORKSPACE/scripts/issue-read-release-gate"
+          for arm in baseline candidate; do
+            sha="$(node -p "require('./scripts/issue-read-release-gate/manifest.json')['$arm']")"
+            runtime="$RUNNER_TEMP/runtime-$arm"
+            mkdir -p "$runtime"
+            git archive "$sha" | tar -x -C "$runtime"
+            git -C "$runtime" init -q
+            git -C "$runtime" fetch --depth=1 "$GITHUB_WORKSPACE" "$sha"
+            git -C "$runtime" reset --hard FETCH_HEAD
+            mkdir -p "$runtime/scripts/issue-read-release-gate"
+            cp "$evidence_source/"* "$runtime/scripts/issue-read-release-gate/"
+            cp "$GITHUB_WORKSPACE/server/src/__tests__/helpers/issue-read-release-probe.ts" "$runtime/server/src/__tests__/helpers/issue-read-release-probe.ts"
+            export TMPDIR="$RUNNER_TEMP/tmp-$arm"
+            export PAPERCLIP_HOME="$RUNNER_TEMP/paperclip-$arm"
+            mkdir -p "$TMPDIR" "$PAPERCLIP_HOME"
+            (
+              cd "$runtime"
+              pnpm install --frozen-lockfile
+              pnpm --filter @paperclipai/server prepare:runner-vendor
+              pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
+              RELEASE_EVIDENCE_ARM="$arm" RELEASE_EVIDENCE_OUTPUT="$RUNNER_TEMP/evidence" \
+                PAPERCLIP_WORKSPACE_GIT_SCAN_TIMEOUT_MS=1000 \
+                timeout --kill-after=10s 600s node server/node_modules/tsx/dist/cli.mjs server/src/__tests__/helpers/issue-read-release-probe.ts
+            ) >"$RUNNER_TEMP/evidence/$arm.log" 2>&1 || touch "$RUNNER_TEMP/evidence/$arm.failed"
+            rm -rf "$runtime" "$TMPDIR" "$PAPERCLIP_HOME"
+          done
+          unset TMPDIR PAPERCLIP_HOME
+          node scripts/issue-read-release-gate/compare.mjs "$RUNNER_TEMP/evidence"
+      - name: Run candidate close and finalization regression suites
+        if: success() || failure()
+        run: |
+          set -euo pipefail
+          runtime="$RUNNER_TEMP/finalization"
+          sha="$(node -p "require('./scripts/issue-read-release-gate/manifest.json').candidate")"
+          mkdir -p "$runtime"
+          git archive "$sha" | tar -x -C "$runtime"
+          cp "$GITHUB_WORKSPACE/server/src/__tests__/issue-read-evidence-comparison.test.ts" "$runtime/server/src/__tests__/issue-read-evidence-comparison.test.ts"
+          mkdir -p "$runtime/scripts/issue-read-release-gate"
+          cp "$GITHUB_WORKSPACE/scripts/issue-read-release-gate/"* "$runtime/scripts/issue-read-release-gate/"
+          export TMPDIR="$RUNNER_TEMP/tmp-finalization"
+          export PAPERCLIP_HOME="$RUNNER_TEMP/paperclip-finalization"
+          mkdir -p "$TMPDIR" "$PAPERCLIP_HOME"
+          cd "$runtime"
+          pnpm install --frozen-lockfile
+          pnpm --filter @paperclipai/server prepare:runner-vendor
+          pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
+          timeout --kill-after=10s 600s pnpm exec vitest run \
+            server/src/__tests__/issue-read-evidence-comparison.test.ts \
+            server/src/__tests__/issues-goal-context-routes.test.ts \
+            server/src/__tests__/issue-closed-workspace-routes.test.ts \
+            server/src/__tests__/git-workspace-expiration.test.ts \
+            server/src/__tests__/heartbeat-workspace-finalize-branch.test.ts \
+            server/src/__tests__/workspace-git-inspection-cache.test.ts \
+            --maxWorkers=1 --reporter=default --reporter=json --outputFile="$RUNNER_TEMP/evidence/regressions.json"
+          node --input-type=module <<'JS'
+          import fs from 'node:fs';
+          const file = `${process.env.RUNNER_TEMP}/evidence/regressions.json`;
+          const result = JSON.parse(fs.readFileSync(file));
+          if (!result.success || result.numFailedTests || result.numPendingTests || result.numTodoTests || !(result.numPassedTests > 0)) throw Error('regressions must run without failures or skips');
+          JS
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: issue-read-evidence-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: error

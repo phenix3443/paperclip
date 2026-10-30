@@ -121,6 +121,7 @@ import type {
   IssueReviewAttentionPath,
   IssueBlockedInboxAttention,
   IssueBlockedInboxIssueRef,
+  IssueBlockedInboxOwner,
   IssueRelationIssueSummary,
   IssueWatchdogSummary,
   LowTrustBoundary,
@@ -134,6 +135,7 @@ import {
   issueCommentMetadataSchema,
   issueCommentPresentationSchema,
   isAgentCreatedIssue,
+  isAgentInvokable,
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
 } from "@paperclipai/shared";
@@ -5282,6 +5284,8 @@ type BlockedInboxInteractionRow = {
   issueId: string;
   kind: string;
   createdAt: Date;
+  addresseeAgentId: string | null;
+  addresseeUserId: string | null;
 };
 type BlockedInboxApprovalRow = {
   approvalId: string;
@@ -5557,6 +5561,7 @@ function blockedInboxSearchText(
     attention.leafIssue?.title,
     attention.recoveryIssue?.identifier,
     attention.recoveryIssue?.title,
+    attention.owner.label,
     attention.action.label,
     attention.action.detail,
   ]
@@ -5635,6 +5640,88 @@ function compareBlockedInboxRows(
   if (leftActivity !== rightActivity) return rightActivity - leftActivity;
 
   return right.id.localeCompare(left.id);
+}
+
+/** Who must answer a pending interaction: its addressee when it names one, else the board. */
+function pendingInteractionOwner(
+  interaction: BlockedInboxInteractionRow,
+): IssueBlockedInboxOwner {
+  if (interaction.addresseeAgentId) {
+    return { type: "agent", agentId: interaction.addresseeAgentId, userId: null, label: null };
+  }
+  if (interaction.addresseeUserId) {
+    return { type: "user", agentId: null, userId: interaction.addresseeUserId, label: null };
+  }
+  return { type: "board", agentId: null, userId: null, label: "Board" };
+}
+
+function blockedChainOwner(
+  row: IssueRow,
+  terminalBlockerIssueId: string | null | undefined,
+  issuesById: Map<string, IssueRow>,
+  interactionByIssueId: Map<string, BlockedInboxInteractionRow>,
+  approvalByIssueId: Map<string, BlockedInboxApprovalRow>,
+): IssueBlockedInboxOwner {
+  const unknown: IssueBlockedInboxOwner = {
+    type: "unknown",
+    agentId: null,
+    userId: null,
+    label: null,
+  };
+  const terminal = terminalBlockerIssueId
+    ? issuesById.get(terminalBlockerIssueId)
+    : undefined;
+  if (terminal && terminal.id !== row.id && terminal.visibility !== "open") {
+    return unknown;
+  }
+  const actor = terminal ?? row;
+  const agent = (agentId: string): IssueBlockedInboxOwner => ({
+    type: "agent",
+    agentId,
+    userId: null,
+    label: null,
+  });
+  const user = (userId: string): IssueBlockedInboxOwner => ({
+    type: "user",
+    agentId: null,
+    userId,
+    label: null,
+  });
+  const board: IssueBlockedInboxOwner = {
+    type: "board",
+    agentId: null,
+    userId: null,
+    label: "Board",
+  };
+  const interaction = interactionByIssueId.get(actor.id);
+  if (interaction) return pendingInteractionOwner(interaction);
+  if (approvalByIssueId.has(actor.id)) return board;
+  const hasMonitor = Boolean(
+    actor.monitorNextCheckAt && actor.monitorNextCheckAt.getTime() > Date.now(),
+  );
+  const external =
+    actor.status === "blocked" && !hasMonitor
+      ? externalWaitFromDescription(actor.description)
+      : null;
+  if (external) {
+    return { type: "external", agentId: null, userId: null, label: external.owner };
+  }
+  const descriptorOwner =
+    actor.status === "blocked" ? actor.unblockDescriptor?.owner : undefined;
+  if (descriptorOwner === "board") return board;
+  if (descriptorOwner && "agentId" in descriptorOwner) return agent(descriptorOwner.agentId);
+  if (descriptorOwner && "userId" in descriptorOwner) return user(descriptorOwner.userId);
+  if (actor.status === "in_review") {
+    const participant = parseObject(actor.executionState).currentParticipant;
+    if (participant && typeof participant === "object" && !Array.isArray(participant)) {
+      const { agentId, userId } = participant as Record<string, unknown>;
+      if (typeof agentId === "string") return agent(agentId);
+      if (typeof userId === "string") return user(userId);
+    }
+  }
+  if (actor.assigneeAgentId) return agent(actor.assigneeAgentId);
+  if (actor.assigneeUserId) return user(actor.assigneeUserId);
+  return unknown;
 }
 
 async function listIssueBlockedInboxAttentionMap(
@@ -5807,6 +5894,8 @@ async function listIssueBlockedInboxAttentionMap(
             issueId: issueThreadInteractions.issueId,
             kind: issueThreadInteractions.kind,
             createdAt: issueThreadInteractions.createdAt,
+            addresseeAgentId: issueThreadInteractions.addresseeAgentId,
+            addresseeUserId: issueThreadInteractions.addresseeUserId,
           })
           .from(issueThreadInteractions)
           .where(
@@ -6099,28 +6188,28 @@ async function listIssueBlockedInboxAttentionMap(
 
     const interaction = interactionByIssueId.get(row.id);
     if (interaction) {
-      const isUserQuestion =
-        interaction.kind === "ask_user_questions" &&
-        Boolean(row.assigneeUserId);
+      const isQuestion = interaction.kind === "ask_user_questions";
+      const addressee = pendingInteractionOwner(interaction);
+      // An interaction without an addressee keeps the earlier rule: a question on a user-assigned issue is theirs.
+      const owner: IssueBlockedInboxOwner =
+        addressee.type === "board" && isQuestion && row.assigneeUserId
+          ? { type: "user", agentId: null, userId: row.assigneeUserId, label: null }
+          : addressee;
       result.set(
         row.id,
         attentionBase({
           state: "awaiting_decision",
-          reason: isUserQuestion
-            ? "pending_user_decision"
-            : "pending_board_decision",
+          reason:
+            owner.type === "agent"
+              ? "pending_agent_decision"
+              : owner.type === "user"
+                ? "pending_user_decision"
+                : "pending_board_decision",
           severity: "medium",
           stoppedSinceAt: interaction.createdAt,
-          owner: isUserQuestion
-            ? {
-                type: "user",
-                agentId: null,
-                userId: row.assigneeUserId,
-                label: null,
-              }
-            : { type: "board", agentId: null, userId: null, label: "Board" },
+          owner,
           action: {
-            label: isUserQuestion ? "Answer question" : "Answer confirmation",
+            label: isQuestion ? "Answer question" : "Answer confirmation",
             detail:
               "Respond to the pending issue-thread interaction so the assignee has a live next action.",
           },
@@ -6235,10 +6324,10 @@ async function listIssueBlockedInboxAttentionMap(
           reason: "external_owner_action",
           severity: "medium",
           stoppedSinceAt: row.updatedAt,
-          owner: { type: "external", agentId: null, userId: null, label: null },
+          owner: { type: "external", agentId: null, userId: null, label: external.owner },
           action: {
             label: "External owner action",
-            detail: null,
+            detail: external.action,
           },
           sourceIssue: source,
           externalDetailsRedacted: true,
@@ -6258,19 +6347,52 @@ async function listIssueBlockedInboxAttentionMap(
       (blockerState?.state === "needs_attention" ||
         blockerState?.state === "stalled")
     ) {
+      const owner = blockedChainOwner(
+        row,
+        blockerState.terminalBlockerIssueId,
+        issuesById,
+        interactionByIssueId,
+        approvalByIssueId,
+      );
+      const ownerAgent = owner.agentId
+        ? companyAgents.find((candidate) => candidate.id === owner.agentId)
+        : undefined;
+      const externalAction =
+        owner.type === "external"
+          ? externalWaitFromDescription(
+              (blockerState.terminalBlockerIssueId
+                ? issuesById.get(blockerState.terminalBlockerIssueId)
+                : undefined
+              )?.description ?? row.description,
+            )?.action
+          : undefined;
+      const ownerCannotRun =
+        owner.type === "agent" &&
+        (!ownerAgent ||
+          !isAgentInvokable({ agent: ownerAgent, agents: companyAgents }));
       result.set(
         row.id,
         attentionBase({
           state: "needs_attention",
-          reason: "blocked_chain_stalled",
-          severity: "high",
+          reason: ownerCannotRun
+            ? "blocked_by_uninvokable_assignee"
+            : "blocked_chain_stalled",
+          severity: ownerCannotRun ? "critical" : "high",
           stoppedSinceAt: row.updatedAt,
-          owner: { type: "unknown", agentId: null, userId: null, label: null },
-          action: {
-            label: "Inspect blocker chain",
-            detail:
-              "Inspect the stalled blocker or review leaf and make the next owner/action explicit.",
-          },
+          owner,
+          action: ownerCannotRun
+            ? {
+                label: "Assign active owner",
+                detail:
+                  "The next owner of this blocker chain cannot run. Assign an active owner or replace the blocker.",
+              }
+            : externalAction
+              ? { label: "External owner action", detail: externalAction }
+              : {
+                  label: "Inspect blocker chain",
+                  detail:
+                    "Inspect the stalled blocker or review leaf and make the next owner/action explicit.",
+                },
           sourceIssue: source,
           sampleIssueIdentifier:
             blockerState.sampleStalledBlockerIdentifier ??

@@ -1,0 +1,160 @@
+name: server-typecheck-cache-measure
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/server-typecheck-cache-measure.yml
+      - .github/scripts/server-typecheck-measure.sh
+      - .github/workflows/server-typecheck.yml
+      - .github/actions/setup-server-typecheck/action.yml
+      - tsconfig.base.json
+      - server/tsconfig*.json
+      - server/package.json
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CACHE_DIR: server/node_modules/.cache/typecheck
+  CACHE_NAMESPACE: server-tsc-src-measure-v1-${{ github.run_id }}
+  HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+jobs:
+  miss:
+    if: github.repository == 'phenix3443/paperclip'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      cache-key: ${{ steps.key.outputs.key }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - id: setup
+        uses: ./.github/actions/setup-server-typecheck
+        with:
+          cache-namespace: ${{ env.CACHE_NAMESPACE }}
+
+      - id: key
+        env:
+          PREFIX: ${{ steps.setup.outputs.cache-prefix }}
+        run: echo "key=$PREFIX-$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Measure the cold build
+        env:
+          SCENARIO: miss
+          TSC_VERSION: ${{ steps.setup.outputs.tsc-version }}
+          CACHE_HIT: 'n/a'
+          MATCHED_KEY: 'none'
+        run: |
+          set +e -uo pipefail
+          test ! -e "$CACHE_DIR" || { echo "cache dir exists before a cold build" >&2; exit 1; }
+          source .github/scripts/server-typecheck-measure.sh
+          write_header
+          measure_phases || exit 1
+          echo "Entry size: $(du -sb "$CACHE_DIR" | cut -f1) bytes, $(find "$CACHE_DIR" -type f | wc -l) files" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Check test coverage of the split
+        working-directory: server
+        run: |
+          set -euo pipefail
+          tsc="$(pnpm bin)/tsc"
+          list() { "$tsc" -p "$1" --listFilesOnly | grep "/server/src/" | grep -E '\.[cm]?tsx?$' | sort -u; }
+          list tsconfig.json > "$RUNNER_TEMP/single.txt"
+          { list tsconfig.src.json; list tsconfig.tests.json; } | sort -u > "$RUNNER_TEMP/split.txt"
+          single=$(wc -l < "$RUNNER_TEMP/single.txt"); split=$(wc -l < "$RUNNER_TEMP/split.txt")
+          tests=$(grep -c '\.test\.ts$' "$RUNNER_TEMP/single.txt" || true)
+          echo "Coverage: tsconfig.json $single server/src files ($tests *.test.ts); src+tests $split" | tee -a "$GITHUB_STEP_SUMMARY"
+          if ! diff "$RUNNER_TEMP/single.txt" "$RUNNER_TEMP/split.txt"; then
+            echo "src+tests projects do not cover the same files as tsconfig.json" >&2
+            exit 1
+          fi
+
+      - name: Save the measurement entry
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CACHE_DIR }}
+          key: ${{ steps.key.outputs.key }}
+
+  warm:
+    needs: miss
+    if: github.repository == 'phenix3443/paperclip'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - hit
+          - partial-body
+          - partial-signature
+          - probe-direct
+          - probe-cross-file
+          - probe-tests
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - id: setup
+        uses: ./.github/actions/setup-server-typecheck
+        with:
+          cache-namespace: ${{ env.CACHE_NAMESPACE }}
+
+      - id: restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CACHE_DIR }}
+          key: ${{ needs.miss.outputs.cache-key }}
+          fail-on-cache-miss: true
+
+      - name: Age the restored build state
+        run: find "$CACHE_DIR" -exec touch -h -d '2000-01-01T00:00:00Z' {} +
+
+      - name: Measure ${{ matrix.scenario }}
+        env:
+          SCENARIO: ${{ matrix.scenario }}
+          TSC_VERSION: ${{ steps.setup.outputs.tsc-version }}
+          CACHE_HIT: ${{ steps.restore.outputs.cache-hit }}
+          MATCHED_KEY: ${{ steps.restore.outputs.cache-matched-key }}
+        run: |
+          set +e -uo pipefail
+          source .github/scripts/server-typecheck-measure.sh
+          write_header
+          case "$SCENARIO" in
+            hit)
+              measure_phases || exit 1 ;;
+            partial-body)
+              before="$(git diff --stat)"
+              sed -i 's/PAPERCLIP_DISABLE_CWD_ENV_FILE !== "true"/PAPERCLIP_DISABLE_CWD_ENV_FILE !== "yes"/' server/src/env-file-policy.ts
+              show_edit "$before"
+              grep -q '!== "yes"' server/src/env-file-policy.ts || { echo "partial edit did not apply" >&2; exit 1; }
+              measure_phases || exit 1 ;;
+            partial-signature)
+              append_line server/src/sentry-run-failure-policy.ts 'export const __cacheProbeAdded = 1;'
+              measure_phases || exit 1 ;;
+            probe-direct)
+              append_line server/src/env-file-policy.ts 'export const __cacheProbe: number = "x";'
+              expect_failure src/env-file-policy.ts ;;
+            probe-cross-file)
+              before="$(git diff --stat)"
+              sed -i 's/readBrandedStaticIndexHtml(uiDist: string)/readBrandedStaticIndexHtml(uiDist: number)/' server/src/static-index-html.ts
+              show_edit "$before"
+              grep -q 'uiDist: number' server/src/static-index-html.ts || { echo "probe edit did not apply" >&2; exit 1; }
+              expect_failure src/app.ts ;;
+            probe-tests)
+              append_line server/src/embedded-postgres-owner.test.ts 'export const __cacheProbe: number = "x";'
+              expect_failure src/embedded-postgres-owner.test.ts ;;
+            *)
+              echo "unknown scenario $SCENARIO" >&2; exit 1 ;;
+          esac
+
+      - name: Discard workspace edits
+        if: always()
+        run: |
+          git checkout -- .
+          git status --short
+          test -z "$(git status --porcelain --untracked-files=no)"

@@ -1,6 +1,6 @@
 // @vitest-environment node
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   Issue,
   IssueBlockedInboxAttention,
@@ -18,8 +18,13 @@ import {
   buildBlockedInboxRows,
   compareBlockedAttention,
   compareBlockedRows,
+  BLOCKED_INBOX_GROUP_BY_KEY,
+  blockedInboxGroupOptions,
   formatStoppedAge,
   groupBlockedInboxRows,
+  loadBlockedInboxGroupBy,
+  saveBlockedInboxGroupBy,
+  nestBlockedInboxRows,
   sortBlockedInboxRows,
   type BlockedInboxIssueRow,
 } from "./blockedInbox";
@@ -95,6 +100,7 @@ describe("blockedInbox", () => {
     const reasons: IssueBlockedInboxReason[] = [
       "pending_board_decision",
       "pending_user_decision",
+      "pending_agent_decision",
       "missing_successful_run_disposition",
       "blocked_chain_stalled",
       "blocked_by_unassigned_issue",
@@ -271,5 +277,109 @@ describe("blockedInbox", () => {
     expect(formatStoppedAge("2026-05-09T20:00:00.000Z", now)).toBe("stopped 4h");
     expect(formatStoppedAge("2026-05-07T00:00:00.000Z", now)).toBe("stopped 3d");
     expect(formatStoppedAge("2026-04-15T00:00:00.000Z", now)).toBe("stopped 3w");
+  });
+});
+
+describe("nestBlockedInboxRows", () => {
+  const rowsFor = (specs: Array<[string, string | null]>) =>
+    buildBlockedInboxRows(specs.map(([id, parentId]) => makeIssue({ id, parentId, title: id }, makeAttention())));
+  const shape = (nodes: ReturnType<typeof nestBlockedInboxRows>): unknown =>
+    nodes.map((node) => (node.children.length ? { [node.row.issue.id]: shape(node.children) } : node.row.issue.id));
+
+  it("nests children under a listed parent and keeps the input order", () => {
+    const nested = nestBlockedInboxRows(rowsFor([
+      ["child-b", "parent"],
+      ["parent", null],
+      ["grandchild", "child-a"],
+      ["child-a", "parent"],
+      ["orphan", "missing-parent"],
+    ]));
+
+    expect(shape(nested)).toEqual([{ parent: ["child-b", { "child-a": ["grandchild"] }] }, "orphan"]);
+  });
+
+  it("keeps rows of a parent cycle as roots", () => {
+    const nested = nestBlockedInboxRows(rowsFor([
+      ["a", "b"],
+      ["b", "a"],
+      ["self", "self"],
+    ]));
+
+    expect(shape(nested)).toEqual(["a", "b", "self"]);
+  });
+});
+
+describe("blocked inbox grouping", () => {
+  const issues = [
+    makeIssue({ id: "a", projectId: "p-beta", title: "A" }, makeAttention({ owner: { type: "agent", agentId: "agent-2", userId: null, label: null } })),
+    makeIssue({ id: "b", projectId: null, title: "B" }, makeAttention({ owner: { type: "external", agentId: null, userId: null, label: "upstream maintainers" } })),
+    makeIssue({ id: "c", projectId: "p-alpha", title: "C" }, makeAttention({ owner: { type: "unknown", agentId: null, userId: null, label: null } })),
+    makeIssue({ id: "d", projectId: "p-alpha", title: "D" }, makeAttention({ owner: { type: "agent", agentId: "agent-2", userId: null, label: null } })),
+  ];
+  const rows = buildBlockedInboxRows(issues);
+  const agentNames = new Map([["agent-2", "Coder"]]);
+  const ownerLabel = (row: BlockedInboxIssueRow) =>
+    row.attention.owner.label ?? (row.attention.owner.agentId ? agentNames.get(row.attention.owner.agentId) ?? null : null);
+
+  it("groups by responsible owner with Unknown last", () => {
+    const groups = groupBlockedInboxRows(rows, "urgency", "responsible", { ownerLabel });
+    expect(groups.map((group) => [group.label, group.rows.map((row) => row.issue.id).sort()])).toEqual([
+      ["Coder", ["a", "d"]],
+      ["upstream maintainers", ["b"]],
+      ["Unknown", ["c"]],
+    ]);
+    expect(groups[0].key).toBe("owner:agent:agent-2");
+  });
+
+  it("groups by project name with No project last", () => {
+    const names = new Map([["p-alpha", "Alpha"], ["p-beta", "Beta"]]);
+    const groups = groupBlockedInboxRows(rows, "urgency", "project", { projectName: (id) => names.get(id) ?? null });
+    expect(groups.map((group) => [group.label, group.rows.map((row) => row.issue.id).sort()])).toEqual([
+      ["Alpha", ["c", "d"]],
+      ["Beta", ["a"]],
+      ["No project", ["b"]],
+    ]);
+  });
+
+  it("groups by the resolved workspace", () => {
+    const groups = groupBlockedInboxRows(rows, "urgency", "workspace", {
+      workspaceGroup: (issue) => issue.projectId
+        ? { key: `workspace:project:${issue.projectId}`, label: `${issue.projectId} main` }
+        : { key: "workspace:none", label: "No workspace" },
+    });
+    expect(groups.map((group) => group.label)).toEqual(["p-alpha main", "p-beta main", "No workspace"]);
+  });
+
+  it("keeps blocker type grouping keyed by variant", () => {
+    const groups = groupBlockedInboxRows(rows, "urgency", "blocker_type");
+    expect(groups.every((group) => group.key === group.variant)).toBe(true);
+  });
+
+  it("offers Workspace only with isolated workspaces", () => {
+    expect(blockedInboxGroupOptions(false).map(([value]) => value)).toEqual(["none", "blocker_type", "responsible", "project"]);
+    expect(blockedInboxGroupOptions(true).map(([value]) => value)).toContain("workspace");
+  });
+});
+
+describe("blocked inbox group persistence", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("saves and loads the grouping under its own key", () => {
+    const store = new Map<string, string>();
+    vi.stubGlobal("localStorage", {
+      getItem: (key: string) => store.get(key) ?? null,
+      setItem: (key: string, value: string) => void store.set(key, value),
+    });
+
+    expect(loadBlockedInboxGroupBy()).toBe("none");
+    saveBlockedInboxGroupBy("project");
+    expect(store.get(BLOCKED_INBOX_GROUP_BY_KEY)).toBe("project");
+    expect(store.has("paperclip:inbox:group-by")).toBe(false);
+    expect(loadBlockedInboxGroupBy()).toBe("project");
+
+    store.set(BLOCKED_INBOX_GROUP_BY_KEY, "bogus");
+    expect(loadBlockedInboxGroupBy()).toBe("none");
   });
 });

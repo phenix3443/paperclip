@@ -134,6 +134,7 @@ const blockedViewProps = {
   showStatusColumn: true,
   showIdentifierColumn: true,
   showUpdatedColumn: true,
+  showResponsibleColumn: true,
 };
 
 async function waitFor(predicate: () => boolean, attempts = 30): Promise<void> {
@@ -307,6 +308,221 @@ describe("BlockedInboxView", () => {
     expect(row?.textContent).toContain("PAP-41");
 
     act(() => root.unmount());
+  });
+
+  it("hides the owner when the Responsible column is turned off", async () => {
+    mockIssuesApi.list.mockResolvedValue([
+      makeIssue(
+        "issue-hidden-owner",
+        "PAP-42",
+        "Owner column hidden",
+        attention({ owner: { type: "board", agentId: null, userId: null, label: "Board" } }),
+      ),
+    ]);
+
+    const { root } = renderWithClient(
+      <BlockedInboxView {...blockedViewProps} presentation="task" showResponsibleColumn={false} />,
+      container,
+    );
+    await waitFor(() => container.textContent?.includes("Owner column hidden") === true);
+
+    expect(container.querySelector("a")?.parentElement?.textContent).not.toContain("Board");
+    expect(container.querySelector('[data-testid="blocked-row-owner-mobile"]')).toBeNull();
+
+    act(() => root.unmount());
+  });
+
+  it("shows External as the owner of an external wait", async () => {
+    mockIssuesApi.list.mockResolvedValue([
+      makeIssue(
+        "issue-external",
+        "PAP-43",
+        "Waiting on a vendor",
+        attention({
+          state: "external_wait",
+          reason: "external_owner_action",
+          owner: { type: "external", agentId: null, userId: null, label: null },
+          action: { label: "External owner action", detail: null },
+          redaction: { externalDetailsRedacted: true, secretFieldsOmitted: true },
+        }),
+      ),
+    ]);
+
+    const { root } = renderWithClient(<BlockedInboxView {...blockedViewProps} presentation="task" />, container);
+    await waitFor(() => container.textContent?.includes("Waiting on a vendor") === true);
+
+    expect(container.querySelector('[data-testid="blocked-row-owner-mobile"]')?.textContent).toBe("External");
+
+    act(() => root.unmount());
+  });
+
+  it("names the external owner and shows the action on hover", async () => {
+    mockIssuesApi.list.mockResolvedValue([
+      makeIssue(
+        "issue-external-named",
+        "PAP-44",
+        "Waiting on a review",
+        attention({
+          state: "external_wait",
+          reason: "external_owner_action",
+          owner: { type: "external", agentId: null, userId: null, label: "upstream maintainers" },
+          action: { label: "External owner action", detail: "Review paperclipai/paperclip#18156" },
+          redaction: { externalDetailsRedacted: true, secretFieldsOmitted: true },
+        }),
+      ),
+    ]);
+
+    const { root } = renderWithClient(<BlockedInboxView {...blockedViewProps} presentation="task" />, container);
+    await waitFor(() => container.textContent?.includes("Waiting on a review") === true);
+
+    const owner = container.querySelector('[data-testid="blocked-row-owner"]');
+    expect(owner?.textContent).toContain("upstream maintainers");
+    expect(owner?.getAttribute("title")).toBe("upstream maintainers: Review paperclipai/paperclip#18156");
+    expect(container.querySelector('[data-testid="blocked-row-owner-mobile"]')?.getAttribute("title")).toBe(
+      "upstream maintainers: Review paperclipai/paperclip#18156",
+    );
+
+    act(() => root.unmount());
+  });
+
+  it("renders the inbox issue columns with the blocked owner in the Responsible cell", async () => {
+    mockIssuesApi.list.mockResolvedValue([
+      makeIssue(
+        "issue-columns",
+        "PAP-45",
+        "Waiting with project columns",
+        attention({
+          owner: { type: "agent", agentId: null, userId: null, label: "Charlie" },
+        }),
+      ),
+    ]);
+    const rendered: string[] = [];
+
+    const { root } = renderWithClient(
+      <BlockedInboxView
+        {...blockedViewProps}
+        presentation="task"
+        renderIssueColumns={(issue, responsible) => {
+          rendered.push(issue.id);
+          return (
+            <span>
+              <span data-testid="project-cell">Project X</span>
+              {responsible}
+            </span>
+          );
+        }}
+      />,
+      container,
+    );
+    await waitFor(() => container.textContent?.includes("Waiting with project columns") === true);
+
+    expect(rendered).toContain("issue-columns");
+    const columns = container.querySelector('[data-testid="blocked-row-issue-columns"]');
+    expect(columns?.querySelector('[data-testid="project-cell"]')?.textContent).toBe("Project X");
+    expect(columns?.querySelector('[data-testid="blocked-row-owner"]')?.textContent).toContain("Charlie");
+    expect(columns?.querySelector('[data-testid="blocked-row-owner"]')?.getAttribute("title")).toBe("Charlie");
+
+    act(() => root.unmount());
+  });
+
+  describe("parent-child nesting", () => {
+    const parent = makeIssue("issue-parent", "PAP-50", "Parent work", attention({ reason: "blocked_chain_stalled" }));
+    const child = { ...makeIssue("issue-child", "PAP-51", "Child work", attention({ reason: "blocked_chain_stalled" })), parentId: "issue-parent" };
+
+    it("shows a listed child under its parent and collapses it", async () => {
+      mockIssuesApi.list.mockResolvedValue([child, parent]);
+
+      const { root } = renderWithClient(<BlockedInboxView {...blockedViewProps} presentation="task" nestingEnabled />, container);
+      await waitFor(() => container.textContent?.includes("Child work") === true);
+
+      const text = container.textContent ?? "";
+      expect(text.indexOf("Parent work")).toBeLessThan(text.indexOf("Child work"));
+      const disclosure = container.querySelector<HTMLButtonElement>('[data-testid="blocked-row-disclosure"]');
+      expect(disclosure?.getAttribute("aria-expanded")).toBe("true");
+
+      act(() => disclosure!.click());
+      expect(container.textContent).not.toContain("Child work");
+      expect(container.querySelector('[data-testid="blocked-row-child-count"]')?.textContent).toBe("(1 sub-task)");
+
+      act(() => root.unmount());
+    });
+
+    it("keeps rows flat when nesting is off", async () => {
+      mockIssuesApi.list.mockResolvedValue([child, parent]);
+
+      const { root } = renderWithClient(<BlockedInboxView {...blockedViewProps} presentation="task" />, container);
+      await waitFor(() => container.textContent?.includes("Child work") === true);
+
+      expect(container.querySelector('[data-testid="blocked-row-disclosure"]')).toBeNull();
+
+      act(() => root.unmount());
+    });
+
+    it("does not nest a child under a parent in another group", async () => {
+      const externalChild = {
+        ...makeIssue("issue-child", "PAP-51", "Child work", attention({ reason: "external_owner_action" })),
+        parentId: "issue-parent",
+      };
+      mockIssuesApi.list.mockResolvedValue([externalChild, parent]);
+
+      const { root } = renderWithClient(
+        <BlockedInboxView {...blockedViewProps} groupBy="blocker_type" presentation="task" nestingEnabled />,
+        container,
+      );
+      await waitFor(() => container.textContent?.includes("Child work") === true);
+
+      expect(container.querySelector('[data-testid="blocked-row-disclosure"]')).toBeNull();
+      expect(container.querySelector('[data-testid="blocked-inbox-group-external_wait"]')?.textContent).toContain("Child work");
+
+      act(() => root.unmount());
+    });
+  });
+
+  describe("grouping", () => {
+    const grouped = () => [
+      { ...makeIssue("issue-g1", "PAP-61", "Coder work", attention({ owner: { type: "agent", agentId: "agent-1", userId: null, label: null } })), projectId: "project-1" },
+      { ...makeIssue("issue-g2", "PAP-62", "Vendor work", attention({ reason: "external_owner_action", owner: { type: "external", agentId: null, userId: null, label: "Vendor" } })), projectId: null },
+    ];
+
+    it("groups by the blocked owner", async () => {
+      mockIssuesApi.list.mockResolvedValue(grouped());
+
+      const { root } = renderWithClient(
+        <BlockedInboxView {...blockedViewProps} agentNameById={new Map([["agent-1", "Coder"]])} groupBy="responsible" presentation="task" />,
+        container,
+      );
+      await waitFor(() => container.textContent?.includes("Vendor work") === true);
+
+      expect(container.querySelector('[data-testid="blocked-inbox-group-owner:agent:agent-1"]')?.textContent).toContain("Coder work");
+      expect(container.querySelector('[data-testid="blocked-inbox-group-owner:external:Vendor"]')?.textContent).toContain("Vendor work");
+
+      act(() => root.unmount());
+    });
+
+    it("groups by project name with No project last", async () => {
+      mockIssuesApi.list.mockResolvedValue(grouped());
+
+      const { root } = renderWithClient(
+        <BlockedInboxView
+          {...blockedViewProps}
+          groupBy="project"
+          groupingContext={{ projectById: new Map([["project-1", { name: "Launch" }]]) }}
+          presentation="task"
+        />,
+        container,
+      );
+      await waitFor(() => container.textContent?.includes("Vendor work") === true);
+
+      const groups = Array.from(container.querySelectorAll('[data-testid^="blocked-inbox-group-"]'));
+      expect(groups.map((group) => group.getAttribute("data-testid"))).toEqual([
+        "blocked-inbox-group-project:project-1",
+        "blocked-inbox-group-project:none",
+      ]);
+      expect(groups[0]?.textContent).toContain("Launch");
+      expect(groups[1]?.textContent).toContain("No project");
+
+      act(() => root.unmount());
+    });
   });
 
   it("filters rows by search query against title, identifier, owner and action", async () => {

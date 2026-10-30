@@ -13,7 +13,6 @@ import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-uti
 import {
   costEvents,
   agents,
-  agentRuntimeState,
   approvals,
   budgetPolicies,
   authUsers,
@@ -31,7 +30,6 @@ import {
   issueDocuments,
   documents,
   environmentLeases,
-  environments,
   heartbeatRuns,
   issueApprovals,
   issueComments,
@@ -73,6 +71,7 @@ import {
   sha256HexOfText,
 } from "@paperclipai/shared/execution-reconciliation-canonical";
 import { executionReconciliationRequestIntent } from "@paperclipai/shared";
+import { truncateTablesWithDeadlockRetry } from "./helpers/truncate-with-deadlock-retry.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -185,28 +184,12 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   }, 30_000);
 
   afterEach(async () => {
-    await db.delete(executionReconciliationReceipts);
-    await db.delete(issueDocumentDecisions);
-    await db.delete(caseHandoffs);
-    await db.delete(cases);
-    await db.delete(documentRevisions);
-    await db.delete(documents);
-    await db.delete(workspaceOperations);
-    await db.delete(issueThreadInteractions);
-    await db.delete(issueRecoveryActions);
-    await db.delete(issueComments);
-    await db.delete(environmentLeases);
-    await db.delete(activityLog);
-    await db.delete(costEvents);
-    await db.delete(heartbeatRuns);
-    await db.delete(agentWakeupRequests);
-    await db.delete(environments);
-    await db.delete(issueInboxArchives);
-    await db.delete(issues);
-    await db.delete(agentRuntimeState);
-    await db.delete(agents);
-    await db.delete(companies);
-    await db.delete(authUsers);
+    // A delivered wake starts its run in the background. Let it finish its
+    // writes before cleanup, then clear every company-scoped table at once:
+    // a finished run writes rows (run events, runtime state, company skills)
+    // that a fixed delete list does not know about.
+    await heartbeatService(db).drainActiveRunExecutions();
+    await truncateTablesWithDeadlockRetry(db, `TRUNCATE TABLE "companies", "user" CASCADE`);
   });
 
   afterAll(async () => {

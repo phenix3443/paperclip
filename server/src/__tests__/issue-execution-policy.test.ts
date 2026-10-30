@@ -1466,6 +1466,80 @@ describe("issue execution policy transitions", () => {
       // No rewind to the first stage — the caller's done is allowed through.
       expect(result.patch).toEqual({});
     });
+
+    it("a stage added after completion runs before done", () => {
+      const policy = threeStagePolicy();
+      const [firstStage, secondStage, addedStage] = policy.stages;
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: {
+            status: "completed",
+            currentStageId: null,
+            currentStageIndex: null,
+            currentStageType: null,
+            currentParticipant: null,
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [firstStage.id, secondStage.id],
+            lastDecisionId: null,
+            lastDecisionOutcome: "approved",
+          },
+        },
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        commentBody: "Report ready",
+      });
+
+      expect(result.patch).toMatchObject({
+        status: "in_review",
+        assigneeUserId: ctoUserId,
+        executionState: {
+          status: "pending",
+          currentStageId: addedStage.id,
+          currentParticipant: { type: "user", userId: ctoUserId },
+          completedStageIds: [firstStage.id, secondStage.id],
+        },
+      });
+    });
+
+    it("a stage added after completion starts on in_review", () => {
+      const policy = threeStagePolicy();
+      const [firstStage, secondStage, addedStage] = policy.stages;
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_progress",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: {
+            status: "completed",
+            currentStageId: null,
+            currentStageIndex: null,
+            currentStageType: null,
+            currentParticipant: null,
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [firstStage.id, secondStage.id],
+            lastDecisionId: null,
+            lastDecisionOutcome: "approved",
+          },
+        },
+        policy,
+        requestedStatus: "in_review",
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        commentBody: "Please review the added report",
+      });
+
+      expect(result.patch).toMatchObject({
+        status: "in_review",
+        executionState: { status: "pending", currentStageId: addedStage.id },
+      });
+    });
   });
 
   describe("changes requested with no return assignee", () => {

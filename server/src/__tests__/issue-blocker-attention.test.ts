@@ -101,6 +101,8 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     originFingerprint?: string | null;
     executionState?: Record<string, unknown> | null;
     description?: string | null;
+    unblockDescriptor?: { owner: { agentId: string } | { userId: string } | "board"; action: string } | null;
+    visibility?: "open" | "private";
   }) {
     const id = input.id ?? randomUUID();
     await db.insert(issues).values({
@@ -118,6 +120,8 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       originFingerprint: input.originFingerprint ?? "default",
       executionState: input.executionState ?? null,
       description: input.description ?? null,
+      unblockDescriptor: input.unblockDescriptor ?? null,
+      visibility: input.visibility ?? "open",
     });
     return id;
   }
@@ -705,7 +709,153 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     });
   });
 
-  it("redacts external wait details from blocked inbox payloads and search", async () => {
+  it("names the current reviewer of a stalled chain's review leaf as its blocked inbox owner", async () => {
+    const { companyId, agentId, pausedAgentId } = await createCompany("BCO");
+    const parentId = await insertIssue({ companyId, identifier: "BCO-1", title: "Blocked source", status: "blocked" });
+    const reviewLeafId = await insertIssue({
+      companyId,
+      identifier: "BCO-2",
+      title: "Review leaf",
+      status: "in_review",
+      assigneeAgentId: pausedAgentId,
+      executionState: { status: "pending", currentParticipant: { type: "agent", agentId } },
+    });
+    await block({ companyId, blockerIssueId: reviewLeafId, blockedIssueId: parentId });
+
+    const parent = (await svc.list(companyId, { attention: "blocked" })).find((row) => row.id === parentId);
+
+    expect(parent?.blockedInboxAttention).toMatchObject({
+      reason: "blocked_chain_stalled",
+      owner: { type: "agent", agentId, userId: null },
+    });
+  });
+
+  it("names the unblock descriptor owner of a blocked issue waiting on itself", async () => {
+    const { companyId, agentId, pausedAgentId } = await createCompany("BCS");
+    const issueId = await insertIssue({
+      companyId,
+      identifier: "BCS-1",
+      title: "Waiting on an upstream review",
+      status: "blocked",
+      assigneeAgentId: pausedAgentId,
+      unblockDescriptor: { owner: { agentId }, action: "Re-check when the upstream PR is reviewed" },
+    });
+
+    const row = (await svc.list(companyId, { attention: "blocked" })).find((issue) => issue.id === issueId);
+
+    expect(row?.blockedInboxAttention).toMatchObject({
+      reason: "blocked_chain_stalled",
+      owner: { type: "agent", agentId },
+    });
+  });
+
+  it("names the unblock descriptor owner of a stalled chain's blocked leaf", async () => {
+    const { companyId, agentId } = await createCompany("BCD");
+    const assigneeId = randomUUID();
+    await db.insert(agents).values({ id: assigneeId, companyId, name: "BCD Assignee", role: "engineer", status: "idle" });
+    const parentId = await insertIssue({ companyId, identifier: "BCD-1", title: "Blocked source", status: "blocked" });
+    const leafId = await insertIssue({
+      companyId,
+      identifier: "BCD-2",
+      title: "Leaf waiting on upstream",
+      status: "blocked",
+      assigneeAgentId: assigneeId,
+      unblockDescriptor: { owner: { agentId }, action: "Re-check after the upstream PR merges" },
+    });
+    await block({ companyId, blockerIssueId: leafId, blockedIssueId: parentId });
+
+    const rows = await svc.list(companyId, { attention: "blocked" });
+    const parent = rows.find((row) => row.id === parentId);
+
+    expect(parent?.blockedInboxAttention).toMatchObject({
+      reason: "blocked_chain_stalled",
+      owner: { type: "agent", agentId },
+    });
+  });
+
+  it("does not copy the owner of a private terminal blocker", async () => {
+    const { companyId, agentId } = await createCompany("BCP");
+    const parentId = await insertIssue({ companyId, identifier: "BCP-1", title: "Blocked source", status: "blocked" });
+    const leafId = await insertIssue({
+      companyId,
+      identifier: "BCP-2",
+      title: "Private review leaf",
+      status: "in_review",
+      assigneeAgentId: agentId,
+      executionState: { status: "pending", currentParticipant: { type: "agent", agentId } },
+      visibility: "private",
+    });
+    await block({ companyId, blockerIssueId: leafId, blockedIssueId: parentId });
+
+    const parent = (await svc.list(companyId, { attention: "blocked" })).find((row) => row.id === parentId);
+
+    expect(parent?.blockedInboxAttention?.owner).toEqual({ type: "unknown", agentId: null, userId: null, label: null });
+  });
+
+  it("names an external owner when the terminal blocker is an external wait", async () => {
+    const { companyId, agentId } = await createCompany("BCE");
+    const parentId = await insertIssue({ companyId, identifier: "BCE-1", title: "Blocked source", status: "blocked" });
+    const leafId = await insertIssue({
+      companyId,
+      identifier: "BCE-2",
+      title: "Waiting on a vendor",
+      status: "blocked",
+      assigneeAgentId: agentId,
+      description: "External owner: Vendor support\nExternal action: Restore the sandbox account",
+    });
+    await block({ companyId, blockerIssueId: leafId, blockedIssueId: parentId });
+
+    const rows = await svc.list(companyId, { attention: "blocked" });
+
+    expect(rows.find((row) => row.id === leafId)?.blockedInboxAttention).toMatchObject({ reason: "external_owner_action" });
+    expect(rows.find((row) => row.id === parentId)?.blockedInboxAttention).toMatchObject({
+      reason: "blocked_chain_stalled",
+      owner: { type: "external", agentId: null, userId: null, label: "Vendor support" },
+      action: { label: "External owner action", detail: "Restore the sandbox account" },
+    });
+  });
+
+  it("names the addressee of a pending interaction as the owner", async () => {
+    const { companyId, agentId } = await createCompany("BIQ");
+    const toAgentId = await insertIssue({ companyId, identifier: "BIQ-1", title: "Question for an agent", status: "blocked", assigneeAgentId: agentId });
+    const toUserId = await insertIssue({ companyId, identifier: "BIQ-2", title: "Question for a user", status: "blocked", assigneeAgentId: agentId });
+    const toBoardId = await insertIssue({ companyId, identifier: "BIQ-3", title: "Confirmation for the board", status: "blocked", assigneeAgentId: agentId });
+    await db.insert(issueThreadInteractions).values([
+      { companyId, issueId: toAgentId, kind: "ask_user_questions", status: "pending", continuationPolicy: "wake_assignee", payload: { version: 1 }, addresseeAgentId: agentId },
+      { companyId, issueId: toUserId, kind: "ask_user_questions", status: "pending", continuationPolicy: "wake_assignee", payload: { version: 1 }, addresseeUserId: "user-1" },
+      { companyId, issueId: toBoardId, kind: "request_confirmation", status: "pending", continuationPolicy: "wake_assignee", payload: { version: 1 } },
+    ]);
+
+    const rows = await svc.list(companyId, { attention: "blocked" });
+    const attention = (id: string) => rows.find((row) => row.id === id)?.blockedInboxAttention;
+
+    expect(attention(toAgentId)).toMatchObject({ reason: "pending_agent_decision", owner: { type: "agent", agentId } });
+    expect(attention(toUserId)).toMatchObject({ reason: "pending_user_decision", owner: { type: "user", userId: "user-1" } });
+    expect(attention(toBoardId)).toMatchObject({ reason: "pending_board_decision", owner: { type: "board" } });
+  });
+
+  it("flags a stalled chain whose next owner cannot run", async () => {
+    const { companyId, agentId, pausedAgentId } = await createCompany("BCU");
+    const issueId = await insertIssue({
+      companyId,
+      identifier: "BCU-1",
+      title: "Waiting on a paused owner",
+      status: "blocked",
+      assigneeAgentId: agentId,
+      unblockDescriptor: { owner: { agentId: pausedAgentId }, action: "Re-check after the upstream PR merges" },
+    });
+
+    const row = (await svc.list(companyId, { attention: "blocked" })).find((issue) => issue.id === issueId);
+
+    expect(row?.blockedInboxAttention).toMatchObject({
+      reason: "blocked_by_uninvokable_assignee",
+      severity: "critical",
+      owner: { type: "agent", agentId: pausedAgentId },
+      action: { label: "Assign active owner" },
+    });
+  });
+
+  it("moves external wait details from the description into attention", async () => {
     const { companyId } = await createCompany("BIX");
     const owner = "Private Vendor Security Team";
     const action = "Send the confidential access token for customer Alpha";
@@ -732,15 +882,13 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     expect(issue?.blockedInboxAttention).toMatchObject({
       state: "external_wait",
       reason: "external_owner_action",
-      owner: { type: "external", label: null },
-      action: { label: "External owner action", detail: null },
+      owner: { type: "external", label: owner },
+      action: { label: "External owner action", detail: action },
       redaction: { externalDetailsRedacted: true, secretFieldsOmitted: true },
     });
-    expect(JSON.stringify(issue?.blockedInboxAttention)).not.toContain(owner);
-    expect(JSON.stringify(issue?.blockedInboxAttention)).not.toContain(action);
 
-    await expect(svc.list(companyId, { attention: "blocked", q: owner })).resolves.toEqual([]);
-    await expect(svc.count(companyId, { attention: "blocked", q: action })).resolves.toBe(0);
+    await expect(svc.count(companyId, { attention: "blocked", q: owner })).resolves.toBe(1);
+    await expect(svc.count(companyId, { attention: "blocked", q: action })).resolves.toBe(1);
     await expect(svc.count(companyId, { attention: "blocked", q: "Public context" })).resolves.toBe(1);
   });
 

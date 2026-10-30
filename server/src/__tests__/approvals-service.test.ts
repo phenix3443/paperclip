@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { approvalService } from "../services/approvals.ts";
 import { companies } from "@paperclipai/db";
+import { installDatabaseWorkSignals } from "@paperclipai/db/work-signals";
 
 vi.mock("../services/budgets.js", async importOriginal => ({
   ...await importOriginal<typeof import("../services/budgets.js")>(),
@@ -46,7 +47,7 @@ function createApproval(status: string): ApprovalRecord {
   };
 }
 
-function createDbStub(selectResults: ApprovalRecord[][], updateResults: ApprovalRecord[]) {
+function createDbStub(selectResults: ApprovalRecord[][], updateResults: ApprovalRecord[], failCommit = false) {
   const pendingSelectResults = [...selectResults];
   let inTransaction = false;
   const selectWhere = vi.fn(async () => (inTransaction ? pendingSelectResults.shift() : pendingSelectResults[0]) ?? []);
@@ -60,11 +61,17 @@ function createDbStub(selectResults: ApprovalRecord[][], updateResults: Approval
   const set = vi.fn(() => ({ where: updateWhere }));
   const update = vi.fn(() => ({ set }));
 
-  const db = { select, update, transaction: vi.fn(async (callback: (db: unknown) => Promise<unknown>) => {
+  const execute = vi.fn(async () => [{ xid: "1", status: "aborted" }]);
+  const transaction = async (callback: (db: unknown) => Promise<unknown>) => {
     const outerTransaction = inTransaction;
     inTransaction = true;
-    try { return await callback(db); } finally { inTransaction = outerTransaction; }
-  }) };
+    try {
+      const result = await callback({ select, update, execute, transaction });
+      if (failCommit) throw new Error("commit failed");
+      return result;
+    } finally { inTransaction = outerTransaction; }
+  };
+  const db = installDatabaseWorkSignals({ select, update, execute, transaction });
   return { db, selectWhere, returning };
 }
 
@@ -120,11 +127,7 @@ describe("approvalService resolution idempotency", () => {
 
   it("does not notify the adapter when the approval transaction fails to commit", async () => {
     const approved = createApproval("approved");
-    const dbStub = createDbStub([[createApproval("pending")]], [approved]);
-    dbStub.db.transaction.mockImplementationOnce(async callback => {
-      await callback(dbStub.db);
-      throw new Error("commit failed");
-    });
+    const dbStub = createDbStub([[createApproval("pending")]], [approved], true);
     await expect(approvalService(dbStub.db as any).approve("approval-1", "board")).rejects.toThrow("commit failed");
     expect(mockNotifyHireApproved).not.toHaveBeenCalled();
   });

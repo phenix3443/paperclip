@@ -567,6 +567,75 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
           }
         : baseSchedule;
 
+    // Lock the source, then reuse a live continuation for this source run and
+    // attempt, counting the duplicate request on its wakeup.
+    async function reuseLiveContinuation(
+      tx: Parameters<Parameters<typeof db.transaction>[0]>[0],
+    ) {
+      if (issueId) {
+        await tx.execute(
+          sql`select id from issues where company_id = ${run.companyId} and id = ${issueId} for update`,
+        );
+      } else {
+        await tx.execute(
+          sql`select id from heartbeat_runs where company_id = ${run.companyId} and id = ${run.id} for update`,
+        );
+      }
+
+      const existingContinuation = await tx
+        .select()
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, run.companyId),
+            eq(heartbeatRuns.retryOfRunId, run.id),
+            eq(heartbeatRuns.scheduledRetryReason, retryReason),
+            eq(heartbeatRuns.scheduledRetryAttempt, schedule.attempt),
+            inArray(heartbeatRuns.status, [
+              ...MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES,
+            ]),
+            issueId
+              ? sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`
+              : sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' is null`,
+          ),
+        )
+        .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (!existingContinuation) return null;
+
+      if (existingContinuation.wakeupRequestId) {
+        const existingWakeup = await tx
+          .select({ coalescedCount: agentWakeupRequests.coalescedCount })
+          .from(agentWakeupRequests)
+          .where(
+            and(ordinaryWakeRequestPredicate(), eq(
+              agentWakeupRequests.id,
+              existingContinuation.wakeupRequestId,
+            )),
+          )
+          .then((rows) => rows[0] ?? null);
+
+        await tx
+          .update(agentWakeupRequests)
+          .set({
+            coalescedCount: (existingWakeup?.coalescedCount ?? 0) + 1,
+            updatedAt: now,
+          })
+          .where(
+            and(ordinaryWakeRequestPredicate(), eq(
+              agentWakeupRequests.id,
+              existingContinuation.wakeupRequestId,
+            )),
+          );
+      }
+      return existingContinuation;
+    }
+    const isContinuationRetry =
+      retryReason === MAX_TURN_CONTINUATION_RETRY_REASON ||
+      retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON;
+    let continuationReusedAfterGate: typeof heartbeatRuns.$inferSelect | null = null;
+
     const requiresIssueGate =
       isTransientWorkspaceGitScanCode(run.errorCode) ||
       hasConversationContinuationPolicy(run.resultJson) ||
@@ -580,7 +649,13 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
         retryReasonOverride: retryReason,
         now,
       });
-      if (!gate.allowed) {
+      // A concurrent duplicate that committed first moves the issue execution
+      // lock to its successor, so the unlocked gate sees a changed lock. That
+      // successor is the continuation this request asks for: reuse it.
+      if (!gate.allowed && isContinuationRetry && gate.errorCode === "issue_execution_lock_changed") {
+        continuationReusedAfterGate = await db.transaction((tx) => reuseLiveContinuation(tx));
+      }
+      if (!gate.allowed && !continuationReusedAfterGate) {
         await appendRunEvent(run, {
           eventType: "lifecycle",
           stream: "system",
@@ -711,7 +786,9 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
           details: Record<string, unknown>;
         };
 
-    const scheduleResult = await db.transaction(
+    const scheduleResult: ScheduledRetryTransactionResult = continuationReusedAfterGate
+      ? { outcome: "scheduled", run: continuationReusedAfterGate, reusedExisting: true }
+      : await db.transaction(
       async (tx): Promise<ScheduledRetryTransactionResult> => {
         if (monitorAdmission) await tx.select({ id: companies.id }).from(companies).where(eq(companies.id, run.companyId)).for("share");
         // All automatic failure paths share the same predecessor claim. A
@@ -746,64 +823,8 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
             };
         }
         if (retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON) {
-          if (issueId) {
-            await tx.execute(
-              sql`select id from issues where company_id = ${run.companyId} and id = ${issueId} for update`,
-            );
-          } else {
-            await tx.execute(
-              sql`select id from heartbeat_runs where company_id = ${run.companyId} and id = ${run.id} for update`,
-            );
-          }
-
-          const existingContinuation = await tx
-            .select()
-            .from(heartbeatRuns)
-            .where(
-              and(
-                eq(heartbeatRuns.companyId, run.companyId),
-                eq(heartbeatRuns.retryOfRunId, run.id),
-                eq(heartbeatRuns.scheduledRetryReason, retryReason),
-                eq(heartbeatRuns.scheduledRetryAttempt, schedule.attempt),
-                inArray(heartbeatRuns.status, [
-                  ...MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES,
-                ]),
-                issueId
-                  ? sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`
-                  : sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' is null`,
-              ),
-            )
-            .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
-            .limit(1)
-            .then((rows) => rows[0] ?? null);
-
+          const existingContinuation = await reuseLiveContinuation(tx);
           if (existingContinuation) {
-            if (existingContinuation.wakeupRequestId) {
-              const existingWakeup = await tx
-                .select({ coalescedCount: agentWakeupRequests.coalescedCount })
-                .from(agentWakeupRequests)
-                .where(
-                  and(ordinaryWakeRequestPredicate(), eq(
-                    agentWakeupRequests.id,
-                    existingContinuation.wakeupRequestId,
-                  )),
-                )
-                .then((rows) => rows[0] ?? null);
-
-              await tx
-                .update(agentWakeupRequests)
-                .set({
-                  coalescedCount: (existingWakeup?.coalescedCount ?? 0) + 1,
-                  updatedAt: now,
-                })
-                .where(
-                  and(ordinaryWakeRequestPredicate(), eq(
-                    agentWakeupRequests.id,
-                    existingContinuation.wakeupRequestId,
-                  )),
-                );
-            }
-
             return {
               outcome: "scheduled",
               run: existingContinuation,
@@ -813,64 +834,8 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
         }
 
         if (retryReason === MAX_TURN_CONTINUATION_RETRY_REASON) {
-          if (issueId) {
-            await tx.execute(
-              sql`select id from issues where company_id = ${run.companyId} and id = ${issueId} for update`,
-            );
-          } else {
-            await tx.execute(
-              sql`select id from heartbeat_runs where company_id = ${run.companyId} and id = ${run.id} for update`,
-            );
-          }
-
-          const existingContinuation = await tx
-            .select()
-            .from(heartbeatRuns)
-            .where(
-              and(
-                eq(heartbeatRuns.companyId, run.companyId),
-                eq(heartbeatRuns.retryOfRunId, run.id),
-                eq(heartbeatRuns.scheduledRetryReason, retryReason),
-                eq(heartbeatRuns.scheduledRetryAttempt, schedule.attempt),
-                inArray(heartbeatRuns.status, [
-                  ...MAX_TURN_CONTINUATION_LIVE_RUN_STATUSES,
-                ]),
-                issueId
-                  ? sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`
-                  : sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' is null`,
-              ),
-            )
-            .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
-            .limit(1)
-            .then((rows) => rows[0] ?? null);
-
+          const existingContinuation = await reuseLiveContinuation(tx);
           if (existingContinuation) {
-            if (existingContinuation.wakeupRequestId) {
-              const existingWakeup = await tx
-                .select({ coalescedCount: agentWakeupRequests.coalescedCount })
-                .from(agentWakeupRequests)
-                .where(
-                  and(ordinaryWakeRequestPredicate(), eq(
-                    agentWakeupRequests.id,
-                    existingContinuation.wakeupRequestId,
-                  )),
-                )
-                .then((rows) => rows[0] ?? null);
-
-              await tx
-                .update(agentWakeupRequests)
-                .set({
-                  coalescedCount: (existingWakeup?.coalescedCount ?? 0) + 1,
-                  updatedAt: now,
-                })
-                .where(
-                  and(ordinaryWakeRequestPredicate(), eq(
-                    agentWakeupRequests.id,
-                    existingContinuation.wakeupRequestId,
-                  )),
-                );
-            }
-
             return {
               outcome: "scheduled",
               run: existingContinuation,

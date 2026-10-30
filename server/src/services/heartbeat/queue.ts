@@ -1,4 +1,5 @@
 import { settleNewReviewRunIdentity, settleReviewRunClaimIdentity } from "../run-identity.js";
+import { createDependencyAdmission, DependencyAdmissionHeld, pendingDependencyIntents, pendingDependencyReceiptResults, type DependencyClaim } from "./dependency-admission.js";
 import type { IssueMonitorAdmission } from "./scheduling.js";
 import { parseIssueExecutionState } from "../issue-execution-policy.js";
 import { admitReviewerIntent, consumeReviewerIntent, reconcileReviewerAssignments, reviewerAssignmentGeneration } from "./reviewer-assignment-continuation.js";
@@ -117,6 +118,7 @@ import {
   notFound,
 } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
+import { admitDeferredOwnerWake } from "./deferred-owner-wake.js";
 import { publishLiveEvent } from "../live-events.js";
 import { allocateHeartbeatRunEventSeq } from "../heartbeat-run-events.js";
 import {
@@ -221,7 +223,7 @@ export interface HeartbeatQueueDependencies extends Pick<HeartbeatRetryDependenc
   budgets: Pick<ReturnType<typeof budgetService>, "getInvocationBlock">;
   instanceSettings: Pick<ReturnType<typeof instanceSettingsService>, "getExperimental">;
   runDispatch: Pick<ReturnType<typeof createRunDispatch>, "cancelStaleQueuedRun">;
-  wakeQueue: Pick<ReturnType<typeof createWakeQueue>, "createAdmissionTransactionScope" | "admitWakeBehindIssueExecution">;
+  wakeQueue: Pick<ReturnType<typeof createWakeQueue>, "createAdmissionTransactionScope" | "admitWakeBehindIssueExecution" | "appendQueuedComment">;
   activeRunExecutions: Set<string>;
   activeRunExecutionPromises: Set<Promise<void>>;
   activeWakeupPromises: Set<Promise<unknown>>;
@@ -1187,6 +1189,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       });
       if (staleness.outcome === "cancelled" || staleness.outcome === "deferred") {
         applyRunDispatchPostCommitEffects(staleness.postCommitEffects);
+        // "The new owner will be woken instead": a wake it queued behind this run is admitted now, once.
+        if (staleness.outcome === "cancelled") {
+          await admitDeferredOwnerWake(db, enqueueWakeup, { companyId: run.companyId, issueId, endedRunId: run.id })
+            .catch(err => logger.warn({ err, runId: run.id }, "Could not admit the owner's deferred wake after a stale dispatch"));
+        }
         logger.info(
           {
             runId: run.id,
@@ -2212,7 +2219,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     return promise;
   }
 
-  async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string, reviewerIntent?: typeof agentWakeupRequests.$inferSelect, monitorAdmission?: IssueMonitorAdmission) {
+  const dependencyAdmission = createDependencyAdmission(db, async () => {
+    if ((await getSchedulingSuppression()).suppressed) return "operational_suppression";
+    return await getWorktreeExecutionCutoff() ? "worktree_cutoff" : null;
+  }, async (queryDb, agent) => (await getHeartbeatDailyCapBlock(agent, parseHeartbeatPolicy(agent), {}, queryDb))?.reason ?? null);
+
+  async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string, reviewerIntent?: typeof agentWakeupRequests.$inferSelect, monitorAdmission?: IssueMonitorAdmission, dependencyClaim?: DependencyClaim) {
     if (hasReviewerAssignmentContinuation(opts.payload) || hasReviewerAssignmentContinuation(opts.contextSnapshot)) {
       throw new HttpError(400, "Reviewer assignment continuation payload is reserved");
     }
@@ -2441,7 +2453,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         opts.idempotencyKey !== museRequest.idempotencyKey)) {
       throw conflict("Muse work request does not match its admission authority.");
     }
-    const receiptRequest = durableRequest ?? dotRequest ?? museRequest ?? caseReceipt ?? ownerRepairReceipt;
+    const receiptRequest = durableRequest ?? dotRequest ?? museRequest ?? caseReceipt ?? ownerRepairReceipt
+      ?? (dependencyClaim ? { id: dependencyClaim.reservation.receiptId, requestedAt: dependencyClaim.intent.requestedAt } : undefined);
     const durableReceiptFields = receiptRequest
       ? { id: receiptRequest.id, requestedAt: receiptRequest.requestedAt }
       : {};
@@ -2489,7 +2502,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       }
       return receipt;
     };
-    const priorReceipt = await existingDurableReceipt(db);
+    const priorReceipt = dependencyClaim ? null : await existingDurableReceipt(db);
     if (priorReceipt) {
       // Replaying an admission receipt is not fresh authority to dispatch it.
       // The normal queue owns dispatch and its current execution-policy checks.
@@ -2525,6 +2538,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       patch: Partial<typeof agentWakeupRequests.$inferInsert> = {},
       waitCondition?: Record<string, unknown>,
     ) => {
+      if (dependencyClaim) throw new DependencyAdmissionHeld(skipReason);
       // A temporary refusal must leave the handoff retryable, without burning
       // its one durable receipt ID on a skipped wake.
       if (outboxRequest || reviewerIntent || monitorAdmission) return { created: false };
@@ -2934,11 +2948,25 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           }
 
           if (executionReconciliationWake) await lockReconciledDeliveryPrefix(tx, agent.companyId, agentId);
+          const dependencyReceipt = dependencyClaim
+            ? await dependencyAdmission.authorize(tx as unknown as Db, dependencyClaim) : null;
           await tx.execute(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );
 
-          let reusedDispatchReceipt: typeof agentWakeupRequests.$inferSelect | null = null;
+          if (dependencyClaim) {
+            if (dependencyReceipt?.runId) return { kind: "durable" as const, receipt: dependencyReceipt };
+            if (dependencyReceipt && dependencyReceipt.status !== "deferred_issue_execution") throw new DependencyAdmissionHeld("receipt_requires_reconciliation");
+            const eligibility = await dependencyAdmission.inspect(tx as unknown as Db, dependencyClaim.intent);
+            if (eligibility.kind !== "eligible") throw new DependencyAdmissionHeld(eligibility.kind === "waiting" ? eligibility.gate : "target_invalidated");
+            const [current] = await tx.select({ responsibleUserId: issues.responsibleUserId }).from(issues).where(and(
+              eq(issues.companyId, agent.companyId), eq(issues.id, issueId!)));
+            operatorResponsibleUserId = current!.responsibleUserId;
+            enrichedContextSnapshot.responsibleUserId = current!.responsibleUserId;
+            delete enrichedContextSnapshot.retryOfRunId;
+          }
+
+          let reusedDispatchReceipt: typeof agentWakeupRequests.$inferSelect | null = dependencyReceipt;
           const dispatchReceiptReadmission = Boolean(executionWaitRequestId)
             && opts.dispatchReceiptReadmissionId === executionWaitRequestId;
           if (executionWaitRequestId) {
@@ -3092,7 +3120,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             }
           }
 
-          const durableReceipt = await existingDurableReceipt(
+          const durableReceipt = dependencyClaim ? null : await existingDurableReceipt(
             tx as unknown as Db,
           );
           if (durableReceipt)
@@ -4489,8 +4517,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           };
           // A deferred durable chat wake already owns this ID and source.
           // Promote that receipt in the same transaction as its successor.
-          const wakeupRequest = reusedDispatchReceipt
-            ? await tx.update(agentWakeupRequests)
+          const wakeupRequest = dependencyClaim && reusedDispatchReceipt
+            ? await dependencyAdmission.promoteReceipt(tx as unknown as Db, dependencyClaim, reusedDispatchReceipt)
+            : reusedDispatchReceipt ? await tx.update(agentWakeupRequests)
               .set({ status: "queued", error: null, updatedAt: new Date() })
               .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, reusedDispatchReceipt.id),
                 eq(agentWakeupRequests.status, "deferred_issue_execution")))
@@ -4681,6 +4710,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
           return { kind: "queued" as const, run: newRun };
           })();
+          if (dependencyClaim && result.kind === "skipped") throw new DependencyAdmissionHeld("admission_gate");
+          if (dependencyClaim) await dependencyAdmission.settle(tx as unknown as Db, dependencyClaim,
+            "run" in result && result.run ? { kind: "admitted", runId: result.run.id }
+              : { kind: "waiting", gate: result.kind });
           if (monitorAdmission && result.kind !== "queued") throw new MonitorAdmissionHeld();
           if (reviewerIntent && reviewerAdmitted) {
             if (!("run" in result) || !result.run || result.run.contextSnapshot?.reviewerAssignmentGeneration !== reviewerAssignmentGeneration(
@@ -4802,7 +4835,23 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       ? null
       : filterZombieCoalesceTarget(rawCoalescedTarget, liveRunExecutions);
 
-    if (coalescedTargetRun) {
+    let commentAppend: Awaited<ReturnType<typeof wakeQueue.appendQueuedComment>> = null;
+    if (coalescedTargetRun && wakeCommentId) {
+      const queueIssueId = readNonEmptyString(enrichedContextSnapshot.issueId) ?? taskKey;
+      commentAppend = queueIssueId && isUuidLike(queueIssueId)
+        ? await db.transaction(tx => wakeQueue.appendQueuedComment(
+            wakeQueue.createAdmissionTransactionScope(agent.companyId, tx as unknown as Db), {
+              companyId: agent.companyId, issueId: queueIssueId, agentId,
+              targetRunId: coalescedTargetRun.id, contextSnapshot: enrichedContextSnapshot, commentId: wakeCommentId,
+              source, triggerDetail, reason, payload,
+              requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+              idempotencyKey: opts.idempotencyKey ?? null,
+            })) : null;
+      if (commentAppend?.kind === "appended") return commentAppend.run as typeof heartbeatRuns.$inferSelect;
+    }
+
+    if (coalescedTargetRun && (!wakeCommentId || commentAppend?.kind === "legacy_root")) {
       const mergedContextSnapshot = mergeCoalescedContextSnapshot(
         coalescedTargetRun.contextSnapshot,
         enrichedContextSnapshot,
@@ -4978,25 +5027,20 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
   ) {
     const now = new Date();
     const staleClaimMs = Math.max(1_000, input.staleClaimMs ?? 60_000);
-    const candidates = await db
-      .select()
-      .from(agentWakeupRequests)
-      .where(
-        and(
-          ordinaryWakeRequestPredicate(), input.companyId
-            ? eq(agentWakeupRequests.companyId, input.companyId)
-            : undefined,
-          eq(agentWakeupRequests.requestedByActorType, "system"),
-          inArray(agentWakeupRequests.requestedByActorId, [
-            "native-status-committer",
-            CROSS_TASK_CONTINUATION_COMMITTER_ID,
-          ]),
-          inArray(agentWakeupRequests.status, ["queued", "claimed"]),
-          isNull(agentWakeupRequests.runId),
-        ),
-      )
-      .orderBy(asc(agentWakeupRequests.requestedAt))
-      .limit(Math.max(1, Math.min(input.limit ?? 100, 500)));
+    const limit = Math.max(1, Math.min(input.limit ?? 100, 500));
+    const selectCandidates = (predicate: ReturnType<typeof and>) => db.select().from(agentWakeupRequests)
+      .where(and(ordinaryWakeRequestPredicate(),
+        input.companyId ? eq(agentWakeupRequests.companyId, input.companyId) : undefined,
+        eq(agentWakeupRequests.requestedByActorType, "system"), predicate))
+      .orderBy(asc(agentWakeupRequests.requestedAt)).limit(limit);
+    const nativeIntents = await selectCandidates(and(
+      inArray(agentWakeupRequests.requestedByActorId, ["native-status-committer", CROSS_TASK_CONTINUATION_COMMITTER_ID]),
+      inArray(agentWakeupRequests.status, ["queued", "claimed"]), isNull(agentWakeupRequests.runId),
+      or(sql`${agentWakeupRequests.reason} is distinct from ${ISSUE_BLOCKERS_RESOLVED_WAKE_REASON}`,
+        sql`${agentWakeupRequests.requestedByActorId} is distinct from 'native-status-committer'`)));
+    const dependencyIntents = await selectCandidates(pendingDependencyIntents(db));
+    const receiptResults = await selectCandidates(pendingDependencyReceiptResults(db));
+    const candidates = [...nativeIntents, ...dependencyIntents, ...receiptResults];
 
     let dispatched = 0;
     let recovered = 0;
@@ -5007,6 +5051,51 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     >();
 
     for (const candidate of candidates) {
+      if (candidate.runId) {
+        try {
+          if (await dependencyAdmission.recoverReceipt(candidate)) recovered += 1;
+        } catch (error) {
+          logger.warn({ err: error, wakeupRequestId: candidate.id }, "Dependency result receipt requires reconciliation");
+        }
+        continue;
+      }
+
+      if (candidate.reason === ISSUE_BLOCKERS_RESOLVED_WAKE_REASON && candidate.requestedByActorId === "native-status-committer") {
+        const payload = parseObject(candidate.payload);
+        let claim: DependencyClaim | null = null;
+        try {
+          claim = await dependencyAdmission.prepare(candidate, staleClaimMs);
+          if (!claim) { deferred += 1; continue; }
+          const run = await enqueueWakeup(candidate.agentId, {
+            allowRunCoalescing: false, source: candidate.source as WakeupOptions["source"],
+            triggerDetail: "system", reason: candidate.reason, payload: claim.reservation.inputPayload,
+            idempotencyKey: candidate.idempotencyKey, requestedByActorType: "system",
+            requestedByActorId: `native-status-wake-dispatch:${candidate.id}`,
+            contextSnapshot: { ...parseObject(payload._paperclipWakeContext), issueId: claim.reservation.issueId, taskId: claim.reservation.issueId,
+              wakeReason: candidate.reason, source: "native_status_decision", statusDecisionSource: "native_status_decision",
+              nativeStatusWakeIntentId: candidate.id },
+          }, undefined, undefined, undefined, claim);
+          if (run) dispatched += 1;
+          else {
+            await db.transaction(tx => dependencyAdmission.settle(tx as unknown as Db, claim!, { kind: "waiting", gate: "admission" }));
+            deferred += 1;
+          }
+        } catch (error) {
+          if (claim && !(error instanceof DependencyAdmissionHeld && error.gate === "claim_superseded")) {
+            try {
+              await db.transaction(tx => dependencyAdmission.settle(tx as unknown as Db, claim!, {
+                ...(error instanceof DependencyAdmissionHeld ? { kind: "waiting" as const, gate: error.gate }
+                  : { kind: "retryableFailure" as const, error: String(error) }),
+              }));
+            } catch (settlementError) {
+              if (!(settlementError instanceof DependencyAdmissionHeld)) throw settlementError;
+            }
+          }
+          if (!(error instanceof DependencyAdmissionHeld)) logger.warn({ err: error, wakeupRequestId: candidate.id }, "Dependency admission requires reconciliation");
+          deferred += 1;
+        }
+        continue;
+      }
       const isContinuation =
         candidate.requestedByActorId === CROSS_TASK_CONTINUATION_COMMITTER_ID;
       const dispatchKey = isContinuation
@@ -5334,6 +5423,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     else deferredReceiptPromotionCursors.delete(scope);
     let promoted = 0;
     for (const receipt of receipts) {
+      if (receipt.reason === ISSUE_BLOCKERS_RESOLVED_WAKE_REASON) continue;
       const identity = deferredDispatchReceiptIntentId(receipt);
       const payload = parseObject(receipt.payload);
       const issueId = readNonEmptyString(payload.issueId);

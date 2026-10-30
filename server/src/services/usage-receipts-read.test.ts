@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, companies, createDb, heartbeatRuns, runUsageReceipts, type Db } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { persistUsageReceipt, type UsageReceiptEnvelope } from "./usage-receipts.js";
@@ -34,26 +34,25 @@ describe.skipIf(!support.supported)("usage receipt PostgreSQL reads", () => {
     const f = await fixture(), reads: unknown[][] = [];
     const observed = new Proxy(db, { get(target, key) {
       if (key !== "transaction") return Reflect.get(target, key);
-      return (callback: Parameters<Db["transaction"]>[0]) => target.transaction(tx => callback(new Proxy(tx, {
-        get(transaction, property) {
-          if (property !== "select") return Reflect.get(transaction, property);
-          return (...fields: Parameters<Db["select"]>) => {
-            const builder = transaction.select(...fields), from = builder.from.bind(builder);
-            builder.from = ((...args: Parameters<typeof from>) => {
-              const query = from(...args);
-              if (args[0] === heartbeatRuns) {
-                const execute = query.execute.bind(query);
-                query.execute = async (...executeArgs: Parameters<typeof execute>) => {
-                  expect(query.toSQL().sql).toContain("for update");
-                  const rows = await execute(...executeArgs); reads.push(rows); return rows;
-                };
-              }
-              return query;
-            }) as typeof builder.from;
-            return builder;
-          };
-        },
-      })));
+      return (callback: Parameters<Db["transaction"]>[0]) => target.transaction(tx => {
+        const select = tx.select.bind(tx);
+        vi.spyOn(tx, "select").mockImplementation((...fields: Parameters<Db["select"]>) => {
+          const builder = select(...fields), from = builder.from.bind(builder);
+          builder.from = ((...args: Parameters<typeof from>) => {
+            const query = from(...args);
+            if (args[0] === heartbeatRuns) {
+              const execute = query.execute.bind(query);
+              query.execute = async (...executeArgs: Parameters<typeof execute>) => {
+                expect(query.toSQL().sql).toContain("for update");
+                const rows = await execute(...executeArgs); reads.push(rows); return rows;
+              };
+            }
+            return query;
+          }) as typeof builder.from;
+          return builder;
+        });
+        return callback(tx);
+      });
     } });
     await persistUsageReceipt(observed, f.receipt(1));
     expect(reads).toHaveLength(1);

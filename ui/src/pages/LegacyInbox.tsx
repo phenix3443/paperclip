@@ -15,7 +15,9 @@ import { heartbeatsApi } from "../api/heartbeats";
 import { instanceSettingsApi } from "../api/instanceSettings";
 import { projectsApi } from "../api/projects";
 import {
-  BLOCKED_GROUP_OPTIONS,
+  blockedInboxGroupOptions,
+  loadBlockedInboxGroupBy,
+  saveBlockedInboxGroupBy,
   BLOCKED_SORT_OPTIONS,
   type BlockedInboxGroupBy,
   type BlockedInboxSort,
@@ -711,7 +713,7 @@ export function Inbox() {
     () => loadInboxFilterPreferences(selectedCompanyId),
   );
   const [groupBy, setGroupBy] = useState<InboxWorkItemGroupBy>(() => loadInboxWorkItemGroupBy());
-  const [blockedGroupBy, setBlockedGroupBy] = useState<BlockedInboxGroupBy>("none");
+  const [blockedGroupBy, setBlockedGroupBy] = useState<BlockedInboxGroupBy>(() => loadBlockedInboxGroupBy());
   const [blockedSortBy, setBlockedSortBy] = useState<BlockedInboxSort>("most_recent");
   const [visibleIssueColumns, setVisibleIssueColumns] = useState<InboxIssueColumn[]>(loadInboxIssueColumns);
   const { dismissed: dismissedAlerts, dismiss: dismissAlert } = useDismissedInboxAlerts();
@@ -1354,6 +1356,14 @@ export function Inbox() {
     setGroupBy("none");
     saveInboxWorkItemGroupBy("none");
   }, [experimentalSettingsLoaded, groupBy, isolatedWorkspacesEnabled]);
+  const updateBlockedGroupBy = useCallback((next: BlockedInboxGroupBy) => {
+    setBlockedGroupBy(next);
+    saveBlockedInboxGroupBy(next);
+  }, []);
+  useEffect(() => {
+    if (!experimentalSettingsLoaded || isolatedWorkspacesEnabled || blockedGroupBy !== "workspace") return;
+    updateBlockedGroupBy("none");
+  }, [blockedGroupBy, experimentalSettingsLoaded, isolatedWorkspacesEnabled, updateBlockedGroupBy]);
   const toggleNesting = useCallback(() => {
     setNestingPreferenceEnabled((prev) => {
       const next = !prev;
@@ -1567,6 +1577,47 @@ export function Inbox() {
   const agentName = (id: string | null) => {
     if (!id) return null;
     return agentById.get(id) ?? null;
+  };
+  const renderIssueTrailingColumns = (issue: Issue, columns: InboxIssueColumn[], assigneeContent?: ReactNode) => {
+    if (columns.length === 0) return undefined;
+    const project = issue.projectId ? projectById.get(issue.projectId) ?? null : null;
+    const assigneeUserProfile = issue.assigneeUserId
+      ? companyUserProfileMap.get(issue.assigneeUserId) ?? null
+      : null;
+    const originatingActor = deriveOriginatingActor(issue);
+    const originatingUserId = originatingActor?.kind === "user" ? originatingActor.id : null;
+    const originatingViaAgentId =
+      originatingActor?.kind === "user" ? originatingActor.viaAgentId ?? null : null;
+    return (
+      <InboxIssueTrailingColumns
+        issue={issue}
+        columns={columns}
+        projectName={project?.name ?? null}
+        projectColor={project?.color ?? null}
+        workspaceName={resolveIssueWorkspaceName(issue, {
+          executionWorkspaceById,
+          projectWorkspaceById,
+          defaultProjectWorkspaceIdByProjectId,
+        })}
+        assigneeName={agentName(issue.assigneeAgentId)}
+        assigneeAgent={agents?.find((agent) => agent.id === issue.assigneeAgentId)}
+        creatorAgent={agents?.find((agent) => agent.id === issue.createdByAgentId)}
+        assigneeUserName={
+          formatAssigneeUserLabel(issue.assigneeUserId, currentUserId, companyUserLabelMap)
+          ?? assigneeUserProfile?.label
+          ?? null
+        }
+        assigneeUserAvatarUrl={assigneeUserProfile?.image ?? null}
+        creatorAgentName={agentName(issue.createdByAgentId)}
+        creatorUserName={originatingUserId ? (companyUserProfileMap.get(originatingUserId)?.label ?? null) : null}
+        creatorUserAvatarUrl={originatingUserId ? (companyUserProfileMap.get(originatingUserId)?.image ?? null) : null}
+        viaAgentName={originatingViaAgentId ? agentName(originatingViaAgentId) : null}
+        currentUserId={currentUserId}
+        parentIdentifier={issue.parentId ? (issueById.get(issue.parentId)?.identifier ?? null) : null}
+        parentTitle={issue.parentId ? (issueById.get(issue.parentId)?.title ?? null) : null}
+        assigneeContent={assigneeContent}
+      />
+    );
   };
   const setIssueColumns = useCallback((next: InboxIssueColumn[]) => {
     const normalized = normalizeInboxIssueColumns(next);
@@ -2341,6 +2392,16 @@ export function Inbox() {
           </div>
           {tab === "blocked" ? (
             <>
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                className="hidden h-8 w-8 shrink-0 sm:inline-flex" data-active={nestingEnabled} aria-pressed={nestingEnabled}
+                onClick={toggleNesting}
+                title={nestingEnabled ? "Disable parent-child nesting" : "Enable parent-child nesting"}
+              >
+                <ListTree className="h-3.5 w-3.5" />
+              </Button>
               <IssueFiltersPopover
                 presentation="legacy"
                 state={issueFilters}
@@ -2362,15 +2423,15 @@ export function Inbox() {
                     type="button"
                     variant="outline"
                     size="icon"
-                    className={cn("h-8 w-8 shrink-0", blockedGroupBy !== "none" && "bg-accent")}
+                    className="h-8 w-8 shrink-0" data-active={blockedGroupBy !== "none"}
                     title="Group"
                   >
                     <Layers className="h-3.5 w-3.5" />
                   </Button>
                 </PopoverTrigger>
-                <PopoverContent align="end" className="w-44 p-0">
-                  <div className="space-y-0.5 p-2">
-                    {BLOCKED_GROUP_OPTIONS.map(([value, label]) => (
+                <PopoverContent align="end" className="w-40 p-2">
+                  <div className="space-y-0.5">
+                    {blockedInboxGroupOptions(isolatedWorkspacesEnabled).map(([value, label]) => (
                       <button
                         key={value}
                         type="button"
@@ -2378,7 +2439,7 @@ export function Inbox() {
                           "flex w-full items-center justify-between rounded-sm px-2 py-1.5 text-sm",
                           blockedGroupBy === value ? "bg-accent/50 text-foreground" : "text-muted-foreground hover:bg-accent/50",
                         )}
-                        onClick={() => setBlockedGroupBy(value)}
+                        onClick={() => updateBlockedGroupBy(value)}
                       >
                         <span>{label}</span>
                         {blockedGroupBy === value ? <Check className="h-3.5 w-3.5" /> : null}
@@ -2433,7 +2494,7 @@ export function Inbox() {
                 type="button"
                 variant="outline"
                 size="icon"
-                className={cn("hidden h-8 w-8 shrink-0 sm:inline-flex", nestingEnabled && "bg-accent")}
+                className="hidden h-8 w-8 shrink-0 sm:inline-flex" data-active={nestingEnabled} aria-pressed={nestingEnabled}
                 onClick={toggleNesting}
                 title={nestingEnabled ? "Disable parent-child nesting" : "Enable parent-child nesting"}
               >
@@ -2460,7 +2521,7 @@ export function Inbox() {
                     type="button"
                     variant="outline"
                     size="icon"
-                    className={cn("h-8 w-8 shrink-0", groupBy !== "none" && "bg-accent")}
+                    className="h-8 w-8 shrink-0" data-active={groupBy !== "none"}
                     title="Group"
                   >
                     <Layers className="h-3.5 w-3.5" />
@@ -2591,6 +2652,7 @@ export function Inbox() {
           userLabelById={companyUserLabelMap}
           issueLinkState={issueLinkState}
           groupBy={blockedGroupBy}
+          groupingContext={inboxWorkspaceGrouping}
           sortBy={blockedSortBy}
           issueFilters={issueFilters}
           currentUserId={currentUserId}
@@ -2600,6 +2662,10 @@ export function Inbox() {
           showStatusColumn={visibleIssueColumnSet.has("status") && availableIssueColumnSet.has("status")}
           showIdentifierColumn={visibleIssueColumnSet.has("id") && availableIssueColumnSet.has("id")}
           showUpdatedColumn={visibleIssueColumnSet.has("updated") && availableIssueColumnSet.has("updated")}
+          showResponsibleColumn={visibleIssueColumnSet.has("assignee") && availableIssueColumnSet.has("assignee")}
+          nestingEnabled={nestingEnabled}
+          renderIssueColumns={(issue: Issue, responsible: ReactNode) =>
+            renderIssueTrailingColumns(issue, visibleTrailingIssueColumns.filter((column) => column !== "updated"), responsible)}
         />
       ) : null}
 
@@ -2657,14 +2723,6 @@ export function Inbox() {
                   const isUnread = issue.isUnreadForMe && !fadingOutIssues.has(issue.id);
                   const isFading = fadingOutIssues.has(issue.id);
                   const isArchiving = archivingIssueIds.has(issue.id);
-                  const project = issue.projectId ? projectById.get(issue.projectId) ?? null : null;
-                  const assigneeUserProfile = issue.assigneeUserId
-                    ? companyUserProfileMap.get(issue.assigneeUserId) ?? null
-                    : null;
-                  const originatingActor = deriveOriginatingActor(issue);
-                  const originatingUserId = originatingActor?.kind === "user" ? originatingActor.id : null;
-                  const originatingViaAgentId =
-                    originatingActor?.kind === "user" ? originatingActor.viaAgentId ?? null : null;
                   const isLive = liveIssueIds.has(issue.id);
                   const loadedSubtreeLiveCount = subtreeLiveCounts.get(issue.id) ?? 0;
                   const liveDescendantCount = resolveIssueLiveDescendantCount(issue, loadedSubtreeLiveCount);
@@ -2756,37 +2814,7 @@ export function Inbox() {
                       onMarkRead={() => markReadMutation.mutate(issue.id)}
                       onArchive={allowArchive ? () => archiveIssueMutation.mutate(issue.id) : undefined}
                       archiveDisabled={isArchiving}
-                      desktopTrailing={
-                        visibleTrailingIssueColumns.length > 0 ? (
-                          <InboxIssueTrailingColumns
-                            issue={issue}
-                            columns={visibleTrailingIssueColumns}
-                            projectName={project?.name ?? null}
-                            projectColor={project?.color ?? null}
-                            workspaceName={resolveIssueWorkspaceName(issue, {
-                              executionWorkspaceById,
-                              projectWorkspaceById,
-                              defaultProjectWorkspaceIdByProjectId,
-                            })}
-                            assigneeName={agentName(issue.assigneeAgentId)}
-                            assigneeAgent={agents?.find((agent) => agent.id === issue.assigneeAgentId)}
-                            creatorAgent={agents?.find((agent) => agent.id === issue.createdByAgentId)}
-                            assigneeUserName={
-                              formatAssigneeUserLabel(issue.assigneeUserId, currentUserId, companyUserLabelMap)
-                              ?? assigneeUserProfile?.label
-                              ?? null
-                            }
-                            assigneeUserAvatarUrl={assigneeUserProfile?.image ?? null}
-                            creatorAgentName={agentName(issue.createdByAgentId)}
-                            creatorUserName={originatingUserId ? (companyUserProfileMap.get(originatingUserId)?.label ?? null) : null}
-                            creatorUserAvatarUrl={originatingUserId ? (companyUserProfileMap.get(originatingUserId)?.image ?? null) : null}
-                            viaAgentName={originatingViaAgentId ? agentName(originatingViaAgentId) : null}
-                            currentUserId={currentUserId}
-                            parentIdentifier={issue.parentId ? (issueById.get(issue.parentId)?.identifier ?? null) : null}
-                            parentTitle={issue.parentId ? (issueById.get(issue.parentId)?.title ?? null) : null}
-                          />
-                        ) : undefined
-                      }
+                      desktopTrailing={renderIssueTrailingColumns(issue, visibleTrailingIssueColumns)}
                     />
                   );
                 };

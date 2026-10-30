@@ -1,22 +1,25 @@
 import { AgentIdentity } from "@/components/AgentIdentity";
-import { useMemo, useState } from "react";
+import { type ReactNode, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { AlertTriangle, CheckCircle2 } from "lucide-react";
+import { AlertTriangle, CheckCircle2, ChevronRight } from "lucide-react";
 import type { Issue } from "@paperclipai/shared";
 import { issuesApi } from "../api/issues";
 import { queryKeys } from "../lib/queryKeys";
 import { cn } from "../lib/utils";
 import { applyIssueFilters, type IssueFilterState, type IssueFilterWorkspaceContext } from "../lib/issue-filters";
 import { resolveInboxIssueBlockerAttention } from "../lib/inbox-live-descendants";
+import { resolveIssueWorkspaceGroup, type InboxWorkspaceGroupingOptions } from "../lib/inbox";
 import {
   blockedRowMatchesSearch,
   buildBlockedInboxRows,
   formatStoppedAge,
   groupBlockedInboxRows,
+  nestBlockedInboxRows,
   sortBlockedInboxRows,
   type BlockedInboxGroupBy,
   type BlockedInboxIssueRow,
   type BlockedInboxSort,
+  type BlockedInboxTreeNode,
 } from "../lib/blockedInbox";
 import { BlockedReasonChip } from "./BlockedReasonChip";
 import { IssueGroupHeader } from "./IssueGroupHeader";
@@ -43,6 +46,13 @@ interface BlockedInboxViewProps {
   showStatusColumn: boolean;
   showIdentifierColumn: boolean;
   showUpdatedColumn: boolean;
+  showResponsibleColumn: boolean;
+  /** Renders the inbox's issue columns; the Responsible cell takes `responsible` instead of the assignee. */
+  renderIssueColumns?: (issue: Issue, responsible: ReactNode) => ReactNode;
+  /** Shows a listed child issue under its listed parent in the same group. */
+  nestingEnabled?: boolean;
+  /** Project and workspace lookups for the Project and Workspace groupings. */
+  groupingContext?: InboxWorkspaceGroupingOptions;
   presentation?: IssueRowPresentation;
 }
 
@@ -65,9 +75,14 @@ export function BlockedInboxView({
   showStatusColumn,
   showIdentifierColumn,
   showUpdatedColumn,
+  showResponsibleColumn,
+  renderIssueColumns,
+  nestingEnabled = false,
+  groupingContext,
   presentation = "legacy",
 }: BlockedInboxViewProps) {
-  const [collapsedVariants, setCollapsedVariants] = useState<Set<string>>(() => new Set());
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set());
+  const [collapsedParents, setCollapsedParents] = useState<Set<string>>(() => new Set());
 
   const {
     data: issues = [] as Issue[],
@@ -110,15 +125,57 @@ export function BlockedInboxView({
   }, [currentUserId, filteredRows, issueFilters, liveIssueIds, workspaceFilterContext]);
   const sortedRows = useMemo(() => sortBlockedInboxRows(issueFilteredRows, sortBy), [issueFilteredRows, sortBy]);
   const groups = useMemo(
-    () => groupBlockedInboxRows(issueFilteredRows, sortBy),
-    [issueFilteredRows, sortBy],
+    () => groupBy === "none"
+      ? []
+      : groupBlockedInboxRows(issueFilteredRows, sortBy, groupBy, {
+        ownerLabel: (row) => resolveOwnerName(row, agentNameById, userLabelById).label,
+        projectName: (projectId) => groupingContext?.projectById?.get(projectId)?.name?.trim() || null,
+        workspaceGroup: (issue) => resolveIssueWorkspaceGroup(issue, groupingContext),
+      }),
+    [agentNameById, groupBy, groupingContext, issueFilteredRows, sortBy, userLabelById],
   );
 
-  const toggleVariant = (variant: string) => {
-    setCollapsedVariants((prev) => {
+  const toggleParent = (issueId: string) => {
+    setCollapsedParents((prev) => {
       const next = new Set(prev);
-      if (next.has(variant)) next.delete(variant);
-      else next.add(variant);
+      if (next.has(issueId)) next.delete(issueId);
+      else next.add(issueId);
+      return next;
+    });
+  };
+
+  const renderRow = (row: BlockedInboxIssueRow, tree?: { depth: number; childCount: number; expanded: boolean }) => (
+    <BlockedInboxRow
+      key={row.issue.id}
+      row={row}
+      issueLinkState={issueLinkState}
+      agentNameById={agentNameById} agents={agents}
+      userLabelById={userLabelById}
+      liveIssueIds={liveIssueIds}
+      subtreeLiveCounts={subtreeLiveCounts}
+      showStatusColumn={showStatusColumn}
+      showIdentifierColumn={showIdentifierColumn}
+      showUpdatedColumn={showUpdatedColumn}
+      showResponsibleColumn={showResponsibleColumn}
+      renderIssueColumns={renderIssueColumns}
+      presentation={presentation}
+      tree={tree ? { ...tree, nestingEnabled, onToggle: () => toggleParent(row.issue.id) } : undefined}
+    />
+  );
+  const renderTree = (nodes: BlockedInboxTreeNode[], depth: number): ReactNode[] =>
+    nodes.flatMap((node) => {
+      const expanded = !collapsedParents.has(node.row.issue.id);
+      const row = renderRow(node.row, { depth, childCount: node.children.length, expanded });
+      return expanded && node.children.length > 0 ? [row, ...renderTree(node.children, depth + 1)] : [row];
+    });
+  const renderRows = (rows: BlockedInboxIssueRow[]): ReactNode[] =>
+    nestingEnabled ? renderTree(nestBlockedInboxRows(rows), 0) : rows.map((row) => renderRow(row));
+
+  const toggleGroup = (key: string) => {
+    setCollapsedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
       return next;
     });
   };
@@ -201,7 +258,7 @@ export function BlockedInboxView({
     );
   }
 
-  if (groups.length === 0) {
+  if (issueFilteredRows.length === 0) {
     return (
       <div className="space-y-3">
         <Card
@@ -218,51 +275,23 @@ export function BlockedInboxView({
     <div data-testid="blocked-inbox" className="space-y-3">
       <div className="overflow-hidden rounded-xl">
         {groupBy === "none" ? (
-          sortedRows.map((row) => (
-            <BlockedInboxRow
-              key={row.issue.id}
-              row={row}
-              issueLinkState={issueLinkState}
-              agentNameById={agentNameById} agents={agents}
-              userLabelById={userLabelById}
-              liveIssueIds={liveIssueIds}
-              subtreeLiveCounts={subtreeLiveCounts}
-              showStatusColumn={showStatusColumn}
-              showIdentifierColumn={showIdentifierColumn}
-              showUpdatedColumn={showUpdatedColumn}
-              presentation={presentation}
-            />
-          ))
+          renderRows(sortedRows)
         ) : (
           groups.map((group) => {
-            const isCollapsed = collapsedVariants.has(group.variant);
+            const isCollapsed = collapsedGroups.has(group.key);
             return (
-              <div key={group.variant} data-testid={`blocked-inbox-group-${group.variant}`}>
+              <div key={group.key} data-testid={`blocked-inbox-group-${group.key}`}>
                 <div className={presentation === "task" ? "rounded-lg px-3 sm:pl-0 sm:pr-4" : "px-3 sm:px-4"}>
                   <IssueGroupHeader
                     label={`${group.label} · ${group.rows.length}`}
                     collapsible
                     collapsed={isCollapsed}
-                    onToggle={() => toggleVariant(group.variant)}
+                    onToggle={() => toggleGroup(group.key)}
                   />
                 </div>
                 {!isCollapsed && (
                   <div>
-                    {group.rows.map((row) => (
-                      <BlockedInboxRow
-                        key={row.issue.id}
-                        row={row}
-                        issueLinkState={issueLinkState}
-                        agentNameById={agentNameById} agents={agents}
-                        userLabelById={userLabelById}
-                        liveIssueIds={liveIssueIds}
-                        subtreeLiveCounts={subtreeLiveCounts}
-                        showStatusColumn={showStatusColumn}
-                        showIdentifierColumn={showIdentifierColumn}
-                        showUpdatedColumn={showUpdatedColumn}
-                        presentation={presentation}
-                      />
-                    ))}
+                    {renderRows(group.rows)}
                   </div>
                 )}
               </div>
@@ -285,7 +314,10 @@ interface BlockedInboxRowProps {
   showStatusColumn: boolean;
   showIdentifierColumn: boolean;
   showUpdatedColumn: boolean;
+  showResponsibleColumn: boolean;
+  renderIssueColumns?: (issue: Issue, responsible: ReactNode) => ReactNode;
   presentation: IssueRowPresentation;
+  tree?: { depth: number; childCount: number; expanded: boolean; nestingEnabled: boolean; onToggle: () => void };
 }
 
 function resolveOwnerName(
@@ -295,6 +327,7 @@ function resolveOwnerName(
 ): { label: string | null; isAgent: boolean } {
   const owner = row.attention.owner;
   if (owner.label) return { label: owner.label, isAgent: owner.type === "agent" };
+  if (owner.type === "external") return { label: "External", isAgent: false };
   if (owner.agentId) {
     return { label: agentNameById.get(owner.agentId) ?? null, isAgent: true };
   }
@@ -315,10 +348,50 @@ function BlockedInboxRow({
   showStatusColumn,
   showIdentifierColumn,
   showUpdatedColumn,
+  showResponsibleColumn,
+  renderIssueColumns,
   presentation,
+  tree,
 }: BlockedInboxRowProps) {
   const { label: ownerName, isAgent } = resolveOwnerName(row, agentNameById, userLabelById);
+  // The Responsible cell truncates long names; hover shows the full name, and for an external wait also the action.
+  const ownerTitle = !ownerName
+    ? undefined
+    : row.attention.owner.type === "external" && row.attention.action.detail
+      ? `${ownerName}: ${row.attention.action.detail}`
+      : ownerName;
+  // An element even without an owner: the shared columns fall back to the issue assignee for an empty cell.
+  const ownerCell = ownerName ? (
+    // relative z-10 lifts the cell above the row's full-size link, so its hover title can show.
+    <span className="relative z-10 inline-flex min-w-0 max-w-full items-center" title={ownerTitle} data-testid="blocked-row-owner">
+      {isAgent ? <AgentIdentity agent={agents?.find((agent) => agent.id === row.attention.owner.agentId) ?? { id: row.attention.owner.agentId ?? undefined, name: ownerName }} size="xs" className="max-w-full" /> : <Identity name={ownerName} size="xs" className="max-w-full" />}
+    </span>
+  ) : (
+    <span aria-hidden="true" />
+  );
   const stoppedAge = formatStoppedAge(row.attention.stoppedSinceAt);
+  const hasChildren = (tree?.childCount ?? 0) > 0;
+  const disclosure = tree?.nestingEnabled ? (
+    hasChildren ? (
+      <button
+        type="button"
+        data-slot="icon-button"
+        className="inline-flex h-4 w-4 shrink-0 items-center justify-center"
+        aria-label={tree.expanded ? "Collapse sub-tasks" : "Expand sub-tasks"}
+        aria-expanded={tree.expanded}
+        data-testid="blocked-row-disclosure"
+        onClick={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          tree.onToggle();
+        }}
+      >
+        <ChevronRight className={cn("h-3.5 w-3.5 transition-transform", tree.expanded && "rotate-90")} />
+      </button>
+    ) : (
+      <span data-slot="task-row-disclosure-spacer" className="hidden h-4 w-4 shrink-0 sm:block" aria-hidden="true" />
+    )
+  ) : undefined;
   const blockerAttention = resolveInboxIssueBlockerAttention(row.issue, {
     isLive: liveIssueIds.has(row.issue.id),
     loadedSubtreeLiveCount: subtreeLiveCounts.get(row.issue.id) ?? 0,
@@ -336,12 +409,14 @@ function BlockedInboxRow({
           className="max-w-full"
         />
       </span>
-      {ownerName ? (
-        <span className="hidden w-(--sz-150px) min-w-0 items-center text-muted-foreground sm:inline-flex">
-          {isAgent ? <AgentIdentity agent={agents?.find((agent) => agent.id === row.attention.owner.agentId) ?? { id: row.attention.owner.agentId ?? undefined, name: ownerName }} size="xs" className="max-w-full" /> : <Identity name={ownerName} size="xs" className="max-w-full" />}
+      {renderIssueColumns ? (
+        <span className="hidden min-w-0 sm:inline-flex" data-testid="blocked-row-issue-columns">
+          {renderIssueColumns(row.issue, ownerCell)}
         </span>
-      ) : (
-        <span className="hidden w-(--sz-150px) shrink-0 sm:inline-flex" aria-hidden="true" />
+      ) : !showResponsibleColumn ? null : (
+        <span className="hidden w-(--sz-150px) min-w-0 items-center text-muted-foreground sm:inline-flex">
+          {ownerCell}
+        </span>
       )}
       {presentation === "legacy" && showUpdatedColumn ? (
         <span className="hidden w-(--sz-5_75rem) text-right text-muted-foreground sm:inline" data-testid="blocked-row-age">
@@ -354,11 +429,12 @@ function BlockedInboxRow({
   const mobileMeta = (
     <span className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted-foreground">
       {presentation === "legacy" && <span data-testid="blocked-row-age-mobile">{stoppedAge}</span>}
-      {ownerName ? (
+      {showResponsibleColumn && ownerName ? (
         <>
           {presentation === "legacy" && <span aria-hidden="true">·</span>}
           <span
             className={cn(isAgent ? "font-medium text-foreground/90" : null)}
+            title={ownerTitle}
             data-testid="blocked-row-owner-mobile"
           >
             {ownerName}
@@ -373,6 +449,9 @@ function BlockedInboxRow({
       issue={row.issue}
       issueLinkState={issueLinkState}
       presentation={presentation}
+      treeGuides={tree?.depth ?? 0}
+      chevronInGuide={presentation === "task" && (tree?.depth ?? 0) > 0 && hasChildren}
+      leadingControl={presentation === "task" ? disclosure : undefined}
       showDivider={presentation === "legacy"}
       statusSlot={presentation === "task"
         ? showStatusColumn
@@ -381,12 +460,15 @@ function BlockedInboxRow({
         : undefined}
       showIdentifier={presentation === "task" ? showIdentifierColumn : undefined}
       desktopMetaLeading={presentation === "legacy" ? (
-        <BlockedRowDesktopMeta
-          row={row}
-          blockerAttention={blockerAttention}
-          showStatusColumn={showStatusColumn}
-          showIdentifierColumn={showIdentifierColumn}
-        />
+        <>
+          {disclosure}
+          <BlockedRowDesktopMeta
+            row={row}
+            blockerAttention={blockerAttention}
+            showStatusColumn={showStatusColumn}
+            showIdentifierColumn={showIdentifierColumn}
+          />
+        </>
       ) : undefined}
       mobileLeading={
         <span className="flex shrink-0 items-center gap-1.5 pt-px">
@@ -394,11 +476,18 @@ function BlockedInboxRow({
         </span>
       }
       titleSuffix={
-        <BlockedReasonChip
-          reason={row.attention.reason}
-          severity={row.attention.severity}
-          className="ml-2 max-w-(--sz-12rem) align-middle sm:hidden"
-        />
+        <>
+          {hasChildren && !tree?.expanded ? (
+            <span className="ml-1.5 text-xs text-muted-foreground" data-testid="blocked-row-child-count">
+              ({tree!.childCount} sub-task{tree!.childCount !== 1 ? "s" : ""})
+            </span>
+          ) : null}
+          <BlockedReasonChip
+            reason={row.attention.reason}
+            severity={row.attention.severity}
+            className="ml-2 max-w-(--sz-12rem) align-middle sm:hidden"
+          />
+        </>
       }
       mobileMeta={mobileMeta}
       mobileTitleMeta={presentation === "task" ? <span data-testid="blocked-row-age-mobile">{stoppedAge}</span> : undefined}

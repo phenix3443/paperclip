@@ -61,7 +61,7 @@ export function ArtifactsToolbar({ query: draftQuery, onQueryChange: setDraftQue
               data-testid="artifact-group-control"
               data-group-by={groupBy}
               data-active={grouping}
-              className={cn("h-8 w-8 shrink-0", grouping && "bg-accent")}
+              className="h-8 w-8 shrink-0"
             >
               <Layers className="h-3.5 w-3.5" aria-hidden="true" />
             </Button>
