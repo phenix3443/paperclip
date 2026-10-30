@@ -133,7 +133,7 @@ describe.skipIf(!postgres.supported)("heartbeat scheduling database boundary", (
     const unsubscribe = subscribeDatabaseWork(db, DELIVERY_QUEUES.issueMonitors, event => events.push(event));
     try {
       const consume = db.transaction(async tx => {
-        const consumed = await new IssueMonitorAdmission(claimed, now).consume(tx as Db, claimed, f.agent.id);
+        const consumed = await new IssueMonitorAdmission(claimed, now).consume(tx as unknown as Db, claimed, f.agent.id);
         expect(consumed.monitorNextCheckAt).toBeNull();
         expect(events).toEqual(["intent"]);
         expect((await readIssue(f.issue.id)).monitorNextCheckAt).toEqual(dueAt);
