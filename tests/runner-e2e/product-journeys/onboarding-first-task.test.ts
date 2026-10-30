@@ -237,7 +237,7 @@ describe("Cloud canonical onboarding first task", () => {
     } });
     await expect(onboardingFirstTask(f.input)).rejects.toMatchObject({ code: mode === "no-child" ? "onboarding_completed_without_child" : "onboarding_approved_child_mismatch" });
   });
-  it.each(["parent-run", "wrong-connection", "bad-hash", "missing-document", "missing-parent-links"])("does not pass an unverified deliverable: %s", async mode => {
+  it.each(["parent-run", "wrong-connection", "bad-hash", "missing-document", "missing-parent-links", "filename-only-parent-result"])("does not pass an unverified deliverable: %s", async mode => {
     const f = fixture({ mutate(phase, state) {
       if (phase !== "accepted") return;
       if (mode === "parent-run") state.attachments[0]!.originatingRunId = "acceptance-run";
@@ -245,8 +245,9 @@ describe("Cloud canonical onboarding first task", () => {
       if (mode === "bad-hash") state.attachments[0]!.sha256 = "0".repeat(64);
       if (mode === "missing-document") state.documents = [];
       if (mode === "missing-parent-links") state.comments.pop();
+      if (mode === "filename-only-parent-result") state.comments.at(-1)!.body = "Done: `QA-2` completed. Saved document: `connection-proof`. Deliverable published: `connection-proof.json`.";
     } });
-    await expect(onboardingFirstTask(f.input)).rejects.toMatchObject({ code: mode === "bad-hash" ? "artifact_independent_check_failed" : mode === "missing-document" ? "onboarding_child_document_missing" : mode === "missing-parent-links" ? "onboarding_parent_result_links_missing" : "artifact_run_attribution_mismatch" });
+    await expect(onboardingFirstTask(f.input)).rejects.toMatchObject({ code: mode === "bad-hash" ? "artifact_independent_check_failed" : mode === "missing-document" ? "onboarding_child_document_missing" : ["missing-parent-links", "filename-only-parent-result"].includes(mode) ? "onboarding_parent_result_links_missing" : "artifact_run_attribution_mismatch" });
     expect(f.events).not.toContain("visible:download");
   });
   it("counts proposal and parent runs toward the campaign cap", async () => {

@@ -22,6 +22,12 @@ describe("ACPX launch environment", () => {
     expect(launch.ACPX_CLAUDE_INCLUDE_USER_SETTINGS).toBeUndefined();
     expect(environment.CLAUDE_CONFIG_DIR).toBe(configured);
   });
+  it("retains Runner notification discovery while denying task-supplied overrides", () => {
+    for (const key of ["PAPERCLIP_RUNTIME_NOTIFICATION_CONTEXT", "PAPERCLIP_RUNTIME_NOTIFICATION_HELPER"]) {
+      expect(createSanitizedAcpxSpawnInput({ [key]: "/private/runner/context" }, "claude").env[key]).toBe("/private/runner/context");
+      expect(configuredEnvironmentProjection({ [key]: "/caller/override" })).not.toHaveProperty(key);
+    }
+  });
   it("retains an explicit Claude MCP timeout without inheriting an ambient or sibling setting", () => {
     vi.stubEnv("MCP_TOOL_TIMEOUT", "999999");
     expect(createSanitizedAcpxSpawnInput(undefined, "claude").env).not.toHaveProperty("MCP_TOOL_TIMEOUT");
@@ -109,7 +115,7 @@ describe("ACPX launch environment", () => {
 
   it.each([
     ["pi", "OPENROUTER_API_KEY"], ["cursor", "CURSOR_API_KEY"],
-    ["cursor", "CURSOR_AUTH_TOKEN"], ["copilot", "COPILOT_GITHUB_TOKEN"],
+    ["cursor", "CURSOR_AUTH_TOKEN"], ["copilot", "COPILOT_GITHUB_TOKEN"], ["antigravity", "GEMINI_API_KEY"],
   ] as const)("requires an explicit %s credential binding for %s", (agent, name) => {
     vi.stubEnv(name, "ambient-secret");
     expect(createSanitizedAcpxSpawnInput(undefined, agent).env[name]).toBeUndefined();
@@ -131,7 +137,7 @@ describe("ACPX launch environment", () => {
 
   it.each([
     ["pi", "OPENROUTER_API_KEY"], ["cursor", "CURSOR_API_KEY"],
-    ["cursor", "CURSOR_AUTH_TOKEN"], ["copilot", "COPILOT_GITHUB_TOKEN"],
+    ["cursor", "CURSOR_AUTH_TOKEN"], ["copilot", "COPILOT_GITHUB_TOKEN"], ["antigravity", "GEMINI_API_KEY"],
   ] as const)("admits only session-bound %s sidecar credentials for %s", (agent, name) => {
     const source = { [name]: "task-secret" };
     const binding = createAcpxCredentialBinding(source, agent, "session-1");

@@ -559,6 +559,11 @@ const MIGRATIONS_WITH_TOP_LEVEL_STATEMENTS = new Set([
   "0407_greedy_star_brand.sql",
   "0408_short_red_skull.sql",
   "0409_uneven_zuras.sql",
+  "0410_freezing_kinsey_walden.sql",
+  "0411_real_scrambler.sql",
+  "0412_tearful_squadron_supreme.sql",
+  "0413_tired_kronos.sql",
+  "0414_closed_edwin_jarvis.sql",
 
 
   "0384_funny_adam_warlock.sql",
