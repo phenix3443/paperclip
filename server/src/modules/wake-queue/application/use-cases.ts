@@ -978,7 +978,8 @@ export function createAdmitWakeBehindIssueExecution(deps: {
         mergedPayload,
         nextCoalescedCount: (existingDeferred.coalescedCount ?? 0) + 1,
         ...(manualUserWakeActorId ? { manualUserWakeActorId } : {}),
-        ...(input.durableReceipt
+        ...(input.durableReceipt || (input.requestedByActorType === "user" &&
+            readNonEmptyString(input.requestedByActorId) && readNonEmptyString(input.wakeCommentId))
           ? {
               coalescedReceipt: {
                 ...input.durableReceipt,
@@ -988,6 +989,7 @@ export function createAdmitWakeBehindIssueExecution(deps: {
                 reason: input.reason ?? null,
                 payload: {
                   ...(input.payload ?? {}),
+                  issueId: input.issueId,
                   coalescedIntoWakeupRequestId: existingDeferred.id,
                 },
                 requestedByActorType: input.requestedByActorType,

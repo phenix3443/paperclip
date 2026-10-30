@@ -347,9 +347,9 @@ describeEmbeddedPostgres("merged Muse migration histories", () => {
     }
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
-  it("upgrades a develop database with the renumbered 0372-0376 already applied by running only the upstream 0372-0394", async () => {
+  it.each([371, 394])("upgrades real develop history through %i without replaying five fork SQL migrations", async baseline => {
     const referenceUrl = await createTempDatabase();
-    const adminUrl = new URL(referenceUrl), databaseName = "merged_upstream_develop0376";
+    const adminUrl = new URL(referenceUrl), databaseName = `merged_upstream_develop_${baseline}`;
     adminUrl.pathname = "/postgres";
     await ensurePostgresDatabase(adminUrl.toString(), databaseName);
     adminUrl.pathname = `/${databaseName}`;
@@ -359,21 +359,21 @@ describeEmbeddedPostgres("merged Muse migration histories", () => {
     try {
       const journal = JSON.parse(await fs.promises.readFile(new URL("./migrations/meta/_journal.json", import.meta.url), "utf8")) as { entries: MergedHistoryEntry[] };
       const developTail = [
-        { file: "0395_aromatic_loki.sql", when: 1792809786245, hash: "f7f8da4d04b7b2c6d87b1d8b31f438a27715727e19eab7d6b1252ff30f892f87" },
-        { file: "0396_melted_hydra.sql", when: 1793109921370, hash: "8ce631d5c1dda67a32135ed4ca4c38aee1ba82b470e69f79f755f10edeb17c3a" },
-        { file: "0397_purple_sue_storm.sql", when: 1793124505405, hash: "44ab97136e6634ac9e9be9a9f7ec5bf7c8bf20566271dddbcf01e329aeb163f7" },
-        { file: "0398_young_garia.sql", when: 1793130317685, hash: "17debea737c743049555aa56a5ba2189e624a143c09ec5260bb3508a2ef473bd" },
-        { file: "0399_messy_chimera.sql", when: 1793154577343, hash: "30dea19f19e0c7a00b8c8d44957a2638db45f6d6421e9c0cb2276ccd1c3c3cd1" },
+        { file: "0417_aromatic_loki.sql", when: 1792809786245, hash: "f7f8da4d04b7b2c6d87b1d8b31f438a27715727e19eab7d6b1252ff30f892f87" },
+        { file: "0418_melted_hydra.sql", when: 1793109921370, hash: "8ce631d5c1dda67a32135ed4ca4c38aee1ba82b470e69f79f755f10edeb17c3a" },
+        { file: "0419_purple_sue_storm.sql", when: 1793124505405, hash: "44ab97136e6634ac9e9be9a9f7ec5bf7c8bf20566271dddbcf01e329aeb163f7" },
+        { file: "0420_young_garia.sql", when: 1793130317685, hash: "17debea737c743049555aa56a5ba2189e624a143c09ec5260bb3508a2ef473bd" },
+        { file: "0421_messy_chimera.sql", when: 1793154577343, hash: "30dea19f19e0c7a00b8c8d44957a2638db45f6d6421e9c0cb2276ccd1c3c3cd1" },
       ];
       for (const entry of developTail) {
         expect(journal.entries.find(candidate => `${candidate.tag}.sql` === entry.file)?.when).toBe(entry.when);
       }
-      const common = await Promise.all(journal.entries.filter(entry => entry.idx <= 371).map(async entry => ({
+      const common = await Promise.all(journal.entries.filter(entry => entry.idx <= baseline).map(async entry => ({
         file: `${entry.tag}.sql`, when: entry.when, hash: await migrationHash(`${entry.tag}.sql`),
       })));
-      const upstreamTail = journal.entries.filter(entry => entry.idx >= 372 && entry.idx <= 394).map(entry => `${entry.tag}.sql`);
-      expect(upstreamTail).toHaveLength(23);
-      expect(journal.entries.filter(entry => entry.idx > 394).map(entry => `${entry.tag}.sql`)).toEqual(developTail.map(entry => entry.file));
+      const upstreamTail = journal.entries.filter(entry => entry.idx > baseline && entry.idx <= 416).map(entry => `${entry.tag}.sql`);
+      expect(upstreamTail).toHaveLength(416 - baseline);
+      expect(journal.entries.filter(entry => entry.idx > 416).map(entry => `${entry.tag}.sql`)).toEqual(developTail.map(entry => entry.file));
 
       await replayHistoricalSchema(sql, [...common, ...developTail]);
       const beforeHistory = await historyRows(sql);

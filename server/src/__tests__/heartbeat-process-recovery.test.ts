@@ -2839,15 +2839,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         const lateCallback = new Promise<void>((resolve) => {
           releaseLateCallback = resolve;
         });
-        const pendingOperationDrain =
-          outcome === "late_callback"
-            ? vi
-                .spyOn(
-                  paperclipRunner,
-                  "drainRetainedRunnerdMaintenanceOperations",
-                )
-                .mockImplementation(() => lateCallback)
-            : null;
         let physicalCleanupFinished = false;
         mockRetainedNativeCleanup.mockImplementationOnce(
           async (cleanupDb, input) => {
@@ -2855,6 +2846,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
             expect(input).toEqual({ companyId, runId });
             await held;
             physicalCleanupFinished = true;
+
+
+            if (outcome === "late_callback") await lateCallback;
             if (outcome === "rejected")
               throw new Error("maintenance-test-closed-failure");
             return {
@@ -2919,10 +2913,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           expect(mockAdapterExecute).not.toHaveBeenCalled();
           expect(mockExecutePaperclipNativeSession).not.toHaveBeenCalled();
           release();
-          if (pendingOperationDrain) {
-            await vi.waitFor(() =>
-              expect(pendingOperationDrain).toHaveBeenCalled(),
-            );
+          if (outcome === "late_callback") {
+            await vi.waitFor(() => expect(physicalCleanupFinished).toBe(true));
             expect(physicalCleanupFinished).toBe(true);
             expect(drainFinished).toBe(false);
             expect(heartbeat.getTaskDrainStatus().quiescent).toBe(false);
@@ -2962,7 +2954,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           await startup;
           await drain;
           await heartbeat.drainActiveRunExecutions();
-          pendingOperationDrain?.mockRestore();
         }
       });
     },
@@ -10699,22 +10690,32 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       processGroupId: null,
     });
     mockTerminateLocalService.mockResolvedValueOnce(undefined);
-    const updateSpy = vi.spyOn(db, "update");
-    updateSpy.mockImplementationOnce((() => {
-      throw new Error("db update unavailable");
-    }) as typeof db.update);
 
+
+    await db.execute(sql.raw(
+      `create function test_process_cancellation_fault() returns trigger language plpgsql as $$
+       begin
+         if new.id = '${runId}'::uuid and new.status = 'cancelled' then
+           raise exception 'db update unavailable';
+         end if;
+         return new;
+       end $$`,
+    ));
+    await db.execute(sql`create trigger test_process_cancellation_fault before update on heartbeat_runs
+      for each row execute function test_process_cancellation_fault()`);
     try {
-      await expect(heartbeat.cancelRun(runId)).rejects.toThrow(
-        "db update unavailable",
-      );
+      await expect(heartbeat.cancelRun(runId)).rejects.toMatchObject({
+        cause: expect.objectContaining({ message: "db update unavailable" }),
+      });
       expect(mockTerminateLocalService).toHaveBeenCalledWith(
         expect.objectContaining({ pid: 12345, processGroupId: null }),
         { forceAfterMs: 1000, signal: "SIGINT" },
       );
       expect(runningProcesses.has(runId)).toBe(false);
+      expect((await heartbeat.getRun(runId))?.status).toBe("running");
     } finally {
-      updateSpy.mockRestore();
+      await db.execute(sql`drop trigger test_process_cancellation_fault on heartbeat_runs`);
+      await db.execute(sql`drop function test_process_cancellation_fault()`);
     }
   });
 

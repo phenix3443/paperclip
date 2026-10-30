@@ -1,4 +1,5 @@
 import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
+import { notifyChatRunMilestones } from "../chat-run-milestone-notifications.js";
 import { withExternalAdmissionGuard, assertNoExternalOverlap } from "../../modules/external-agents/index.js";
 import { agentWakeupRequests, heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import { and, eq } from "drizzle-orm";
@@ -41,6 +42,7 @@ export async function claimQueuedNativeReviewRun(db: Db, input: {
       contextSnapshot: context, agentNameKey: input.agentNameKey, claimedAt: input.claimedAt,
     });
     if (!locked) return null;
+    await notifyChatRunMilestones(tx, { companyId: run.companyId, issueId });
     const [claimed] = await tx.update(heartbeatRuns).set({
       ...input.claimValues, status: "running", startedAt: run.startedAt ?? input.claimedAt,
       updatedAt: input.claimedAt,

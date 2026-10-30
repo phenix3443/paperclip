@@ -34,6 +34,7 @@ import {
 import { groupBy } from "../lib/groupBy";
 import {
   applyIssueFilters,
+  issueCreationRequestFilters,
   countActiveIssueFilters,
   defaultIssueFilterState,
   issueFilterLabel,
@@ -487,6 +488,8 @@ interface IssuesListProps {
    * Used by the Tasks view presets (PAP-670).
    */
   initialStatuses?: string[];
+  routineTasksOnly?: boolean;
+  onRoutineTasksOnlyChange?: (checked: boolean) => void;
   initialSearch?: string;
   searchFilters?: Omit<IssueListRequestFilters, "q" | "projectId" | "limit" | "includeRoutineExecutions">;
   searchWithinLoadedIssues?: boolean;
@@ -733,6 +736,8 @@ function StreamlinedIssuesList({
   initialAssignees,
   initialWorkspaces,
   initialStatuses,
+  routineTasksOnly,
+  onRoutineTasksOnlyChange,
   initialSearch,
   searchFilters,
   searchWithinLoadedIssues = false,
@@ -820,7 +825,7 @@ function StreamlinedIssuesList({
   }
   const initialPreferences = initialPreferencesRef.current;
 
-  const [viewState, setViewState] = useState<IssueViewState>(() =>
+  const [savedViewState, setViewState] = useState<IssueViewState>(() =>
     getInitialWorkspaceViewState(
       initialPreferences,
       initialAssignees,
@@ -829,6 +834,8 @@ function StreamlinedIssuesList({
       initialStatuses,
     ),
   );
+  // The Tasks URL owns this filter; other collections keep their saved state.
+  const viewState = useMemo(() => routineTasksOnly === undefined ? savedViewState : { ...savedViewState, routineTasksOnly }, [savedViewState, routineTasksOnly]);
   const statusFilter = [...viewState.statuses].sort().join(",");
   useEffect(() => {
     onStatusFilterChange?.(statusFilter);
@@ -888,6 +895,7 @@ function StreamlinedIssuesList({
   ]);
 
   const updateView = useCallback((patch: Partial<IssueViewState>) => {
+    if (patch.routineTasksOnly !== undefined) onRoutineTasksOnlyChange?.(patch.routineTasksOnly);
     setViewState((prev) => {
       const next = { ...prev, ...patch };
       saveTaskCollectionPreferences(preferenceLocation, {
@@ -902,6 +910,7 @@ function StreamlinedIssuesList({
     preferenceLocation.legacyColumnsStorageKey,
     preferenceLocation.legacyViewStorageKey,
     visibleIssueColumns,
+    onRoutineTasksOnlyChange,
   ]);
 
   useEffect(() => {
@@ -923,14 +932,14 @@ function StreamlinedIssuesList({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [issues]);
 
+  const creationRequestFilters = issueCreationRequestFilters(viewState, enableAgentCreatedVisibilityFilter);
   const { data: searchedIssues = [] } = useQuery({
     queryKey: [
       ...queryKeys.issues.search(selectedCompanyId!, normalizedIssueSearch, projectId),
       searchFilters ?? {},
+      creationRequestFilters,
       enableAgentCreatedVisibilityFilter && viewState.viewMode === "list" ? "index" : "compact",
       ISSUE_SEARCH_RESULT_LIMIT,
-      enableAgentCreatedVisibilityFilter ? "with-routine-executions" : "without-routine-executions",
-        enableAgentCreatedVisibilityFilter ? viewState.showAgentCreatedTasks : undefined,
     ],
     queryFn: ({ signal }) =>
       issuesApi.listCompact(selectedCompanyId!, {
@@ -939,7 +948,7 @@ function StreamlinedIssuesList({
         projectId,
         limit: ISSUE_SEARCH_RESULT_LIMIT,
         ...searchFilters,
-        ...(enableAgentCreatedVisibilityFilter ? { includeRoutineExecutions: true, includeAgentCreatedTasks: viewState.showAgentCreatedTasks } : {}),
+        ...creationRequestFilters,
       }, { signal }).then((rows) => rows as Issue[]),
     enabled: !!selectedCompanyId && normalizedIssueSearch.length > 0 && !searchWithinLoadedIssues,
     placeholderData: (previousData) => previousData,
@@ -953,10 +962,9 @@ function StreamlinedIssuesList({
         normalizedIssueSearch,
         projectId ?? "__all-projects__",
         searchFilters ?? {},
+        creationRequestFilters,
         "compact",
         ISSUE_BOARD_COLUMN_RESULT_LIMIT,
-        enableAgentCreatedVisibilityFilter ? "with-routine-executions" : "without-routine-executions",
-        enableAgentCreatedVisibilityFilter ? viewState.showAgentCreatedTasks : undefined,
       ],
       queryFn: ({ signal }: { signal: AbortSignal }) =>
         issuesApi.listCompact(selectedCompanyId!, {
@@ -965,7 +973,7 @@ function StreamlinedIssuesList({
           projectId,
           status,
           limit: ISSUE_BOARD_COLUMN_RESULT_LIMIT,
-          ...(enableAgentCreatedVisibilityFilter ? { includeRoutineExecutions: true, includeAgentCreatedTasks: viewState.showAgentCreatedTasks } : {}),
+          ...creationRequestFilters,
         }, { signal }).then((rows) => rows as Issue[]),
       enabled: !!selectedCompanyId && viewState.viewMode === "board" && !searchWithinLoadedIssues,
       placeholderData: (previousData: Issue[] | undefined) => previousData,
@@ -1313,7 +1321,7 @@ function StreamlinedIssuesList({
     || viewState.boardColdLaneMode !== "auto"
     || viewState.boardColumnPageSize !== KANBAN_COLUMN_DEFAULT_PAGE_SIZE;
 
-  const hierarchyEnabled = enableAgentCreatedVisibilityFilter && !viewState.showAgentCreatedTasks && viewState.nestingEnabled && viewState.viewMode === "list";
+  const hierarchyEnabled = enableAgentCreatedVisibilityFilter && !viewState.showAgentCreatedTasks && !viewState.routineTasksOnly && viewState.nestingEnabled && viewState.viewMode === "list";
   const hierarchy = useIssueHierarchyContext(
     selectedCompanyId, filtered.slice(0, renderedIssueRowLimit), viewState.collapsedParents,
     hierarchyEnabled,
@@ -1416,10 +1424,10 @@ function StreamlinedIssuesList({
   ]);
   const groupedContent = useMemo(() => baseGroupedContent.map((group) => ({
     ...group,
-    items: enableAgentCreatedVisibilityFilter && !viewState.showAgentCreatedTasks && viewState.nestingEnabled && viewState.viewMode === "list"
+    items: enableAgentCreatedVisibilityFilter && !viewState.showAgentCreatedTasks && !viewState.routineTasksOnly && viewState.nestingEnabled && viewState.viewMode === "list"
       ? includeIssueHierarchyContext(group.items, [...issues, ...hierarchy.issues])
       : group.items,
-  })), [baseGroupedContent, hierarchy.issues, issues, enableAgentCreatedVisibilityFilter, viewState.showAgentCreatedTasks, viewState.nestingEnabled, viewState.viewMode]);
+  })), [baseGroupedContent, hierarchy.issues, issues, enableAgentCreatedVisibilityFilter, viewState.showAgentCreatedTasks, viewState.routineTasksOnly, viewState.nestingEnabled, viewState.viewMode]);
   const visibleListRowCount = groupedContent.reduce((total, group) => total + group.items.length, 0);
 
 
@@ -1962,6 +1970,7 @@ function StreamlinedIssuesList({
           />
 
           <IssueFiltersPopover
+            enableRoutineTasksFilter={routineTasksOnly !== undefined}
             state={viewState}
             onChange={updateView}
             buttonVariant="outline"

@@ -1,4 +1,5 @@
 import { ordinaryWakeRequestPredicate } from "../../../modules/wake-queue/receipt-namespace.js";
+import { notifyChatInboundWakeNotices } from "../../chat-inbound-wake-notice-notifications.js";
 import type { EndpointRow, DbTransaction, DbOrTransaction, RuntimeContext, LifecycleRuntimeFence } from "../runtime-types.js";
 
 import { dueChatAction, PROVIDER_EFFECT_STALE_MS } from "../../chat-action-work.js";
@@ -585,6 +586,7 @@ export function createSlackSessionStop(db: Db, options: SlackSessionStopOptions)
           ["queued", "deferred_issue_execution"].includes(wakeup.status) &&
           !issue.executionRunId
         ) {
+          await notifyChatInboundWakeNotices(tx, { companyId: current.companyId, issueId: issue.id });
           await tx
             .update(agentWakeupRequests)
             .set({
