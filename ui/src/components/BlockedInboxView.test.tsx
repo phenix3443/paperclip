@@ -356,6 +356,35 @@ describe("BlockedInboxView", () => {
     act(() => root.unmount());
   });
 
+  it("names the external owner and shows the action on hover", async () => {
+    mockIssuesApi.list.mockResolvedValue([
+      makeIssue(
+        "issue-external-named",
+        "PAP-44",
+        "Waiting on a review",
+        attention({
+          state: "external_wait",
+          reason: "external_owner_action",
+          owner: { type: "external", agentId: null, userId: null, label: "upstream maintainers" },
+          action: { label: "External owner action", detail: "Review paperclipai/paperclip#18156" },
+          redaction: { externalDetailsRedacted: true, secretFieldsOmitted: true },
+        }),
+      ),
+    ]);
+
+    const { root } = renderWithClient(<BlockedInboxView {...blockedViewProps} presentation="task" />, container);
+    await waitFor(() => container.textContent?.includes("Waiting on a review") === true);
+
+    const owner = container.querySelector('[data-testid="blocked-row-owner"]');
+    expect(owner?.textContent).toContain("upstream maintainers");
+    expect(owner?.getAttribute("title")).toBe("Review paperclipai/paperclip#18156");
+    expect(container.querySelector('[data-testid="blocked-row-owner-mobile"]')?.getAttribute("title")).toBe(
+      "Review paperclipai/paperclip#18156",
+    );
+
+    act(() => root.unmount());
+  });
+
   it("filters rows by search query against title, identifier, owner and action", async () => {
     const issues: Issue[] = [
       makeIssue(
