@@ -884,7 +884,7 @@ export function createAdmitWakeBehindIssueExecution(deps: {
       }));
     // A resolved card never merges with comments or another card.
     const interactionReceipt = Boolean(input.contextSnapshot.interactionId || input.payload?.interactionId);
-    const decision = decideWakeAdmission({
+    let decision = decideWakeAdmission({
       allowRunCoalescing: wakeMustNotJoinActiveRun(input.activeExecutionRun.contextSnapshot, input.contextSnapshot, interactionReceipt)
         ? false : input.allowRunCoalescing,
       sameDurableActor,
@@ -895,6 +895,19 @@ export function createAdmitWakeBehindIssueExecution(deps: {
     });
 
     if (decision.kind === "proceed") return { kind: "proceed" };
+
+    if (decision.kind === "coalesce" && input.wakeCommentId) {
+      const run = await deps.writer.appendQueuedComment(scope, {
+        companyId: input.companyId, issueId: input.issueId, agentId: input.agentId,
+        targetRunId: availableActiveExecutionRun!.id, contextSnapshot: input.contextSnapshot, commentId: input.wakeCommentId,
+        source: input.source, triggerDetail: input.triggerDetail, reason: input.reason ?? null,
+        payload: input.payload, requestedByActorType: input.requestedByActorType,
+        requestedByActorId: input.requestedByActorId, idempotencyKey: input.idempotencyKey,
+        durableReceipt: input.durableReceipt,
+      });
+      if (run) return { kind: "coalesced", run };
+      decision = { kind: "defer" };
+    }
 
     if (decision.kind === "coalesce") {
       const target = availableActiveExecutionRun!;

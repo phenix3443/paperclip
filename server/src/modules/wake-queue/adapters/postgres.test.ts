@@ -30,7 +30,7 @@ import {
 } from "./postgres.js";
 import type { WakeQueuePostgresAdapterDeps } from "./postgres.js";
 import { createReleaseIssueExecution } from "../application/use-cases.js";
-import type { TransactionScope } from "../application/ports.js";
+import type { AppendQueuedCommentInput, TransactionScope } from "../application/ports.js";
 
 // Proves the atomicity and company-scope properties the security review
 // requires: every mutation names `companyId` in its own SQL `WHERE` clause,
@@ -155,6 +155,125 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     });
     return runId;
   }
+
+  async function seedAppendQueue() {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent({ companyId });
+    const issueId = await seedIssue({ companyId, assigneeAgentId: agentId });
+    const comments = await db.insert(issueComments).values(["first", "next"].map(body => ({ companyId, issueId, authorUserId: "board", body }))).returning();
+    const context = { issueId, wakeReason: "issue_commented", wakeCommentIds: [comments[0].id], commentId: comments[0].id };
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation", reason: "issue_commented",
+      status: "queued", payload: { issueId, commentId: comments[0].id, _paperclipWakeContext: context } }).returning();
+    const targetRunId = await seedRun({ companyId, agentId, status: "queued", contextSnapshot: context });
+    await db.update(heartbeatRuns).set({ invocationSource: "automation", wakeupRequestId: wake.id }).where(eq(heartbeatRuns.id, targetRunId));
+    await db.update(agentWakeupRequests).set({ runId: targetRunId }).where(eq(agentWakeupRequests.id, wake.id));
+    const input: AppendQueuedCommentInput = { companyId, issueId, agentId, targetRunId, contextSnapshot: { issueId, wakeReason: "issue_commented" },
+      commentId: comments[1].id, source: "automation", triggerDetail: null, reason: "issue_commented",
+      payload: { issueId, commentId: comments[1].id }, requestedByActorType: "user", requestedByActorId: "board", idempotencyKey: null };
+    return { wake, comments, input };
+  }
+
+  async function appendState(companyId: string) {
+    return {
+      wakes: await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId)).orderBy(agentWakeupRequests.id),
+      runs: await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId)).orderBy(heartbeatRuns.id),
+      tasks: await db.select().from(issues).where(eq(issues.companyId, companyId)).orderBy(issues.id),
+    };
+  }
+
+  it.each(["envelope", "receipt", "outer"])("rolls back the complete append at %s failure and admits a retry once", async fault => {
+    const { input, comments, wake } = await seedAppendQueue();
+    const before = await appendState(input.companyId);
+    const table = fault === "envelope" ? "heartbeat_runs" : "agent_wakeup_requests";
+    if (fault !== "outer") {
+      await db.execute(sql.raw("CREATE FUNCTION fail_append() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'append fault'; END $$"));
+      await db.execute(sql.raw(`CREATE TRIGGER fail_append ${fault === "envelope" ? "BEFORE UPDATE" : "AFTER INSERT"} ON ${table} FOR EACH ROW EXECUTE FUNCTION fail_append()`));
+    }
+    const append = () => db.transaction(async tx => {
+      const result = await createWakeAdmissionWriter().appendQueuedComment(createAdmissionTransactionScope(input.companyId, tx as unknown as Db), input);
+      expect(result).not.toBeNull();
+      if (fault === "outer") throw new Error("append fault");
+    });
+    try {
+      await expect(append()).rejects.toThrow();
+      expect(await appendState(input.companyId)).toEqual(before);
+    } finally {
+      if (fault !== "outer") {
+        await db.execute(sql.raw(`DROP TRIGGER fail_append ON ${table}`));
+        await db.execute(sql.raw("DROP FUNCTION fail_append()"));
+      }
+    }
+    const result = await db.transaction(tx => createWakeAdmissionWriter().appendQueuedComment(
+      createAdmissionTransactionScope(input.companyId, tx as unknown as Db), input));
+    expect(result).toMatchObject({ id: input.targetRunId, contextSnapshot: { wakeCommentIds: comments.map(comment => comment.id) } });
+    const after = await appendState(input.companyId);
+    expect(after.wakes).toHaveLength(2);
+    expect(after.wakes.find(row => row.id === wake.id)?.payload?._paperclipWakeContext).toMatchObject({ wakeCommentIds: comments.map(comment => comment.id) });
+  });
+
+  it("serializes concurrent appenders and deduplicates a repeated comment without changing order", async () => {
+    const { input, comments, wake } = await seedAppendQueue();
+    const [third] = await db.insert(issueComments).values({ companyId: input.companyId, issueId: input.issueId,
+      authorUserId: "board", body: "third" }).returning();
+    const appended = Promise.withResolvers<void>();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const writer = createWakeAdmissionWriter();
+    const first = db.transaction(async tx => {
+      try {
+        const result = await writer.appendQueuedComment(createAdmissionTransactionScope(input.companyId, tx as unknown as Db), input);
+        appended.resolve();
+        await release.promise;
+        return result;
+      } finally { appended.resolve(); }
+    });
+    await appended.promise;
+    const second = db.transaction(tx => {
+      entered.resolve();
+      return writer.appendQueuedComment(createAdmissionTransactionScope(input.companyId, tx as unknown as Db), {
+        ...input, commentId: third.id, payload: { issueId: input.issueId, commentId: third.id },
+      });
+    });
+    await entered.promise;
+    release.resolve();
+    for (const result of await Promise.all([first, second])) expect(result).not.toBeNull();
+    await db.transaction(tx => writer.appendQueuedComment(createAdmissionTransactionScope(input.companyId, tx as unknown as Db), input));
+    const after = await appendState(input.companyId);
+    const ids = [comments[0].id, comments[1].id, third.id];
+    expect(after.runs[0].contextSnapshot?.wakeCommentIds).toEqual(ids);
+    expect(after.wakes.find(row => row.id === wake.id)?.payload?._paperclipWakeContext).toMatchObject({ wakeCommentIds: ids });
+  });
+
+  it.each(["actor", "company", "issue", "agent", "deleted", "claimed", "immutable", "source", "mutation", "generation", "linkage", "root-interaction", "root-source", "root-durable", "incoming-interaction", "incoming-source", "incoming-durable", "payload-issue"])("rejects a %s append without changing its target", async invalid => {
+    const { input, comments, wake } = await seedAppendQueue();
+    if (invalid === "actor") input.requestedByActorId = "forged";
+    if (invalid === "payload-issue") input.payload = { ...input.payload, issueId: randomUUID() };
+    if (invalid === "incoming-interaction") input.contextSnapshot = { ...input.contextSnapshot, interactionId: randomUUID() };
+    if (invalid === "incoming-source") input.contextSnapshot = { ...input.contextSnapshot, sourceRunId: randomUUID() };
+    if (invalid === "incoming-durable") input.durableReceipt = { id: randomUUID(), requestedAt: new Date() };
+    if (invalid.startsWith("root-")) await db.update(agentWakeupRequests).set({ payload: { ...wake.payload,
+      ...(invalid === "root-interaction" ? { interactionId: randomUUID() } :
+        invalid === "root-source" ? { sourceRunId: randomUUID() } : { _paperclipReviewerAssignmentContinuation: { version: 1 } }),
+    } }).where(eq(agentWakeupRequests.id, wake.id));
+    if (invalid === "source") input.contextSnapshot = { ...input.contextSnapshot, source: "issue.interaction.respond" };
+    if (invalid === "mutation") input.payload = { ...input.payload, mutation: "interaction" };
+    if (invalid === "generation") await db.update(heartbeatRuns).set({ contextSnapshot: {
+      issueId: input.issueId, wakeReason: "issue_commented", reviewerAssignmentGeneration: "retired-generation",
+    } }).where(eq(heartbeatRuns.id, input.targetRunId));
+    if (invalid === "linkage") await db.update(agentWakeupRequests).set({ runId: null }).where(eq(agentWakeupRequests.id, wake.id));
+    if (invalid === "company") input.companyId = await seedCompany();
+    if (invalid === "issue") input.issueId = await seedIssue({ companyId: input.companyId, assigneeAgentId: input.agentId });
+    if (invalid === "agent") input.agentId = await seedAgent({ companyId: input.companyId });
+    if (invalid === "deleted") await db.update(issueComments).set({ deletedAt: new Date() }).where(eq(issueComments.id, comments[1].id));
+    if (invalid === "claimed") await db.update(heartbeatRuns).set({ status: "running", startedAt: new Date() }).where(eq(heartbeatRuns.id, input.targetRunId));
+    if (invalid === "immutable") await db.update(agentWakeupRequests).set({ idempotencyKey: "source-proof", payload: { ...wake.payload,
+      sourceRunId: randomUUID(), interactionId: randomUUID() } }).where(eq(agentWakeupRequests.id, wake.id));
+    const before = await appendState(wake.companyId);
+    const result = await db.transaction(tx => createWakeAdmissionWriter().appendQueuedComment(
+      createAdmissionTransactionScope(input.companyId, tx as unknown as Db), input));
+    expect(result).toBeNull();
+    expect(await appendState(wake.companyId)).toEqual(before);
+  });
 
   async function seedDeferredWake(input: {
     companyId: string;

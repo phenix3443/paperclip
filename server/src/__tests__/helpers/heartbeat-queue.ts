@@ -44,6 +44,7 @@ export function createHeartbeatQueueTestDependencies(db: Db): QueueTestDependenc
     instanceSettings: { getExperimental: vi.fn<HeartbeatQueueDependencies["instanceSettings"]["getExperimental"]>() },
     runDispatch: createRunDispatch(db),
     wakeQueue: {
+      appendQueuedComment: vi.fn<ReturnType<typeof createWakeQueue>["appendQueuedComment"]>(async () => null),
       createAdmissionTransactionScope: vi.fn<ReturnType<typeof createWakeQueue>["createAdmissionTransactionScope"]>(),
       admitWakeBehindIssueExecution: vi.fn<ReturnType<typeof createWakeQueue>["admitWakeBehindIssueExecution"]>(),
     },

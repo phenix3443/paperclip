@@ -221,7 +221,7 @@ export interface HeartbeatQueueDependencies extends Pick<HeartbeatRetryDependenc
   budgets: Pick<ReturnType<typeof budgetService>, "getInvocationBlock">;
   instanceSettings: Pick<ReturnType<typeof instanceSettingsService>, "getExperimental">;
   runDispatch: Pick<ReturnType<typeof createRunDispatch>, "cancelStaleQueuedRun">;
-  wakeQueue: Pick<ReturnType<typeof createWakeQueue>, "createAdmissionTransactionScope" | "admitWakeBehindIssueExecution">;
+  wakeQueue: Pick<ReturnType<typeof createWakeQueue>, "createAdmissionTransactionScope" | "admitWakeBehindIssueExecution" | "appendQueuedComment">;
   activeRunExecutions: Set<string>;
   activeRunExecutionPromises: Set<Promise<void>>;
   activeWakeupPromises: Set<Promise<unknown>>;
@@ -4802,7 +4802,22 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       ? null
       : filterZombieCoalesceTarget(rawCoalescedTarget, liveRunExecutions);
 
-    if (coalescedTargetRun) {
+    if (coalescedTargetRun && wakeCommentId) {
+      const queueIssueId = readNonEmptyString(enrichedContextSnapshot.issueId) ?? taskKey;
+      const merged = queueIssueId && isUuidLike(queueIssueId)
+        ? await db.transaction(tx => wakeQueue.appendQueuedComment(
+            wakeQueue.createAdmissionTransactionScope(agent.companyId, tx as unknown as Db), {
+              companyId: agent.companyId, issueId: queueIssueId, agentId,
+              targetRunId: coalescedTargetRun.id, contextSnapshot: enrichedContextSnapshot, commentId: wakeCommentId,
+              source, triggerDetail, reason, payload,
+              requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+              idempotencyKey: opts.idempotencyKey ?? null,
+            })) : null;
+      if (merged) return merged as typeof heartbeatRuns.$inferSelect;
+    }
+
+    if (coalescedTargetRun && !wakeCommentId) {
       const mergedContextSnapshot = mergeCoalescedContextSnapshot(
         coalescedTargetRun.contextSnapshot,
         enrichedContextSnapshot,

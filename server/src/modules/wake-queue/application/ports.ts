@@ -419,8 +419,26 @@ export interface WakeAdmissionReader {
   ): Promise<ExistingDeferredWake | null>;
 }
 
+export type AppendQueuedCommentInput = {
+  companyId: string;
+  issueId: string;
+  agentId: string;
+  targetRunId: string;
+  contextSnapshot: Record<string, unknown>;
+  commentId: string;
+  source: string;
+  triggerDetail: string | null;
+  reason: string | null;
+  payload: Record<string, unknown> | null;
+  requestedByActorType: string | null;
+  requestedByActorId: string | null;
+  idempotencyKey: string | null;
+  durableReceipt?: DurableWakeAdmissionReceipt;
+};
+
 /** The transaction-scoped write operations that admit a wake behind an active issue execution. */
 export interface WakeAdmissionWriter {
+  appendQueuedComment(scope: TransactionScope, input: AppendQueuedCommentInput): Promise<Record<string, unknown> | null>;
   /** Merges the wake's context into the active execution run and records the wake as coalesced. Returns the updated run row. */
   coalesceIntoActiveExecutionRun(
     scope: TransactionScope,

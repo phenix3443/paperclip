@@ -192,6 +192,8 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
   const taskSessionForRun = resetTaskSession ? null : taskSession;
   const getFreshSessionHandoff = issueRef ? createNativeSessionHandoffLoader({
     db, companyId: agent.companyId, issueId: issueRef.id, agentId: agent.id, before: run.createdAt,
+    inlineCommentIds: Array.isArray(context.wakeCommentIds)
+      ? context.wakeCommentIds.filter((id): id is string => typeof id === "string") : [],
     throughCommentId: readNonEmptyString(context.conversationReplayThroughCommentId) ?? (context.interactionKind ? null : wakeCommentId),
   }) : undefined;
   const previousSessionParams =

@@ -50,6 +50,7 @@ export function renderNativeSessionHandoff(input: {
 export async function buildNativeSessionHandoff(input: {
   db: Db; companyId: string; issueId: string; agentId: string; before: Date;
   throughCommentId?: string | null;
+  inlineCommentIds?: string[];
 }): Promise<string | null> {
   const { db, companyId, issueId, agentId } = input;
   const [issue] = await db.select({
@@ -145,7 +146,7 @@ export async function buildNativeSessionHandoff(input: {
     return trust.kind === "standard" ? null : buildLowTrustSourceTrust({ issueId, agentId, runId });
   };
   const addComment = (row: typeof recent[number], kind: string) => {
-    if (entries.some(entry => entry.id === row.id)) return;
+    if (input.inlineCommentIds?.includes(row.id) || entries.some(entry => entry.id === row.id)) return;
     const safe = sanitizeQuarantinedCommentForHigherTrust(row);
     entries.push({ ...safe, body: fastResponseHistoryBody(safe), kind,
       author: row.origin === "fast_response" ? "paperclip_receipt" : row.authorAgentId ? "agent" : "user" });
