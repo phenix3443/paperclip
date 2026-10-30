@@ -117,6 +117,7 @@ import {
   notFound,
 } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
+import { admitDeferredOwnerWake } from "./deferred-owner-wake.js";
 import { publishLiveEvent } from "../live-events.js";
 import { allocateHeartbeatRunEventSeq } from "../heartbeat-run-events.js";
 import {
@@ -1187,6 +1188,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       });
       if (staleness.outcome === "cancelled" || staleness.outcome === "deferred") {
         applyRunDispatchPostCommitEffects(staleness.postCommitEffects);
+        // "The new owner will be woken instead": a wake it queued behind this run is admitted now, once.
+        if (staleness.outcome === "cancelled") {
+          await admitDeferredOwnerWake(db, enqueueWakeup, { companyId: run.companyId, issueId, endedRunId: run.id })
+            .catch(err => logger.warn({ err, runId: run.id }, "Could not admit the owner's deferred wake after a stale dispatch"));
+        }
         logger.info(
           {
             runId: run.id,

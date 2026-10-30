@@ -119,6 +119,7 @@ import {
 } from "../native-runtime/index.js";
 import { runningProcesses } from "../../adapters/index.js";
 import { parseObject } from "../../adapters/utils.js";
+import { admitDeferredOwnerWake } from "./deferred-owner-wake.js";
 import { isNativeRunnerOwnershipHeld } from "../native-runtime/native-runner-ownership.js";
 import {
   withCurrentBudgetEnforcement,
@@ -1523,6 +1524,14 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         await releaseIssueExecutionAndPromote(cancelled, {
           suppressImmediateRecovery: options.suppressImmediateRecovery,
         });
+        // An operator or reassignment stop releases without promoting other agents' wakes.
+        // The current owner's deferred wake continues now, once.
+        const cancelledIssueId = readNonEmptyString(parseObject(cancelled.contextSnapshot).issueId);
+        if (cancelledIssueId) {
+          await admitDeferredOwnerWake(db, enqueueWakeup, {
+            companyId: cancelled.companyId, issueId: cancelledIssueId, endedRunId: cancelled.id,
+          }).catch(error => logger.warn({ err: error, runId: cancelled.id }, "Could not admit the owner's deferred wake after a cancel"));
+        }
         await finalizeAgentStatus(run.agentId, "cancelled", undefined, {
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
         });
