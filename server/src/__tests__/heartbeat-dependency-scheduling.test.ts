@@ -44,11 +44,14 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { DependencyAdmissionHeld } from "../services/heartbeat/dependency-admission.js";
+import { createAgentLifecycle, configureAgentLifecycle } from "../services/agent-lifecycle.js";
+import { createLifecycleDriver } from "../services/agent-lifecycle-driver.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { seedNativeDependency } from "./helpers/native-dependency-fixture.js";
 import { logger } from "../middleware/logger.js";
 import { CROSS_TASK_CONTINUATION_COMMITTER_ID, crossTaskContinuationIntentKey } from "../services/cross-task-continuation.js";
-import { budgetService } from "../services/budgets.js";
+import { budgetService, subscribeBudgetScopeRelease } from "../services/budgets.js";
 import { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
 import { runningProcesses } from "../adapters/index.ts";
 
@@ -207,6 +210,143 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     if (continuationCwd) await rm(continuationCwd, { recursive: true, force: true });
   });
 
+  it("automatically drains a real native dependency after lifecycle readiness without periodic recovery", async () => {
+    const f = await seedNativeDependency(db, "paused", true);
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+        summary: "Dependency input delivered.", provider: "test", model: "test-model" };
+    });
+    await db.update(agents).set({ lifecycleState: "paused", lifecycleHolds: ["manual"], pauseReason: "manual" })
+      .where(eq(agents.id, f.agentId));
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+    const worker = configureAgentLifecycle(db, { ...createLifecycleDriver(db, null!),
+      requiredPluginIds: async () => [], runPlugin: async () => "complete", runHost: async () => "complete" });
+    try {
+      await createAgentLifecycle(db).resumeAgent(f.agentId);
+      await worker.process(f.agentId);
+      expect(await waitForCondition(async () => mockAdapterExecute.mock.calls.length === 1)).toBe(true);
+      await heartbeat.drainActiveRunExecutions();
+      const runs = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${f.issueId}`));
+      expect(runs).toHaveLength(1);
+      await worker.process(f.agentId);
+      expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+    } finally { await worker.stop(); }
+  });
+
+  it("automatically drains a native dependency when the real project budget is raised", async () => {
+    const f = await seedNativeDependency(db, "idle", true);
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+        summary: "Dependency input delivered.", provider: "test", model: "test-model" };
+    });
+    const [project] = await db.insert(projects).values({ companyId: f.companyId, name: "Budget release", status: "in_progress" }).returning();
+    await db.update(issues).set({ projectId: project!.id }).where(eq(issues.id, f.issueId));
+    await db.insert(costEvents).values({ companyId: f.companyId, agentId: f.agentId, projectId: project!.id,
+      provider: "test", model: "test", costCents: 100, occurredAt: new Date() });
+    const input = { scopeType: "project" as const, scopeId: project!.id, amount: 50, windowKind: "lifetime" as const,
+      hardStopEnabled: true, notifyEnabled: false };
+    await budgetService(db).upsertPolicy(f.companyId, input, null);
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+    const unsubscribe = subscribeBudgetScopeRelease(db, async scope => {
+      expect(scope).toEqual({ companyId: f.companyId, scopeType: "project", scopeId: project!.id });
+      await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: scope.companyId });
+    });
+    try {
+      await budgetService(db).upsertPolicy(f.companyId, { ...input, amount: 200 }, null);
+      expect(await waitForCondition(async () => mockAdapterExecute.mock.calls.length === 1)).toBe(true);
+      await heartbeat.drainActiveRunExecutions();
+      expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+    } finally { unsubscribe(); }
+  });
+
+  it("reaches eligible native inputs behind more than a page of stable holds", async () => {
+    for (let i = 0; i < 4; i++) await seedNativeDependency(db, "paused", true);
+    const f = await seedNativeDependency(db, "idle", true);
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+        summary: "Dependency input delivered.", provider: "test", model: "test-model" };
+    });
+    for (let i = 0; i < 4; i++) await heartbeat.dispatchPendingNativeStatusWakeups({ limit: 2 });
+    expect(await waitForCondition(async () => mockAdapterExecute.mock.calls.length === 1)).toBe(true);
+    await heartbeat.drainActiveRunExecutions();
+    const parked = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.status, "deferred_issue_execution"));
+    expect(parked).toHaveLength(4);
+    for (let i = 0; i < 4; i++) await heartbeat.dispatchPendingNativeStatusWakeups({ limit: 2 });
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.status, "deferred_issue_execution"))).toEqual(parked);
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not lose a release before an in-flight claim settles into parking", async () => {
+    const f = await seedNativeDependency(db, "idle", true);
+    let entered!: () => void, release!: () => void;
+    const observed = new Promise<void>(resolve => { entered = resolve; });
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const transaction = db.transaction.bind(db);
+    let intercept = true;
+    const spy = vi.spyOn(db, "transaction").mockImplementation(async (callback, config) => {
+      const [intent] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.intent.id));
+      if (intercept && intent?.status === "claimed") {
+        intercept = false; entered(); await held;
+        throw new DependencyAdmissionHeld("budget");
+      }
+      return transaction(callback, config);
+    });
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+        summary: "Raced input delivered.", provider: "test", model: "test-model" };
+    });
+    const first = heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    try {
+      await observed;
+      const second = heartbeatService(db).dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+      expect(second).toBe(first);
+      release();
+      await Promise.all([first, second]);
+      expect(await waitForCondition(async () => mockAdapterExecute.mock.calls.length === 1)).toBe(true);
+      await heartbeat.drainActiveRunExecutions();
+      expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+      const [original] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.intent.id));
+      expect(original!.runId).not.toBeNull();
+    } finally { release(); await first; spy.mockRestore(); }
+  });
+
+  it.each(["agent", "project", "company"] as const)("the root hook automatically drains a real %s budget hold", async scopeType => {
+    const f = await seedNativeDependency(db, "idle", true);
+    const [project] = await db.insert(projects).values({ companyId: f.companyId, name: "Root release", status: "in_progress" }).returning();
+    await db.update(issues).set({ projectId: project!.id }).where(eq(issues.id, f.issueId));
+    await db.insert(costEvents).values({ companyId: f.companyId, agentId: f.agentId, projectId: project!.id,
+      provider: "test", model: "test", costCents: 100, occurredAt: new Date() });
+    const input = { scopeType, scopeId: scopeType === "company" ? f.companyId : scopeType === "agent" ? f.agentId : project!.id,
+      amount: 50, windowKind: "lifetime" as const, hardStopEnabled: true, notifyEnabled: false };
+    const worker = configureAgentLifecycle(db, { ...createLifecycleDriver(db, null!),
+      requiredPluginIds: async () => [], runPlugin: async () => "complete", runHost: async () => "complete" });
+    const stop = heartbeat.startDependencyReleaseNotifications();
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, f.issueId));
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+        summary: "Root release delivered.", provider: "test", model: "test-model" };
+    });
+    try {
+      await budgetService(db).upsertPolicy(f.companyId, input, null);
+      await worker.process(f.agentId);
+      await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
+      await budgetService(db).upsertPolicy(f.companyId, { ...input, isActive: false }, null);
+      await worker.process(f.agentId);
+      expect(await waitForCondition(async () => mockAdapterExecute.mock.calls.length === 1)).toBe(true);
+      await heartbeat.drainActiveRunExecutions();
+      await budgetService(db).upsertPolicy(f.companyId, { ...input, isActive: false }, null);
+      expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+    } finally { await worker.stop(); await stop(); await heartbeat.resumeQueuedRunsAfterDrain(); }
+  });
+
   const seedDependency = (status = "paused", nativeProducer = false) => seedNativeDependency(db, status, nativeProducer);
 
   it("parks a durable dependency input without consuming it or rewriting an unchanged hold", async () => {
@@ -362,7 +502,8 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
         return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Winner delivered.", provider: "test", model: "test-model" };
       });
       await otherHeartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
-      await otherHeartbeat.drainActiveRunExecutions();
+      const [winningIntent] = await other.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.intent.id));
+      await otherHeartbeat.waitForRunExecutionDrain(winningIntent!.runId!);
       const winner = await other.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
       const intent = winner.find(row => row.id === f.intent.id)!;
       expect(intent.runId, JSON.stringify(winner.map(row => ({ status: row.status, runId: row.runId, error: row.error })))).not.toBeNull();

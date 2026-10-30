@@ -13,6 +13,7 @@ export function createLifecycleDriver(db: Db, manager: PluginWorkerManager): Lif
   return {
     async onReady(agent) {
       await heartbeat.resumeQueuedRunsForAgent(agent.companyId, agent.id);
+      await heartbeat.releasePendingDependencyWakeups({ companyId: agent.companyId, scopeType: "agent", scopeId: agent.id });
     },
     async requiredPluginIds(agent) {
       if (agent.lifecycleRequiredPluginIds !== null) return agent.lifecycleRequiredPluginIds;

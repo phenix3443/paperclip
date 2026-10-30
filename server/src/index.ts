@@ -971,6 +971,7 @@ async function startServerWithDatabaseTeardown(
     ? heartbeatService(db as any, { pluginWorkerManager })
     : null;
   const accountingHeartbeat = heartbeat ?? heartbeatService(db as any, { pluginWorkerManager });
+  const stopDependencyReleaseNotifications = accountingHeartbeat.startDependencyReleaseNotifications();
   const decisionServiceOptions = {
     wakeOriginAgent: createDecisionWakeOriginAgent(heartbeat?.wakeup ?? null),
   };
@@ -2191,6 +2192,7 @@ async function startServerWithDatabaseTeardown(
     );
     embeddedPostgresSupervisor?.beginShutdown();
     heartbeatSchedulerStopped = true;
+    await stopDependencyReleaseNotifications();
     await taskDrainExpiryWork.stop();
     clearInterval(skillVersionRetentionInterval);
     clearTimeout(skillVersionRetentionStartup);

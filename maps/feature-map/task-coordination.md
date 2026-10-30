@@ -39,7 +39,11 @@ creates a hold; it does not change task statuses to a paused status.
 
 ### `task-relationships`
 
-Automated: [dependency wakeups](../../server/src/__tests__/issue-dependency-wakeups-routes.test.ts) checks server behavior; visual relationship navigation remains a manual check.
+Automated: [dependency wakeups](../../server/src/__tests__/issue-dependency-wakeups-routes.test.ts) checks server behavior; visual relationship navigation remains a manual check. The [native queue suite](../../server/src/__tests__/heartbeat-dependency-scheduling.test.ts)
+includes frozen-periodic-recovery lifecycle/budget release, held-input paging,
+and release racing claim settlement. [Budget release commit tests](../../server/src/__tests__/budget-release-commit.test.ts)
+cover root/dedicated and nested commit/rollback. These fixtures do not prove a
+live deployment or every policy/accounting variation.
 
 Manual: Block one task on another, finish the prerequisite, and observe the dependent task’s eligible continuation. Follow parent/child links back to the source request. Verify no duplicate run or false parent completion occurs.
 

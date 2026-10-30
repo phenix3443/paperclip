@@ -392,6 +392,8 @@ import { collectRunFailureSecretValues, type RunFailureReportOptions } from "./r
 import { companySkillService } from "./company-skills.js";
 import {
   budgetService,
+  subscribeBudgetScopeRelease,
+  type BudgetReleaseScope,
 } from "./budgets.js";
 import {
   secretService,
@@ -1317,8 +1319,30 @@ export function heartbeatService(
     return heartbeatQueue.dispatchPendingNativeStatusWakeups(...args);
   }
 
+  function releasePendingDependencyWakeups(scope: BudgetReleaseScope) {
+    const input = { companyId: scope.companyId,
+      ...(scope.scopeType === "agent" ? { agentId: scope.scopeId } : {}),
+      ...(scope.scopeType === "project" ? { projectId: scope.scopeId } : {}) };
+    const promise = heartbeatQueue.releasePendingNativeStatusWakeups(input);
+    activeWakeupPromises.add(promise);
+    void promise.finally(() => activeWakeupPromises.delete(promise)).catch(() => undefined);
+    return promise;
+  }
+
+  function startDependencyReleaseNotifications() {
+    const unsubscribe = subscribeBudgetScopeRelease(db, releasePendingDependencyWakeups);
+    const resumed = heartbeatQueue.resumeNativeStatusDrains();
+    activeWakeupPromises.add(resumed);
+    void resumed.finally(() => activeWakeupPromises.delete(resumed)).catch(() => undefined);
+    return async () => { unsubscribe(); await heartbeatQueue.stopNativeStatusDrains(); };
+  }
+
   function resumeQueuedRunsAfterDrain() {
-    const promise = heartbeatQueue.resumeQueuedRunsAfterDrain();
+    const promise = (async () => {
+      await heartbeatQueue.resumeQueuedRunsAfterDrain();
+      await heartbeatQueue.resumeNativeStatusDrains();
+      await dispatchPendingNativeStatusWakeups();
+    })();
     activeWakeupPromises.add(promise);
     void promise.then(
       () => { activeWakeupPromises.delete(promise); },
@@ -4100,6 +4124,8 @@ export function heartbeatService(
     wakeup: trackWakeup,
     reconcileReviewerAssignments: heartbeatQueue.reconcileReviewerAssignments,
     dispatchPendingNativeStatusWakeups,
+    releasePendingDependencyWakeups,
+    startDependencyReleaseNotifications,
     triggerIssueMonitor,
 
     reportRunActivity: clearDetachedRunWarning,

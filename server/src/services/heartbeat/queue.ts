@@ -1,3 +1,4 @@
+import { createNativeStatusDrain, nativeWakeScopeKey, type NativeWakeDispatchInput } from "./native-status-drain.js";
 import { settleNewReviewRunIdentity, settleReviewRunClaimIdentity } from "../run-identity.js";
 import { createDependencyAdmission, DependencyAdmissionHeld, pendingDependencyIntents, pendingDependencyReceiptResults, type DependencyClaim } from "./dependency-admission.js";
 import type { IssueMonitorAdmission } from "./scheduling.js";
@@ -92,7 +93,7 @@ import {
   sql,
   like,
 } from "drizzle-orm";
-import type { Db } from "@paperclipai/db";
+import { databaseWorkScopeKey, type Db } from "@paperclipai/db";
 import { AGENT_DEFAULT_MAX_CONCURRENT_RUNS } from "@paperclipai/shared";
 import {
   agents,
@@ -380,6 +381,9 @@ function readNonEmptyString(value: unknown): string | null {
 class MonitorAdmissionHeld extends Error {}
 
 /** Queue admission and dispatch share the service lifecycle callbacks and execution ownership. */
+type NativeWakeCursor = { requestedAt: Date; id: string };
+const nativeWakeCursors = new WeakMap<object, Map<string, NativeWakeCursor>>();
+
 export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDependencies) {
   const {
     setRunStatus,
@@ -5018,28 +5022,57 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
    * wake was inserted but before the intent was linked to it. Dispatch failure
    * only requeues the intent; it never changes the provider run outcome.
    */
-  async function dispatchPendingNativeStatusWakeups(
-    input: {
-      companyId?: string;
-      limit?: number;
-      staleClaimMs?: number;
-    } = {},
+  const nativeStatusDrain = createNativeStatusDrain(db, dispatchNativeStatusWakeupPage,
+    async () => !(await getSchedulingSuppression()).suppressed);
+
+  function dispatchPendingNativeStatusWakeups(input: NativeWakeDispatchInput = {}) {
+    const promise = nativeStatusDrain.dispatch(input);
+    activeWakeupPromises.add(promise);
+    void promise.finally(() => activeWakeupPromises.delete(promise)).catch(() => undefined);
+    return promise;
+  }
+
+  async function releasePendingNativeStatusWakeups(input: NativeWakeDispatchInput) {
+    for (let page = 0; page < 5; page++) {
+      const result = await dispatchPendingNativeStatusWakeups(input);
+      if (result.scanned < 100) break;
+    }
+  }
+
+  async function dispatchNativeStatusWakeupPage(
+    input: NativeWakeDispatchInput = {}, replayIds?: string[],
   ) {
     const now = new Date();
     const staleClaimMs = Math.max(1_000, input.staleClaimMs ?? 60_000);
     const limit = Math.max(1, Math.min(input.limit ?? 100, 500));
-    const selectCandidates = (predicate: ReturnType<typeof and>) => db.select().from(agentWakeupRequests)
-      .where(and(ordinaryWakeRequestPredicate(),
-        input.companyId ? eq(agentWakeupRequests.companyId, input.companyId) : undefined,
-        eq(agentWakeupRequests.requestedByActorType, "system"), predicate))
-      .orderBy(asc(agentWakeupRequests.requestedAt)).limit(limit);
-    const nativeIntents = await selectCandidates(and(
+    const scopeKey = databaseWorkScopeKey(db);
+    let cursors = nativeWakeCursors.get(scopeKey);
+    if (!cursors) nativeWakeCursors.set(scopeKey, cursors = new Map());
+    const selectCandidates = async (kind: string, predicate: ReturnType<typeof and>) => {
+      const key = `${nativeWakeScopeKey(input)}:${kind}`;
+      const cursor = replayIds ? undefined : cursors.get(key);
+      const rows = await db.select().from(agentWakeupRequests)
+        .where(and(ordinaryWakeRequestPredicate(),
+          input.companyId ? eq(agentWakeupRequests.companyId, input.companyId) : undefined,
+          input.agentId ? eq(agentWakeupRequests.agentId, input.agentId) : undefined,
+          input.projectId ? sql`exists (select 1 from ${issues} where ${issues.companyId} = ${agentWakeupRequests.companyId}
+            and ${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId' and ${issues.projectId} = ${input.projectId}::uuid)` : undefined,
+          cursor ? sql`(${agentWakeupRequests.requestedAt}, ${agentWakeupRequests.id}) > (${cursor.requestedAt.toISOString()}::timestamptz, ${cursor.id}::uuid)` : undefined,
+          replayIds ? inArray(agentWakeupRequests.id, replayIds) : undefined,
+          eq(agentWakeupRequests.requestedByActorType, "system"), predicate))
+        .orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id)).limit(limit);
+      if (replayIds) return rows;
+      if (rows.length === limit) cursors.set(key, { requestedAt: rows.at(-1)!.requestedAt, id: rows.at(-1)!.id });
+      else cursors.delete(key);
+      return rows;
+    };
+    const nativeIntents = replayIds ? [] : await selectCandidates("native", and(
       inArray(agentWakeupRequests.requestedByActorId, ["native-status-committer", CROSS_TASK_CONTINUATION_COMMITTER_ID]),
       inArray(agentWakeupRequests.status, ["queued", "claimed"]), isNull(agentWakeupRequests.runId),
       or(sql`${agentWakeupRequests.reason} is distinct from ${ISSUE_BLOCKERS_RESOLVED_WAKE_REASON}`,
         sql`${agentWakeupRequests.requestedByActorId} is distinct from 'native-status-committer'`)));
-    const dependencyIntents = await selectCandidates(pendingDependencyIntents(db));
-    const receiptResults = await selectCandidates(pendingDependencyReceiptResults(db));
+    const dependencyIntents = await selectCandidates("dependency", pendingDependencyIntents(db));
+    const receiptResults = replayIds ? [] : await selectCandidates("results", pendingDependencyReceiptResults(db));
     const candidates = [...nativeIntents, ...dependencyIntents, ...receiptResults];
 
     let dispatched = 0;
@@ -5050,6 +5083,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       { runId: string | null; status: string }
     >();
 
+    const releaseObservation = nativeStatusDrain.observe(candidates);
+    try {
     for (const candidate of candidates) {
       if (candidate.runId) {
         try {
@@ -5397,8 +5432,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       }
     }
 
-    const promoted = await promoteDeferredDispatchReceipts(input);
+    const promoted = replayIds || input.agentId || input.projectId ? 0 : await promoteDeferredDispatchReceipts(input);
     return { scanned: candidates.length, dispatched, recovered, deferred, promoted };
+    } finally { releaseObservation(); }
   }
 
   const deferredReceiptPromotionCursors = new Map<string, { requestedAt: Date; id: string }>();
@@ -5488,6 +5524,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     enqueueMonitorWakeup: (agentId: string, opts: WakeupOptions, admission: IssueMonitorAdmission) =>
       enqueueWakeup(agentId, { ...opts, allowRunCoalescing: false }, undefined, undefined, admission),
     dispatchPendingNativeStatusWakeups,
+    releasePendingNativeStatusWakeups,
+    stopNativeStatusDrains: nativeStatusDrain.stop,
+    resumeNativeStatusDrains: nativeStatusDrain.resume,
     startNextQueuedRunForAgent,
     countRunningRunsForAgent,
     releaseRunClaimedJustBeforeSuppression,

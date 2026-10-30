@@ -2,7 +2,7 @@ import { notifyApprovalWork } from "./approval-work-notifications.js";
 import { notifyCompanyRetentionWork } from "./retention-work-notifications.js";
 import { addCents, compareCents, normalizeCents } from "@paperclipai/shared";
 import { and, desc, eq, inArray, sql, or, isNull } from "drizzle-orm";
-import type { Db } from "@paperclipai/db";
+import { afterDatabaseCommit, databaseWorkScopeKey, type Db } from "@paperclipai/db";
 
 import {
   agents,
@@ -63,6 +63,17 @@ export type BudgetEnforcementScope = {
 export type BudgetServiceHooks = {
   cancelWorkForScope?: (scope: BudgetEnforcementScope) => Promise<void>;
 };
+
+export type BudgetReleaseScope = Pick<BudgetEnforcementScope, "companyId" | "scopeType" | "scopeId">;
+const releaseListeners = new WeakMap<object, Set<(scope: BudgetReleaseScope) => Promise<void>>>();
+
+export function subscribeBudgetScopeRelease(db: Db, listener: (scope: BudgetReleaseScope) => Promise<void>) {
+  const key = databaseWorkScopeKey(db);
+  let listeners = releaseListeners.get(key);
+  if (!listeners) releaseListeners.set(key, listeners = new Set());
+  listeners.add(listener);
+  return () => { listeners.delete(listener); };
+}
 
 function currentUtcMonthWindow(now = new Date()) {
   const year = now.getUTCFullYear();
@@ -345,6 +356,15 @@ export function budgetServiceInTransaction(db: Db, publications: ActivityPublica
     }).where(eq(budgetPolicies.id, policy.id));
   }
 
+  async function publishScopeRelease(policy: PolicyRow) {
+    const key = databaseWorkScopeKey(db);
+    const scope: BudgetReleaseScope = { companyId: policy.companyId,
+      scopeType: policy.scopeType as BudgetScopeType, scopeId: policy.scopeId };
+    await afterDatabaseCommit(db, DELIVERY_QUEUES.accounting, async () => {
+      await Promise.all([...releaseListeners.get(key) ?? []].map(listener => listener(scope)));
+    });
+  }
+
   async function resumeScopeFromBudget(policy: PolicyRow) {
     const policies = await db.select().from(budgetPolicies).where(and(
       eq(budgetPolicies.companyId, policy.companyId), eq(budgetPolicies.scopeType, policy.scopeType),
@@ -355,19 +375,23 @@ export function budgetServiceInTransaction(db: Db, publications: ActivityPublica
     const now = new Date();
     if (policy.scopeType === "agent") {
       const { applyAgentBudgetHoldInTransaction } = await import("./agent-lifecycle.js");
+      const before = await resolveScopeRecord(db, "agent", policy.scopeId);
       await applyAgentBudgetHoldInTransaction(db, policy.companyId, policy.scopeId, false);
+      if (before.budgetHeld && !(await resolveScopeRecord(db, "agent", policy.scopeId)).budgetHeld) await publishScopeRelease(policy);
       return;
     }
 
     if (policy.scopeType === "project") {
-      await db
+      const released = await db
         .update(projects)
         .set({
           pauseReason: null,
           pausedAt: null,
           updatedAt: now,
         })
-        .where(and(eq(projects.id, policy.scopeId), eq(projects.pauseReason, "budget")));
+        .where(and(eq(projects.id, policy.scopeId), eq(projects.companyId, policy.companyId), eq(projects.pauseReason, "budget")))
+        .returning({ id: projects.id });
+      if (released.length) await publishScopeRelease(policy);
       return;
     }
 
@@ -376,7 +400,7 @@ export function budgetServiceInTransaction(db: Db, publications: ActivityPublica
     if (scope.pauseReason !== "budget") return;
     await notifyCompanyRetentionWork(db, policy.companyId);
     await notifyDeliveryWork(db, DELIVERY_QUEUES.agentLifecycle, policy.companyId);
-    await db
+    const released = await db
       .update(companies)
       .set({
         status: "active",
@@ -384,7 +408,9 @@ export function budgetServiceInTransaction(db: Db, publications: ActivityPublica
         pausedAt: null,
         updatedAt: now,
       })
-      .where(and(eq(companies.id, policy.scopeId), eq(companies.status, "paused"), eq(companies.pauseReason, "budget")));
+      .where(and(eq(companies.id, policy.companyId), eq(companies.id, policy.scopeId), eq(companies.status, "paused"), eq(companies.pauseReason, "budget")))
+      .returning({ id: companies.id });
+    if (released.length) await publishScopeRelease(policy);
   }
 
   async function getPolicyRow(policyId: string) {

@@ -70,6 +70,12 @@ credentials/run context; inspect its result and applicable persistence/attributi
 Assert the relevant denied actor, owner, company or mode from Policy. Review the
 remaining operations before qualifying the whole capability.
 
+Native dependency delivery retains company, current target, responsible-user,
+checkout, budget, dependency, subtree and review admission checks. Root budget
+release and lifecycle readiness request the queue internally; they grant no new
+agent mutation permission. The native queue and budget commit fixtures are
+service evidence, not authenticated REST/native access proof.
+
 Gaps: Dedicated set_dependencies is current-task scoped. Generic `call_api`
 forwards blockedByIssueIds to the REST route and retains its ownership checks.
 
