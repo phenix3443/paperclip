@@ -211,10 +211,22 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     }
     const result = await db.transaction(tx => createWakeAdmissionWriter().appendQueuedComment(
       createAdmissionTransactionScope(input.companyId, tx as unknown as Db), input));
-    expect(result).toMatchObject({ id: input.targetRunId, contextSnapshot: { wakeCommentIds: comments.map(comment => comment.id) } });
+    expect(result).toMatchObject({ kind: "appended", run: { id: input.targetRunId, contextSnapshot: { wakeCommentIds: comments.map(comment => comment.id) } } });
     const after = await appendState(input.companyId);
     expect(after.wakes).toHaveLength(2);
     expect(after.wakes.find(row => row.id === wake.id)?.payload?._paperclipWakeContext).toMatchObject({ wakeCommentIds: comments.map(comment => comment.id) });
+  });
+
+  it.each([false, true])("keeps non-comment roots with the existing owner unless immutable (immutable=%s)", async immutable => {
+    const { input, wake } = await seedAppendQueue();
+    await db.update(agentWakeupRequests).set({ source: "assignment", reason: "execution_review_requested",
+      payload: { issueId: input.issueId }, idempotencyKey: immutable ? "immutable-source" : null,
+    }).where(eq(agentWakeupRequests.id, wake.id));
+    const before = await appendState(input.companyId);
+    const result = await db.transaction(tx => createWakeAdmissionWriter().appendQueuedComment(
+      createAdmissionTransactionScope(input.companyId, tx as unknown as Db), input));
+    expect(result).toEqual(immutable ? null : { kind: "legacy_root" });
+    expect(await appendState(input.companyId)).toEqual(before);
   });
 
   it("serializes concurrent appenders and deduplicates a repeated comment without changing order", async () => {

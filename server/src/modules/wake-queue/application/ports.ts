@@ -419,6 +419,11 @@ export interface WakeAdmissionReader {
   ): Promise<ExistingDeferredWake | null>;
 }
 
+export type AppendQueuedCommentResult =
+  | { kind: "appended"; run: Record<string, unknown> }
+  | { kind: "legacy_root" }
+  | null;
+
 export type AppendQueuedCommentInput = {
   companyId: string;
   issueId: string;
@@ -438,7 +443,7 @@ export type AppendQueuedCommentInput = {
 
 /** The transaction-scoped write operations that admit a wake behind an active issue execution. */
 export interface WakeAdmissionWriter {
-  appendQueuedComment(scope: TransactionScope, input: AppendQueuedCommentInput): Promise<Record<string, unknown> | null>;
+  appendQueuedComment(scope: TransactionScope, input: AppendQueuedCommentInput): Promise<AppendQueuedCommentResult>;
   /** Merges the wake's context into the active execution run and records the wake as coalesced. Returns the updated run row. */
   coalesceIntoActiveExecutionRun(
     scope: TransactionScope,

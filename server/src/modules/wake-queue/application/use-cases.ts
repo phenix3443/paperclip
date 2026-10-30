@@ -905,8 +905,8 @@ export function createAdmitWakeBehindIssueExecution(deps: {
         requestedByActorId: input.requestedByActorId, idempotencyKey: input.idempotencyKey,
         durableReceipt: input.durableReceipt,
       });
-      if (run) return { kind: "coalesced", run };
-      decision = { kind: "defer" };
+      if (run?.kind === "appended") return { kind: "coalesced", run: run.run };
+      if (run?.kind !== "legacy_root") decision = { kind: "defer" };
     }
 
     if (decision.kind === "coalesce") {

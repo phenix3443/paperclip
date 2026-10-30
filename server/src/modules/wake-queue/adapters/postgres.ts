@@ -66,6 +66,7 @@ import type {
   ReleaseTransactionResult,
   RunSnapshot,
   AppendQueuedCommentInput,
+  AppendQueuedCommentResult,
   WakeAdmissionReader,
   WakeAdmissionWriter,
   WakeQueueHost,
@@ -978,7 +979,7 @@ export function createWakeAdmissionReader(): WakeAdmissionReader {
   };
 }
 
-export async function appendQueuedComment(scope: TransactionScope, input: AppendQueuedCommentInput): Promise<Record<string, unknown> | null> {
+export async function appendQueuedComment(scope: TransactionScope, input: AppendQueuedCommentInput): Promise<AppendQueuedCommentResult> {
   const tx = requireAdmissionTx(scope, input.companyId);
   if (input.source !== "automation" || input.reason !== "issue_commented" || input.idempotencyKey || input.durableReceipt)
     return null;
@@ -1013,10 +1014,13 @@ export async function appendQueuedComment(scope: TransactionScope, input: Append
   const [run] = await tx.select().from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.id, input.targetRunId),
   )).for("update");
-  if (!wake || !run || run.invocationSource !== "automation" || wake.status !== "queued" || run.status !== "queued" || run.startedAt ||
+  if (!wake || !run || wake.status !== "queued" || run.status !== "queued" || run.startedAt ||
       run.processStartedAt || run.processPid || run.processGroupId || run.runtimeModeResolvedAt || run.retryOfRunId ||
-      run.scheduledRetryAttempt > 0 || run.continuationAttempt > 0 || wake.runId !== run.id || run.wakeupRequestId !== wake.id ||
-      wake.source !== "automation" || wake.reason !== "issue_commented" || wake.idempotencyKey ||
+      run.scheduledRetryAttempt > 0 || run.continuationAttempt > 0 || wake.runId !== run.id || run.wakeupRequestId !== wake.id)
+    return null;
+  if (!wake.idempotencyKey && wake.reason !== "issue_commented" && queuedCommentIdsFromWakePayload(wake.payload).length === 0)
+    return { kind: "legacy_root" };
+  if (run.invocationSource !== "automation" || wake.source !== "automation" || wake.reason !== "issue_commented" || wake.idempotencyKey ||
       queuedCommentIdsFromWakePayload(wake.payload).length === 0 ||
       wake.payload?.issueId !== issue.id || run.contextSnapshot?.issueId !== issue.id || !ordinaryPayload(parseObject(wake.payload)) ||
       !ordinaryContext(parseObject(run.contextSnapshot)) ||
@@ -1050,7 +1054,7 @@ export async function appendQueuedComment(scope: TransactionScope, input: Append
     requestedByActorType: input.requestedByActorType, requestedByActorId: input.requestedByActorId,
     idempotencyKey: input.idempotencyKey, runId: run.id, finishedAt: now,
   });
-  return updatedRun as unknown as Record<string, unknown>;
+  return { kind: "appended", run: updatedRun as unknown as Record<string, unknown> };
 }
 
 export function createWakeAdmissionWriter(): WakeAdmissionWriter {

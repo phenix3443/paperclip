@@ -4802,9 +4802,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       ? null
       : filterZombieCoalesceTarget(rawCoalescedTarget, liveRunExecutions);
 
+    let commentAppend: Awaited<ReturnType<typeof wakeQueue.appendQueuedComment>> = null;
     if (coalescedTargetRun && wakeCommentId) {
       const queueIssueId = readNonEmptyString(enrichedContextSnapshot.issueId) ?? taskKey;
-      const merged = queueIssueId && isUuidLike(queueIssueId)
+      commentAppend = queueIssueId && isUuidLike(queueIssueId)
         ? await db.transaction(tx => wakeQueue.appendQueuedComment(
             wakeQueue.createAdmissionTransactionScope(agent.companyId, tx as unknown as Db), {
               companyId: agent.companyId, issueId: queueIssueId, agentId,
@@ -4814,10 +4815,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               requestedByActorId: opts.requestedByActorId ?? null,
               idempotencyKey: opts.idempotencyKey ?? null,
             })) : null;
-      if (merged) return merged as typeof heartbeatRuns.$inferSelect;
+      if (commentAppend?.kind === "appended") return commentAppend.run as typeof heartbeatRuns.$inferSelect;
     }
 
-    if (coalescedTargetRun && !wakeCommentId) {
+    if (coalescedTargetRun && (!wakeCommentId || commentAppend?.kind === "legacy_root")) {
       const mergedContextSnapshot = mergeCoalescedContextSnapshot(
         coalescedTargetRun.contextSnapshot,
         enrichedContextSnapshot,
