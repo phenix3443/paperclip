@@ -283,12 +283,34 @@ Active execution/recovery owners and holds exclude a task from all three in
 both bodies.
 
 - **Scope (1)**: `blocked` with no unresolved dependency, declared wait,
-  monitor or pending interaction. Native coverage: none by design. The backstop
-  needs recorded blockers (§2.1 step 1) and stranded recovery does not scan
-  `blocked`. Issues with a no-replay hold (§2.4: SOL-2771, SOL-2813) do **not**
-  belong here: they carry an execution hold and are excluded by the plugin's
-  own hold guard. Classification: intended native gap; the plugin does not
-  duplicate native recovery here.
+  monitor or pending interaction. "No unresolved dependency" covers two
+  native cases, and native stranded recovery scans neither (it does not scan
+  `blocked`):
+  - *Zero recorded blockers.* The backstop skips these as `notReadySkipped`
+    (service.ts 6392-6401). Native coverage: none by design (T3). This is the
+    plugin-only part of scope (1).
+  - *Recorded blockers, all resolved.* The backstop covers these
+    (service.ts 6383-6441, then the enqueue): it wakes the assignee once per ready state unless
+    a wake for that state already exists, a live path or queued wake exists,
+    or the self-blocked exception applies (service.ts 6429:
+    `wasBlockedByAssigneeAgent`, the agent opened the blocked cycle after its
+    blockers had already resolved). So a blocker that resolves after the agent
+    self-blocked, with no other wait, hold or live path, is a native wake (T1),
+    and the plugin overlaps native here. The self-blocked exception (T2) is
+    left to the agent on purpose; a plugin wake there would be the re-block
+    loop that the native comment describes, unless the plugin's own guards
+    rule it out.
+  - *Execution/recovery holds.* Issues with a no-replay hold (§2.4:
+    SOL-2771, SOL-2813) or an active recovery owner are **not** scope (1) in
+    either case: the plugin's hold guard excludes them, and native does not
+    replay them.
+
+  Classification: zero blockers is an intended native gap; all-resolved is
+  native-covered except the intended self-blocked exception; holds are
+  excluded on both sides. T1-T3 characterize these boundaries. The overlap on
+  the all-resolved subset stays safe only through the plugin's race guard
+  (native wake or queued wake wins) and hold guard, so it is not grounds to
+  retire either side.
 - **Scope (2)**: native skips caused by a pause whose actor is now available.
   Native coverage: §2.3. While paused, stranded recovery skips on purpose; after
   resume the continuation path is expected to requeue (untested, T6). If T6
