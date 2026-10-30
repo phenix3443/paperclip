@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import { and, asc, eq, exists, inArray, isNotNull, isNull, like, sql } from "drizzle-orm";
+import { and, asc, eq, exists, inArray, isNotNull, isNull, like, or, sql } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
 import { agents, companies, heartbeatRuns, agentWakeupRequests, issues, statusDecisionEffects, statusDecisions, type Db } from "@paperclipai/db";
 import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { evaluateAgentInvokability } from "../agent-invokability.js";
@@ -24,6 +25,34 @@ export function pendingDependencyReceiptResults(db: Db) {
     isNotNull(agentWakeupRequests.runId), exists(db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.id, agentWakeupRequests.runId), eq(heartbeatRuns.companyId, agentWakeupRequests.companyId),
       eq(heartbeatRuns.agentId, agentWakeupRequests.agentId), inArray(heartbeatRuns.status, terminalRunStatuses)))));
+}
+
+export function pendingDependencyIntents(db: Db) {
+  const legacy = alias(agentWakeupRequests, "legacy_dependency_receipt");
+  const legacyReceipt = exists(db.select({ id: legacy.id }).from(legacy).where(and(
+    ordinaryWakeRequestPredicate(legacy.payload),
+    eq(legacy.companyId, agentWakeupRequests.companyId), eq(legacy.agentId, agentWakeupRequests.agentId),
+    eq(legacy.source, agentWakeupRequests.source),
+    sql`${legacy.triggerDetail} is not distinct from ${agentWakeupRequests.triggerDetail}`,
+    eq(legacy.requestedByActorType, "system"),
+    sql`${legacy.requestedByActorId} = 'native-status-wake-dispatch:' || ${agentWakeupRequests.id}::text`,
+    sql`${legacy.payload} @> ${agentWakeupRequests.payload}`,
+    sql`${legacy.payload}->'_paperclipWakeContext'->>'nativeStatusWakeIntentId' = ${agentWakeupRequests.id}::text`,
+    or(and(eq(legacy.reason, "issue_blockers_resolved"),
+      sql`${legacy.idempotencyKey} is not distinct from ${agentWakeupRequests.idempotencyKey}`),
+    and(eq(legacy.status, "skipped"), isNull(legacy.runId),
+      sql`${legacy.payload}->'executionWait'->>'requestedIdempotencyKey' = ${agentWakeupRequests.idempotencyKey}`,
+      or(and(eq(legacy.reason, "agent.not_invokable"),
+        sql`${legacy.payload}->'executionWait'->>'status' = 'paused'`,
+        sql`${legacy.payload}->'executionWait'->>'reason' = 'paused'`),
+      and(eq(legacy.reason, "budget.blocked"),
+        sql`${legacy.payload}->'executionWait'->>'scopeType' in ('company', 'agent', 'project')`)))))));
+  return and(eq(agentWakeupRequests.requestedByActorId, "native-status-committer"),
+    eq(agentWakeupRequests.reason, "issue_blockers_resolved"), isNull(agentWakeupRequests.runId),
+    or(and(isNull(agentWakeupRequests.finishedAt),
+      inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution", "coalesced"])),
+    and(eq(agentWakeupRequests.status, "skipped"),
+      sql`${agentWakeupRequests.payload}->'_paperclipDependencyAdmission' is null`, legacyReceipt)));
 }
 
 type Reservation = {
@@ -198,6 +227,7 @@ export function createDependencyAdmission(db: Db, schedulingGate: () => Promise<
       const origin = current && await provenance(tx, current);
       if (!current || !origin) return null;
       if (current.status === "skipped" && reservation(current)) return null;
+      if (current.finishedAt && current.status !== "skipped") return null;
       if (current.status === "claimed" && current.claimedAt
         && Date.now() - current.claimedAt.getTime() < staleClaimMs) return null;
       let binding = reservation(current);
@@ -212,7 +242,7 @@ export function createDependencyAdmission(db: Db, schedulingGate: () => Promise<
           effectId: origin.id, inputPayload: inputPayload(current), idempotencyKey: current.idempotencyKey,
           triggerDetail: current.triggerDetail };
         const previous = legacy[0];
-        if (current.status === "skipped" && !previous) throw new Error("Unbound skipped dependency input requires repair");
+        if (current.status === "skipped" && !previous) return null;
         if (previous && !matchesReceipt(previous, current, binding)) {
           const wait = previous.payload?.executionWait as Record<string, unknown> | undefined;
           const reversible = previous.reason === "budget.blocked" && ["company", "agent", "project"].includes(String(wait?.scopeType))
@@ -245,13 +275,13 @@ export function createDependencyAdmission(db: Db, schedulingGate: () => Promise<
         const status = receipt ? "coalesced" : "deferred_issue_execution";
         if (current.status !== status || !reservation(current)) {
           await tx.update(agentWakeupRequests).set({ status,
-            payload: { ...current.payload, [markerKey]: binding }, error: eligibility.gate, updatedAt: new Date() }).where(observed(current));
+            payload: { ...current.payload, [markerKey]: binding }, finishedAt: null, error: eligibility.gate, updatedAt: new Date() }).where(observed(current));
         }
         return null;
       }
       const [claimed] = await tx.update(agentWakeupRequests).set({ status: "claimed",
         claimedAt: sql`greatest(date_trunc('milliseconds', clock_timestamp()), coalesce(${agentWakeupRequests.claimedAt} + interval '1 millisecond', '-infinity'::timestamptz))`,
-        payload: { ...current.payload, [markerKey]: binding }, error: null, updatedAt: new Date() })
+        payload: { ...current.payload, [markerKey]: binding }, finishedAt: null, error: null, updatedAt: new Date() })
         .where(observed(current)).returning();
       return claimed ? { intent: claimed, reservation: binding, receipt } : null;
     });

@@ -1,5 +1,5 @@
 import { settleNewReviewRunIdentity, settleReviewRunClaimIdentity } from "../run-identity.js";
-import { createDependencyAdmission, DependencyAdmissionHeld, pendingDependencyReceiptResults, type DependencyClaim } from "./dependency-admission.js";
+import { createDependencyAdmission, DependencyAdmissionHeld, pendingDependencyIntents, pendingDependencyReceiptResults, type DependencyClaim } from "./dependency-admission.js";
 import type { IssueMonitorAdmission } from "./scheduling.js";
 import { parseIssueExecutionState } from "../issue-execution-policy.js";
 import { admitReviewerIntent, consumeReviewerIntent, reconcileReviewerAssignments, reviewerAssignmentGeneration } from "./reviewer-assignment-continuation.js";
@@ -5005,30 +5005,20 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
   ) {
     const now = new Date();
     const staleClaimMs = Math.max(1_000, input.staleClaimMs ?? 60_000);
-    const candidates = await db
-      .select()
-      .from(agentWakeupRequests)
-      .where(
-        and(
-          ordinaryWakeRequestPredicate(), input.companyId
-            ? eq(agentWakeupRequests.companyId, input.companyId)
-            : undefined,
-          eq(agentWakeupRequests.requestedByActorType, "system"),
-          or(and(
-          inArray(agentWakeupRequests.requestedByActorId, [
-            "native-status-committer",
-            CROSS_TASK_CONTINUATION_COMMITTER_ID,
-          ]),
-          or(inArray(agentWakeupRequests.status, ["queued", "claimed"]), and(
-            eq(agentWakeupRequests.reason, ISSUE_BLOCKERS_RESOLVED_WAKE_REASON),
-            inArray(agentWakeupRequests.status, ["deferred_issue_execution", "coalesced", "skipped"]),
-          )),
-          isNull(agentWakeupRequests.runId),
-          ), pendingDependencyReceiptResults(db)),
-        ),
-      )
-      .orderBy(asc(agentWakeupRequests.requestedAt))
-      .limit(Math.max(1, Math.min(input.limit ?? 100, 500)));
+    const limit = Math.max(1, Math.min(input.limit ?? 100, 500));
+    const selectCandidates = (predicate: ReturnType<typeof and>) => db.select().from(agentWakeupRequests)
+      .where(and(ordinaryWakeRequestPredicate(),
+        input.companyId ? eq(agentWakeupRequests.companyId, input.companyId) : undefined,
+        eq(agentWakeupRequests.requestedByActorType, "system"), predicate))
+      .orderBy(asc(agentWakeupRequests.requestedAt)).limit(limit);
+    const nativeIntents = await selectCandidates(and(
+      inArray(agentWakeupRequests.requestedByActorId, ["native-status-committer", CROSS_TASK_CONTINUATION_COMMITTER_ID]),
+      inArray(agentWakeupRequests.status, ["queued", "claimed"]), isNull(agentWakeupRequests.runId),
+      or(sql`${agentWakeupRequests.reason} is distinct from ${ISSUE_BLOCKERS_RESOLVED_WAKE_REASON}`,
+        sql`${agentWakeupRequests.requestedByActorId} is distinct from 'native-status-committer'`)));
+    const dependencyIntents = await selectCandidates(pendingDependencyIntents(db));
+    const receiptResults = await selectCandidates(pendingDependencyReceiptResults(db));
+    const candidates = [...nativeIntents, ...dependencyIntents, ...receiptResults];
 
     let dispatched = 0;
     let recovered = 0;
