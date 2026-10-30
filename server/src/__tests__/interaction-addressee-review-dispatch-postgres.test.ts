@@ -65,12 +65,6 @@ async function waitForCondition(fn: () => Promise<boolean>, timeoutMs = 5_000) {
   return fn();
 }
 
-/**
- * Route-level proof that a question card addressed to an agent other than the
- * current review participant reaches that agent: the real interaction route
- * enqueues the wake, the real heartbeat queue claims it, and the run-dispatch
- * gates let it reach an inert adapter while the task stays in review.
- */
 describeEmbeddedPostgres("pending interaction addressee dispatch during review (routes + postgres)", () => {
   let db!: ReturnType<typeof createDb>;
   let heartbeat!: ReturnType<typeof heartbeatService>;

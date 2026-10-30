@@ -1280,8 +1280,15 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       { label: "cancels an interaction on another issue", otherIssue: true, errorCode: "issue_assignee_changed" },
       { label: "cancels an interaction in another company", otherCompany: true, errorCode: "issue_assignee_changed" },
       { label: "cancels a non-participant wake without an interaction", wakeReason: "issue_commented", errorCode: "issue_assignee_changed" },
-      { label: "cancels the assignee's wake when it is not the addressee", runAgent: "assignee", addressee: "participant", errorCode: "issue_review_participant_changed" },
       { label: "cancels the addressee's wake from a stale review generation", staleGeneration: true, errorCode: "issue_review_participant_changed" },
+      { label: "keeps the assignee's wake as the addressee", runAgent: "assignee" },
+      { label: "cancels the assignee's wake when it is not the addressee", runAgent: "assignee", addressee: "participant", errorCode: "issue_review_participant_changed" },
+      { label: "cancels the assignee's wake once the interaction is answered", runAgent: "assignee", status: "accepted", errorCode: "issue_review_participant_changed" },
+      { label: "cancels the assignee's wake once the interaction is cancelled", runAgent: "assignee", status: "cancelled", errorCode: "issue_review_participant_changed" },
+      { label: "cancels the assignee's wake without an interaction id", runAgent: "assignee", omitInteractionId: true, errorCode: "issue_review_participant_changed" },
+      { label: "cancels the assignee's wake for an interaction on another issue", runAgent: "assignee", otherIssue: true, errorCode: "issue_review_participant_changed" },
+      { label: "cancels the assignee's wake for an interaction in another company", runAgent: "assignee", otherCompany: true, errorCode: "issue_review_participant_changed" },
+      { label: "cancels the assignee's wake for another reason", runAgent: "assignee", wakeReason: "issue_assigned", errorCode: "issue_review_participant_changed" },
     ];
 
     async function seedInReviewAddresseeRun(testCase: InReviewAddresseeCase, status: "queued" | "running") {
