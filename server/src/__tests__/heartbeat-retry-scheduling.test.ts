@@ -1503,6 +1503,40 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(issue?.executionRunId).toBe(retryRuns[0]?.id);
   });
 
+  it("reuses a committed max-turn continuation when a duplicate schedule arrives after it", async () => {
+    const { issueId, runId, now } = await seedMaxTurnFixture();
+    const retryOptions = {
+      now,
+      retryReason: MAX_TURN_CONTINUATION_RETRY_REASON,
+      wakeReason: MAX_TURN_CONTINUATION_WAKE_REASON,
+      maxAttempts: 2,
+      delayMs: 1_000,
+    };
+
+    // The first schedule commits and moves the issue execution lock to its
+    // successor before the duplicate evaluates the retry gate.
+    const first = await heartbeat.scheduleBoundedRetry(runId, retryOptions);
+    const second = await heartbeat.scheduleBoundedRetry(runId, retryOptions);
+
+    expect(first.outcome).toBe("scheduled");
+    expect(second).toMatchObject({ outcome: "scheduled", reusedExisting: true });
+    if (first.outcome !== "scheduled" || second.outcome !== "scheduled") return;
+    expect(second.run.id).toBe(first.run.id);
+
+    const wakeups = await db
+      .select({ coalescedCount: agentWakeupRequests.coalescedCount })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.reason, MAX_TURN_CONTINUATION_WAKE_REASON));
+    expect(wakeups).toEqual([{ coalescedCount: 1 }]);
+
+    const issue = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.executionRunId).toBe(first.run.id);
+  });
+
   it.each(["schedule", "transaction", "promote", "dispatch"] as const)(
     "suppresses a busy-subscription retry whose task lock was cleared before %s",
     async (phase) => {
