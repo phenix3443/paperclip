@@ -352,7 +352,8 @@ function BlockedInboxRow({
       : ownerName;
   // An element even without an owner: the shared columns fall back to the issue assignee for an empty cell.
   const ownerCell = ownerName ? (
-    <span className="inline-flex min-w-0 max-w-full items-center" title={ownerTitle} data-testid="blocked-row-owner">
+    // relative z-10 lifts the cell above the row's full-size link, so its hover title can show.
+    <span className="relative z-10 inline-flex min-w-0 max-w-full items-center" title={ownerTitle} data-testid="blocked-row-owner">
       {isAgent ? <AgentIdentity agent={agents?.find((agent) => agent.id === row.attention.owner.agentId) ?? { id: row.attention.owner.agentId ?? undefined, name: ownerName }} size="xs" className="max-w-full" /> : <Identity name={ownerName} size="xs" className="max-w-full" />}
     </span>
   ) : (

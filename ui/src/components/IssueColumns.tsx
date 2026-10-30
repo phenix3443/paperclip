@@ -329,7 +329,8 @@ export function InboxIssueTrailingColumns({
           if (issue.assigneeAgentId) {
             const agentName = assigneeAgent?.name ?? assigneeName ?? issue.assigneeAgentId.slice(0, 8);
             return (
-              <span key={column} className="min-w-0 text-xs text-foreground" title={agentName}>
+              // relative z-10 lifts the cell above the row's full-size link, so its hover title can show.
+              <span key={column} className="relative z-10 min-w-0 text-xs text-foreground" title={agentName}>
                 <AgentIdentity
                   agent={assigneeAgent ?? { id: issue.assigneeAgentId, name: agentName }}
                   size="sm"
@@ -341,7 +342,7 @@ export function InboxIssueTrailingColumns({
 
           if (issue.assigneeUserId) {
             return (
-              <span key={column} className="min-w-0 text-xs text-foreground" title={userLabel}>
+              <span key={column} className="relative z-10 min-w-0 text-xs text-foreground" title={userLabel}>
                 <Identity
                   name={userLabel}
                   avatarUrl={assigneeUserAvatarUrl}
