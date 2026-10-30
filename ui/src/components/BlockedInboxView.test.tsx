@@ -377,9 +377,9 @@ describe("BlockedInboxView", () => {
 
     const owner = container.querySelector('[data-testid="blocked-row-owner"]');
     expect(owner?.textContent).toContain("upstream maintainers");
-    expect(owner?.getAttribute("title")).toBe("Review paperclipai/paperclip#18156");
+    expect(owner?.getAttribute("title")).toBe("upstream maintainers: Review paperclipai/paperclip#18156");
     expect(container.querySelector('[data-testid="blocked-row-owner-mobile"]')?.getAttribute("title")).toBe(
-      "Review paperclipai/paperclip#18156",
+      "upstream maintainers: Review paperclipai/paperclip#18156",
     );
 
     act(() => root.unmount());
@@ -420,6 +420,7 @@ describe("BlockedInboxView", () => {
     const columns = container.querySelector('[data-testid="blocked-row-issue-columns"]');
     expect(columns?.querySelector('[data-testid="project-cell"]')?.textContent).toBe("Project X");
     expect(columns?.querySelector('[data-testid="blocked-row-owner"]')?.textContent).toContain("Charlie");
+    expect(columns?.querySelector('[data-testid="blocked-row-owner"]')?.getAttribute("title")).toBe("Charlie");
 
     act(() => root.unmount());
   });

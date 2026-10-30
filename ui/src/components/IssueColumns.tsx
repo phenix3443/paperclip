@@ -73,7 +73,8 @@ export function issueActivityText(issue: Issue): string {
 function issueTrailingGridTemplate(columns: InboxIssueColumn[]): string {
   return columns
     .map((column) => {
-      if (column === "assignee") return "minmax(6rem, 8rem)";
+      // "paperclipai/paperclip maintainers" plus its avatar needs about 15.25rem.
+      if (column === "assignee") return "minmax(6rem, 16rem)";
       if (column === "kickedOffBy") return "minmax(6rem, 8rem)";
       if (column === "project") return "minmax(4.5rem, 7rem)";
       if (column === "workspace") return "minmax(6rem, 9rem)";
@@ -326,10 +327,12 @@ export function InboxIssueTrailingColumns({
           }
 
           if (issue.assigneeAgentId) {
+            const agentName = assigneeAgent?.name ?? assigneeName ?? issue.assigneeAgentId.slice(0, 8);
             return (
-              <span key={column} className="min-w-0 text-xs text-foreground">
+              // relative z-10 lifts the cell above the row's full-size link, so its hover title can show.
+              <span key={column} className="relative z-10 min-w-0 text-xs text-foreground" title={agentName}>
                 <AgentIdentity
-                  agent={assigneeAgent ?? { id: issue.assigneeAgentId, name: assigneeName ?? issue.assigneeAgentId.slice(0, 8) }}
+                  agent={assigneeAgent ?? { id: issue.assigneeAgentId, name: agentName }}
                   size="sm"
                   className="min-w-0"
                 />
@@ -339,7 +342,7 @@ export function InboxIssueTrailingColumns({
 
           if (issue.assigneeUserId) {
             return (
-              <span key={column} className="min-w-0 text-xs text-foreground">
+              <span key={column} className="relative z-10 min-w-0 text-xs text-foreground" title={userLabel}>
                 <Identity
                   name={userLabel}
                   avatarUrl={assigneeUserAvatarUrl}
