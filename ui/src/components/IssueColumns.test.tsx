@@ -133,6 +133,46 @@ describe("InboxIssueMetaLeading live state", () => {
   });
 });
 
+describe("InboxIssueTrailingColumns Responsible", () => {
+  it("shows the full agent and user names on hover", () => {
+    renderLeading(
+      <InboxIssueTrailingColumns
+        issue={makeIssue({ assigneeAgentId: "agent-1", assigneeUserId: null })}
+        columns={["assignee"]}
+        projectName={null}
+        projectColor={null}
+        workspaceName={null}
+        assigneeName="paperclipai/paperclip maintainers"
+        currentUserId="user-1"
+        parentIdentifier={null}
+        parentTitle={null}
+      />,
+    );
+    expect(container?.querySelector('[title="paperclipai/paperclip maintainers"]')).not.toBeNull();
+
+    act(() => root!.unmount());
+    root = null;
+    container?.remove();
+    container = null;
+
+    renderLeading(
+      <InboxIssueTrailingColumns
+        issue={makeIssue({ assigneeAgentId: null, assigneeUserId: "user-2" })}
+        columns={["assignee"]}
+        projectName={null}
+        projectColor={null}
+        workspaceName={null}
+        assigneeName={null}
+        assigneeUserName="A very long board user display name"
+        currentUserId="user-1"
+        parentIdentifier={null}
+        parentTitle={null}
+      />,
+    );
+    expect(container?.querySelector('[title="A very long board user display name"]')).not.toBeNull();
+  });
+});
+
 describe("InboxIssueTrailingColumns attribution", () => {
   it("renders a kicked off by column for agent creators with a character identity", () => {
     const text = renderLeading(

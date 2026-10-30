@@ -344,8 +344,12 @@ function BlockedInboxRow({
   tree,
 }: BlockedInboxRowProps) {
   const { label: ownerName, isAgent } = resolveOwnerName(row, agentNameById, userLabelById);
-  const ownerTitle =
-    row.attention.owner.type === "external" ? row.attention.action.detail ?? undefined : undefined;
+  // The Responsible cell truncates long names; hover shows the full name, and for an external wait also the action.
+  const ownerTitle = !ownerName
+    ? undefined
+    : row.attention.owner.type === "external" && row.attention.action.detail
+      ? `${ownerName}: ${row.attention.action.detail}`
+      : ownerName;
   // An element even without an owner: the shared columns fall back to the issue assignee for an empty cell.
   const ownerCell = ownerName ? (
     <span className="inline-flex min-w-0 max-w-full items-center" title={ownerTitle} data-testid="blocked-row-owner">
