@@ -1,6 +1,6 @@
 # Preserve approval progress during reassignment
 
-Date: 2026-10-30. Design revision: 1. Scope: design only.
+Date: 2026-10-30. Design revision: 2. Scope: design only.
 Tracks [issue #240](https://github.com/phenix3443/paperclip/issues/240).
 This document specifies proposed behavior; none of its recovery operations is deployed.
 
@@ -29,8 +29,9 @@ provenance remains a mandatory recovery precondition, not an established fact.
 
 Deliver two separate results:
 
-1. Prevent future cursor loss by rejecting unsupported reassignment before it has
-   effects. Use existing participant selection and policy CAS for supported moves.
+1. Prevent future cursor loss in two paths: unsupported assignee-only reassignment,
+   and reconciliation of a live stage with no eligible participant. Use existing
+   participant selection and policy CAS for supported moves.
 2. Keep an already lost cursor blocked until a separately authorized native repair
    can derive it from verified history. A preventive patch alone cannot repair it.
 
@@ -73,32 +74,83 @@ For a live pending review or approval:
   supported assignment, if the policy edit has not already reconciled assignment.
   This sequence has two transactions: a failed second step retains the gate and
   the explicit policy change; it must never clear state to finish the move.
-- Reject a policy edit that removes the live stage, regenerates its IDs, removes
-  completed stages, lowers a live review limit, or would discard decision/counter
-  provenance. Do not combine a policy edit with status or assignment changes.
-- A Board status override must not clear a live gate to reach `todo`, `in_progress`
-  or `done`. Reject that bypass. Explicit cancellation may retain the cursor as
-  historical state under existing cancellation authority; it does not approve the
-  stage. Reopening cancelled work must not silently reset its uncompleted gate.
+- Reject a policy edit that retains the live stage but leaves it with no eligible
+  participant after excluding `returnAssignee`. Use the same selection rules as
+  reconciliation, not merely a nonempty participant array. Removing the current
+  participant without a replacement, or leaving only `returnAssignee`, is rejected.
+  An eligible alternative allows reconciliation within the same stage. The explicit
+  slot replacement above must preserve completed-stage and counter provenance.
+- If the stored live stage already has no eligible replacement, an unrelated PATCH
+  must never call `clearExecutionStatePatch`. An untouched blocked hold stays blocked
+  with its cursor intact; otherwise reject with `422` before effects, retaining the
+  full issue snapshot. A failed request need not write `blocked`. This also covers
+  a missing current participant. An authorized policy-only CAS that supplies an
+  eligible participant can repair membership without importing or resetting state.
 - An escalated human participant remains authoritative even if absent from the
-  configured participant list. Neither assignment nor policy editing may convert
-  that hold back into an agent review. Resolve through the existing escalation gate.
+  configured participant list. Apply this exception before ordinary membership
+  validation: an agent candidate is not required to sustain the human hold.
+  Neither assignment nor policy editing may turn that hold back into an agent review.
 
 An untouched blocked gate stays blocked. Same-assignee requests are idempotent.
-A completed workflow retains completed IDs during ordinary reassignment; no review
-starts unless there is an actual new uncompleted stage. A new issue with no cursor
-and no evidence of a lost cycle still starts its first stage normally.
+Ordinary supported reassignment retains completed IDs and does not restart completed
+reviews. These guarantees apply to a retained cycle, not a deliberately abandoned one.
 
-For null state with recorded evidence of a previously live cycle, ordinary status
-advancement must fail closed rather than infer an empty completed-stage list. The
-transaction checks the existing decision/activity history for that issue. This is
-an indexed, issue-scoped read on an explicit workflow transition, not background
-polling. A decision-free first-stage loss requires the recorded state-clearing
-activity as well. Missing, inaccessible or ambiguous evidence cannot authorize
-reconstruction. Genuine fresh tasks must remain unaffected. Deliberate reopen and
-policy replacement need explicit abandonment evidence; absence of state alone is
-not such evidence. No new history index or table is proposed; measure the bounded
-lookup during implementation before claiming its cost is acceptable.
+### Inventory of clearing paths and the scope of classification
+
+The following references are to `server/src/services/issue-execution-policy.ts` at
+revision 1's source HEAD `d700bdf6ba01173b9f19c36bc7816a3a04b7904b`. Line numbers
+identify the reviewed baseline, not a new runtime implementation.
+
+| Existing path | Classification and revision 2 behavior | Evidence used by the transaction |
+| --- | --- | --- |
+| No policy, L697-705 | Existing policy removal/absence cleanup; preserve existing behavior, including return-to-executor behavior | Locked current policy/state and the authorized request's policy removal, if any; history alone cannot prove explicit removal |
+| Terminal done/cancelled reopened, L707-713 | Deliberate new cycle; preserve clearing and allow later normal first-stage start, even with old decisions | Locked terminal status and authorized requested nonterminal status |
+| Stored stage ID absent from replacement policy, L714-741 | Existing policy replacement/abandonment semantics; preserve the live-cycle `done` rejection and other allowed clear/return paths | Locked old state, effective policy and policy CAS/request; a pre-existing mismatch without an explicit edit is ambiguous historical drift |
+| Board pending done/cancelled, L658-662 | Existing explicit terminal override; preserve clearing and terminal status; neither override fabricates an approval | Authorized Board actor, explicit requested terminal status and locked pending state |
+| Live participant no longer belongs and selection fails, L796-813 | Accidental loss; reject the causing policy edit and retain/reject already-invalid state as described above | Effective live stage, stored participant/returnAssignee and actual eligible selection, after the escalation exception |
+| Board assignee-only non-participant/unassign, L948-976 | Accident path; reject with `422`, preserving snapshot and all decisions | Authorized assignment request, locked live state and effective stage membership |
+
+Classification here is an in-transaction branch decision using the locked snapshot
+and explicit request. It does not require scanning historical decisions. Explicit
+terminal operations keep their existing precedence over the assignee-only rejection;
+a combined Board done/cancel plus assignment request is not silently reclassified as
+assignee-only. Other pending status overrides retain their existing rejection rules.
+The two new guards must not intercept legitimate terminal/reopen paths. A live policy
+edit that retains a stage but strands its participants is the new rejection; blanket
+rejection of policy removal, stage-ID replacement, completed-stage edits or limit
+lowering is not part of this minimum patch. Existing validation still applies.
+
+### Historical null detection is a separate capability gap
+
+There is no established durable cycle-abandonment discriminator in this proposal.
+The ordinary route records `issue.updated` with `details.changes`, `details._previous`,
+updated fields and actor/run attribution. Reopen logging can also supply
+`details.reopened` and `details.reopenedFrom`. These are candidate evidence for
+individual investigation, not a demonstrated complete, atomic cycle ledger covering
+every writer, retention gap and historical deployment. Decisions alone cannot
+separate an intentional new cycle from a lost one; a first-stage loss may have no
+decision at all. This revision therefore withdraws the general history-based
+null-state fail-closed guard from the minimum prevention patch. It adds no historical
+lookup, inferred abandonment marker or restart ban for tasks with old decisions.
+Fresh tasks and legitimate reopen/policy replacement continue their normal start.
+The known lost incident remains blocked by its existing operational hold; the minimum
+patch does not automatically identify or protect every legacy null-state task.
+
+CTO must separately decide whether to authorize a durable classification contract in
+the existing mutation/audit transaction, with explicit transition reason, cycle
+identity, before/after state and policy, actor and version binding. This is a gap,
+not an existing action name or permission to add fields now. Until complete coverage
+is proven, an ambiguous historical null remains unclassified: do not reconstruct it
+or claim that ordinary advancement is globally blocked. Any future guard must use
+proven loss evidence for the current episode, honor later proven abandonment, and
+permit a fresh cycle after legitimate reopen/replacement. Incomplete history must
+never become evidence that a task is fresh or that it lost a cycle.
+
+Optional broader changes for CTO: reject Board done overrides, retain state on
+cancellation/reopen, or prohibit all destructive live policy changes. These alter
+existing escape semantics and are not prerequisites for the two-path correction.
+If selected later, define their abandonment evidence and migration behavior together
+with the classification contract; do not infer the new semantics from old null rows.
 
 ## Implementation decisions: incident recovery gap
 
@@ -198,13 +250,18 @@ reported as passing by this design PR.
 | Case | Observable acceptance |
 | --- | --- |
 | Pending review and approval; eligible reassignment | Same stage/index, IDs, decisions, count and return owner; no fabricated decision |
-| Non-participant, unassign, combined status override | 422 before stop/upload/comment effects; complete source snapshot unchanged |
+| Assignee-only non-participant or unassign | 422 before stop/upload/comment effects; complete source snapshot unchanged |
+| Board done/cancel, including combined assignment | Existing explicit terminal override succeeds and clears state; no fabricated decision; existing rejection of other pending statuses survives |
 | Completed reviews/workflow | No completed review restarts; completed workflow remains complete |
 | Policy slot replacement | Exact CAS; only pending principal changes; stage/slot IDs and old decision actors retained |
-| Policy removal/ID regeneration/limit lowering | Live-cycle destructive edit rejected; no cursor clearing |
+| Live stage loses eligible participants | Remove current principal without alternative, leave only returnAssignee, or remove all candidates: policy edit rejected with exact snapshot preserved |
+| Already-invalid live membership | Unrelated PATCH rejects or preserves untouched blocked hold; cursor never clears; eligible policy-only CAS repairs membership in the same stage |
+| Escalated human outside configured list | Human hold survives candidate validation even without an eligible configured agent |
+| Policy removal/stage-ID replacement | Existing clear/return behavior survives; existing live-cycle done rejection survives; later permitted new cycle starts normally with old decisions still attributed |
 | Escalation and limits | Human hold sticky; default/null limit 3; third consecutive agent change request escalates; explicit limits survive |
-| Fresh null versus lost null | Fresh issue enters first stage; evidenced lost review or approval refuses ordinary done/in_review |
-| Lost state without decisions | Clearing activity still blocks restart; missing proof refuses repair |
+| Fresh null and legitimate reopen | Fresh issue starts first stage; done/cancelled issue with old decisions reopens and later starts normally; no history-based false rejection |
+| Known lost null or decision-free loss | Incident remains operationally blocked; minimum patch claims no automatic legacy-null detection; missing/ambiguous proof refuses repair |
+| Future classification contract (conditional) | Proven current loss blocks restart; proven later abandonment permits a new cycle; incomplete history cannot classify either way |
 | Authentic recovery | Exact verified chain restored pending at index 2; blocked successor unchanged; zero decision inserts |
 | Wrong source/tenant/actor/run/stage/outcome | Denied or invalid; no writes, no wake, no evidence leakage |
 | Concurrent policy/state/version/owner drift | One admissible winner; stale request rejected under lock, even if statusVersion alone did not change |
@@ -212,13 +269,16 @@ reported as passing by this design PR.
 | Retry, response loss and replay | Same post-state returns one receipt; altered retry/later null cannot reuse consumed source |
 | Paused return author | Changes requested persists count/decision, blocks hand-back, does not resume or wake author |
 | Successor approval and external delivery | Restoration grants no approval; open upstream PR prevents final delivery; new code needs independent review |
-| Failure injection and cancellation | Evidence/audit/state/policy failure rolls back; intentional cancel/reopen cannot reset pending progress |
+| Failure injection | Evidence/audit/state/policy failure rolls back repair; no partial cursor, policy, decision or wake effects |
 | Post-commit publication failure | Committed receipt remains inspectable; no duplicate repair, decision or wake on retry |
 
 Minimum red/green path after authorization: reproduce non-participant clearing in the
-existing policy test; add route rejection and preservation assertions; exercise actual
-persistence for concurrent CAS, receipt deduplication and injected audit failure. Add
-recovery tests only after its scope is granted. Relevant existing suites are
+existing policy test; reproduce failed participant reselection; add route rejection,
+preservation and the terminal/reopen/policy-replacement counterexamples above.
+Exercise actual persistence for concurrent policy CAS. Add receipt deduplication,
+injected audit failure and recovery tests only after recovery scope is granted.
+Historical classification tests are conditional on its separate scope decision.
+Relevant existing suites are
 `issue-execution-policy.test.ts`, `issue-execution-policy-routes.test.ts` and
 `issue-execution-policy-persistence.test.ts` under server tests. Identify recovery test
 fixtures at implementation time; do not mistake a mocked route for a durable transaction.
@@ -248,7 +308,8 @@ Available: independently checked deployment diagnosis and source-transition evid
 existing route/transaction ownership and targeted suite names; this inspectable design.
 Private source IDs and exact historical SHA remain bound in the task plan/handoff.
 
-Still required: individual durable decision/provenance verification; proof that retained
+Still required: CTO scope decisions for optional escape-semantics changes and durable
+historical-null classification; individual durable decision/provenance verification; proof that retained
 activity has the full historical policy/state needed for safe restoration; authorized
 caller availability; all red/green and concurrency/fault tests; deployed-version and live
 read-back evidence. CI passing on documentation proves none of those runtime outcomes.
