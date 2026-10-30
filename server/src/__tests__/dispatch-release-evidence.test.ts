@@ -170,7 +170,10 @@ describe("isolated native release evidence", () => {
       const failure = error as { stdout: string; stderr: string; code: unknown };
       crashed = { stdout: failure.stdout, stderr: failure.stderr, code: failure.code };
     }
-    expect(crashed?.stdout).toContain("DISPATCH_CHILD_BEFORE_COMMIT");
+    expect(crashed?.stdout).toContain("DISPATCH_CHILD_BEFORE_COMMIT SIGKILL");
+    expect(crashed?.stdout).not.toContain("DISPATCH_CHILD_FINALLY");
+    expect(crashed?.code).toBe(1);
+    expect(crashed?.stderr).toContain("Worker exited unexpectedly with signal SIGKILL");
     const [retained] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wake.id));
     expect(retained).toMatchObject({ status: "deferred_issue_execution", runId: null, payload: f.wake.payload });
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.target.id))).toHaveLength(0);

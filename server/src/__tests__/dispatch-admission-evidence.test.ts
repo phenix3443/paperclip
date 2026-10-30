@@ -137,7 +137,10 @@ describe("isolated plugin wake admission evidence", () => {
       const failure = error as { stdout: string; stderr: string; code: unknown };
       crashed = { stdout: failure.stdout, stderr: failure.stderr, code: failure.code };
     }
-    expect(crashed?.stdout).toContain("DISPATCH_SDK_ACCEPTED_RESPONSE_LOST");
+    expect(crashed?.stdout).toContain("DISPATCH_SDK_ACCEPTED_RESPONSE_LOST SIGKILL");
+    expect(crashed?.stdout).not.toContain("DISPATCH_SDK_FINALLY");
+    expect(crashed?.code).toBe(1);
+    expect(crashed?.stderr).toContain("Worker exited unexpectedly with signal SIGKILL");
     const [receipt] = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.company.id),
       eq(agentWakeupRequests.idempotencyKey, "synthetic:sdk-process-response-loss")));
     expect(receipt.runId).toBeTruthy();

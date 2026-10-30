@@ -141,7 +141,11 @@ when the reviewer becomes idle. A matching intent remains held during manual or
 unknown pause. Stale submission, return owner, participant, responsible user or
 decision retires the old intent without rewriting the changed turn or history.
 The eligible original-reviewer control binds one queued successor across two
-service instances. An eligible legacy cancelled/issue_reassigned decided-review
+service instances. A separate matching-intent control pauses for quota, records
+the held receipt, explicitly restores eligibility in the fixture and advances
+the retry deadline clock. Reconciliation then binds that same receipt to one
+original-reviewer queued successor, preserving policy and history. This does not
+certify an automatic quota-release notification. An eligible legacy cancelled/issue_reassigned decided-review
 projection also continues through its existing native owner. Its retained receipt
 remains intact. A nine-case matrix exercises that owner with stale statusVersion,
 stage, decision, receipt source, action source, participant, return owner, assignee
@@ -163,7 +167,11 @@ in the PR and the attached archive manifest. The initial queue command failed
 with exit 254 because dependencies were absent. After offline installation it
 failed at import because SDK artifacts were absent. After the permitted
 dependency preparation, the existing queue suite passed 33 tests at both source
-versions. These setup failures are not dispatch-oracle failures.
+versions. These setup failures are not dispatch-oracle failures. The earlier nine-test
+positive-control selection also logged `CONNECTION_ENDED` during queued work
+after database teardown. Its exit-zero suite result is not evidence of clean
+shutdown. That log is retained; this test-only PR does not claim to fix it. The
+new evidence suites drain active executions before closing their database.
 
 Early fixture failures are retained in the evidence ledger: a stub event bus
 lacked `clear`; the first process control lacked its synthetic auth user; paused
@@ -172,6 +180,16 @@ comparison used a synthetic row without live process evidence; and the first
 deferred SDK fixture incorrectly used the same agent as lock holder. The final
 running control uses a real process barrier, and the deferred control uses a
 separate execution owner. These failures are not accepted as production bugs.
+
+The first worker-restart fixtures used `process.exit(73)`. Author self-review
+found that Vitest 5.0.3 intercepts that call and throws; those green checks
+proved exception rollback and host reconstruction, not an OS process crash.
+Their logs remain in the archive and their crash claim is withdrawn. The final
+fixtures synchronously write a fault marker, kill their own worker with
+`SIGKILL`, and check that its `finally` marker never ran before a fresh worker
+reuses the same isolated database. Supervisor errors are retained in each
+JSONL fault record. A failed initial copy command used the pinned directory as
+its own source root; the paths were corrected before final reproduction.
 
 No natural incident was replayed. No provider quota reset, live reviewer
 recovery, automatic gate-release notification, or

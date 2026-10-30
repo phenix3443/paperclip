@@ -1,3 +1,4 @@
+import { writeSync } from "node:fs";
 import { createDb } from "@paperclipai/db";
 import { describe, expect, it } from "vitest";
 import { createPostgresWakeQueueAdapter } from "../../modules/wake-queue/adapters/postgres.js";
@@ -17,8 +18,9 @@ describe.skipIf(!url)("isolated release process fixture", () => {
       if (key !== "transaction" || !crashing) return Reflect.get(target, key);
       const transaction: typeof db.transaction = (callback, options) => target.transaction(async tx => {
         await callback(tx);
-        process.stdout.write("DISPATCH_CHILD_BEFORE_COMMIT\n");
-        process.exit(73);
+        writeSync(1, "DISPATCH_CHILD_BEFORE_COMMIT SIGKILL\n");
+        process.kill(process.pid, "SIGKILL");
+        return await new Promise<never>(() => {});
       }, options);
       return transaction;
     } });
@@ -34,6 +36,6 @@ describe.skipIf(!url)("isolated release process fixture", () => {
       const result = await release({ companyId: companyId!, runId: runId!, now: new Date(), suppressImmediateRecovery: true });
       expect(result.outcome.kind).toBe("promoted");
       process.stdout.write("DISPATCH_CHILD_AFTER_COMMIT\n");
-    } finally { await db.$client.end(); }
+    } finally { writeSync(1, "DISPATCH_CHILD_FINALLY\n"); await db.$client.end(); }
   }, 30_000);
 });

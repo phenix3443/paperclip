@@ -1,7 +1,7 @@
 import { appendFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { activityLog, agents, agentWakeupRequests, authUsers, createDb, heartbeatRuns, issueExecutionDecisions, issueRecoveryActions, issues } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { seedReviewerIntent } from "./helpers/reviewer-intent.js";
@@ -139,6 +139,36 @@ describe("isolated original reviewer continuation evidence", () => {
     expect(after).toMatchObject({ status: "deferred_issue_execution", runId: null });
     expect(await snapshot(f.issueId)).toEqual(before);
     await evidence("paused-matching-intent", f, { pauseReason, receiptBefore: receipt, receiptAfter: after });
+  });
+
+  it("binds the same retained reviewer intent after explicit quota eligibility restoration", async () => {
+    const f = await seed(), before = await snapshot(f.issueId);
+    const receipt = await db.transaction(tx => createReviewerAssignmentIntent(tx, { companyId: f.companyId, issueId: f.issueId,
+      sourceRunId: f.source.id, requestedByActorType: "agent", requestedByActorId: f.source.agentId }));
+    expect(receipt).toBeTruthy();
+    await db.update(agents).set({ status: "paused", pauseReason: "quota" }).where(eq(agents.id, f.agentId));
+    await heartbeatService(db).reconcileReviewerAssignments();
+    const [held] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt!.id));
+    expect(held).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(0);
+    await db.update(agents).set({ status: "idle", pauseReason: null }).where(eq(agents.id, f.agentId));
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running", contextSnapshot: {} });
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 120_000);
+    try {
+      await heartbeatService(db).reconcileReviewerAssignments();
+      await heartbeatService(db).reconcileReviewerAssignments();
+    } finally { clock.mockRestore(); }
+    const [after] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt!.id));
+    expect(after).toMatchObject({ status: "coalesced", agentId: f.agentId });
+    expect(after.runId).toBeTruthy();
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId));
+    expect(runs.filter(run => run.status === "queued")).toHaveLength(1);
+    expect(runs.find(run => run.id === after.runId)).toMatchObject({ status: "queued", startedAt: null,
+      responsibleUserId: before.responsibleUserId, contextSnapshot: { issueId: f.issueId } });
+    expect(await snapshot(f.issueId)).toEqual(before);
+    await evidence("quota-paused-retained-intent-restored", f, { receiptBefore: receipt, heldReceipt: held, receiptAfter: after,
+      eligibilityRestoration: "explicit synthetic fixture update; native reconciliation after retry deadline; no automatic quota notification claimed",
+      providerStart: "absent; reviewer held busy by unrelated synthetic run" });
   });
 
   it.each(["submission", "return-owner", "participant", "responsible-user", "decision"])("retires a stale intent after the %s changes without rewriting review history", async changed => {

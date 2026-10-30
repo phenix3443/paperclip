@@ -1,3 +1,4 @@
+import { writeSync } from "node:fs";
 import { createDb } from "@paperclipai/db";
 import { describe, expect, it } from "vitest";
 import { buildHostServices } from "../../services/plugin-host-services.js";
@@ -20,11 +21,13 @@ describe.skipIf(!url)("isolated SDK process fixture", () => {
       expect(response.queued).toBe(true);
       expect(response.runId).toBeTruthy();
       if (process.env.DISPATCH_EVIDENCE_SDK_CRASH === "after-admission") {
-        process.stdout.write("DISPATCH_SDK_ACCEPTED_RESPONSE_LOST\n");
-        process.exit(73);
+        writeSync(1, "DISPATCH_SDK_ACCEPTED_RESPONSE_LOST SIGKILL\n");
+        process.kill(process.pid, "SIGKILL");
+        return await new Promise<never>(() => {});
       }
       process.stdout.write(`DISPATCH_SDK_RESPONSE ${JSON.stringify(response)}\n`);
     } finally {
+      writeSync(1, "DISPATCH_SDK_FINALLY\n");
       host.dispose();
       await db.$client.end();
     }
