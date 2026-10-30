@@ -1512,7 +1512,7 @@ describe("issue execution policy transitions", () => {
       const [firstStage, secondStage, addedStage] = policy.stages;
       const result = applyIssueExecutionPolicyTransition({
         issue: {
-          status: "done",
+          status: "in_progress",
           assigneeAgentId: coderAgentId,
           assigneeUserId: null,
           executionPolicy: policy,
