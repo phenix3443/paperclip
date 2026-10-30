@@ -2,6 +2,7 @@ import type { Db } from "@paperclipai/db";
 import {
   createAdmissionTransactionScope as buildAdmissionTransactionScope,
   createPostgresWakeQueueAdapter,
+  appendQueuedComment,
   createWakeAdmissionReader,
   createWakeAdmissionWriter,
 } from "./adapters/postgres.js";
@@ -94,6 +95,7 @@ export function createWakeQueue(db: Db, deps: WakeQueueDeps) {
   });
 
   return {
+    appendQueuedComment,
     releaseIssueExecution: createReleaseIssueExecution({ issueLock, recovery: deps.recovery }),
     admitWakeBehindIssueExecution: createAdmitWakeBehindIssueExecution({
       reader: createWakeAdmissionReader(),

@@ -60,6 +60,7 @@ export function continuationOriginCommentIds(context: unknown): string[] {
   return [
     ...new Set(
       [
+        ...(c.wakeReason === "issue_commented" && Array.isArray(c.wakeCommentIds) ? c.wakeCommentIds : []),
         c.commentId,
         c.latestCommentId,
         ...(Array.isArray(c.commentIds) ? c.commentIds : []),
@@ -289,7 +290,14 @@ export async function buildExecutionContinuation(input: {
   // Missing source rows cannot silently become a claim of complete context.
   if (originCommentIds.some((id) => !rows.some((row) => row.id === id)))
     throw new Error("continuation_source_context_missing");
-  const messages = rows.map((row) => {
+  const queueIds = input.context.wakeReason === "issue_commented" && Array.isArray(input.context.wakeCommentIds)
+    ? [...new Set(input.context.wakeCommentIds.filter((id): id is string => typeof id === "string"))] : [];
+  const queuedIds = new Set(queueIds);
+  const rowsById = new Map(rows.map(row => [row.id, row]));
+  const queuedRows = queueIds.flatMap(id => rowsById.has(id) ? [rowsById.get(id)!] : []);
+  let queuedIndex = 0;
+  const orderedRows = rows.map(row => queuedIds.has(row.id) ? queuedRows[queuedIndex++]! : row);
+  const messages = orderedRows.map((row) => {
     const safe = input.exposeLowTrustRaw
       ? row
       : sanitizeQuarantinedCommentForHigherTrust(row);
@@ -347,7 +355,8 @@ export async function buildExecutionContinuation(input: {
           ),
         }
       : undefined;
-  const latestRequest = messages.findLast(
+  const messagesById = new Map(messages.map(message => [message.id, message]));
+  const latestRequest = rows.map(row => messagesById.get(row.id)!).findLast(
     (row) =>
       row.authorType === "user" && !row.createdByRunId && !row.deleted && row.body.trim().length > 0,
   );
@@ -536,7 +545,7 @@ export async function buildExecutionContinuation(input: {
       .map((row) => row.id),
     coverage: {
       kind: "full_task_history",
-      throughCommentId: messages.at(-1)?.id ?? null,
+      throughCommentId: rows.at(-1)?.id ?? null,
       summaryThroughCommentId: null,
     },
   };

@@ -832,6 +832,7 @@ function createFakeAdmissionReader(overrides: Partial<WakeAdmissionReader> = {})
 
 function createFakeAdmissionWriter(overrides: Partial<WakeAdmissionWriter> = {}): WakeAdmissionWriter {
   return {
+    appendQueuedComment: vi.fn(async () => null),
     coalesceIntoActiveExecutionRun: vi.fn(async () => ({ id: "merged-run-1" })),
     mergeIntoExistingDeferredWake: vi.fn(async () => {}),
     insertNewDeferredWake: vi.fn(async () => {}),

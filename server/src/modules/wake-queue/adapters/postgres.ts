@@ -46,6 +46,7 @@ import { parseIssueExecutionState } from "../../../services/issue-execution-poli
 import {
   queuedCommentIdsFromWakePayload,
   withQueuedCommentIdsInWakePayload,
+  withQueuedCommentIdsInRunContext,
 } from "../../../services/issue-queued-comment-queue.js";
 import { CHAT_CONVERSATION_ID_KEY, extractWakeCommentIds } from "../../run-dispatch/index.js";
 import { hasInteractionContinuationWakeContext } from "../domain/context.js";
@@ -66,6 +67,8 @@ import type {
   LockedIssueExecution,
   ReleaseTransactionResult,
   RunSnapshot,
+  AppendQueuedCommentInput,
+  AppendQueuedCommentResult,
   WakeAdmissionReader,
   WakeAdmissionWriter,
   WakeQueueHost,
@@ -954,8 +957,92 @@ export function createWakeAdmissionReader(): WakeAdmissionReader {
   };
 }
 
+export async function appendQueuedComment(scope: TransactionScope, input: AppendQueuedCommentInput): Promise<AppendQueuedCommentResult> {
+  const tx = requireAdmissionTx(scope, input.companyId);
+  if (input.source !== "automation" || input.reason !== "issue_commented" || input.idempotencyKey || input.durableReceipt)
+    return null;
+  const payloadKeys = new Set(["issueId", "commentId", "mutation", "_paperclipWakeContext"]);
+  const contextKeys = new Set(["issueId", "taskId", "taskKey", "commentId", "wakeCommentId", "wakeCommentIds", "wakeReason", "wakeSource", "wakeTriggerDetail", "projectId", "source"]);
+  const ordinaryContext = (context: Record<string, unknown>) =>
+    (context.source === undefined || context.source === "issue.comment") &&
+    (context.wakeReason === undefined || context.wakeReason === "issue_commented") &&
+    (context.wakeSource === undefined || context.wakeSource === "automation");
+  const ordinaryPayload = (payload: Record<string, unknown>) =>
+    (payload.mutation === undefined || payload.mutation === "comment") &&
+    ordinaryContext(parseObject(payload._paperclipWakeContext)) &&
+    Object.keys(payload).every(key => payloadKeys.has(key)) &&
+    Object.keys(parseObject(payload._paperclipWakeContext)).every(key => contextKeys.has(key));
+  if (!ordinaryPayload(input.payload ?? {}) || !ordinaryContext(input.contextSnapshot) || !Object.keys(input.contextSnapshot).every(key => contextKeys.has(key)) ||
+      extractWakeCommentIds(input.contextSnapshot).some(id => id !== input.commentId) ||
+      (input.payload?.commentId && input.payload.commentId !== input.commentId) ||
+      [input.payload?.issueId, input.contextSnapshot.issueId, input.contextSnapshot.taskId, input.contextSnapshot.taskKey].some(id => id && id !== input.issueId)) return null;
+  const [issue] = await tx.select().from(issues).where(and(
+    eq(issues.companyId, input.companyId), eq(issues.id, input.issueId),
+  )).for("update");
+  if (!issue || issue.assigneeAgentId !== input.agentId || issue.conversationAgentId ||
+      (issue.executionRunId && issue.executionRunId !== input.targetRunId)) return null;
+  const [hint] = await tx.select({ wakeId: heartbeatRuns.wakeupRequestId }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.id, input.targetRunId),
+  ));
+  if (!hint?.wakeId) return null;
+  const [wake] = await tx.select().from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, input.companyId),
+    eq(agentWakeupRequests.agentId, input.agentId), eq(agentWakeupRequests.id, hint.wakeId),
+  )).for("update");
+  const [run] = await tx.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.id, input.targetRunId),
+  )).for("update");
+  if (!wake || !run || wake.status !== "queued" || run.status !== "queued" || run.startedAt ||
+      run.processStartedAt || run.processPid || run.processGroupId || run.runtimeModeResolvedAt || run.retryOfRunId ||
+      run.scheduledRetryAttempt > 0 || run.continuationAttempt > 0 || wake.runId !== run.id || run.wakeupRequestId !== wake.id)
+    return null;
+  if (wake.payload?.issueId !== issue.id || run.contextSnapshot?.issueId !== issue.id) return null;
+  const [comment] = await tx.select().from(issueComments).where(and(
+    eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, issue.id), eq(issueComments.id, input.commentId),
+  ));
+  if (!comment || comment.deletedAt || (input.requestedByActorType === "user" ? comment.authorUserId !== input.requestedByActorId :
+      input.requestedByActorType === "agent" ? comment.authorAgentId !== input.requestedByActorId : true)) return null;
+  if (!wake.idempotencyKey && wake.reason !== "issue_commented" && queuedCommentIdsFromWakePayload(wake.payload).length === 0) {
+    const rootPayload = parseObject(wake.payload);
+    const plainContext = (context: Record<string, unknown>) =>
+      (context.source === undefined || context.source === "issue.comment") && Object.keys(context).every(key =>
+      contextKeys.has(key));
+    if ((wake.source === "assignment" || wake.source === "on_demand") &&
+        Object.keys(rootPayload).every(key => ["issueId", "manualUserWake", "_paperclipWakeContext"].includes(key)) &&
+        plainContext(parseObject(rootPayload._paperclipWakeContext)) && plainContext(parseObject(run.contextSnapshot)))
+      return { kind: "legacy_root" };
+    return null;
+  }
+  if (run.invocationSource !== "automation" || wake.source !== "automation" || wake.reason !== "issue_commented" || wake.idempotencyKey ||
+      queuedCommentIdsFromWakePayload(wake.payload).length === 0 ||
+      wake.payload?.issueId !== issue.id || run.contextSnapshot?.issueId !== issue.id || !ordinaryPayload(parseObject(wake.payload)) ||
+      !ordinaryContext(parseObject(run.contextSnapshot)) ||
+      !Object.keys(parseObject(run.contextSnapshot)).every(key => contextKeys.has(key))) return null;
+  const ids = [...new Set([...queuedCommentIdsFromWakePayload(wake.payload), comment.id])];
+  const now = new Date();
+  const updatedWake = await tx.update(agentWakeupRequests).set({
+    payload: withQueuedCommentIdsInWakePayload(wake.payload, ids), updatedAt: now,
+  }).where(and(eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.agentId, input.agentId),
+    eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "queued"), eq(agentWakeupRequests.runId, run.id),
+  )).returning({ id: agentWakeupRequests.id });
+  const [updatedRun] = await tx.update(heartbeatRuns).set({
+    contextSnapshot: withQueuedCommentIdsInRunContext(run.contextSnapshot, ids), updatedAt: now,
+  }).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId),
+    eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued"), eq(heartbeatRuns.wakeupRequestId, wake.id), isNull(heartbeatRuns.startedAt),
+  )).returning();
+  if (updatedWake.length !== 1 || !updatedRun) throw new Error("wake-queue: queued comment append lost its locked target");
+  await tx.insert(agentWakeupRequests).values({
+    companyId: input.companyId, agentId: input.agentId, source: input.source, triggerDetail: input.triggerDetail,
+    reason: input.reason, payload: input.payload, status: "coalesced", coalescedCount: 1,
+    requestedByActorType: input.requestedByActorType, requestedByActorId: input.requestedByActorId,
+    idempotencyKey: input.idempotencyKey, runId: run.id, finishedAt: now,
+  });
+  return { kind: "appended", run: updatedRun as unknown as Record<string, unknown> };
+}
+
 export function createWakeAdmissionWriter(): WakeAdmissionWriter {
   return {
+    appendQueuedComment,
     async coalesceIntoActiveExecutionRun(scope, input) {
       const tx = requireAdmissionTx(scope, input.companyId);
       const now = new Date();
