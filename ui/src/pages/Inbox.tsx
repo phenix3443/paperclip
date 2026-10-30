@@ -2987,7 +2987,11 @@ function StreamlinedInbox({
                       ) : streamlinedUiEnabled ? (
                         <span data-slot="task-row-disclosure-spacer" className={cn("h-4 w-4 shrink-0", !nestingEnabled && "hidden sm:block")} aria-hidden="true" />
                       ) : undefined}
-                      statusSlot={streamlinedUiEnabled ? rowStatusIcon : undefined}
+                      statusSlot={streamlinedUiEnabled
+                        ? showStatus
+                          ? rowStatusIcon
+                          : <span className="inline-flex size-4" aria-hidden="true" data-testid="inbox-row-status-placeholder" />
+                        : undefined}
                       metadata={streamlinedUiEnabled ? (
                         <InboxIssueMetaLeading
                           issue={issue}
