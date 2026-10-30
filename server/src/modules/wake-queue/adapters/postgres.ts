@@ -1018,8 +1018,25 @@ export async function appendQueuedComment(scope: TransactionScope, input: Append
       run.processStartedAt || run.processPid || run.processGroupId || run.runtimeModeResolvedAt || run.retryOfRunId ||
       run.scheduledRetryAttempt > 0 || run.continuationAttempt > 0 || wake.runId !== run.id || run.wakeupRequestId !== wake.id)
     return null;
-  if (!wake.idempotencyKey && wake.reason !== "issue_commented" && queuedCommentIdsFromWakePayload(wake.payload).length === 0)
-    return { kind: "legacy_root" };
+  if (wake.payload?.issueId !== issue.id || run.contextSnapshot?.issueId !== issue.id) return null;
+  if (typeof run.contextSnapshot?.reviewerAssignmentGeneration === "string" &&
+      run.contextSnapshot.reviewerAssignmentGeneration !== issueExecutionGeneration(issue)) return null;
+  const [comment] = await tx.select().from(issueComments).where(and(
+    eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, issue.id), eq(issueComments.id, input.commentId),
+  ));
+  if (!comment || comment.deletedAt || (input.requestedByActorType === "user" ? comment.authorUserId !== input.requestedByActorId :
+      input.requestedByActorType === "agent" ? comment.authorAgentId !== input.requestedByActorId : true)) return null;
+  if ((!wake.idempotencyKey || run.activeIdentityContextId) && wake.reason !== "issue_commented" && queuedCommentIdsFromWakePayload(wake.payload).length === 0) {
+    const rootPayload = parseObject(wake.payload);
+    const plainContext = (context: Record<string, unknown>) =>
+      (context.source === undefined || context.source === "issue.comment") && Object.keys(context).every(key =>
+      contextKeys.has(key) || key === "reviewerAssignmentGeneration" || key === "executionIdentityCause");
+    if ((wake.source === "assignment" || wake.source === "on_demand") &&
+        Object.keys(rootPayload).every(key => ["issueId", "manualUserWake", "_paperclipWakeContext"].includes(key)) &&
+        plainContext(parseObject(rootPayload._paperclipWakeContext)) && plainContext(parseObject(run.contextSnapshot)))
+      return { kind: "legacy_root" };
+    return null;
+  }
   if (run.invocationSource !== "automation" || wake.source !== "automation" || wake.reason !== "issue_commented" || wake.idempotencyKey ||
       queuedCommentIdsFromWakePayload(wake.payload).length === 0 ||
       wake.payload?.issueId !== issue.id || run.contextSnapshot?.issueId !== issue.id || !ordinaryPayload(parseObject(wake.payload)) ||
@@ -1030,11 +1047,6 @@ export async function appendQueuedComment(scope: TransactionScope, input: Append
   const review = parseIssueExecutionState(issue.executionState);
   if (issue.status === "in_review" && review?.status === "pending" &&
       typeof run.contextSnapshot?.reviewerAssignmentGeneration !== "string") return null;
-  const [comment] = await tx.select().from(issueComments).where(and(
-    eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, issue.id), eq(issueComments.id, input.commentId),
-  ));
-  if (!comment || comment.deletedAt || (input.requestedByActorType === "user" ? comment.authorUserId !== input.requestedByActorId :
-      input.requestedByActorType === "agent" ? comment.authorAgentId !== input.requestedByActorId : true)) return null;
   const ids = [...new Set([...queuedCommentIdsFromWakePayload(wake.payload), comment.id])];
   const now = new Date();
   const updatedWake = await tx.update(agentWakeupRequests).set({

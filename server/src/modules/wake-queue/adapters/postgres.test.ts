@@ -217,15 +217,21 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     expect(after.wakes.find(row => row.id === wake.id)?.payload?._paperclipWakeContext).toMatchObject({ wakeCommentIds: comments.map(comment => comment.id) });
   });
 
-  it.each([false, true])("keeps non-comment roots with the existing owner unless immutable (immutable=%s)", async immutable => {
+  it.each(["mutable", "immutable", "source-proof", "interaction", "stale-generation", "actor"])("keeps only plain non-comment roots with the existing owner (%s)", async kind => {
     const { input, wake } = await seedAppendQueue();
     await db.update(agentWakeupRequests).set({ source: "assignment", reason: "execution_review_requested",
-      payload: { issueId: input.issueId }, idempotencyKey: immutable ? "immutable-source" : null,
+      payload: { issueId: input.issueId, ...(kind === "source-proof" ? { sourceRunId: randomUUID() } : {}),
+        ...(kind === "interaction" ? { interactionId: randomUUID() } : {}) },
+      idempotencyKey: kind === "immutable" ? "immutable-source" : null,
     }).where(eq(agentWakeupRequests.id, wake.id));
+    if (kind === "stale-generation") await db.update(heartbeatRuns).set({ contextSnapshot: {
+      issueId: input.issueId, reviewerAssignmentGeneration: "retired-generation",
+    } }).where(eq(heartbeatRuns.id, input.targetRunId));
+    if (kind === "actor") input.requestedByActorId = "forged";
     const before = await appendState(input.companyId);
     const result = await db.transaction(tx => createWakeAdmissionWriter().appendQueuedComment(
       createAdmissionTransactionScope(input.companyId, tx as unknown as Db), input));
-    expect(result).toEqual(immutable ? null : { kind: "legacy_root" });
+    expect(result).toEqual(kind === "mutable" ? { kind: "legacy_root" } : null);
     expect(await appendState(input.companyId)).toEqual(before);
   });
 
