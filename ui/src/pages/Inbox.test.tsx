@@ -680,7 +680,7 @@ describe("Inbox toolbar", () => {
     expect(container.querySelector('button[title="Group"]')).not.toBeNull();
     expect(container.querySelector('button[title="Columns"]')).not.toBeNull();
     expect(container.querySelector('button[title="Sort"]')).not.toBeNull();
-    expect(container.querySelector('button[title="Enable parent-child nesting"]')).toBeNull();
+    expect(container.querySelector('button[title$="parent-child nesting"]')).not.toBeNull();
     expect(container.textContent).not.toContain("Mark all as read");
 
     act(() => {

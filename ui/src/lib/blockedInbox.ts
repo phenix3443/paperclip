@@ -215,6 +215,42 @@ export function groupBlockedInboxRows(
   return groups;
 }
 
+export interface BlockedInboxTreeNode {
+  row: BlockedInboxIssueRow;
+  children: BlockedInboxTreeNode[];
+}
+
+/**
+ * Nests sorted rows under their parent issue when the parent is in the same list.
+ * Roots and each child list keep the input order. A row whose parent is absent stays a root.
+ * A parent cycle cannot hide rows: its members stay roots.
+ */
+export function nestBlockedInboxRows(rows: readonly BlockedInboxIssueRow[]): BlockedInboxTreeNode[] {
+  const byId = new Map(rows.map((row) => [row.issue.id, row]));
+  const parentOf = (row: BlockedInboxIssueRow): BlockedInboxIssueRow | null => {
+    const parentId = row.issue.parentId;
+    if (!parentId || parentId === row.issue.id) return null;
+    return byId.get(parentId) ?? null;
+  };
+  const inCycle = (row: BlockedInboxIssueRow): boolean => {
+    const seen = new Set<string>([row.issue.id]);
+    for (let parent = parentOf(row); parent; parent = parentOf(parent)) {
+      if (seen.has(parent.issue.id)) return true;
+      seen.add(parent.issue.id);
+    }
+    return false;
+  };
+  const nodes = new Map(rows.map((row) => [row.issue.id, { row, children: [] as BlockedInboxTreeNode[] }]));
+  const roots: BlockedInboxTreeNode[] = [];
+  for (const row of rows) {
+    const node = nodes.get(row.issue.id)!;
+    const parent = inCycle(row) ? null : parentOf(row);
+    if (parent) nodes.get(parent.issue.id)!.children.push(node);
+    else roots.push(node);
+  }
+  return roots;
+}
+
 export function blockedRowMatchesSearch(row: BlockedInboxIssueRow, query: string): boolean {
   const q = query.trim().toLowerCase();
   if (!q) return true;
