@@ -1209,6 +1209,11 @@ const timer = setInterval(() => { if (fs.existsSync(${JSON.stringify(gate)})) { 
       .patch(`/api/issues/${b.f.issueId}`).send({ status: "in_progress", comment: "The null case still throws." });
     expect(decided.status, JSON.stringify(decided.body)).toBe(200);
     await waitFor(async () => ["cancelled", "succeeded"].includes((await heartbeat.getRun(s!.id))?.status ?? ""), 10_000, "S to stop");
+    await waitFor(async () => {
+      const { executionRunId } = await readTask(b.f);
+      const run = executionRunId ? await heartbeat.getRun(executionRunId) : null;
+      return run?.agentId === b.f.authorId && run.status === "running";
+    }, 10_000, "the author's changes-requested turn to hold the task");
 
     const beforeOld = new Date();
     await heartbeat.wakeup(b.f.reviewerId, await authorReviewRequest(b.f));
