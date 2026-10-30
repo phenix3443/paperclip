@@ -385,6 +385,45 @@ describe("BlockedInboxView", () => {
     act(() => root.unmount());
   });
 
+  it("renders the inbox issue columns with the blocked owner in the Responsible cell", async () => {
+    mockIssuesApi.list.mockResolvedValue([
+      makeIssue(
+        "issue-columns",
+        "PAP-45",
+        "Waiting with project columns",
+        attention({
+          owner: { type: "agent", agentId: null, userId: null, label: "Charlie" },
+        }),
+      ),
+    ]);
+    const rendered: string[] = [];
+
+    const { root } = renderWithClient(
+      <BlockedInboxView
+        {...blockedViewProps}
+        presentation="task"
+        renderIssueColumns={(issue, responsible) => {
+          rendered.push(issue.id);
+          return (
+            <span>
+              <span data-testid="project-cell">Project X</span>
+              {responsible}
+            </span>
+          );
+        }}
+      />,
+      container,
+    );
+    await waitFor(() => container.textContent?.includes("Waiting with project columns") === true);
+
+    expect(rendered).toContain("issue-columns");
+    const columns = container.querySelector('[data-testid="blocked-row-issue-columns"]');
+    expect(columns?.querySelector('[data-testid="project-cell"]')?.textContent).toBe("Project X");
+    expect(columns?.querySelector('[data-testid="blocked-row-owner"]')?.textContent).toContain("Charlie");
+
+    act(() => root.unmount());
+  });
+
   it("filters rows by search query against title, identifier, owner and action", async () => {
     const issues: Issue[] = [
       makeIssue(

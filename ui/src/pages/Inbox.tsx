@@ -1760,6 +1760,47 @@ function StreamlinedInbox({
     if (!id) return null;
     return agentById.get(id) ?? null;
   };
+  const renderIssueTrailingColumns = (issue: Issue, columns: InboxIssueColumn[], assigneeContent?: ReactNode) => {
+    if (columns.length === 0) return undefined;
+    const project = issue.projectId ? projectById.get(issue.projectId) ?? null : null;
+    const assigneeUserProfile = issue.assigneeUserId
+      ? companyUserProfileMap.get(issue.assigneeUserId) ?? null
+      : null;
+    const originatingActor = deriveOriginatingActor(issue);
+    const originatingUserId = originatingActor?.kind === "user" ? originatingActor.id : null;
+    const originatingViaAgentId =
+      originatingActor?.kind === "user" ? originatingActor.viaAgentId ?? null : null;
+    return (
+      <InboxIssueTrailingColumns
+        issue={issue}
+        columns={columns}
+        projectName={project?.name ?? null}
+        projectColor={project?.color ?? null}
+        workspaceName={resolveIssueWorkspaceName(issue, {
+          executionWorkspaceById,
+          projectWorkspaceById,
+          defaultProjectWorkspaceIdByProjectId,
+        })}
+        assigneeName={agentName(issue.assigneeAgentId)}
+        assigneeAgent={agents?.find((agent) => agent.id === issue.assigneeAgentId)}
+        creatorAgent={agents?.find((agent) => agent.id === issue.createdByAgentId)}
+        assigneeUserName={
+          formatAssigneeUserLabel(issue.assigneeUserId, currentUserId, companyUserLabelMap)
+          ?? assigneeUserProfile?.label
+          ?? null
+        }
+        assigneeUserAvatarUrl={assigneeUserProfile?.image ?? null}
+        creatorAgentName={agentName(issue.createdByAgentId)}
+        creatorUserName={originatingUserId ? (companyUserProfileMap.get(originatingUserId)?.label ?? null) : null}
+        creatorUserAvatarUrl={originatingUserId ? (companyUserProfileMap.get(originatingUserId)?.image ?? null) : null}
+        viaAgentName={originatingViaAgentId ? agentName(originatingViaAgentId) : null}
+        currentUserId={currentUserId}
+        parentIdentifier={issue.parentId ? (issueById.get(issue.parentId)?.identifier ?? null) : null}
+        parentTitle={issue.parentId ? (issueById.get(issue.parentId)?.title ?? null) : null}
+        assigneeContent={assigneeContent}
+      />
+    );
+  };
   const setIssueColumns = useCallback((next: InboxIssueColumn[]) => {
     const normalized = normalizeInboxIssueColumns(next);
     setVisibleIssueColumns(normalized);
@@ -2836,6 +2877,8 @@ function StreamlinedInbox({
           showIdentifierColumn={visibleIssueColumnSet.has("id") && availableIssueColumnSet.has("id")}
           showUpdatedColumn={visibleIssueColumnSet.has("updated") && availableIssueColumnSet.has("updated")}
           showResponsibleColumn={visibleIssueColumnSet.has("assignee") && availableIssueColumnSet.has("assignee")}
+          renderIssueColumns={(issue: Issue, responsible: ReactNode) =>
+            renderIssueTrailingColumns(issue, visibleTaskDataColumns, responsible)}
           presentation={streamlinedUiEnabled ? "task" : "legacy"}
         />
         </div>
@@ -2896,14 +2939,6 @@ function StreamlinedInbox({
                   const isUnread = issue.isUnreadForMe && !fadingOutIssues.has(issue.id);
                   const isFading = fadingOutIssues.has(issue.id);
                   const isArchiving = archivingIssueIds.has(issue.id);
-                  const project = issue.projectId ? projectById.get(issue.projectId) ?? null : null;
-                  const assigneeUserProfile = issue.assigneeUserId
-                    ? companyUserProfileMap.get(issue.assigneeUserId) ?? null
-                    : null;
-                  const originatingActor = deriveOriginatingActor(issue);
-                  const originatingUserId = originatingActor?.kind === "user" ? originatingActor.id : null;
-                  const originatingViaAgentId =
-                    originatingActor?.kind === "user" ? originatingActor.viaAgentId ?? null : null;
                   const isLive = liveIssueIds.has(issue.id);
                   const loadedSubtreeLiveCount = subtreeLiveCounts.get(issue.id) ?? 0;
                   const liveDescendantCount = resolveIssueLiveDescendantCount(issue, loadedSubtreeLiveCount);
@@ -3025,37 +3060,10 @@ function StreamlinedInbox({
                       onMarkRead={() => markReadMutation.mutate(issue.id)}
                       onArchive={allowArchive ? () => archiveIssueMutation.mutate(issue.id) : undefined}
                       archiveDisabled={isArchiving}
-                      desktopTrailing={
-                        (streamlinedUiEnabled ? visibleTaskDataColumns : visibleTrailingIssueColumns).length > 0 ? (
-                          <InboxIssueTrailingColumns
-                            issue={issue}
-                            columns={streamlinedUiEnabled ? visibleTaskDataColumns : visibleTrailingIssueColumns}
-                            projectName={project?.name ?? null}
-                            projectColor={project?.color ?? null}
-                            workspaceName={resolveIssueWorkspaceName(issue, {
-                              executionWorkspaceById,
-                              projectWorkspaceById,
-                              defaultProjectWorkspaceIdByProjectId,
-                            })}
-                            assigneeName={agentName(issue.assigneeAgentId)}
-                            assigneeAgent={agents?.find((agent) => agent.id === issue.assigneeAgentId)}
-                            creatorAgent={agents?.find((agent) => agent.id === issue.createdByAgentId)}
-                            assigneeUserName={
-                              formatAssigneeUserLabel(issue.assigneeUserId, currentUserId, companyUserLabelMap)
-                              ?? assigneeUserProfile?.label
-                              ?? null
-                            }
-                            assigneeUserAvatarUrl={assigneeUserProfile?.image ?? null}
-                            creatorAgentName={agentName(issue.createdByAgentId)}
-                            creatorUserName={originatingUserId ? (companyUserProfileMap.get(originatingUserId)?.label ?? null) : null}
-                            creatorUserAvatarUrl={originatingUserId ? (companyUserProfileMap.get(originatingUserId)?.image ?? null) : null}
-                            viaAgentName={originatingViaAgentId ? agentName(originatingViaAgentId) : null}
-                            currentUserId={currentUserId}
-                            parentIdentifier={issue.parentId ? (issueById.get(issue.parentId)?.identifier ?? null) : null}
-                            parentTitle={issue.parentId ? (issueById.get(issue.parentId)?.title ?? null) : null}
-                          />
-                        ) : undefined
-                      }
+                      desktopTrailing={renderIssueTrailingColumns(
+                        issue,
+                        streamlinedUiEnabled ? visibleTaskDataColumns : visibleTrailingIssueColumns,
+                      )}
                       trailingMeta={streamlinedUiEnabled && showTaskTimestamp ? issueActivityTimestamp(issue) : null}
                     />
                   );
