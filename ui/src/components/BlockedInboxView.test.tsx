@@ -424,6 +424,59 @@ describe("BlockedInboxView", () => {
     act(() => root.unmount());
   });
 
+  describe("parent-child nesting", () => {
+    const parent = makeIssue("issue-parent", "PAP-50", "Parent work", attention({ reason: "blocked_chain_stalled" }));
+    const child = { ...makeIssue("issue-child", "PAP-51", "Child work", attention({ reason: "blocked_chain_stalled" })), parentId: "issue-parent" };
+
+    it("shows a listed child under its parent and collapses it", async () => {
+      mockIssuesApi.list.mockResolvedValue([child, parent]);
+
+      const { root } = renderWithClient(<BlockedInboxView {...blockedViewProps} presentation="task" nestingEnabled />, container);
+      await waitFor(() => container.textContent?.includes("Child work") === true);
+
+      const text = container.textContent ?? "";
+      expect(text.indexOf("Parent work")).toBeLessThan(text.indexOf("Child work"));
+      const disclosure = container.querySelector<HTMLButtonElement>('[data-testid="blocked-row-disclosure"]');
+      expect(disclosure?.getAttribute("aria-expanded")).toBe("true");
+
+      act(() => disclosure!.click());
+      expect(container.textContent).not.toContain("Child work");
+      expect(container.querySelector('[data-testid="blocked-row-child-count"]')?.textContent).toBe("(1 sub-task)");
+
+      act(() => root.unmount());
+    });
+
+    it("keeps rows flat when nesting is off", async () => {
+      mockIssuesApi.list.mockResolvedValue([child, parent]);
+
+      const { root } = renderWithClient(<BlockedInboxView {...blockedViewProps} presentation="task" />, container);
+      await waitFor(() => container.textContent?.includes("Child work") === true);
+
+      expect(container.querySelector('[data-testid="blocked-row-disclosure"]')).toBeNull();
+
+      act(() => root.unmount());
+    });
+
+    it("does not nest a child under a parent in another group", async () => {
+      const externalChild = {
+        ...makeIssue("issue-child", "PAP-51", "Child work", attention({ reason: "external_owner_action" })),
+        parentId: "issue-parent",
+      };
+      mockIssuesApi.list.mockResolvedValue([externalChild, parent]);
+
+      const { root } = renderWithClient(
+        <BlockedInboxView {...blockedViewProps} groupBy="blocker_type" presentation="task" nestingEnabled />,
+        container,
+      );
+      await waitFor(() => container.textContent?.includes("Child work") === true);
+
+      expect(container.querySelector('[data-testid="blocked-row-disclosure"]')).toBeNull();
+      expect(container.querySelector('[data-testid="blocked-inbox-group-external_wait"]')?.textContent).toContain("Child work");
+
+      act(() => root.unmount());
+    });
+  });
+
   it("filters rows by search query against title, identifier, owner and action", async () => {
     const issues: Issue[] = [
       makeIssue(

@@ -20,6 +20,7 @@ import {
   compareBlockedRows,
   formatStoppedAge,
   groupBlockedInboxRows,
+  nestBlockedInboxRows,
   sortBlockedInboxRows,
   type BlockedInboxIssueRow,
 } from "./blockedInbox";
@@ -271,5 +272,34 @@ describe("blockedInbox", () => {
     expect(formatStoppedAge("2026-05-09T20:00:00.000Z", now)).toBe("stopped 4h");
     expect(formatStoppedAge("2026-05-07T00:00:00.000Z", now)).toBe("stopped 3d");
     expect(formatStoppedAge("2026-04-15T00:00:00.000Z", now)).toBe("stopped 3w");
+  });
+});
+
+describe("nestBlockedInboxRows", () => {
+  const rowsFor = (specs: Array<[string, string | null]>) =>
+    buildBlockedInboxRows(specs.map(([id, parentId]) => makeIssue({ id, parentId, title: id }, makeAttention())));
+  const shape = (nodes: ReturnType<typeof nestBlockedInboxRows>): unknown =>
+    nodes.map((node) => (node.children.length ? { [node.row.issue.id]: shape(node.children) } : node.row.issue.id));
+
+  it("nests children under a listed parent and keeps the input order", () => {
+    const nested = nestBlockedInboxRows(rowsFor([
+      ["child-b", "parent"],
+      ["parent", null],
+      ["grandchild", "child-a"],
+      ["child-a", "parent"],
+      ["orphan", "missing-parent"],
+    ]));
+
+    expect(shape(nested)).toEqual([{ parent: ["child-b", { "child-a": ["grandchild"] }] }, "orphan"]);
+  });
+
+  it("keeps rows of a parent cycle as roots", () => {
+    const nested = nestBlockedInboxRows(rowsFor([
+      ["a", "b"],
+      ["b", "a"],
+      ["self", "self"],
+    ]));
+
+    expect(shape(nested)).toEqual(["a", "b", "self"]);
   });
 });
