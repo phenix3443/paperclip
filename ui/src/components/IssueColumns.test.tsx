@@ -169,7 +169,7 @@ describe("InboxIssueTrailingColumns Responsible", () => {
         parentTitle={null}
       />,
     );
-    expect(container?.querySelector('[title="A very long board user display name"]')).not.toBeNull();
+    expect(document.body.querySelector('[title="A very long board user display name"]')).not.toBeNull();
   });
 });
 
