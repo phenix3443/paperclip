@@ -1,0 +1,16 @@
+{
+  "baseline": "fdbafff72d8fd6ae7f12eb5827631efc67d208f3",
+  "candidate": "6cda8f0c46636f8abd42375e57794cff59da258a",
+  "upstreamMerge": "100477e8876f51add368554643e073a2d1c1becf",
+  "packageRunId": 41018500178,
+  "packageArtifactId": 12961445041,
+  "packageArtifactName": "paperclip-payload-6cda8f0c46636f8abd42375e57794cff59da258a",
+  "workspaces": 75,
+  "trackedFiles": 11480,
+  "skills": 50,
+  "warmups": 2,
+  "requests": 20,
+  "concurrency": [1, 4],
+  "batchDeadlineMs": 120000,
+  "cacheExpiryWaitMs": 31000
+}
