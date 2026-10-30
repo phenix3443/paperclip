@@ -222,7 +222,7 @@ export interface HeartbeatQueueDependencies extends Pick<HeartbeatRetryDependenc
   budgets: Pick<ReturnType<typeof budgetService>, "getInvocationBlock">;
   instanceSettings: Pick<ReturnType<typeof instanceSettingsService>, "getExperimental">;
   runDispatch: Pick<ReturnType<typeof createRunDispatch>, "cancelStaleQueuedRun">;
-  wakeQueue: Pick<ReturnType<typeof createWakeQueue>, "createAdmissionTransactionScope" | "admitWakeBehindIssueExecution">;
+  wakeQueue: Pick<ReturnType<typeof createWakeQueue>, "createAdmissionTransactionScope" | "admitWakeBehindIssueExecution" | "appendQueuedComment">;
   activeRunExecutions: Set<string>;
   activeRunExecutionPromises: Set<Promise<void>>;
   activeWakeupPromises: Set<Promise<unknown>>;
@@ -4808,7 +4808,23 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       ? null
       : filterZombieCoalesceTarget(rawCoalescedTarget, liveRunExecutions);
 
-    if (coalescedTargetRun) {
+    let commentAppend: Awaited<ReturnType<typeof wakeQueue.appendQueuedComment>> = null;
+    if (coalescedTargetRun && wakeCommentId) {
+      const queueIssueId = readNonEmptyString(enrichedContextSnapshot.issueId) ?? taskKey;
+      commentAppend = queueIssueId && isUuidLike(queueIssueId)
+        ? await db.transaction(tx => wakeQueue.appendQueuedComment(
+            wakeQueue.createAdmissionTransactionScope(agent.companyId, tx as unknown as Db), {
+              companyId: agent.companyId, issueId: queueIssueId, agentId,
+              targetRunId: coalescedTargetRun.id, contextSnapshot: enrichedContextSnapshot, commentId: wakeCommentId,
+              source, triggerDetail, reason, payload,
+              requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+              idempotencyKey: opts.idempotencyKey ?? null,
+            })) : null;
+      if (commentAppend?.kind === "appended") return commentAppend.run as typeof heartbeatRuns.$inferSelect;
+    }
+
+    if (coalescedTargetRun && (!wakeCommentId || commentAppend?.kind === "legacy_root")) {
       const mergedContextSnapshot = mergeCoalescedContextSnapshot(
         coalescedTargetRun.contextSnapshot,
         enrichedContextSnapshot,
