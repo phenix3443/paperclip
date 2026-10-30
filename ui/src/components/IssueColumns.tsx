@@ -73,8 +73,8 @@ export function issueActivityText(issue: Issue): string {
 function issueTrailingGridTemplate(columns: InboxIssueColumn[]): string {
   return columns
     .map((column) => {
-      // Responsible names such as "paperclipai/paperclip maintainers" need more than 8rem.
-      if (column === "assignee") return "minmax(6rem, 14rem)";
+      // "paperclipai/paperclip maintainers" plus its avatar needs about 15.25rem.
+      if (column === "assignee") return "minmax(6rem, 16rem)";
       if (column === "kickedOffBy") return "minmax(6rem, 8rem)";
       if (column === "project") return "minmax(4.5rem, 7rem)";
       if (column === "workspace") return "minmax(6rem, 9rem)";
