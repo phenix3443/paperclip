@@ -1,11 +1,12 @@
 import { and, asc, eq, gte, or, sql } from "drizzle-orm";
-import { agentWakeupRequests, heartbeatRuns, issues, type Db } from "@paperclipai/db";
+import { agentWakeupRequests, agents, heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
 import { parseIssueExecutionState } from "../issue-execution-policy.js";
 import { isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";
 import type { WakeupOptions } from "./run-preparation.js";
 
 const DEFERRED_STATUS = "deferred_issue_execution";
+const INVOKABLE_AGENT_STATUSES = new Set(["idle", "running", "active"]);
 const WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -21,9 +22,13 @@ export type DeferredOwnerWake = { agentId: string; deferredWakeId: string; opts:
  * that run is a reassigned owner's run and it ends by an operator stop, an acknowledged
  * reassignment stop or a stale-dispatch cancel, the release drain does not promote other agents'
  * wakes, so the new owner's wake waits forever. This selects the oldest such wake for the current
- * owner (the pending review participant, else the assignee), so the end event can admit it once.
- * It returns null while another live run still holds the task, and for a stale wake (closed task,
- * other review stage or participant, or a newer run of the owner on the task).
+ * assignee, so the end event can admit it once. It returns null while another live run still holds
+ * the task, for a stale wake (closed task, other assignee, or a newer run of the assignee on the
+ * task) and for a paused or otherwise not invokable assignee.
+ *
+ * Two kinds of deferred wake stay with their own paths. The ended run's own agent keeps its
+ * queued input after a Stop until the next explicit wake adopts it. A review-stage wake follows
+ * the review continuation and its parked-request rules.
  */
 export async function selectDeferredOwnerWake(
   db: Db,
@@ -48,11 +53,14 @@ async function select(
     if (holder && !isHeartbeatRunTerminalStatus(holder.status)) return null;
   }
 
-  const state = parseIssueExecutionState(issue.executionState);
-  const participant = state?.status === "pending" && state.currentParticipant?.type === "agent"
-    ? state.currentParticipant.agentId : null;
-  const agentId = participant ?? (issue.assigneeUserId ? null : issue.assigneeAgentId);
+  const agentId = issue.assigneeUserId ? null : issue.assigneeAgentId;
   if (!agentId) return null;
+  const [ended] = await db.select({ agentId: heartbeatRuns.agentId }).from(heartbeatRuns)
+    .where(eq(heartbeatRuns.id, input.endedRunId));
+  if (!ended || ended.agentId === agentId) return null;
+  const [owner] = await db.select({ status: agents.status }).from(agents)
+    .where(and(eq(agents.companyId, input.companyId), eq(agents.id, agentId)));
+  if (!owner || !INVOKABLE_AGENT_STATUSES.has(owner.status)) return null;
 
   const [deferred] = await db.select().from(agentWakeupRequests).where(and(
     ordinaryWakeRequestPredicate(),
@@ -65,8 +73,7 @@ async function select(
 
   const payload = record(deferred.payload) ?? {};
   const context = record(payload[WAKE_CONTEXT_KEY]);
-  const stage = record(payload.executionStage);
-  if (stage && (state?.status !== "pending" || state.currentStageId !== stage.stageId || participant !== agentId)) return null;
+  if (record(payload.executionStage) || parseIssueExecutionState(issue.executionState)?.status === "pending") return null;
 
   const [newerRun] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId),

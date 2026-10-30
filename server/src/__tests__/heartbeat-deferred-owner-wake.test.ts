@@ -81,6 +81,20 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await deferredRow(f)).toMatchObject({ status: "deferred_issue_execution" });
   }, 60_000);
 
+  it("leaves the stopped agent's own deferred input and a paused owner's wake deferred", async () => {
+    const f = await seed();
+    // The previous owner's own queued input waits for its next explicit wake after a Stop.
+    await db.update(issues).set({ assigneeAgentId: f.previousId }).where(eq(issues.id, f.issueId));
+    await db.update(agentWakeupRequests).set({ agentId: f.previousId }).where(eq(agentWakeupRequests.id, f.deferred.id));
+    expect(await select(f)).toBeNull();
+
+    await db.update(issues).set({ assigneeAgentId: f.ownerId }).where(eq(issues.id, f.issueId));
+    await db.update(agentWakeupRequests).set({ agentId: f.ownerId }).where(eq(agentWakeupRequests.id, f.deferred.id));
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.ownerId));
+    expect(await select(f)).toBeNull();
+    expect(await deferredRow(f)).toMatchObject({ status: "deferred_issue_execution" });
+  }, 60_000);
+
   it("waits while another live run still holds the task", async () => {
     const f = await seed();
     const [other] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.previousId, status: "running",
