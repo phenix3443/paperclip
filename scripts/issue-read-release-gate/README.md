@@ -42,6 +42,8 @@ cannot mask an unsafe inspection result. A PATH shim delays only `git status`;
 the production Git scheduler must time out that real child. A failed inspection
 must block archive with 409 and retain the active workspace. Existing workspace
 expiration/finalization and close-route suites run beside the probe in CI.
+The heartbeat finalization branch-guard suite exercises the real heartbeat
+service with PostgreSQL and Git. Only the adapter execution is synthetic.
 
 Run only in an isolated CI checkout with dependencies prepared:
 

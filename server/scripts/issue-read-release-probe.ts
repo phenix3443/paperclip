@@ -91,7 +91,7 @@ try {
   }
   await db.insert(agents).values({
     id: agentId, companyId, name: "Fixture reader", adapterType: "codex_local", status: "paused",
-    adapterConfig: { cwd: repo, paperclipSkills: desiredSkills },
+    adapterConfig: { cwd: repo, paperclipSkillSync: { desiredSkills } },
   });
   const records: { issueId: string; workspaceId: string; cwd: string; serviceId: string }[] = [];
   for (let index = 0; index < manifest.workspaces; index++) {
@@ -150,7 +150,13 @@ try {
   process.env.GIT_TRACE = trace;
   const checkWorkspace = (body: Record<string, any>, index: number) => {
     assert.equal(body.currentExecutionWorkspace.id, records[index].workspaceId);
-    assert.ok(body.currentExecutionWorkspace.runtimeServices.some((row: { id: string }) => row.id === records[index].serviceId));
+    const runtime = body.currentExecutionWorkspace.runtimeServices.find((row: { id: string }) => row.id === records[index].serviceId);
+    assert.ok(runtime);
+    if (arm === "candidate") {
+      assert.equal(runtime.status, "running");
+      assert.equal(runtime.healthStatus, "healthy");
+      assert.equal(runtime.url, "http://127.0.0.1:1");
+    }
   };
   for (let warmup = 0; warmup < manifest.warmups; warmup++) {
     for (const name of ["detail", "context"] as const) {
@@ -164,17 +170,6 @@ try {
   }
   for (const phase of ["warm", "past-cache-ttl"]) {
     if (phase === "past-cache-ttl") await new Promise(resolve => setTimeout(resolve, manifest.cacheExpiryWaitMs));
-    const before = await traceCounts();
-    const coverageSignal = AbortSignal.timeout(manifest.batchDeadlineMs);
-    for (const name of ["detail", "context"] as const) {
-      for (let index = 0; index < records.length; index++) checkWorkspace(await request(urls[name](index), coverageSignal), index);
-    }
-    const after = await traceCounts();
-    const result = { phase, distinctWorkspaces: records.length, requests: records.length * 2,
-      scans: after.scans - before.scans, commands: after.commands - before.commands };
-    coverage.push(result);
-    if (arm === "candidate") assert.equal(result.commands, 0, "metadata reads must cause no Git work");
-    if (arm === "baseline" && phase === "past-cache-ttl") assert.ok(result.scans > 0, "expired baseline cache must reproduce scans");
     for (const concurrency of manifest.concurrency) {
       for (const name of ["detail", "context", "list", "skills"] as const) {
         const start = performance.now();
@@ -211,6 +206,16 @@ try {
         if (arm === "candidate" && (name === "detail" || name === "context")) assert.equal(result.gitCommands, 0);
       }
     }
+    const before = await traceCounts();
+    const coverageSignal = AbortSignal.timeout(manifest.batchDeadlineMs);
+    for (const name of ["detail", "context"] as const) {
+      for (let index = 0; index < records.length; index++) checkWorkspace(await request(urls[name](index), coverageSignal), index);
+    }
+    const after = await traceCounts();
+    const result = { phase, distinctWorkspaces: records.length, requests: records.length * 2,
+      scans: after.scans - before.scans, commands: after.commands - before.commands };
+    coverage.push(result);
+    if (arm === "candidate") assert.equal(result.commands, 0, "metadata reads must cause no Git work");
   }
   if (arm === "baseline") {
     assert.ok((await traceCounts()).scans > 0, "baseline must reproduce actual Git scan cost");
@@ -291,11 +296,20 @@ try {
   process.env.PATH = originalPath;
   if (originalTrace === undefined) delete process.env.GIT_TRACE;
   else process.env.GIT_TRACE = originalTrace;
-  await fs.writeFile(path.join(output, `${arm}.json`), JSON.stringify(report, null, 2));
   await fs.copyFile(trace, path.join(output, `${arm}.git.trace`)).catch(() => {});
   server?.closeAllConnections();
-  if (server) await new Promise<void>(resolve => server!.close(() => resolve()));
-  await db.$client.end({ timeout: 0 });
-  await database.cleanup();
-  await fs.rm(root, { recursive: true, force: true });
+  for (const cleanup of [
+    async () => { if (server) await new Promise<void>((resolve, reject) => server!.close(error => error ? reject(error) : resolve())); },
+    async () => { await db.$client.end({ timeout: 0 }); },
+    async () => { await database.cleanup(); },
+    async () => { await fs.rm(root, { recursive: true, force: true }); },
+  ]) {
+    try { await cleanup(); }
+    catch (error) {
+      report.passed = false;
+      report.cleanupError = `${report.cleanupError ?? ""}\n${String(error)}`;
+      process.exitCode = 1;
+    }
+  }
+  await fs.writeFile(path.join(output, `${arm}.json`), JSON.stringify(report, null, 2));
 }

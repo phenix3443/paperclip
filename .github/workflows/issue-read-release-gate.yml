@@ -6,6 +6,7 @@ on:
     paths:
       - scripts/issue-read-release-gate/**
       - server/scripts/issue-read-release-probe.ts
+      - server/src/__tests__/issue-read-evidence-comparison.test.ts
       - .github/workflows/issue-read-release-gate.yml
 
 permissions:
@@ -99,6 +100,7 @@ jobs:
             ) >"$RUNNER_TEMP/evidence/$arm.log" 2>&1 || touch "$RUNNER_TEMP/evidence/$arm.failed"
             rm -rf "$runtime" "$TMPDIR" "$PAPERCLIP_HOME"
           done
+          unset TMPDIR PAPERCLIP_HOME
           node scripts/issue-read-release-gate/compare.mjs "$RUNNER_TEMP/evidence"
       - name: Run candidate close and finalization regression suites
         if: success() || failure()
@@ -108,16 +110,30 @@ jobs:
           sha="$(node -p "require('./scripts/issue-read-release-gate/manifest.json').candidate")"
           mkdir -p "$runtime"
           git archive "$sha" | tar -x -C "$runtime"
+          cp "$GITHUB_WORKSPACE/server/src/__tests__/issue-read-evidence-comparison.test.ts" "$runtime/server/src/__tests__/issue-read-evidence-comparison.test.ts"
+          mkdir -p "$runtime/scripts/issue-read-release-gate"
+          cp "$GITHUB_WORKSPACE/scripts/issue-read-release-gate/"* "$runtime/scripts/issue-read-release-gate/"
+          export TMPDIR="$RUNNER_TEMP/tmp-finalization"
+          export PAPERCLIP_HOME="$RUNNER_TEMP/paperclip-finalization"
+          mkdir -p "$TMPDIR" "$PAPERCLIP_HOME"
           cd "$runtime"
           pnpm install --frozen-lockfile
           pnpm --filter @paperclipai/server prepare:runner-vendor
           pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
           timeout --kill-after=10s 600s pnpm exec vitest run \
+            server/src/__tests__/issue-read-evidence-comparison.test.ts \
             server/src/__tests__/issues-goal-context-routes.test.ts \
             server/src/__tests__/issue-closed-workspace-routes.test.ts \
             server/src/__tests__/git-workspace-expiration.test.ts \
+            server/src/__tests__/heartbeat-workspace-finalize-branch.test.ts \
             server/src/__tests__/workspace-git-inspection-cache.test.ts \
             --maxWorkers=1 --reporter=default --reporter=json --outputFile="$RUNNER_TEMP/evidence/regressions.json"
+          node --input-type=module <<'JS'
+          import fs from 'node:fs';
+          const file = `${process.env.RUNNER_TEMP}/evidence/regressions.json`;
+          const result = JSON.parse(fs.readFileSync(file));
+          if (!result.success || result.numFailedTests || result.numPendingTests || result.numTodoTests || !(result.numPassedTests > 0)) throw Error('regressions must run without failures or skips');
+          JS
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
         with:
