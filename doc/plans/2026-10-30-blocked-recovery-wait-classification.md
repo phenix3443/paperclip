@@ -23,7 +23,10 @@ Line numbers below are at `ef5f0415`.
   - stranded escalation creates board-owned action with `board_escalation_no_takeover_v1` 2600-2640
   - `reconcileResolvedDependencyWakeBackstop` 6237-6530; self-blocked skip 6429
 - `server/src/index.ts` 1823 (startup) and 2005 (periodic recovery tick): both call `heartbeat.reconcileResolvedDependencyWakes()`, a thin wrapper (`heartbeat.ts` 1658) over the backstop. The run-completion path (`heartbeat/run-completion.ts` 1026) calls it scoped to one finished blocker.
-- `server/src/services/execution-recovery-resolution.ts` 625-740 (`preserve_without_replay_v1` settlement)
+- `server/src/services/execution-recovery-resolution.ts` 493-497 (contract comment), 625-740 (`preserve_without_replay_v1` settlement)
+- `server/src/services/execution-blocker.ts` 96-107 (`executionBlockerPredicate`: a resolved action whose `evidence.automaticRecovery.replay = 'blocked'` is still an execution blocker)
+- `server/src/services/execution-projection.ts` 263 (projects that hold as `recovery_needed` / "Stopped")
+- `server/src/services/decided-review-reassignment.ts` 282-340 (`proveDecidedReviewContinuation`, the narrow native path that can continue a `blocked` review behind a `reviewHoldBlock` receipt)
 - `server/src/services/recovery/service.pause-durability.test.ts` (classification only)
 - `server/src/__tests__/heartbeat-process-recovery.test.ts` paused-agent cases at 5414, 11366, 15476
 
@@ -91,8 +94,38 @@ continuation. `service.pause-durability.test.ts` only covers classification.
 
 A second path that #237 did not name shows up in the samples (§4, F3): when the
 cancelled run reaches execution recovery settlement, the issue can be moved to
-`blocked` under `preserve_without_replay_v1` and never reaches the continuation
-requeue at all.
+`blocked` under `preserve_without_replay_v1`. From then on it is not a pause
+skip any more: it carries a no-replay execution hold (§2.4), and the
+continuation requeue is not expected to run.
+
+### 2.4 No-replay execution holds (`preserve_without_replay_v1`)
+
+`settleUnrecoverableExecutions` documents its own contract (493-497): failed
+execution is a system responsibility; after automatic recovery is ruled out it
+preserves evidence and stops without replay, and "the resolved record retains a
+dispatch hold until actual evidence clears it". The code matches that:
+
+- The action row is set to `status: resolved`, `outcome: blocked`, with
+  `evidence.automaticRecovery = { policy: preserve_without_replay_v1, replay:
+  blocked, actionOutcome: unknown }`. When the task was an agent review in
+  progress it also stores a `reviewHoldBlock` receipt (run, statusVersion,
+  previous status `in_review`, stage, last decision).
+- `executionBlockerPredicate` (`execution-blocker.ts` 96-107) counts a resolved
+  action with `replay = 'blocked'` as an execution blocker, and the issue read
+  model exposes it as `executionBlocker` with `canContinue=false`,
+  `canRetry=false`. `execution-projection.ts` shows it as "Stopped".
+- So `activeRecoveryAction: null` on such an issue does **not** mean nobody
+  holds it. The hold is the resolved action, owned by `board`, with the
+  responsible user on the issue. Its `nextAction` is the supported handling:
+  inspect the run, then send a new message to request continuation.
+- The only automatic way out is narrow: `proveDecidedReviewContinuation` can
+  continue a `blocked` review whose `reviewHoldBlock` receipt still matches the
+  current statusVersion/stage/decision and that has a later resubmission. With
+  no recorded decision it holds (`selector_*` / `P4b_*`).
+
+Expected semantics: a deliberate no-replay safety stop with a Board-owned,
+human-cleared hold. Generic wake paths must not replay it, and this includes the
+plugin: ai-team #682/#685 exclude active execution/recovery owners and holds.
 
 ## 3. Sample selection
 
@@ -136,8 +169,22 @@ All twelve had zero pending interactions; only SOL-2304's tree had a live run
 | SOL-2929 | created as `blocked` by CTO run f204f707 | SOL-2589 `blocked` | none | none | creator run running | idle | Real dependency wait; `blockedTransitionAt` null because it was created blocked. |
 | SOL-2308 | system `recovery.reconcile_execution_review_participant` 10:02:16 | none | none | board, `execution_review_participant_recovery` | participant run d1d4765a succeeded 10:01-10:02 | running | Board action re-created 86 s after a Board `recovery_action_resolution` restored `in_review`. Whether d1d4765a recorded a review decision: **unknown**. Code intent (§2.2) suggests intended re-escalation if it did not. |
 | SOL-2789 | system `recovery.reconcile_execution_review_participant` 07:07:08 | none | none | board, `execution_review_participant_recovery` | executor run `issue_reassigned` | participant **paused** | Intended: review participant is paused; board-owned action is the native path. |
-| SOL-2771 | system `execution-recovery` settlement 06:57:07 (`outcome: blocked`, `replay: not_authorized`), no `issue.updated` | none | none | none (settlement resolved it) | 2ff3130d `cancelled` 06:01-06:02, 504e1d06 `issue_reassigned` | running elsewhere | **F3.** Board resolved a stranded action at 06:56:41 (note: run cancelled by manual pause, restore `in_review`). 26 s later a different execution recovery action settled and re-blocked it. Plugin `stale_wake_reconcile` wake requests at 13:00 and 14:00 have no matching run on the issue (cause unknown). |
-| SOL-2813 | system `execution-recovery` settlement 06:37:11 (`outcome: blocked`, `replay: not_authorized`), no `issue.updated` | none | none | none | 14e73544 started 06:36:27, `cancelled agent_paused` 06:36:56 | idle | **F3**, pause path: run had started (not cancel-before-start); whether the provider did any work: unknown. |
+| SOL-2771 | system `execution-recovery` settlement 06:57:07 (`outcome: blocked`, `replay: not_authorized`), no `issue.updated` | none | none | none active; **no-replay hold** (see below) | 2ff3130d `cancelled` 06:01-06:02, 504e1d06 `issue_reassigned` | running elsewhere | **Intended no-replay hold (§2.4)**, board-owned. Board resolved a stranded action at 06:56:41 (note: run cancelled by manual pause, restore `in_review`); 26 s later a second watchdog action on the same run settled and re-blocked it (F3b). Plugin `stale_wake_reconcile` wake requests at 13:00 and 14:00 have no matching run on the issue (U3). |
+| SOL-2813 | system `execution-recovery` settlement 06:37:11 (`outcome: blocked`, `replay: not_authorized`), no `issue.updated` | none | none | none active; **no-replay hold** (see below) | 14e73544 started 06:36:27, `cancelled agent_paused` 06:36:56 | idle | **Intended no-replay hold (§2.4)**, pause path: run had started (not cancel-before-start); whether the provider did any work is unknown (U4). |
+
+Hold detail for SOL-2771 and SOL-2813, re-read on 2026-10-30 with the current
+agent identity from `GET /api/issues/{id}` and `GET /api/issues/{id}/recovery-actions`
+(read-only):
+
+| | SOL-2771 | SOL-2813 |
+|---|---|---|
+| Stage / actual reviewer | review stage pending; current participant = assignee `2808078b`; returnAssignee `0a4e6b65`; no decision yet (`lastDecisionId` null) | review stage pending; current participant = assignee `a42292d9`; returnAssignee `e07f5d35`; last decision `changes_requested` (count 1) |
+| `executionBlocker` | action `d82eec61-53dc-4eb9-a3ac-d0fdd36bb822`, run `2ff3130d-f04b-4eb3-bff5-7dacc05c57bb` (`cancelled`, "Agent lifecycle stop requested") | action `9965c0cc-79e1-4bb8-a042-7c53a2d7eb54`, run `14e73544-0f99-4a95-b139-0e1418c8061c` (`cancelled`, "Cancelled due to agent pause") |
+| cause / flags | `legacy_execution_requires_reconciliation`; `canContinue=false`, `canRetry=false` | same |
+| Action row | kind `active_run_watchdog`, `resolved` / `blocked`, owner `board`, returnOwner = participant; evidence `automaticRecovery.replay=blocked`, `actionOutcome=unknown`, `reviewHoldBlock` present | same shape |
+| Earlier action on same run | `332e7614-5309-4880-91a7-5082e0482388`, resolved 06:02:22 with the same policy | none |
+| `activeRecoveryAction` / `interruption` | null / `responsibility: system`, `state: failed` | same |
+| Supported handling (`nextAction`) | inspect the run, then send a new message to request continuation; responsible user is set on the issue | same |
 
 The backstop's `selfBlockedSkipped` exception did not apply to any of the
 twelve. None had all recorded blockers resolved, so the §2.1 exception never
@@ -157,44 +204,53 @@ settle only on a healthy child or a new source path. SOL-2789 fits that exactly.
 SOL-2308 re-escalated right after a manual restore, and whether that is correct
 depends on whether its participant run recorded a decision (unknown, see §6).
 
-**F3: candidate upstream bug (new, not in #237).** At
-`execution-recovery-resolution.ts` 650-660, `preserve_without_replay_v1` sets
-`status: "blocked"` directly through `tx.update(issues)`:
+**F3: the no-replay stop is intended and owned; two narrower contract
+questions remain (candidates, not confirmed bugs).** The earlier draft of this
+report read the resolved action as "no owner". That was wrong. SOL-2771 and
+SOL-2813 are held by a board-owned no-replay execution hold (§2.4, hold
+table): `executionBlocker` is set, continue/retry are refused, and the
+supported path is a human inspecting the run and requesting continuation. That
+the stranded scan, the backstop and active-action reconciliation do not touch
+these issues is the hold doing its job. It is not a lost wake, and nothing here
+says a plugin should wake them.
 
-- `blockedTransitionAt` is not stamped. The normal issue update path stamps it
-  at `issues.ts` 11204. Every ready-state key and the self-blocked check key off
-  this field.
-- No `issue.updated` status activity is written. Only
-  `issue.execution_recovery_settled` is.
-- The recovery action is marked `resolved`. The issue therefore stays `blocked`
-  with no active recovery action, no blocker, no descriptor and no owner, and
-  none of stranded recovery (status filter), the backstop (no blockers) or
-  active-action reconciliation (no active action) will look at it again.
-- It can override a Board restore made seconds earlier (SOL-2771).
+What remains, both in `execution-recovery-resolution.ts` 650-660 and both also
+on upstream `master` (introduced by upstream #13075):
 
-The same code is on upstream `master` (introduced by upstream #13075), so this
-would be an upstream fix. Two parts are separable. The missing transition
-stamp/activity is a contract inconsistency regardless of intent. "Stop without
-replay and leave no owner" may be a deliberate safety stop, and that is the
-unknown below.
+- **F3a, transition record.** The settlement writes `status: "blocked"` with a
+  direct `tx.update(issues)`. It does not stamp `blockedTransitionAt` (the
+  normal update path stamps it at `issues.ts` 11204, and ready-state keys and
+  the self-blocked check use it) and writes no `issue.updated` status activity,
+  only `issue.execution_recovery_settled`. Classification: candidate contract
+  inconsistency. Whether any reader needs those fields for a hold that
+  dependency logic never sees is unknown (U2).
+- **F3b, re-block after a Board restore.** On SOL-2771 a second watchdog action
+  on the same already-settled run `2ff3130d` settled 26 s after the Board
+  restored `in_review`, re-applying the hold. Classification: unknown (U5).
+  It may be intended (the Board restore did not clear the run's no-replay
+  evidence, and the hold is meant to stay until actual evidence clears it) or
+  a duplicate-action race.
 
 **F4: #237 point 3 is untested, not shown broken.** The code reads as correct
-for the requeue path after resume. Untested: the requeue itself, and the
-interaction with F3 when the paused run reaches settlement first (SOL-2813).
+for the requeue path after resume. Untested: the requeue itself, and the case
+where the paused run reaches settlement first (SOL-2813). In that case the
+expected result is a no-replay hold, not a requeue.
 
 ## 6. Unknowns (not to be read as bugs)
 
 - U1: whether SOL-2308's participant run d1d4765a recorded a review decision
   before re-escalation. That needs the run's status-decision record, which these
   samples do not include.
-- U2: whether the `preserve_without_replay_v1` stop is meant to leave the issue
-  ownerless, or expected some other surface (Inbox, notice) to own it. The code
-  comment only states "Recorded work is preserved; actions with unverified
-  outcomes will not be repeated."
+- U2: whether the missing `blockedTransitionAt` / `issue.updated` record on a
+  `preserve_without_replay_v1` block (F3a) is deliberate, and whether any
+  native reader (inbox ordering, blocked-owner notice, analytics) depends on it.
+  Not unknown: who owns the hold (board, §2.4).
 - U3: why plugin `stale_wake_reconcile` wake requests on SOL-2771 (13:00, 14:00)
   have no run on the issue (deferred, deduped, or run on the agent without issue
   linkage).
 - U4: whether SOL-2813's cancelled run had done provider work before the pause.
+- U5: whether re-settling a second watchdog action on an already-held run after
+  a Board restore (SOL-2771, F3b) is intended.
 
 ## 7. Minimal isolated integration-test matrix
 
@@ -208,41 +264,83 @@ All embedded-Postgres service tests, no production fixtures.
 | T4 | Board-owned stranded action; assignee becomes invokable; no new path | action stays active, issue untouched |
 | T5 | T4 plus a new queued wake outside the action | action resolved `new_source_execution_path` |
 | T6 | Chain-end `in_progress` issue, latest run `cancelled agent_paused`, agent resumed | exactly one continuation requeued; no escalation |
-| T7 | Same as T6 but the run reaches `preserve_without_replay_v1` settlement first | pins current behavior: assert the fields from F3 (`blockedTransitionAt`, activity, action status) so the fix scope is explicit |
-| T8 | Board restores (`recovery_action_resolution`) then a pending execution recovery action settles | pins whether the settlement may re-block the restored issue (F3, SOL-2771) |
+| T7 | Same as T6 but the run reaches `preserve_without_replay_v1` settlement first | issue `blocked`; action `resolved`/`blocked` with `automaticRecovery.replay=blocked`; `executionBlocker` set with `canContinue=false`/`canRetry=false`; stranded scan, backstop and a resumed agent's wake produce **no replay and no dispatch**. Also records the F3a fields (`blockedTransitionAt`, status activity) as current behavior |
+| T8 | Board restores (`recovery_action_resolution`) then a second pending watchdog action on the same held run settles | no replay of the held run in either branch (dispatch hold kept); pins whether the issue is re-blocked (F3b / U5) |
+| T9 | Chain end `todo` / `in_progress` with one `blocked` downstream, actor idle, latest run `succeeded`, no wake | records which native path (if any) dispatches it; this is the plugin candidate (3) boundary |
+| T10 | Chain end `in_review`, participant ≠ assignee, `blocked` downstream, participant idle | native stranded scan picks the participant, not the assignee; records whether it dispatches |
+| T11 | Chain end whose latest run failed or was cancelled (not by operator), `blocked` downstream | native stranded recovery acts (requeue or escalate); a plugin candidate (3) wake must lose the race |
+| T12 | Chain end with a no-replay hold (T7 state) or a board-owned active action | no native and no plugin dispatch |
 
-T7 and T8 decide F3. T1-T6 characterize the existing native behavior, and that
-is enough to close #237 points 1-3 as intended or untested.
+T7 and T8 decide F3a/F3b without weakening the hold. T9-T12 measure the native
+side of candidate (3) (§8). T1-T6 characterize the rest, and that is enough to
+close #237 points 1-3 as intended or untested.
 
 ## 8. Overlap with ai-team #682 / #685 / #706
 
-- #685's scope (1), "blocked issues with no unresolved dependency, declared wait
-  or pending interaction", is exactly the native gap left by §2.1 step 1 plus
-  F3. Native code has no owner for those issues today, so this plugin work does
-  not duplicate native recovery.
-- #685's scope (2), "native skips caused by a pause whose actor is now
-  available", overlaps §2.3. If T6 passes, the plugin part for chain-end
-  `todo/in_progress/in_review` is redundant there. It is not redundant for
-  issues already moved to `blocked` by F3.
-- #706 changes the plugin wake budget only and does not overlap native code.
-- This report changes none of their review, scope or publication gates and is
-  not a prerequisite for them. Nothing here supports retiring plugin behavior. A
-  removal would need an exact native fix version, approved source, deployment
-  and independent acceptance.
+The current #682 "Approved delivery scope" and #685 "Approved scope" bodies
+name three candidate scenarios. Each is compared with native coverage below.
+Active execution/recovery owners and holds exclude a task from all three in
+both bodies.
+
+- **Scope (1)**: `blocked` with no unresolved dependency, declared wait,
+  monitor or pending interaction. Native coverage: none by design. The backstop
+  needs recorded blockers (§2.1 step 1) and stranded recovery does not scan
+  `blocked`. Issues with a no-replay hold (§2.4: SOL-2771, SOL-2813) do **not**
+  belong here: they carry an execution hold and are excluded by the plugin's
+  own hold guard. Classification: intended native gap; the plugin does not
+  duplicate native recovery here.
+- **Scope (2)**: native skips caused by a pause whose actor is now available.
+  Native coverage: §2.3. While paused, stranded recovery skips on purpose; after
+  resume the continuation path is expected to requeue (untested, T6). If T6
+  passes, scope (2) is redundant for `todo/in_progress/in_review` issues that
+  native stranded recovery still scans. A paused run that already reached a
+  no-replay hold (T7, SOL-2813) is not a scope (2) case: it is held, and
+  neither native nor plugin should replay it.
+- **Scope (3)**: blocker-chain ends. A `todo/in_progress/in_review` terminal
+  of an unresolved blocker chain with at least one `blocked` downstream task,
+  whose actual responsible actor (the current review participant in review)
+  is idle and has not executed since the last relevant change. Ranked by
+  distinct blocked downstream count, shared descendants counted once, cycles
+  and incomplete graphs fail closed, re-checked before dispatch so a native
+  wake wins the race. These tasks may have no pause history, so T6 and scope
+  (2) do not cover them. Native coverage: partial and unknown in size. Native
+  stranded recovery scans the same statuses and also uses the review
+  participant (service.ts 5076-5082), but it decides from the task's own latest
+  run (failed/cancelled/missing dispatch, legacy continuation) and does not
+  look at downstream waiters or order by them. Its deliberate skips (board-owned
+  action, operator-cancel exemption, pause, native passive wait, succeeded
+  native run) can leave an idle chain end that native code considers settled.
+  The backstop does not cover it either: it wakes the downstream issue once all
+  of its blockers resolve, and it does not wake the blocker. Classification:
+  native coverage partial (T11), plugin-only remainder unknown (T9-T10),
+  excluded when a hold exists (T12). The plugin's race and hold guards are what
+  keep the overlap safe. This report does not show either side redundant.
+- **#706** changes only the plugin dispatch capacity (distinct available idle
+  Coders instead of a fixed three). It does not overlap native code, and it does
+  not change the candidate scope or the gates.
+
+This report changes none of #682/#685/#706's review, scope, publication or
+acceptance gates and is not a prerequisite for them. Nothing here supports
+retiring plugin behavior. A removal would need an exact native fix version,
+approved source, deployment and independent acceptance, authorized separately.
 
 ## 9. Options for the CTO (#237)
 
 1. Close #237 points 1 and 2 as intended upstream behavior (F1, F2). Keep any
    ownership fix in ai-team process: descriptor owner sync on reassignment, and
    CTO handling of board-owned actions.
-2. Authorize a separately scoped upstream fix issue for F3, limited to: stamp
-   `blockedTransitionAt` and write the status activity in
-   `preserve_without_replay_v1`. Decide U2 first; only if it is not intended,
-   also leave an owned path (for example keep a board/system action active
-   instead of resolving it). The tests are T7-T8.
-3. Authorize characterization tests T1-T6 as a test-only fork/upstream PR to
-   settle point 3 (F4).
+2. Treat no-replay holds (SOL-2771, SOL-2813) as intended (§2.4). Their
+   supported path is a responsible human inspecting the run and requesting
+   continuation. This is a per-task operator decision outside this report; no
+   plugin or fork change follows from it.
+3. Authorize characterization tests T1-T12 as a test-only fork/upstream PR,
+   which settles point 3 (F4), the candidate (3) boundary and F3a/F3b. T7/T8/T12
+   assert that the dispatch hold stays.
+4. Only after T7/T8 and U2/U5 are answered from upstream history or the
+   maintainers: decide whether a separately scoped upstream issue is worth
+   filing for F3a (stamp `blockedTransitionAt` and write the status activity)
+   and/or F3b. Either fix must keep the hold and the no-replay rule.
 
-Recommended: 1 + 3 now, and 2 after U2 is answered from upstream history or the
-maintainers. The plugin's scope (1) stays needed until a native F3 fix is
-deployed and accepted.
+Recommended: 1 + 2 + 3 now; 4 later, only if the tests or U2/U5 show a real
+contract need. The plugin's three candidate scenarios stay as approved under
+#682/#685; this report gives no reason to narrow or retire any of them.
