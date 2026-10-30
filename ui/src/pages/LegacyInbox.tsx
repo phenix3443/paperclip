@@ -15,7 +15,9 @@ import { heartbeatsApi } from "../api/heartbeats";
 import { instanceSettingsApi } from "../api/instanceSettings";
 import { projectsApi } from "../api/projects";
 import {
-  BLOCKED_GROUP_OPTIONS,
+  blockedInboxGroupOptions,
+  loadBlockedInboxGroupBy,
+  saveBlockedInboxGroupBy,
   BLOCKED_SORT_OPTIONS,
   type BlockedInboxGroupBy,
   type BlockedInboxSort,
@@ -711,7 +713,7 @@ export function Inbox() {
     () => loadInboxFilterPreferences(selectedCompanyId),
   );
   const [groupBy, setGroupBy] = useState<InboxWorkItemGroupBy>(() => loadInboxWorkItemGroupBy());
-  const [blockedGroupBy, setBlockedGroupBy] = useState<BlockedInboxGroupBy>("none");
+  const [blockedGroupBy, setBlockedGroupBy] = useState<BlockedInboxGroupBy>(() => loadBlockedInboxGroupBy());
   const [blockedSortBy, setBlockedSortBy] = useState<BlockedInboxSort>("most_recent");
   const [visibleIssueColumns, setVisibleIssueColumns] = useState<InboxIssueColumn[]>(loadInboxIssueColumns);
   const { dismissed: dismissedAlerts, dismiss: dismissAlert } = useDismissedInboxAlerts();
@@ -1354,6 +1356,14 @@ export function Inbox() {
     setGroupBy("none");
     saveInboxWorkItemGroupBy("none");
   }, [experimentalSettingsLoaded, groupBy, isolatedWorkspacesEnabled]);
+  const updateBlockedGroupBy = useCallback((next: BlockedInboxGroupBy) => {
+    setBlockedGroupBy(next);
+    saveBlockedInboxGroupBy(next);
+  }, []);
+  useEffect(() => {
+    if (!experimentalSettingsLoaded || isolatedWorkspacesEnabled || blockedGroupBy !== "workspace") return;
+    updateBlockedGroupBy("none");
+  }, [blockedGroupBy, experimentalSettingsLoaded, isolatedWorkspacesEnabled, updateBlockedGroupBy]);
   const toggleNesting = useCallback(() => {
     setNestingPreferenceEnabled((prev) => {
       const next = !prev;
@@ -2419,9 +2429,9 @@ export function Inbox() {
                     <Layers className="h-3.5 w-3.5" />
                   </Button>
                 </PopoverTrigger>
-                <PopoverContent align="end" className="w-44 p-0">
-                  <div className="space-y-0.5 p-2">
-                    {BLOCKED_GROUP_OPTIONS.map(([value, label]) => (
+                <PopoverContent align="end" className="w-40 p-2">
+                  <div className="space-y-0.5">
+                    {blockedInboxGroupOptions(isolatedWorkspacesEnabled).map(([value, label]) => (
                       <button
                         key={value}
                         type="button"
@@ -2429,7 +2439,7 @@ export function Inbox() {
                           "flex w-full items-center justify-between rounded-sm px-2 py-1.5 text-sm",
                           blockedGroupBy === value ? "bg-accent/50 text-foreground" : "text-muted-foreground hover:bg-accent/50",
                         )}
-                        onClick={() => setBlockedGroupBy(value)}
+                        onClick={() => updateBlockedGroupBy(value)}
                       >
                         <span>{label}</span>
                         {blockedGroupBy === value ? <Check className="h-3.5 w-3.5" /> : null}
@@ -2642,6 +2652,7 @@ export function Inbox() {
           userLabelById={companyUserLabelMap}
           issueLinkState={issueLinkState}
           groupBy={blockedGroupBy}
+          groupingContext={inboxWorkspaceGrouping}
           sortBy={blockedSortBy}
           issueFilters={issueFilters}
           currentUserId={currentUserId}

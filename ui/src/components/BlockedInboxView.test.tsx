@@ -477,6 +477,53 @@ describe("BlockedInboxView", () => {
     });
   });
 
+  describe("grouping", () => {
+    const grouped = () => [
+      { ...makeIssue("issue-g1", "PAP-61", "Coder work", attention({ owner: { type: "agent", agentId: "agent-1", userId: null, label: null } })), projectId: "project-1" },
+      { ...makeIssue("issue-g2", "PAP-62", "Vendor work", attention({ reason: "external_owner_action", owner: { type: "external", agentId: null, userId: null, label: "Vendor" } })), projectId: null },
+    ];
+
+    it("groups by the blocked owner", async () => {
+      mockIssuesApi.list.mockResolvedValue(grouped());
+
+      const { root } = renderWithClient(
+        <BlockedInboxView {...blockedViewProps} agentNameById={new Map([["agent-1", "Coder"]])} groupBy="responsible" presentation="task" />,
+        container,
+      );
+      await waitFor(() => container.textContent?.includes("Vendor work") === true);
+
+      expect(container.querySelector('[data-testid="blocked-inbox-group-owner:agent:agent-1"]')?.textContent).toContain("Coder work");
+      expect(container.querySelector('[data-testid="blocked-inbox-group-owner:external:Vendor"]')?.textContent).toContain("Vendor work");
+
+      act(() => root.unmount());
+    });
+
+    it("groups by project name with No project last", async () => {
+      mockIssuesApi.list.mockResolvedValue(grouped());
+
+      const { root } = renderWithClient(
+        <BlockedInboxView
+          {...blockedViewProps}
+          groupBy="project"
+          groupingContext={{ projectById: new Map([["project-1", { name: "Launch" }]]) }}
+          presentation="task"
+        />,
+        container,
+      );
+      await waitFor(() => container.textContent?.includes("Vendor work") === true);
+
+      const groups = Array.from(container.querySelectorAll('[data-testid^="blocked-inbox-group-"]'));
+      expect(groups.map((group) => group.getAttribute("data-testid"))).toEqual([
+        "blocked-inbox-group-project:project-1",
+        "blocked-inbox-group-project:none",
+      ]);
+      expect(groups[0]?.textContent).toContain("Launch");
+      expect(groups[1]?.textContent).toContain("No project");
+
+      act(() => root.unmount());
+    });
+  });
+
   it("filters rows by search query against title, identifier, owner and action", async () => {
     const issues: Issue[] = [
       makeIssue(

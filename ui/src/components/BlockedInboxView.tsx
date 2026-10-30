@@ -8,6 +8,7 @@ import { queryKeys } from "../lib/queryKeys";
 import { cn } from "../lib/utils";
 import { applyIssueFilters, type IssueFilterState, type IssueFilterWorkspaceContext } from "../lib/issue-filters";
 import { resolveInboxIssueBlockerAttention } from "../lib/inbox-live-descendants";
+import { resolveIssueWorkspaceGroup, type InboxWorkspaceGroupingOptions } from "../lib/inbox";
 import {
   blockedRowMatchesSearch,
   buildBlockedInboxRows,
@@ -50,6 +51,8 @@ interface BlockedInboxViewProps {
   renderIssueColumns?: (issue: Issue, responsible: ReactNode) => ReactNode;
   /** Shows a listed child issue under its listed parent in the same group. */
   nestingEnabled?: boolean;
+  /** Project and workspace lookups for the Project and Workspace groupings. */
+  groupingContext?: InboxWorkspaceGroupingOptions;
   presentation?: IssueRowPresentation;
 }
 
@@ -75,9 +78,10 @@ export function BlockedInboxView({
   showResponsibleColumn,
   renderIssueColumns,
   nestingEnabled = false,
+  groupingContext,
   presentation = "legacy",
 }: BlockedInboxViewProps) {
-  const [collapsedVariants, setCollapsedVariants] = useState<Set<string>>(() => new Set());
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set());
   const [collapsedParents, setCollapsedParents] = useState<Set<string>>(() => new Set());
 
   const {
@@ -121,8 +125,14 @@ export function BlockedInboxView({
   }, [currentUserId, filteredRows, issueFilters, liveIssueIds, workspaceFilterContext]);
   const sortedRows = useMemo(() => sortBlockedInboxRows(issueFilteredRows, sortBy), [issueFilteredRows, sortBy]);
   const groups = useMemo(
-    () => groupBlockedInboxRows(issueFilteredRows, sortBy),
-    [issueFilteredRows, sortBy],
+    () => groupBy === "none"
+      ? []
+      : groupBlockedInboxRows(issueFilteredRows, sortBy, groupBy, {
+        ownerLabel: (row) => resolveOwnerName(row, agentNameById, userLabelById).label,
+        projectName: (projectId) => groupingContext?.projectById?.get(projectId)?.name?.trim() || null,
+        workspaceGroup: (issue) => resolveIssueWorkspaceGroup(issue, groupingContext),
+      }),
+    [agentNameById, groupBy, groupingContext, issueFilteredRows, sortBy, userLabelById],
   );
 
   const toggleParent = (issueId: string) => {
@@ -161,11 +171,11 @@ export function BlockedInboxView({
   const renderRows = (rows: BlockedInboxIssueRow[]): ReactNode[] =>
     nestingEnabled ? renderTree(nestBlockedInboxRows(rows), 0) : rows.map((row) => renderRow(row));
 
-  const toggleVariant = (variant: string) => {
-    setCollapsedVariants((prev) => {
+  const toggleGroup = (key: string) => {
+    setCollapsedGroups((prev) => {
       const next = new Set(prev);
-      if (next.has(variant)) next.delete(variant);
-      else next.add(variant);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
       return next;
     });
   };
@@ -248,7 +258,7 @@ export function BlockedInboxView({
     );
   }
 
-  if (groups.length === 0) {
+  if (issueFilteredRows.length === 0) {
     return (
       <div className="space-y-3">
         <Card
@@ -268,15 +278,15 @@ export function BlockedInboxView({
           renderRows(sortedRows)
         ) : (
           groups.map((group) => {
-            const isCollapsed = collapsedVariants.has(group.variant);
+            const isCollapsed = collapsedGroups.has(group.key);
             return (
-              <div key={group.variant} data-testid={`blocked-inbox-group-${group.variant}`}>
+              <div key={group.key} data-testid={`blocked-inbox-group-${group.key}`}>
                 <div className={presentation === "task" ? "rounded-lg px-3 sm:pl-0 sm:pr-4" : "px-3 sm:px-4"}>
                   <IssueGroupHeader
                     label={`${group.label} · ${group.rows.length}`}
                     collapsible
                     collapsed={isCollapsed}
-                    onToggle={() => toggleVariant(group.variant)}
+                    onToggle={() => toggleGroup(group.key)}
                   />
                 </div>
                 {!isCollapsed && (
