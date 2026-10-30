@@ -185,6 +185,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   }, 30_000);
 
   afterEach(async () => {
+    // A delivered wake starts its run in the background. Let it finish its
+    // writes (for example agent_runtime_state) before the tables are cleared.
+    await heartbeatService(db).drainActiveRunExecutions();
     await db.delete(executionReconciliationReceipts);
     await db.delete(issueDocumentDecisions);
     await db.delete(caseHandoffs);
