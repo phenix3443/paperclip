@@ -810,7 +810,8 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     expect(rows.find((row) => row.id === leafId)?.blockedInboxAttention).toMatchObject({ reason: "external_owner_action" });
     expect(rows.find((row) => row.id === parentId)?.blockedInboxAttention).toMatchObject({
       reason: "blocked_chain_stalled",
-      owner: { type: "external", agentId: null, userId: null },
+      owner: { type: "external", agentId: null, userId: null, label: "Vendor support" },
+      action: { label: "External owner action", detail: "Restore the sandbox account" },
     });
   });
 
@@ -835,7 +836,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     });
   });
 
-  it("redacts external wait details from blocked inbox payloads and search", async () => {
+  it("moves external wait details from the description into attention", async () => {
     const { companyId } = await createCompany("BIX");
     const owner = "Private Vendor Security Team";
     const action = "Send the confidential access token for customer Alpha";
@@ -862,15 +863,13 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     expect(issue?.blockedInboxAttention).toMatchObject({
       state: "external_wait",
       reason: "external_owner_action",
-      owner: { type: "external", label: null },
-      action: { label: "External owner action", detail: null },
+      owner: { type: "external", label: owner },
+      action: { label: "External owner action", detail: action },
       redaction: { externalDetailsRedacted: true, secretFieldsOmitted: true },
     });
-    expect(JSON.stringify(issue?.blockedInboxAttention)).not.toContain(owner);
-    expect(JSON.stringify(issue?.blockedInboxAttention)).not.toContain(action);
 
-    await expect(svc.list(companyId, { attention: "blocked", q: owner })).resolves.toEqual([]);
-    await expect(svc.count(companyId, { attention: "blocked", q: action })).resolves.toBe(0);
+    await expect(svc.count(companyId, { attention: "blocked", q: owner })).resolves.toBe(1);
+    await expect(svc.count(companyId, { attention: "blocked", q: action })).resolves.toBe(1);
     await expect(svc.count(companyId, { attention: "blocked", q: "Public context" })).resolves.toBe(1);
   });
 

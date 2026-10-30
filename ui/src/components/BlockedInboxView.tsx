@@ -325,6 +325,8 @@ function BlockedInboxRow({
   presentation,
 }: BlockedInboxRowProps) {
   const { label: ownerName, isAgent } = resolveOwnerName(row, agentNameById, userLabelById);
+  const ownerTitle =
+    row.attention.owner.type === "external" ? row.attention.action.detail ?? undefined : undefined;
   const stoppedAge = formatStoppedAge(row.attention.stoppedSinceAt);
   const blockerAttention = resolveInboxIssueBlockerAttention(row.issue, {
     isLive: liveIssueIds.has(row.issue.id),
@@ -344,7 +346,11 @@ function BlockedInboxRow({
         />
       </span>
       {!showResponsibleColumn ? null : ownerName ? (
-        <span className="hidden w-(--sz-150px) min-w-0 items-center text-muted-foreground sm:inline-flex">
+        <span
+          className="hidden w-(--sz-150px) min-w-0 items-center text-muted-foreground sm:inline-flex"
+          title={ownerTitle}
+          data-testid="blocked-row-owner"
+        >
           {isAgent ? <AgentIdentity agent={agents?.find((agent) => agent.id === row.attention.owner.agentId) ?? { id: row.attention.owner.agentId ?? undefined, name: ownerName }} size="xs" className="max-w-full" /> : <Identity name={ownerName} size="xs" className="max-w-full" />}
         </span>
       ) : (
@@ -366,6 +372,7 @@ function BlockedInboxRow({
           {presentation === "legacy" && <span aria-hidden="true">·</span>}
           <span
             className={cn(isAgent ? "font-medium text-foreground/90" : null)}
+            title={ownerTitle}
             data-testid="blocked-row-owner-mobile"
           >
             {ownerName}

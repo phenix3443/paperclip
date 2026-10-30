@@ -5559,6 +5559,7 @@ function blockedInboxSearchText(
     attention.leafIssue?.title,
     attention.recoveryIssue?.identifier,
     attention.recoveryIssue?.title,
+    attention.owner.label,
     attention.action.label,
     attention.action.detail,
   ]
@@ -5683,12 +5684,12 @@ function blockedChainOwner(
   const hasMonitor = Boolean(
     actor.monitorNextCheckAt && actor.monitorNextCheckAt.getTime() > Date.now(),
   );
-  if (
-    actor.status === "blocked" &&
-    !hasMonitor &&
-    externalWaitFromDescription(actor.description)
-  ) {
-    return { type: "external", agentId: null, userId: null, label: null };
+  const external =
+    actor.status === "blocked" && !hasMonitor
+      ? externalWaitFromDescription(actor.description)
+      : null;
+  if (external) {
+    return { type: "external", agentId: null, userId: null, label: external.owner };
   }
   const descriptorOwner =
     actor.status === "blocked" ? actor.unblockDescriptor?.owner : undefined;
@@ -6306,10 +6307,10 @@ async function listIssueBlockedInboxAttentionMap(
           reason: "external_owner_action",
           severity: "medium",
           stoppedSinceAt: row.updatedAt,
-          owner: { type: "external", agentId: null, userId: null, label: null },
+          owner: { type: "external", agentId: null, userId: null, label: external.owner },
           action: {
             label: "External owner action",
-            detail: null,
+            detail: external.action,
           },
           sourceIssue: source,
           externalDetailsRedacted: true,
@@ -6339,6 +6340,15 @@ async function listIssueBlockedInboxAttentionMap(
       const ownerAgent = owner.agentId
         ? companyAgents.find((candidate) => candidate.id === owner.agentId)
         : undefined;
+      const externalAction =
+        owner.type === "external"
+          ? externalWaitFromDescription(
+              (blockerState.terminalBlockerIssueId
+                ? issuesById.get(blockerState.terminalBlockerIssueId)
+                : undefined
+              )?.description ?? row.description,
+            )?.action
+          : undefined;
       const ownerCannotRun =
         owner.type === "agent" &&
         (!ownerAgent ||
@@ -6359,11 +6369,13 @@ async function listIssueBlockedInboxAttentionMap(
                 detail:
                   "The next owner of this blocker chain cannot run. Assign an active owner or replace the blocker.",
               }
-            : {
-                label: "Inspect blocker chain",
-                detail:
-                  "Inspect the stalled blocker or review leaf and make the next owner/action explicit.",
-              },
+            : externalAction
+              ? { label: "External owner action", detail: externalAction }
+              : {
+                  label: "Inspect blocker chain",
+                  detail:
+                    "Inspect the stalled blocker or review leaf and make the next owner/action explicit.",
+                },
           sourceIssue: source,
           sampleIssueIdentifier:
             blockerState.sampleStalledBlockerIdentifier ??
