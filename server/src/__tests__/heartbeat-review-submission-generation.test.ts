@@ -75,6 +75,37 @@ const support = await getEmbeddedPostgresTestSupport();
       expect(invoke).not.toHaveBeenCalled();
     } finally { await service.drainActiveRunExecutions(); }
   });
+  it("rejects a submission changed after preflight before claiming a review without active identity", async () => {
+    const f = await seed();
+    const [busy] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" }).returning();
+    let changed = false;
+    const service = heartbeatService(db, {
+      runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "false" },
+      beforeChatControlRecoveryCheck: async ({ stage }) => {
+        if (stage !== "claim" || changed) return;
+        changed = true;
+        await db.update(issues).set({ executionState: {
+          ...f.issue.executionState!, reviewRequest: { instructions: "Changed during claim" },
+        } }).where(eq(issues.id, f.issueId));
+      },
+    });
+    const [comment] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      authorUserId: "board", body: "Review this submission" }).returning();
+    try {
+      const run = await service.wakeup(f.agentId, { source: "automation", reason: "issue_commented",
+        payload: { issueId: f.issueId, commentId: comment.id }, contextSnapshot: { wakeCommentId: comment.id },
+        requestedByActorType: "user", requestedByActorId: "board" });
+      expect(run).toMatchObject({ status: "queued", activeIdentityContextId: null });
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, busy.id));
+      expect(await service.resumeQueuedRunsForAgent(f.companyId, f.agentId)).toEqual([]);
+      expect(changed).toBe(true);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run!.id)))[0])
+        .toMatchObject({ status: "queued", startedAt: null, activeIdentityContextId: null, contextSnapshot: run!.contextSnapshot });
+      await service.resumeQueuedRunsForAgent(f.companyId, f.agentId);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run!.id)))[0])
+        .toMatchObject({ status: "cancelled", errorCode: "issue_review_participant_changed" });
+    } finally { await service.drainActiveRunExecutions(); }
+  });
   it.each([false, true])("delivers fresh comments after the submission changes with the same reviewer (locked: %s)", async locked => {
     const f = await seed();
     const [busy] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" }).returning();

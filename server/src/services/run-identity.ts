@@ -238,11 +238,12 @@ async function appendIdentityMessages(
 }
 
 export async function settleReviewRunClaimIdentity(tx: Db, run: typeof heartbeatRuns.$inferSelect, previousStartedAt: Date | null) {
-  if (!run.activeIdentityContextId || typeof run.contextSnapshot?.reviewerAssignmentGeneration !== "string") return run;
+  if (typeof run.contextSnapshot?.reviewerAssignmentGeneration !== "string") return run;
   const issueId = boundRunIssueId(run);
   const [task] = issueId ? await tx.select().from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId))) : [];
   if (!task || issueExecutionGeneration(task) !== run.contextSnapshot.reviewerAssignmentGeneration)
     throw conflict("The review submission changed while its identity was claimed");
+  if (!run.activeIdentityContextId) return run;
   const [identity] = await tx.select().from(runIdentityContexts).where(and(
     eq(runIdentityContexts.id, run.activeIdentityContextId), eq(runIdentityContexts.companyId, run.companyId),
     eq(runIdentityContexts.runId, run.id), eq(runIdentityContexts.status, "accepted")));
