@@ -134,4 +134,3 @@ export async function syncRoutineRunStatusForIssue(executor: Db, issueId: string
   }
   return null;
 }
-

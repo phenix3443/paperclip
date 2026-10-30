@@ -127,18 +127,6 @@ jobs:
             echo 'CI_NODE_TEST=--test' >> "$GITHUB_ENV"
           fi
 
-      - name: Block manual lockfile edits
-        if: >-
-          github.head_ref != 'chore/refresh-lockfile' &&
-          github.event.pull_request.user.login != 'dependabot[bot]'
-        run: |
-          # Diff the PR branch against its merge base so recent base-branch commits
-          # do not masquerade as changes made by the PR itself.
-          changed="$(git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}")"
-          if printf '%s\n' "$changed" | grep -qx 'pnpm-lock.yaml'; then
-            echo "Do not commit pnpm-lock.yaml in pull requests. CI owns lockfile updates."
-            exit 1
-          fi
 
       - name: Setup Node.js for pnpm bootstrap
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
@@ -163,6 +151,17 @@ jobs:
         run: |
           git fetch --no-tags --force "$MIRROR_URL" +refs/heads/master:refs/paperclip-ci/trusted-master
           echo "sha=$(git rev-parse refs/paperclip-ci/trusted-master^{commit})" >> "$GITHUB_OUTPUT"
+
+      - name: Block manual lockfile edits
+        if: >-
+          !(github.event.pull_request.user.login == 'github-actions[bot]' &&
+          (github.head_ref == 'chore/refresh-lockfile' || github.head_ref == 'chore/refresh-lockfile-develop')) &&
+          github.event.pull_request.user.login != 'dependabot[bot]'
+        run: >-
+          node .github/scripts/check-pr-lockfile.mjs --origin
+          "${{ github.event.pull_request.base.sha }}"
+          "${{ github.event.pull_request.head.sha }}"
+          "${{ steps.migration-mirror.outputs.sha }}"
 
       - name: Validate migration ordering against target branch
         run: >-

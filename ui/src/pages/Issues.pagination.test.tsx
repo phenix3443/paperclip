@@ -24,6 +24,7 @@ vi.mock("@/hooks/useSharedPolling", () => ({
   useSharedPollingQuery: () => ({ enabled: false }),
   usePublishSharedQueryData: () => {},
 }));
+vi.mock("../hooks/useUpdateIssueMutation", () => ({ useUpdateIssueMutation: () => ({ mutate: vi.fn() }) }));
 vi.mock("../api/issues", () => ({ issuesApi: mocks }));
 vi.mock("../api/agents", () => ({ agentsApi: { list: async () => [] } }));
 vi.mock("../api/projects", () => ({ projectsApi: { list: async () => [] } }));

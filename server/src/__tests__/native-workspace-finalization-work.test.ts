@@ -157,7 +157,7 @@ describe("workspace finalization scheduled lifecycle", () => {
     await complete(binding, db, producer); await flush();
     expect(await successful(binding.runId)).toHaveLength(1);
     expect(await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, binding.runId))).toHaveLength(1);
-    expect(settled).not.toHaveBeenCalled(); 
+    expect(settled).not.toHaveBeenCalled();
     await quiet();
     worker!.stop(); await coordinator!.stop(); await start(); await flush(); await quiet();
     expect(await successful(binding.runId)).toHaveLength(1);

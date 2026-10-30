@@ -9,7 +9,6 @@ import { approvalComments, approvals } from "@paperclipai/db";
 import { unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { createAgentLifecycle } from "./agent-lifecycle.js";
-import { lockIssuesLinkedToApproval } from "./execution-reconciliation-locks.js";
 
 import { instanceSettingsService } from "./instance-settings.js";
 
@@ -93,7 +92,6 @@ export function approvalRecords(db: Db) {
 
       const now = new Date();
       return writeApprovalChange(db, existing.companyId, async tx => {
-        await lockIssuesLinkedToApproval(tx, existing.companyId, id);
         return tx
           .update(approvals)
           .set({
@@ -117,7 +115,6 @@ export function approvalRecords(db: Db) {
 
       const now = new Date();
       return writeApprovalChange(db, existing.companyId, async tx => {
-        await lockIssuesLinkedToApproval(tx, existing.companyId, id);
         return tx
           .update(approvals)
           .set({

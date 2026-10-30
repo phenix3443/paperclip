@@ -1,5 +1,6 @@
+import { lockIssuesForGateWrite } from "./execution-reconciliation-locks.js";
 import { and, eq } from "drizzle-orm";
-import { approvals, issueApprovals, type Db } from "@paperclipai/db";
+import { issueApprovals, type Db } from "@paperclipai/db";
 import { notifyIssueReviewState } from "./issue-review-state-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 
@@ -13,14 +14,11 @@ export async function notifyApprovalWork(transaction: object, companyId: string,
   const issueIds = new Set(scope?.issueIds);
   if (scope?.approvalId) {
 
-
-
-    await (transaction as Db).select({ id: approvals.id }).from(approvals)
-      .where(and(eq(approvals.companyId, companyId), eq(approvals.id, scope.approvalId))).for("update");
     const links = await (transaction as Db).select({ issueId: issueApprovals.issueId }).from(issueApprovals)
       .where(and(eq(issueApprovals.companyId, companyId), eq(issueApprovals.approvalId, scope.approvalId)));
     for (const link of links) issueIds.add(link.issueId);
   }
+  await lockIssuesForGateWrite(transaction as Db, companyId, [...issueIds]);
   for (const issueId of issueIds) await notifyIssueReviewState(transaction, { companyId, issueId });
 }
 

@@ -44,4 +44,3 @@ export function parseAdapterRegistryEnv(
   cached = { inline, filePath, registry: result.data };
   return structuredClone(result.data);
 }
-

@@ -12,9 +12,10 @@ const step = (name) => {
 const condition = (name) => step(name).match(/^        if: (.+)$/m)?.[1].trim();
 
 test("the bot key is only reachable from the master-only lockfile-refresh environment", () => {
-  assert.match(workflow, /^    environment: lockfile-refresh$/m);
+  assert.match(workflow, /environment: \$\{\{ github\.ref_name == 'master' && 'lockfile-refresh' \|\| 'lockfile-refresh-develop' \}\}/);
+  assert.equal(condition("Check existing lockfile bot configuration"), "github.ref_name == 'master' && steps.release-age.outputs.eligible == 'true'");
   const keyUses = workflow.match(/secrets\.LOCKFILE_BOT_PRIVATE_KEY/g) ?? [];
-  assert.equal(keyUses.length, 1, "only the token step may read the bot key");
+  assert.equal(keyUses.length, 2, "the master preflight and token step may read the existing bot key");
   assert.match(step("Create lockfile bot token"), /private-key: \$\{\{ secrets\.LOCKFILE_BOT_PRIVATE_KEY \}\}/);
 });
 
@@ -32,14 +33,14 @@ test("the bot token is minted only after resolution and the release-age gate", (
 test("the gate runs only for an open PR, and the bot acts only when the gate passes", () => {
   assert.equal(condition("Check release age of added package versions"), "steps.upsert-pr.outputs.pr_url != ''");
   assert.equal(condition("Hold lockfile PR for review"), "steps.release-age.outputs.eligible == 'false'");
-  assert.equal(condition("Create lockfile bot token"), "steps.release-age.outputs.eligible == 'true'");
-  assert.equal(condition("Merge lockfile PR"), "steps.release-age.outputs.eligible == 'true'");
+  assert.equal(condition("Create lockfile bot token"), "steps.bot-config.outputs.available == 'true'");
+  assert.equal(condition("Merge lockfile PR"), "steps.bot-config.outputs.available == 'true'");
 });
 
 test("a held refresh keeps its versions through the next master run's artifact", () => {
   assert.ok(stepNames.indexOf("Reuse versions from a held refresh") < stepNames.indexOf("Refresh pnpm lockfile"));
   const reuse = step("Reuse versions from a held refresh");
-  assert.match(reuse, /gh run list --workflow refresh-lockfile\.yml --branch master --status success/);
+  assert.match(reuse, /gh run list --workflow refresh-lockfile\.yml --branch "\$BASE_BRANCH" --status success/);
   assert.match(reuse, /gh run download "\$run_id" --name held-pnpm-lock/);
   assert.match(
     reuse,

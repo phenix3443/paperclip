@@ -498,7 +498,7 @@ describe("IssuesList", () => {
     const onStatusFilterChange = vi.fn();
     const { root } = renderWithQueryClient(
       <IssuesList
-        issues={[createIssue({ status: "backlog" })]}
+        issues={[createIssue({ status: "backlog", originKind: "routine_execution" })]}
         agents={[]}
         projects={[]}
         viewStateKey="paperclip:test-issues"

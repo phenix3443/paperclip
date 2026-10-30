@@ -347,9 +347,71 @@ describeEmbeddedPostgres("merged Muse migration histories", () => {
     }
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
-  it.each([371, 394])("upgrades real develop history through %i without replaying five fork SQL migrations", async baseline => {
+  async function seedIntegrationHistoryRows(sql: ReturnType<typeof postgres>, appliedForkCount: number) {
+    const records: Array<{ key: string; table: string; id: string }> = [];
+    for (let tenant = 0; tenant < 2; tenant += 1) {
+      const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
+      const commentId = randomUUID(), assetId = randomUUID(), attachmentId = randomUUID();
+      const documentId = randomUUID(), revisionId = randomUUID(), decisionId = randomUUID();
+      const applicationId = randomUUID(), connectionId = randomUUID(), endpointId = randomUUID(), conversationId = randomUUID();
+      const publicationId = randomUUID(), wakeId = randomUUID();
+      await sql`INSERT INTO companies (id, name, issue_prefix) VALUES (${companyId}, 'History tenant', ${`H${companyId.slice(0, 7)}`})`;
+      await sql`INSERT INTO agents (id, company_id, name, adapter_type) VALUES (${agentId}, ${companyId}, 'History owner', 'codex_local')`;
+      await sql`INSERT INTO issues (id, company_id, title, assignee_agent_id, execution_state)
+        VALUES (${issueId}, ${companyId}, 'Retain review history', ${agentId}, ${JSON.stringify({ status: 'completed', changesRequestedCount: 2, lastDecisionId: decisionId, completedStageIds: ['history-stage'] })}::jsonb)`;
+      await sql`INSERT INTO heartbeat_runs (id, company_id, agent_id, status, context_snapshot)
+        VALUES (${runId}, ${companyId}, ${agentId}, 'succeeded', ${JSON.stringify({ issueId })}::jsonb)`;
+      await sql`INSERT INTO issue_comments (id, company_id, issue_id, author_agent_id, created_by_run_id, body, client_request_id)
+        VALUES (${commentId}, ${companyId}, ${issueId}, ${agentId}, ${runId}, 'Preserved response', ${`history-${commentId}`})`;
+      await sql`INSERT INTO assets (id, company_id, provider, object_key, content_type, byte_size, sha256)
+        VALUES (${assetId}, ${companyId}, 'local_disk', ${`history/${assetId}`}, 'text/plain', 4, 'history-content-hash')`;
+      await sql`INSERT INTO issue_attachments (id, company_id, issue_id, asset_id, issue_comment_id, originating_run_id)
+        VALUES (${attachmentId}, ${companyId}, ${issueId}, ${assetId}, ${commentId}, ${runId})`;
+      await sql`INSERT INTO documents (id, company_id, latest_body) VALUES (${documentId}, ${companyId}, 'Retain approved plan')`;
+      await sql`INSERT INTO document_revisions (id, company_id, document_id, revision_number, body)
+        VALUES (${revisionId}, ${companyId}, ${documentId}, 1, 'Retain approved plan')`;
+      if (appliedForkCount >= 3) {
+        await sql`INSERT INTO issue_document_decisions (id, company_id, issue_id, document_id, revision_id, revision_number, body_sha256, scope, outcome, expires_at)
+          VALUES (${decisionId}, ${companyId}, ${issueId}, ${documentId}, ${revisionId}, 1, 'history-body-hash', 'execution_reconciliation', 'approved', '2099-01-01'::timestamptz)`;
+        records.push({ key: `${tenant}-decision`, table: 'issue_document_decisions', id: decisionId });
+      }
+      if (appliedForkCount >= 2) {
+        const receiptId = randomUUID();
+        await sql`INSERT INTO execution_reconciliation_receipts (id, company_id, issue_id, idempotency_key, state)
+          VALUES (${receiptId}, ${companyId}, ${issueId}, ${`history-${receiptId}`}, 'abandoned')`;
+        records.push({ key: `${tenant}-reconciliation`, table: 'execution_reconciliation_receipts', id: receiptId });
+      }
+      await sql`INSERT INTO agent_wakeup_requests (id, company_id, agent_id, source, reason, status, run_id, payload)
+        VALUES (${wakeId}, ${companyId}, ${agentId}, 'automation', 'cross_task_continuation', 'completed', ${runId}, ${JSON.stringify({ issueId, taskId: issueId, history: true })}::jsonb)`;
+      await sql`INSERT INTO tool_applications (id, company_id, name, type) VALUES (${applicationId}, ${companyId}, 'History chat', 'native')`;
+      await sql`INSERT INTO tool_connections (id, company_id, application_id, name, uid, transport, connection_purpose)
+        VALUES (${connectionId}, ${companyId}, ${applicationId}, 'History chat', ${connectionId}, 'chat_sdk', 'channel')`;
+      await sql`INSERT INTO chat_endpoints (id, company_id, connection_id, provider, public_id, assigned_agent_id, status)
+        VALUES (${endpointId}, ${companyId}, ${connectionId}, 'slack', ${endpointId}, ${agentId}, 'active')`;
+      await sql`INSERT INTO chat_conversations (id, company_id, endpoint_id, issue_id, external_conversation_id, external_label)
+        VALUES (${conversationId}, ${companyId}, ${endpointId}, ${issueId}, ${conversationId}, 'History chat')`;
+      await sql`INSERT INTO chat_publications (id, company_id, endpoint_id, conversation_id, issue_id, comment_id, idempotency_key, payload, state)
+        VALUES (${publicationId}, ${companyId}, ${endpointId}, ${conversationId}, ${issueId}, ${commentId}, ${`history-${publicationId}`}, '{"text":"Never resend without reconciliation"}'::jsonb, 'delivery_unknown')`;
+      for (const [table, id] of [
+        ['companies', companyId], ['agents', agentId], ['issues', issueId], ['heartbeat_runs', runId],
+        ['issue_comments', commentId], ['assets', assetId], ['issue_attachments', attachmentId],
+        ['documents', documentId], ['document_revisions', revisionId], ['agent_wakeup_requests', wakeId],
+        ['chat_endpoints', endpointId], ['chat_conversations', conversationId], ['chat_publications', publicationId],
+      ]) records.push({ key: `${tenant}-${table}`, table, id });
+    }
+    return async () => {
+      const snapshot: Record<string, Record<string, unknown> | null> = {};
+      for (const record of records) {
+        const [row] = await sql.unsafe(`SELECT to_jsonb(t) AS row FROM ${record.table} t WHERE id = $1`, [record.id]);
+        snapshot[record.key] = row?.row ?? null;
+      }
+      return snapshot;
+    };
+  }
+
+  it.each([[371, 1], [371, 2], [371, 3], [371, 4], [371, 5], [394, 5]])("upgrades real develop history through %i with %i fork SQL migrations already applied", async (baseline, appliedForkCount) => {
     const referenceUrl = await createTempDatabase();
-    const adminUrl = new URL(referenceUrl), databaseName = `merged_upstream_develop_${baseline}`;
+    const adminUrl = new URL(referenceUrl), databaseName = `merged_upstream_develop_${baseline}_${appliedForkCount}`;
     adminUrl.pathname = "/postgres";
     await ensurePostgresDatabase(adminUrl.toString(), databaseName);
     adminUrl.pathname = `/${databaseName}`;
@@ -375,19 +437,20 @@ describeEmbeddedPostgres("merged Muse migration histories", () => {
       expect(upstreamTail).toHaveLength(416 - baseline);
       expect(journal.entries.filter(entry => entry.idx > 416).map(entry => `${entry.tag}.sql`)).toEqual(developTail.map(entry => entry.file));
 
-      await replayHistoricalSchema(sql, [...common, ...developTail]);
+      await replayHistoricalSchema(sql, [...common, ...developTail.slice(0, appliedForkCount)]);
       const beforeHistory = await historyRows(sql);
-      expect(beforeHistory.slice(-5).map(row => row.hash)).toEqual(developTail.map(entry => entry.hash));
-      const retainedRows = await seedRetainedRows(sql, false);
+      expect(beforeHistory.slice(-appliedForkCount).map(row => row.hash)).toEqual(developTail.slice(0, appliedForkCount).map(entry => entry.hash));
+      const retainedRows = await seedIntegrationHistoryRows(sql, appliedForkCount);
       const beforeRows = await retainedRows();
 
       const state = await inspectMigrations(connectionString);
-      expect(state).toMatchObject({ status: "needsMigrations", pendingMigrations: upstreamTail });
+      const missing = [...upstreamTail, ...developTail.slice(appliedForkCount).map(entry => entry.file)];
+      expect(state).toMatchObject({ status: "needsMigrations", pendingMigrations: missing });
       await applyPendingMigrations(connectionString);
       expect((await inspectMigrations(connectionString)).status).toBe("upToDate");
 
       const afterHistory = await historyRows(sql);
-      expect(afterHistory).toHaveLength(beforeHistory.length + upstreamTail.length);
+      expect(afterHistory).toHaveLength(beforeHistory.length + missing.length);
       expect(afterHistory.slice(0, beforeHistory.length)).toEqual(beforeHistory);
       for (const entry of developTail) expect(afterHistory.filter(row => row.hash === entry.hash)).toHaveLength(1);
       for (const file of upstreamTail) {

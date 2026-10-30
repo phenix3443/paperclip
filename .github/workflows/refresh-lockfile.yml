@@ -243,9 +243,23 @@ jobs:
       # step can read it. The lockfile bot is a master ruleset bypass actor in
       # pull_request mode: it can merge PRs past checks and review, but cannot
       # push to master directly. See doc/RELEASE-AUTOMATION-SETUP.md.
+      - name: Check existing lockfile bot configuration
+        id: bot-config
+        if: github.ref_name == 'master' && steps.release-age.outputs.eligible == 'true'
+        env:
+          BOT_CLIENT_ID: ${{ vars.LOCKFILE_BOT_CLIENT_ID }}
+          BOT_PRIVATE_KEY: ${{ secrets.LOCKFILE_BOT_PRIVATE_KEY }}
+        run: |
+          if [ -n "$BOT_CLIENT_ID" ] && [ -n "$BOT_PRIVATE_KEY" ]; then
+            echo 'available=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'available=false' >> "$GITHUB_OUTPUT"
+            echo '::notice::No complete bot configuration; leave the PR for normal review.'
+          fi
+
       - name: Create lockfile bot token
         id: bot-token
-        if: github.ref_name == 'master' && vars.LOCKFILE_BOT_CLIENT_ID != '' && steps.release-age.outputs.eligible == 'true'
+        if: steps.bot-config.outputs.available == 'true'
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ vars.LOCKFILE_BOT_CLIENT_ID }}
@@ -254,7 +268,7 @@ jobs:
           permission-pull-requests: write
 
       - name: Merge lockfile PR
-        if: github.ref_name == 'master' && vars.LOCKFILE_BOT_CLIENT_ID != '' && steps.release-age.outputs.eligible == 'true'
+        if: steps.bot-config.outputs.available == 'true'
         env:
           GH_TOKEN: ${{ steps.bot-token.outputs.token }}
           PR_URL: ${{ steps.upsert-pr.outputs.pr_url }}

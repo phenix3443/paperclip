@@ -1,3 +1,5 @@
+import { createDependencyAdmission } from "../services/heartbeat/dependency-admission.js";
+import { seedNativeDependency } from "./helpers/native-dependency-fixture.js";
 import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
 import { createHeartbeatQueue } from "../services/heartbeat/queue.js";
 import { createHeartbeatQueueTestDependencies } from "./helpers/heartbeat-queue.js";
@@ -61,9 +63,9 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     await database?.cleanup();
   });
 
-  async function fixture(native = false, issueId = randomUUID()) {
-    const companyId = randomUUID();
-    const agentId = randomUUID();
+  async function fixture(native = false, issueId = randomUUID(), existing?: { companyId: string; agentId: string }) {
+    const companyId = existing?.companyId ?? randomUUID();
+    const agentId = existing?.agentId ?? randomUUID();
     const endpointId = randomUUID();
     const conversationId = randomUUID();
     const runId = randomUUID();
@@ -73,9 +75,10 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     const applicationId = randomUUID();
     const connectionId = randomUUID();
     const start = new Date(Date.now() - 10000);
-    await db.insert(companies).values({ id: companyId, name: "Slack", issuePrefix: companyId.slice(0, 8) });
-    await db.insert(agents).values({ id: agentId, companyId, name: "Carl", role: "general", adapterType: "codex_local" });
-    await db.insert(issues).values({ id: issueId, companyId, title: "you there?", status: "in_progress", assigneeAgentId: agentId, originKind: "chat_channel" });
+    if (!existing) await db.insert(companies).values({ id: companyId, name: "Slack", issuePrefix: companyId.slice(0, 8) });
+    if (!existing) await db.insert(agents).values({ id: agentId, companyId, name: "Carl", role: "general", adapterType: "codex_local" });
+    if (existing) await db.update(issues).set({ status: "in_progress", originKind: "chat_channel" }).where(eq(issues.id, issueId));
+    else await db.insert(issues).values({ id: issueId, companyId, title: "you there?", status: "in_progress", assigneeAgentId: agentId, originKind: "chat_channel" });
     await db.insert(toolApplications).values({ id: applicationId, companyId, name: "Slack", type: "native" });
     await db.insert(toolConnections).values({ id: connectionId, companyId, applicationId, name: "Slack", uid: connectionId, transport: "chat_sdk", connectionPurpose: "channel" });
     await db.insert(chatEndpoints).values({ id: endpointId, companyId, connectionId, provider: "slack", publicId: endpointId, assignedAgentId: agentId, status: "active" });
@@ -259,6 +262,38 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
       try { await vi.advanceTimersByTimeAsync(120_000); await delay(10); expect(queries).toEqual([]); }
       finally { db.$client.options.debug = prior; }
     }
+    it("settles after dependency receipt recovery only when the outer transaction commits", async () => {
+      const dependency = await seedNativeDependency(db);
+      const f = await fixture(false, dependency.issueId, dependency);
+      const inputContext = dependency.intent.payload!._paperclipWakeContext as Record<string, unknown>;
+      const [receipt] = await db.insert(agentWakeupRequests).values({
+        companyId: f.companyId, agentId: f.agentId, source: dependency.intent.source,
+        triggerDetail: dependency.intent.triggerDetail, reason: dependency.intent.reason,
+        status: "completed", runId: f.runId, finishedAt: new Date(),
+        requestedByActorType: "system", requestedByActorId: `native-status-wake-dispatch:${dependency.intent.id}`,
+        idempotencyKey: dependency.intent.idempotencyKey,
+        payload: { ...dependency.intent.payload,
+          _paperclipWakeContext: { ...inputContext, nativeStatusWakeIntentId: dependency.intent.id } },
+      }).returning();
+      await db.update(heartbeatRuns).set({ wakeupRequestId: receipt.id }).where(eq(heartbeatRuns.id, f.runId));
+      await start(); await flush(); await quiet();
+      expect(await state(f)).toMatchObject({ status: "in_progress", externalConversationState: "active" });
+      await expect(db.transaction(async tx => {
+        await createDependencyAdmission(tx as unknown as Db, async () => null, async () => null).prepare(dependency.intent, 0);
+        expect(await state(f)).toMatchObject({ status: "in_progress" });
+        throw new Error("rollback dependency recovery");
+      })).rejects.toThrow("rollback dependency recovery");
+      await flush();
+      expect(await state(f)).toMatchObject({ status: "in_progress", externalConversationState: "active" });
+      await db.transaction(async tx => {
+        await createDependencyAdmission(tx as unknown as Db, async () => null, async () => null).prepare(dependency.intent, 0);
+        expect(await state(f)).toMatchObject({ status: "in_progress" });
+      });
+      await flush();
+      expect(await state(f)).toMatchObject({ status: "in_review", externalConversationState: "waiting" });
+      await quiet();
+    });
+
     it.each(["native finalization", "chat milestone"] as const)("ignores routine company-only settlement hints from %s and resumes on execution release", async producer => {
       const f = await fixture(true);
       await db.update(issues).set({ executionRunId: f.runId }).where(eq(issues.id, f.issueId));

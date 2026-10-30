@@ -26,7 +26,7 @@ test('inspect reconciles exact historical case identity and discards integration
 test('multiple alias identities, foreign project and incomplete metadata stop before mutation', async () => {
   const conflicts = await inspectChatMetadata(inspectApi([caseRow, { ...caseRow, id: 92, fullName: 'paperclip.Product E2E.chat-features.tasks.create-backlog' }]));
   assert.equal(conflicts.caseConflict, true); assert.deepEqual(conflicts.cases.map(row => row.id), [91, 92]);
-  await assert.rejects(ensureChatPlan(() => assert.fail('no ambiguous write'), conflicts, () => assert.fail('no ambiguous marker'))); 
+  await assert.rejects(ensureChatPlan(() => assert.fail('no ambiguous write'), conflicts, () => assert.fail('no ambiguous marker')));
   await assert.rejects(inspectChatMetadata(inspectApi([{ ...caseRow, projectId: 2 }])), /identity_invalid/);
   await assert.rejects(inspectChatMetadata(async () => ({ content: [], totalPages: 11, totalElements: 1100, number: 0 })), /catalog_incomplete/);
 });
