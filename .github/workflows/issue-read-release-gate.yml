@@ -5,7 +5,7 @@ on:
     branches: [develop]
     paths:
       - scripts/issue-read-release-gate/**
-      - server/scripts/issue-read-release-probe.ts
+      - server/src/__tests__/helpers/issue-read-release-probe.ts
       - server/src/__tests__/issue-read-evidence-comparison.test.ts
       - .github/workflows/issue-read-release-gate.yml
 
@@ -85,7 +85,7 @@ jobs:
             git -C "$runtime" reset --hard FETCH_HEAD
             mkdir -p "$runtime/scripts/issue-read-release-gate"
             cp "$evidence_source/"* "$runtime/scripts/issue-read-release-gate/"
-            cp "$GITHUB_WORKSPACE/server/scripts/issue-read-release-probe.ts" "$runtime/server/scripts/issue-read-release-probe.ts"
+            cp "$GITHUB_WORKSPACE/server/src/__tests__/helpers/issue-read-release-probe.ts" "$runtime/server/src/__tests__/helpers/issue-read-release-probe.ts"
             export TMPDIR="$RUNNER_TEMP/tmp-$arm"
             export PAPERCLIP_HOME="$RUNNER_TEMP/paperclip-$arm"
             mkdir -p "$TMPDIR" "$PAPERCLIP_HOME"
@@ -96,7 +96,7 @@ jobs:
               pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
               RELEASE_EVIDENCE_ARM="$arm" RELEASE_EVIDENCE_OUTPUT="$RUNNER_TEMP/evidence" \
                 PAPERCLIP_WORKSPACE_GIT_SCAN_TIMEOUT_MS=1000 \
-                timeout --kill-after=10s 600s node server/node_modules/tsx/dist/cli.mjs server/scripts/issue-read-release-probe.ts
+                timeout --kill-after=10s 600s node server/node_modules/tsx/dist/cli.mjs server/src/__tests__/helpers/issue-read-release-probe.ts
             ) >"$RUNNER_TEMP/evidence/$arm.log" 2>&1 || touch "$RUNNER_TEMP/evidence/$arm.failed"
             rm -rf "$runtime" "$TMPDIR" "$PAPERCLIP_HOME"
           done

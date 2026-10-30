@@ -51,7 +51,7 @@ Run only in an isolated CI checkout with dependencies prepared:
 RELEASE_EVIDENCE_ARM=candidate \
 RELEASE_EVIDENCE_OUTPUT="$RUNNER_TEMP/evidence" \
 PAPERCLIP_WORKSPACE_GIT_SCAN_TIMEOUT_MS=1000 \
-timeout --kill-after=10s 600s node server/node_modules/tsx/dist/cli.mjs server/scripts/issue-read-release-probe.ts
+timeout --kill-after=10s 600s node server/node_modules/tsx/dist/cli.mjs server/src/__tests__/helpers/issue-read-release-probe.ts
 node scripts/issue-read-release-gate/compare.mjs "$RUNNER_TEMP/evidence"
 ```
 
@@ -60,3 +60,9 @@ only this harness from the evidence checkout; it does not patch either runtime.
 The certificate remains **pending** until results, required CI, package identity,
 upstream ancestry, merge/review provenance and finalization evidence are checked
 and an independent reviewer approves both the evidence head and candidate SHA.
+
+The probe lives in the test-fixture directory because it directly seeds synthetic
+agent records. It is not a production agent-creation path. The lifecycle boundary
+checker stays unchanged. The first evidence head passed its probe but failed the
+PR policy check for placing that fixture in `server/scripts/`; this relocation
+corrects the fixture boundary and requires CI on the new evidence head.

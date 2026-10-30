@@ -9,17 +9,17 @@ import express from "express";
 import {
   agents, companies, companySkills, createDb, executionWorkspaces, issues,
   startEmbeddedPostgresTestDatabase, workspaceRuntimeServices,
-} from "../../packages/db/src/index.js";
-import { issueRoutes } from "../../server/src/routes/issues.js";
-import { agentRoutes } from "../../server/src/routes/agents.js";
-import { executionWorkspaceRoutes } from "../../server/src/routes/execution-workspaces.js";
-import { executionWorkspaceService } from "../../server/src/services/execution-workspaces.js";
-import { errorHandler } from "../../server/src/middleware/error-handler.js";
-import { createStorageService } from "../../server/src/storage/service.js";
-import { createLocalDiskStorageProvider } from "../../server/src/storage/local-disk-provider.js";
+} from "../../../../packages/db/src/index.js";
+import { issueRoutes } from "../../routes/issues.js";
+import { agentRoutes } from "../../routes/agents.js";
+import { executionWorkspaceRoutes } from "../../routes/execution-workspaces.js";
+import { executionWorkspaceService } from "../../services/execution-workspaces.js";
+import { errorHandler } from "../../middleware/error-handler.js";
+import { createStorageService } from "../../storage/service.js";
+import { createLocalDiskStorageProvider } from "../../storage/local-disk-provider.js";
 
 const run = promisify(execFile);
-const manifest = JSON.parse(await fs.readFile(new URL("../../scripts/issue-read-release-gate/manifest.json", import.meta.url), "utf8"));
+const manifest = JSON.parse(await fs.readFile(new URL("../../../../scripts/issue-read-release-gate/manifest.json", import.meta.url), "utf8"));
 const arm = process.env.RELEASE_EVIDENCE_ARM;
 assert.ok(arm === "baseline" || arm === "candidate");
 const sha = (await run("git", ["rev-parse", "HEAD"])).stdout.trim();
