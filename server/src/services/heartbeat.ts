@@ -5,6 +5,7 @@ import { readFreshWorkspaceReadiness } from "./fresh-workspace-continuation.js";
 import { promptInjectionPreventionService } from "./prompt-injection-prevention.js";
 import { createHeartbeatAgentStatus } from "./heartbeat/agent-status.js";
 import { heartbeatExternalProvider, nativeRuntimeHasInstructionFilesystem } from "./heartbeat/external-provider.js";
+import { selectReleasedExecutionWake } from "./heartbeat/released-execution-wake.js";
 import { pendingCaseHandoffForRun, recordCaseHandoffExecutionReleased, recordLegacyCaseHandoffCleanupIntent, recordLegacyCaseHandoffCleanupVerified, recordRunExecutionReleased } from "./heartbeat/case-handoff-lifecycle.js";
 import { hasStoppedLocalProcessTree, legacyAdapterNeedsLocalProcessSettlement } from "./heartbeat/process-settlement.js";
 import { dotRunnerBroker } from "./dot-runner-broker.js";
@@ -3910,7 +3911,13 @@ export function heartbeatService(
         !nativeWorkspaceFinalizeScheduled && !nativeOwnershipHeld && isHeartbeatRunTerminalStatus(latestRun.status);
       if (executionReleased) {
         const releasedIssueId = readNonEmptyString(latestRun!.contextSnapshot?.issueId);
-        if (releasedIssueId) await recordRunExecutionReleased(db, run.id, releasedIssueId);
+        if (releasedIssueId) {
+          await recordRunExecutionReleased(db, run.id, releasedIssueId);
+          // A wake skipped while this executor held the task continues now, once.
+          await selectReleasedExecutionWake(db, { companyId: latestRun!.companyId, issueId: releasedIssueId, releasedRunId: run.id })
+            .then(resume => resume && enqueueWakeup(resume.agentId, resume.opts))
+            .catch(error => logger.warn({ err: error, runId: run.id }, "Could not continue a wake skipped during execution cleanup"));
+        }
         const handoff = await pendingCaseHandoffForRun(db, run.id);
         if (handoff) await recordCaseHandoffExecutionReleased(db, run.id, handoff.issueId);
       }
