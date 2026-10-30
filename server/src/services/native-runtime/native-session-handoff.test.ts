@@ -120,6 +120,15 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await buildNativeSessionHandoff({ db, companyId: randomUUID(), issueId, agentId, before: new Date(20_000) })).toBeNull();
     expect(await buildNativeSessionHandoff({ db, companyId, issueId, agentId: randomUUID(), before: new Date(20_000) })).toBeNull();
   });
+  it("leaves inline comments to the current wake while retaining other history", async () => {
+    const result = await buildNativeSessionHandoff({ db, companyId, issueId, agentId, before: new Date(20_000),
+      inlineCommentIds: [requestId] });
+    expect(result).not.toContain("Build a GitHub PR review bot");
+    expect(result).toContain("Saved plan");
+    expect(result).toContain("Use CODEOWNERS");
+    expect(result).toContain("Legacy answer");
+  });
+
   it("honors the exact wake-comment cutoff when building a fresh replay", async () => {
     const result = await buildNativeSessionHandoff({ db, companyId, issueId, agentId, before: new Date(20_000), throughCommentId: requestId });
     expect(result).toContain("Build a GitHub PR review bot");
