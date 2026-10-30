@@ -1027,8 +1027,15 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
 
   // A workflow whose execution already completed is terminal for approve/done:
   // closing the issue must not restart the chain at the first stage (#7893).
+  // Stages added to the policy after completion still run: they are pending
+  // while the completed ids still match the policy. When none match, the ids
+  // were regenerated and every stage only looks pending.
   if (requestedStatus === "done" && existingState?.status === COMPLETED_STATUS) {
-    return { patch };
+    const policyStageIds = new Set(input.policy.stages.map((stage) => stage.id));
+    const completedIdsCurrent = existingState.completedStageIds.some((id) => policyStageIds.has(id));
+    if (!completedIdsCurrent || !nextPendingStage(input.policy, existingState)) {
+      return { patch };
+    }
   }
 
   let pendingStage =
