@@ -112,6 +112,7 @@ export type RuntimeRequestResolution =
   | { action: "submit"; response: import("@paperclipai/adapter-utils").PaperclipQuestionResponse };
 
 export interface HeartbeatRunListOptions {
+  latestFailuresOnly?: boolean;
   summary?: boolean;
 }
 
@@ -132,6 +133,7 @@ export const heartbeatsApi = {
     if (agentId) searchParams.set("agentId", agentId);
     if (limit) searchParams.set("limit", String(limit));
     if (options.summary) searchParams.set("summary", "true");
+    if (options.latestFailuresOnly) searchParams.set("latestFailuresOnly", "true");
     const qs = searchParams.toString();
     return api.get<HeartbeatRun[]>(
       `/companies/${companyId}/heartbeat-runs${qs ? `?${qs}` : ""}`,
@@ -143,6 +145,8 @@ export const heartbeatsApi = {
       `/heartbeat-runs/${runId}/events?view=conversation&afterSeq=${encodeURIComponent(String(afterSeq))}&limit=${encodeURIComponent(String(limit))}`,
       options,
     ),
+  taskPanelActivations: (runId: string, options?: RequestOptions) =>
+    api.get<Array<{ pluginKey: string; slotId: string }>>(`/heartbeat-runs/${encodeURIComponent(runId)}/events?view=plugin-panels`, options),
   events: (runId: string, afterSeq = 0, limit = 200, options?: RequestOptions) =>
     api.get<HeartbeatRunEvent[]>(
       `/heartbeat-runs/${runId}/events?afterSeq=${encodeURIComponent(String(afterSeq))}&limit=${encodeURIComponent(String(limit))}`,
