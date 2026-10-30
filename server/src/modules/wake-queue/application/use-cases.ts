@@ -896,7 +896,7 @@ export function createAdmitWakeBehindIssueExecution(deps: {
 
     if (decision.kind === "proceed") return { kind: "proceed" };
 
-    if (decision.kind === "coalesce" && input.wakeCommentId) {
+    if (decision.kind === "coalesce" && input.wakeCommentId && !input.durableReceipt) {
       const run = await deps.writer.appendQueuedComment(scope, {
         companyId: input.companyId, issueId: input.issueId, agentId: input.agentId,
         targetRunId: availableActiveExecutionRun!.id, contextSnapshot: input.contextSnapshot, commentId: input.wakeCommentId,

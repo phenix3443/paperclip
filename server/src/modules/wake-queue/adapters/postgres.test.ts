@@ -32,6 +32,12 @@ import type { WakeQueuePostgresAdapterDeps } from "./postgres.js";
 import { createReleaseIssueExecution } from "../application/use-cases.js";
 import type { AppendQueuedCommentInput, TransactionScope } from "../application/ports.js";
 
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>(done => { resolve = done; });
+  return { promise, resolve };
+}
+
 // Proves the atomicity and company-scope properties the security review
 // requires: every mutation names `companyId` in its own SQL `WHERE` clause,
 // a foreign-company row is invisible to a read, and a deferred-status
@@ -215,9 +221,9 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     const { input, comments, wake } = await seedAppendQueue();
     const [third] = await db.insert(issueComments).values({ companyId: input.companyId, issueId: input.issueId,
       authorUserId: "board", body: "third" }).returning();
-    const appended = Promise.withResolvers<void>();
-    const entered = Promise.withResolvers<void>();
-    const release = Promise.withResolvers<void>();
+    const appended = deferred();
+    const entered = deferred();
+    const release = deferred();
     const writer = createWakeAdmissionWriter();
     const first = db.transaction(async tx => {
       try {

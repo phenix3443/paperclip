@@ -9,6 +9,12 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { createQueuedCommentQueue } from "../modules/wake-queue/index.js";
 import { queuedCommentQueueRevision } from "../services/issue-queued-comment-queue.js";
 import { heartbeatService } from "../services/heartbeat.js";
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>(done => { resolve = done; });
+  return { promise, resolve };
+}
+
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("coalesced queued comment input", () => {
   let fixture: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -78,9 +84,9 @@ const support = await getEmbeddedPostgresTestSupport();
     const marker = join(dir, "input.jsonl");
     const providerRelease = join(dir, "release");
     const separate = immutable || scheduled || claimFirst;
-    const entered = Promise.withResolvers<void>();
-    const attempted = Promise.withResolvers<void>();
-    const release = Promise.withResolvers<void>();
+    const entered = deferred();
+    const attempted = deferred();
+    const release = deferred();
     let resumed: Promise<unknown> | undefined;
     let pendingSecond: ReturnType<typeof commentWake> | undefined;
     let restore: (() => void) | undefined;
