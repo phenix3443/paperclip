@@ -69,7 +69,7 @@ export function DecisionsToolbar({
             type="button"
             variant="outline"
             size="icon"
-            className={cn("h-8 w-8 shrink-0", activeFilterCount > 0 && "bg-accent")}
+            className="h-8 w-8 shrink-0"
             title="Filter"
             data-active={activeFilterCount > 0}
             aria-label="Filter"
@@ -88,7 +88,7 @@ export function DecisionsToolbar({
             type="button"
             variant="outline"
             size="icon"
-            className={cn("h-8 w-8 shrink-0", groupBy !== "none" && "bg-accent")}
+            className="h-8 w-8 shrink-0"
             title="Group"
             data-active={groupBy !== "none"}
             aria-label="Group"

@@ -1733,7 +1733,7 @@ export function IssuesList({
               type="button"
               variant="outline"
               size="icon"
-              className={cn("hidden h-8 w-8 shrink-0 sm:inline-flex", viewState.nestingEnabled && "bg-accent")}
+              className="hidden h-8 w-8 shrink-0 sm:inline-flex" data-active={viewState.nestingEnabled} aria-pressed={viewState.nestingEnabled}
               onClick={() => updateView({ nestingEnabled: !viewState.nestingEnabled })}
               title={viewState.nestingEnabled ? "Disable parent-child nesting" : "Enable parent-child nesting"}
             >
@@ -1747,7 +1747,7 @@ export function IssuesList({
                 type="button"
                 variant="outline"
                 size="icon"
-                className={cn("h-8 w-8 shrink-0", boardCompactCards && "bg-accent")}
+                className="h-8 w-8 shrink-0" data-active={boardCompactCards} aria-pressed={boardCompactCards}
                 onClick={() => updateView({ boardCardDensity: boardCompactCards ? "comfortable" : "compact" })}
                 title={boardCompactCards ? "Use comfortable cards" : "Use compact cards"}
               >
@@ -1757,7 +1757,7 @@ export function IssuesList({
                 type="button"
                 variant="outline"
                 size="icon"
-                className={cn("h-8 w-8 shrink-0", boardCollapsedStatuses.length > 0 && "bg-accent")}
+                className="h-8 w-8 shrink-0" data-active={boardCollapsedStatuses.length > 0}
                 onClick={() => updateView({ boardColdLaneMode: boardCollapsedStatuses.length > 0 ? "expanded" : "collapsed" })}
                 title={boardCollapsedStatuses.length > 0 ? "Expand cold lanes" : "Collapse cold lanes"}
               >
