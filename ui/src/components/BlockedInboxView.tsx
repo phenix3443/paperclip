@@ -1,5 +1,5 @@
 import { AgentIdentity } from "@/components/AgentIdentity";
-import { useMemo, useState } from "react";
+import { type ReactNode, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { AlertTriangle, CheckCircle2 } from "lucide-react";
 import type { Issue } from "@paperclipai/shared";
@@ -44,6 +44,8 @@ interface BlockedInboxViewProps {
   showIdentifierColumn: boolean;
   showUpdatedColumn: boolean;
   showResponsibleColumn: boolean;
+  /** Renders the inbox's issue columns; the Responsible cell takes `responsible` instead of the assignee. */
+  renderIssueColumns?: (issue: Issue, responsible: ReactNode) => ReactNode;
   presentation?: IssueRowPresentation;
 }
 
@@ -67,6 +69,7 @@ export function BlockedInboxView({
   showIdentifierColumn,
   showUpdatedColumn,
   showResponsibleColumn,
+  renderIssueColumns,
   presentation = "legacy",
 }: BlockedInboxViewProps) {
   const [collapsedVariants, setCollapsedVariants] = useState<Set<string>>(() => new Set());
@@ -233,6 +236,7 @@ export function BlockedInboxView({
               showIdentifierColumn={showIdentifierColumn}
               showUpdatedColumn={showUpdatedColumn}
               showResponsibleColumn={showResponsibleColumn}
+              renderIssueColumns={renderIssueColumns}
               presentation={presentation}
             />
           ))
@@ -264,6 +268,7 @@ export function BlockedInboxView({
                         showIdentifierColumn={showIdentifierColumn}
                         showUpdatedColumn={showUpdatedColumn}
                         showResponsibleColumn={showResponsibleColumn}
+                        renderIssueColumns={renderIssueColumns}
                         presentation={presentation}
                       />
                     ))}
@@ -290,6 +295,7 @@ interface BlockedInboxRowProps {
   showIdentifierColumn: boolean;
   showUpdatedColumn: boolean;
   showResponsibleColumn: boolean;
+  renderIssueColumns?: (issue: Issue, responsible: ReactNode) => ReactNode;
   presentation: IssueRowPresentation;
 }
 
@@ -322,11 +328,20 @@ function BlockedInboxRow({
   showIdentifierColumn,
   showUpdatedColumn,
   showResponsibleColumn,
+  renderIssueColumns,
   presentation,
 }: BlockedInboxRowProps) {
   const { label: ownerName, isAgent } = resolveOwnerName(row, agentNameById, userLabelById);
   const ownerTitle =
     row.attention.owner.type === "external" ? row.attention.action.detail ?? undefined : undefined;
+  // An element even without an owner: the shared columns fall back to the issue assignee for an empty cell.
+  const ownerCell = ownerName ? (
+    <span className="inline-flex min-w-0 max-w-full items-center" title={ownerTitle} data-testid="blocked-row-owner">
+      {isAgent ? <AgentIdentity agent={agents?.find((agent) => agent.id === row.attention.owner.agentId) ?? { id: row.attention.owner.agentId ?? undefined, name: ownerName }} size="xs" className="max-w-full" /> : <Identity name={ownerName} size="xs" className="max-w-full" />}
+    </span>
+  ) : (
+    <span aria-hidden="true" />
+  );
   const stoppedAge = formatStoppedAge(row.attention.stoppedSinceAt);
   const blockerAttention = resolveInboxIssueBlockerAttention(row.issue, {
     isLive: liveIssueIds.has(row.issue.id),
@@ -345,16 +360,14 @@ function BlockedInboxRow({
           className="max-w-full"
         />
       </span>
-      {!showResponsibleColumn ? null : ownerName ? (
-        <span
-          className="hidden w-(--sz-150px) min-w-0 items-center text-muted-foreground sm:inline-flex"
-          title={ownerTitle}
-          data-testid="blocked-row-owner"
-        >
-          {isAgent ? <AgentIdentity agent={agents?.find((agent) => agent.id === row.attention.owner.agentId) ?? { id: row.attention.owner.agentId ?? undefined, name: ownerName }} size="xs" className="max-w-full" /> : <Identity name={ownerName} size="xs" className="max-w-full" />}
+      {renderIssueColumns ? (
+        <span className="hidden min-w-0 sm:inline-flex" data-testid="blocked-row-issue-columns">
+          {renderIssueColumns(row.issue, ownerCell)}
         </span>
-      ) : (
-        <span className="hidden w-(--sz-150px) shrink-0 sm:inline-flex" aria-hidden="true" />
+      ) : !showResponsibleColumn ? null : (
+        <span className="hidden w-(--sz-150px) min-w-0 items-center text-muted-foreground sm:inline-flex">
+          {ownerCell}
+        </span>
       )}
       {presentation === "legacy" && showUpdatedColumn ? (
         <span className="hidden w-(--sz-5_75rem) text-right text-muted-foreground sm:inline" data-testid="blocked-row-age">
