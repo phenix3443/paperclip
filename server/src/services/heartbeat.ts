@@ -6,6 +6,7 @@ import { promptInjectionPreventionService } from "./prompt-injection-prevention.
 import { createHeartbeatAgentStatus } from "./heartbeat/agent-status.js";
 import { heartbeatExternalProvider, nativeRuntimeHasInstructionFilesystem } from "./heartbeat/external-provider.js";
 import { selectReleasedExecutionWake } from "./heartbeat/released-execution-wake.js";
+import { admitDeferredOwnerWake } from "./heartbeat/deferred-owner-wake.js";
 import { pendingCaseHandoffForRun, recordCaseHandoffExecutionReleased, recordLegacyCaseHandoffCleanupIntent, recordLegacyCaseHandoffCleanupVerified, recordRunExecutionReleased } from "./heartbeat/case-handoff-lifecycle.js";
 import { hasStoppedLocalProcessTree, legacyAdapterNeedsLocalProcessSettlement } from "./heartbeat/process-settlement.js";
 import { dotRunnerBroker } from "./dot-runner-broker.js";
@@ -2116,6 +2117,8 @@ export function heartbeatService(
           });
           if (staleness.outcome === "cancelled") {
             applyRunDispatchPostCommitEffects(staleness.postCommitEffects);
+            await admitDeferredOwnerWake(db, enqueueWakeup, { companyId: run.companyId, issueId, endedRunId: run.id })
+              .catch(err => logger.warn({ err, runId: run.id }, "Could not admit the owner's deferred wake after a stale dispatch"));
             return;
           }
           throw error;
@@ -3917,6 +3920,9 @@ export function heartbeatService(
           await selectReleasedExecutionWake(db, { companyId: latestRun!.companyId, issueId: releasedIssueId, releasedRunId: run.id })
             .then(resume => resume && enqueueWakeup(resume.agentId, resume.opts))
             .catch(error => logger.warn({ err: error, runId: run.id }, "Could not continue a wake skipped during execution cleanup"));
+          // A wake deferred behind this executor for the task's current owner is admitted now, once.
+          await admitDeferredOwnerWake(db, enqueueWakeup, { companyId: latestRun!.companyId, issueId: releasedIssueId, endedRunId: run.id })
+            .catch(error => logger.warn({ err: error, runId: run.id }, "Could not admit the owner's deferred wake after execution cleanup"));
         }
         const handoff = await pendingCaseHandoffForRun(db, run.id);
         if (handoff) await recordCaseHandoffExecutionReleased(db, run.id, handoff.issueId);
