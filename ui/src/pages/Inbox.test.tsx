@@ -824,6 +824,42 @@ describe("Inbox toolbar", () => {
     act(() => root.unmount());
   });
 
+  it("hides the task status icon when the Status column is off", async () => {
+    routerMock.location.pathname = "/inbox/mine";
+    localStorage.setItem(
+      taskCollectionPreferencesStorageKey({
+        companyId: "company-1",
+        collectionKey: "inbox",
+      }),
+      JSON.stringify({
+        version: 1,
+        companyId: "company-1",
+        collectionKey: "inbox",
+        viewState: {},
+        columns: ["id", "updated"],
+      }),
+    );
+    apiMocks.issuesList.mockResolvedValue([createIssue({ title: "Statusless task" })]);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 0, gcTime: 0 } },
+    });
+    const root = createRoot(container);
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <Inbox />
+        </QueryClientProvider>,
+      );
+    });
+    await vi.waitFor(() => expect(container.textContent).toContain("Statusless task"));
+
+    const taskRow = container.querySelector('[data-slot="task-row"]');
+    expect(taskRow?.querySelector('[data-testid="inbox-row-status-placeholder"]')).not.toBeNull();
+
+    act(() => root.unmount());
+  });
+
   it("shows the resolved isolated workspace name in canonical task metadata", async () => {
     routerMock.location.pathname = "/inbox/mine";
     localStorage.setItem("paperclip:inbox:issue-columns", JSON.stringify(["status", "id", "workspace", "updated"]));
