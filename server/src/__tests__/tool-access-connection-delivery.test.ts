@@ -4,6 +4,7 @@ import { activityLog, authUsers, connectionGrants, connectionIntentDeliveries, c
   toolApplications, toolCatalogEntries, toolConnectionInstalls, toolConnections, toolPolicies, toolProfileBindings } from "@paperclipai/db";
 import { toolAccessService } from "../services/tool-access.js";
 import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
+import { idleWorkSnapshot } from "../services/task-admission.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { seedPendingAccessRequest, startConnectionDelivery } from "./helpers/connection-delivery-harness.js";
 
@@ -118,8 +119,8 @@ describePostgres("tool access writes notify the connection delivery worker", () 
     try {
       await expect.poll(async () => (await db.execute(sql`select 1 from pg_stat_activity where wait_event_type = 'Lock'
         and query ilike '%insert into "tool_profile_bindings"%'`)).length, { timeout: 10_000 }).toBe(1);
-      await expect.poll(() => delivery!.sweeps, { timeout: 5_000 }).toBeGreaterThan(baseline);
-      await new Promise(resolve => setTimeout(resolve, 200));
+      await expect.poll(() => delivery!.sweeps > baseline && idleWorkSnapshot().active === 1
+        && (delivery!.nextWakeAt() ?? Infinity) > Date.now() + 300_000, { timeout: 5_000 }).toBe(true);
       expect(databaseWorkPending(db, DELIVERY_QUEUES.connection)).toBe(true);
       expect((await card()).status).toBe("pending");
       const beforeBinding = delivery.sweeps;
@@ -179,11 +180,12 @@ describePostgres("tool access writes notify the connection delivery worker", () 
       const holder = db.transaction(async tx => { await tx.execute(sql`lock table issue_thread_interactions in access exclusive mode`); locked(); await gate; });
       await held;
       const baseline = delivery.sweeps;
-      delivery.wake();
-      await expect.poll(() => delivery!.sweeps).toBeGreaterThan(baseline);
-      await tools().updateConnection(f.connection.id, { enabled: true });
-      if (!enabled) await tools().updateConnection(f.connection.id, { enabled: false });
-      release(); await holder;
+      try {
+        delivery.wake();
+        await expect.poll(() => delivery!.sweeps).toBeGreaterThan(baseline);
+        await tools().updateConnection(f.connection.id, { enabled: true });
+        if (!enabled) await tools().updateConnection(f.connection.id, { enabled: false });
+      } finally { release(); await holder; }
       await delivery.settle(baseline + 2);
       expect((await card()).status).toBe(enabled ? "expired" : "pending");
     }

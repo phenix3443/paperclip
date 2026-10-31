@@ -49,7 +49,7 @@ export async function startConnectionDelivery(db: Db, options: { canRun?: () => 
   await worker.ready;
   await settle(1);
   return {
-    wakeup, wake: worker.wake, settle,
+    wakeup, wake: worker.wake, settle, nextWakeAt: () => coordinator.nextWakeAt(),
     get sweeps() { return sweeps; },
     async stop() {
       await coordinator.stop();
