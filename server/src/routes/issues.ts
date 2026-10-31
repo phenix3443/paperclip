@@ -20137,6 +20137,30 @@ export function issueRoutes(
           }
         }
 
+        // A member named in the comment with the editor's mention link is woken too. The assignee's own wake above
+        // already carries this comment, and an agent is not woken for a comment it wrote.
+        const mentionedAgentIds = ((await svc.findMentionedAgents(currentIssue.companyId, comment.body ?? "")) ?? [])
+          .filter((agentId) => agentId !== assigneeId && !(actor.actorType === "agent" && actor.actorId === agentId));
+        for (const mentionedAgentId of mentionedAgentIds) {
+          addWakeup(mentionedAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "issue_comment_mentioned",
+            payload: { issueId: currentIssue.id, commentId: comment.id, mutation: "comment" },
+            idempotencyKey: `comment-mention:${comment.id}:${mentionedAgentId}`,
+            requestedByActorType: actor.actorType,
+            requestedByActorId: actor.actorId,
+            contextSnapshot: {
+              issueId: currentIssue.id,
+              taskId: currentIssue.id,
+              commentId: comment.id,
+              wakeCommentId: comment.id,
+              source: "comment.mention",
+              wakeReason: "issue_comment_mentioned",
+            },
+          });
+        }
+
         const becameDone =
           issueBeforeCommentDecision.status !== "done" &&
           currentIssue.status === "done";

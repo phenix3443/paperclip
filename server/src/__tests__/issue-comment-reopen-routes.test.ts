@@ -869,6 +869,36 @@ describe("issue comment reopen routes", () => {
     );
   });
 
+  it("wakes an agent mentioned in a POST comment, besides the assignee, and never the author itself", async () => {
+    const issue = makeIssue("in_progress");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.findMentionedAgents.mockResolvedValue([
+      "33333333-3333-4333-8333-333333333333",
+      "22222222-2222-4222-8222-222222222222",
+    ]);
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "[@Reviewer](agent://33333333-3333-4333-8333-333333333333) please look" });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.findMentionedAgents).toHaveBeenCalledWith(issue.companyId, expect.any(String));
+    await waitForWakeup(() =>
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        "33333333-3333-4333-8333-333333333333",
+        expect.objectContaining({
+          reason: "issue_comment_mentioned",
+          idempotencyKey: "comment-mention:comment-1:33333333-3333-4333-8333-333333333333",
+          payload: expect.objectContaining({ issueId: issue.id, commentId: "comment-1" }),
+          contextSnapshot: expect.objectContaining({ wakeReason: "issue_comment_mentioned", source: "comment.mention", commentId: "comment-1" }),
+        }),
+      ),
+    );
+    // The assignee is woken once, by the ordinary comment wake, not a second time as a mention.
+    const assigneeWakes = mockHeartbeatService.wakeup.mock.calls.filter(([agentId]) => agentId === "22222222-2222-4222-8222-222222222222");
+    expect(assigneeWakes.map(([, wake]) => (wake as { reason: string }).reason)).toEqual(["issue_commented"]);
+  });
+
   it("allows default-open non-assignee POST comments on closed issues without reopening", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("done"));
     mockIssueService.addComment.mockResolvedValue({
