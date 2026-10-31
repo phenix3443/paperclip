@@ -180,8 +180,8 @@ export function createConnectionInstalls(db: Db, { now, getConnectionRow, assert
       }> = [];
       await db.transaction(async (tx) => {
         await lockToolConnectionRuntimeInputs(tx, connection.companyId, connection.id);
-        await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
         if (markMcpAccessConfigured) {
+          await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
           // Preserve an explicit zero-agent selection through OAuth. Merge the
           // marker in SQL so concurrent credential/config changes are retained.
           await tx.update(toolConnections).set({
@@ -217,6 +217,7 @@ export function createConnectionInstalls(db: Db, { now, getConnectionRow, assert
         );
         const removeIds = removals.map((install) => install.id);
         if (removeIds.length > 0) {
+          await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
           await tx
             .delete(toolConnectionInstalls)
             .where(inArray(toolConnectionInstalls.id, removeIds));
@@ -262,6 +263,7 @@ export function createConnectionInstalls(db: Db, { now, getConnectionRow, assert
           .filter(([key]) => !existingKeys.has(key))
           .map(([, install]) => install);
         if (additions.length > 0) {
+          await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
           await tx.insert(toolConnectionInstalls).values(
             additions.map((install) => ({
               companyId: connection.companyId,
@@ -276,6 +278,7 @@ export function createConnectionInstalls(db: Db, { now, getConnectionRow, assert
           );
         }
         if (requested.size > 0 && connection.connectionPurpose !== "ai") {
+          await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
           const profile = await appProfileForConnection(tx, connection);
           for (const install of additions) {
             const [binding] = await tx
