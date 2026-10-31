@@ -4036,6 +4036,20 @@ async function listIssueBlockerAttentionMap(
     for (const row of wakeRows) {
       if (row.issueId) activeIssueIds.add(row.issueId);
     }
+
+    // A scheduled monitor is how a member waits for CI or another timed re-check; its due wake is the live path.
+    const monitorRows: Array<{ id: string }> = await dbOrTx
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          inArray(issues.id, chunk),
+          inArray(issues.status, ["in_progress", "in_review"]),
+          gt(issues.monitorNextCheckAt, new Date()),
+        ),
+      );
+    for (const row of monitorRows) activeIssueIds.add(row.id);
   }
 
   const explicitWaitCandidateIds = [...nodesById.values()]
