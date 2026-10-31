@@ -35,11 +35,23 @@ export async function startConnectionDelivery(db: Db, options: { canRun?: () => 
   const service = connectionIntentDeliveryService(db, { wakeup });
   const errors: unknown[] = [];
   let sweeps = 0, accountedSweeps = 0;
-  let running = false;
+  let running = 0;
+  let sweeping = false;
   const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: options.canRun ?? (() => true), onError: error => { errors.push(error); } });
-  const worker = coordinator.register(DELIVERY_QUEUES.connection, { retryMs: RETRY_MS, nextRunAt: () => null, hasPending: async () => { try { return await service.hasPending(); } finally { running = false; } },
-    run: async () => { sweeps += 1; running = true; try { await options.beforeSweep?.(); return await service.sweepPending(); } catch (error) { running = false; throw error; } } });
-  const quiet = () => !running && !databaseWorkPending(db, DELIVERY_QUEUES.connection)
+  const worker = coordinator.register(DELIVERY_QUEUES.connection, { retryMs: RETRY_MS, nextRunAt: () => null,
+    hasPending: async () => {
+      running += 1;
+      try { return await service.hasPending(); } finally { running -= 1; sweeping = false; }
+    },
+    run: async () => {
+      sweeps += 1;
+      running += 1;
+      sweeping = true;
+      try { await options.beforeSweep?.(); return await service.sweepPending(); }
+      catch (error) { sweeping = false; throw error; }
+      finally { running -= 1; }
+    } });
+  const quiet = () => running === 0 && !sweeping && !databaseWorkPending(db, DELIVERY_QUEUES.connection)
     && (coordinator.nextWakeAt() ?? Infinity) > Date.now() + RETRY_MS / 2;
   async function settle(minSweeps = 0) {
     const limit = Date.now() + 5_000;
