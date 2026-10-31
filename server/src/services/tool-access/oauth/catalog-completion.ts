@@ -1,4 +1,5 @@
 import { connectionActorUserId } from "../actor.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../delivery-work-notifications.js";
 import type { ActorInfo } from "../types.js";
 import { isRemoteMcpConnectorMethod } from "@paperclipai/shared";
 import { and, eq } from "drizzle-orm";
@@ -127,7 +128,9 @@ export function createOAuthCatalogCompletion(db: Db, finishGalleryAppConnection:
               targetId: agentId,
             }));
       if (installTargets.length > 0) {
-        await db
+        await db.transaction(async (tx) => {
+          await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
+          await tx
           .insert(toolConnectionInstalls)
           .values(
             installTargets.map((target) => ({
@@ -143,6 +146,7 @@ export function createOAuthCatalogCompletion(db: Db, finishGalleryAppConnection:
             })),
           )
           .onConflictDoNothing();
+        });
       }
     }
     return finished;

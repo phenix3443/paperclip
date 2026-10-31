@@ -1,4 +1,5 @@
 import { writeToolConnectionHealthChange } from "../../tool-connection-health-notifications.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../delivery-work-notifications.js";
 import { connectorToolPolicy } from "../../connectors/tool-policy.js";
 import { connectionSetupUrl, connectionReconnectUrl } from "../identifiers.js";
 import { createToolRuntimeSlots } from "../runtime/slots.js";
@@ -108,6 +109,7 @@ export function createToolCatalogPublication(db: Db, { now, audit, getConnection
       await tx.select({ id: toolConnections.id }).from(toolConnections)
         .where(and(eq(toolConnections.id, connection.id), eq(toolConnections.companyId, connection.companyId)))
         .for("update");
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
       return write(tx);
     });
     descriptors = [...new Map(descriptors.map(descriptor => [descriptor.name, descriptor])).values()];
@@ -270,8 +272,9 @@ export function createToolCatalogPublication(db: Db, { now, audit, getConnection
       : refreshOptions.enableAllByDefault
       ? { ...connection.transportConfig, quarantineNewEntries: false }
       : connection.transportConfig;
-    const [updatedConnection] = await writeToolConnectionHealthChange(db, connection, tx => tx
-      .update(toolConnections)
+    const [updatedConnection] = await writeToolConnectionHealthChange(db, connection, async tx => {
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
+      return tx.update(toolConnections)
       .set({
         config: normalizedConfig,
         transportConfig: normalizedTransportConfig,
@@ -288,12 +291,14 @@ export function createToolCatalogPublication(db: Db, { now, audit, getConnection
         updatedAt: refreshedAt,
       })
       .where(eq(toolConnections.id, connection.id))
-      .returning());
+      .returning();
+    });
 
     if (connection.transport === "local_stdio") {
       await ensureRuntimeSlot(updatedConnection);
-      await db
-        .update(toolRuntimeSlots)
+      await db.transaction(async tx => {
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
+        await tx.update(toolRuntimeSlots)
         .set({
           healthStatus: "ok",
           healthMessage: "Approved stdio template is ready.",
@@ -301,6 +306,7 @@ export function createToolCatalogPublication(db: Db, { now, audit, getConnection
           updatedAt: refreshedAt,
         })
         .where(eq(toolRuntimeSlots.connectionId, connection.id));
+      });
     }
 
     const activeEntries = updatedEntries.filter(
