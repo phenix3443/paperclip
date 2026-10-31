@@ -8,7 +8,7 @@ import { DELIVERY_QUEUES } from "../../services/delivery-work-notifications.js";
 
 const RETRY_MS = 600_000;
 
-export async function seedPendingAccessRequest(db: Db, owner: string, companyId = randomUUID()) {
+export async function seedPendingAccessRequest(db: Db, owner: string, companyId: string = randomUUID()) {
   const agentId = randomUUID(), issueId = randomUUID();
   await db.insert(companies).values({ id: companyId, name: "Connections", issuePrefix: "CON", defaultResponsibleUserId: owner });
   await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: owner, status: "active", membershipRole: "member" });
@@ -30,7 +30,7 @@ export async function seedPendingAccessRequest(db: Db, owner: string, companyId 
 }
 
 export async function startConnectionDelivery(db: Db, options: { canRun?: () => boolean } = {}) {
-  const wakeup = vi.fn().mockResolvedValue(null);
+  const wakeup = vi.fn<() => Promise<null>>().mockResolvedValue(null);
   const service = connectionIntentDeliveryService(db, { wakeup });
   const errors: unknown[] = [];
   let sweeps = 0, running = 0;
