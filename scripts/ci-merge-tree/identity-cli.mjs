@@ -1,10 +1,12 @@
 import path from 'node:path';
-import { writeFileSync } from 'node:fs';
+import { writeFileSync, realpathSync } from 'node:fs';
 import { BASE, HEAD, fixedRow, validateDispatch, verifySource } from './identity.mjs';
 
 const [arm, lane, source, output] = process.argv.slice(2);
 const row = fixedRow(arm, lane);
-if (!path.isAbsolute(output ?? '') || path.resolve(output).startsWith(`${path.resolve(source)}${path.sep}`)) {
+const sourceRoot = realpathSync(source);
+const outputParent = realpathSync(path.dirname(output ?? '.'));
+if (!path.isAbsolute(output ?? '') || outputParent === sourceRoot || outputParent.startsWith(`${sourceRoot}${path.sep}`)) {
   throw new Error('evidence_root_must_be_external');
 }
 validateDispatch({ repository: process.env.GITHUB_REPOSITORY, attempt: process.env.GITHUB_RUN_ATTEMPT,

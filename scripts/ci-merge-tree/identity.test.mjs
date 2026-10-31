@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, unlinkSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -59,4 +59,26 @@ test('dispatch requires fork, first attempt, immutable tag, exact control SHA an
     { ref: 'refs/heads/develop' }, { expectedSha: 'b'.repeat(40) }, { executionKey: 'another' }]) {
     assert.throws(() => validateDispatch({ ...valid, ...invalid }), /dispatch_denied/);
   }
+});
+
+
+test('rejects a tracked symlink replaced by a regular file with matching blob bytes', t => {
+  const { root, git } = fixture(t);
+  symlinkSync('source.txt', path.join(root, 'link'));
+  git('add', 'link'); git('commit', '--quiet', '-m', 'symlink');
+  const expected = { sha: git('rev-parse', 'HEAD') };
+  assert.equal(verifySource(root, expected).trackedStatus, 'unchanged');
+  unlinkSync(path.join(root, 'link'));
+  writeFileSync(path.join(root, 'link'), 'source.txt');
+  assert.throws(() => verifySource(root, expected), /source_integrity/);
+});
+
+test('CLI rejects a symlinked evidence parent that resolves inside source without writing a file', t => {
+  const { root } = fixture(t);
+  const outer = mkdtempSync(path.join(os.tmpdir(), 'merge-tree-output-'));
+  t.after(() => rmSync(outer, { recursive: true, force: true }));
+  symlinkSync(root, path.join(outer, 'alias'));
+  assert.throws(() => execFileSync(process.execPath, [new URL('./identity-cli.mjs', import.meta.url).pathname,
+    'base', 'chat', root, path.join(outer, 'alias', 'identity.json')], { stdio: 'pipe' }),
+    error => error.status !== 0 && /evidence_root_must_be_external/.test(error.stderr));
 });

@@ -55,8 +55,9 @@ export function verifySource(root, expected) {
     if (!target.startsWith(`${root}${path.sep}`)) throw new Error('source_integrity_path');
     try {
       const info = lstatSync(target);
-      const bytes = mode === '120000' && info.isSymbolicLink()
-        ? Buffer.from(readlinkSync(target)) : info.isFile() ? readFileSync(target) : null;
+      const bytes = mode === '120000'
+        ? info.isSymbolicLink() ? Buffer.from(readlinkSync(target)) : null
+        : info.isFile() ? readFileSync(target) : null;
       const actualOid = bytes && createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
       if (!bytes || actualOid !== oid
         || (mode === '100755' && !(info.mode & 0o111))
