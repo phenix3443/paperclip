@@ -305,7 +305,7 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     const [original] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
     await createPostgresWakeQueueAdapter(db, stubDeps).withIssueExecutionLock(
       { companyId, runId, now: new Date(), resumeStrandedQueue: true }, async (_, { transaction }) => {
-        const input = { companyId, wakeId, now: new Date() };
+        const input = { companyId, wakeId, agentId, now: new Date() };
         expect(await transaction.cancelDeferredWake({ ...input, reason: "generic cancellation" })).toBe(false);
         expect(await transaction.failDeferredWake(input)).toBe(false);
         expect(await transaction.normalizeDeferredWakeCommentIds({ ...input, payload: {}, liveCommentIds: [] })).toBeNull();
