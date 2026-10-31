@@ -88,6 +88,54 @@ describePostgres("tool catalog writes notify the connection delivery worker", ()
     await expectRetired(f.connection.id);
   });
 
+  async function holdTable(table: string, writes: () => Promise<unknown>) {
+    const holder = createDb(temp.connectionString);
+    let release!: () => void, locked!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; }), lock = new Promise<void>(resolve => { locked = resolve; });
+    const holding = holder.transaction(async (tx) => { await tx.execute(sql.raw(`lock table ${table} in share mode`)); locked(); await held; });
+    let pending: Promise<unknown> | undefined;
+    try {
+      await lock;
+      pending = writes();
+      const waiting = async () => (await holder.execute(sql`select 1 from pg_locks where not granted`)).length > 0;
+      for (let attempt = 0; attempt < 25 && !await waiting(); attempt += 1) await pause();
+      expect(await waiting()).toBe(true);
+      const before = delivery!.sweeps;
+      for (let attempt = 0; attempt < 25 && (delivery!.sweeps === before || delivery!.running > 0); attempt += 1) await pause();
+      expect(delivery!.running).toBe(0);
+      return delivery!.sweeps;
+    } finally { release(); await holding; await holder.$client.end({ timeout: 1 }); await pending; }
+  }
+
+  it("retires an exact access request through the connection update after the entry upsert sweep found it unhealthy", async () => {
+    const f = await seedRefreshable(true);
+    await permit(f);
+    await db.update(toolConnections).set({ healthStatus: "error" }).where(eq(toolConnections.id, f.connection.id));
+    const baseline = await start();
+    const beforeHealth = await holdTable("tool_connections", async () => {
+      await catalog().refreshCatalog(f.connection.id, undefined, { skipDefaultProfileSync: true });
+    });
+    expect(beforeHealth).toBeGreaterThan(baseline);
+    await delivery!.settle(beforeHealth + 1);
+    await expectRetired(f.connection.id);
+  });
+
+  it("notifies from the runtime slot update after the earlier refresh sweeps finish", async () => {
+    const f = await seedPendingAccessRequest(db, "owner");
+    const service = catalog();
+    await service.createStdioCommandTemplate(f.companyId, { templateId: "admin.local-echo", name: "Admin local echo", command: "node",
+      args: ["./echo-mcp.js"], tools: [{ name: "echo", description: "Echo a message.", annotations: { readOnlyHint: true } }] },
+    { actorType: "user", actorId: "owner" } as never);
+    const stdio = await service.createConnection(f.companyId, { name: "Local echo", transport: "local_stdio", config: { templateId: "admin.local-echo" },
+      enabled: true, status: "active" });
+    const baseline = await start();
+    const beforeSlot = await holdTable("tool_runtime_slots", () => service.refreshCatalog(stdio.id, undefined, { skipDefaultProfileSync: true }));
+    expect(beforeSlot).toBeGreaterThan(baseline);
+    await delivery!.settle(beforeSlot + 1);
+    expect((await card()).status).toBe("pending");
+    expect(delivery!.wakeup).not.toHaveBeenCalled();
+  });
+
   it("retires an exact access request when stale ask-first policies are disabled", async () => {
     const f = await seedAskFirst();
     const baseline = await start();
