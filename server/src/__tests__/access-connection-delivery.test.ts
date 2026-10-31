@@ -166,7 +166,7 @@ describePostgres("membership writes notify connection delivery", () => {
   it.each([false, true])("retains a write during a sweep (then revoke=%s)", async revoke => {
     const f = await fixture();
     let beforeRead: (() => Promise<void>) | undefined;
-    delivery = await startConnectionDelivery(db, { beforeRead: () => beforeRead?.() });
+    delivery = await startConnectionDelivery(db, { beforeSweep: async () => { await beforeRead?.(); } });
     const baseline = delivery.sweeps;
     let entered!: () => void, release!: () => void;
     const reading = new Promise<void>(resolve => { entered = resolve; });
