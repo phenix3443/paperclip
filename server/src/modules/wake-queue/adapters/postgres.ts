@@ -993,8 +993,8 @@ export async function appendQueuedComment(scope: TransactionScope, input: Append
   const tx = requireAdmissionTx(scope, input.companyId);
   if (input.source !== "automation" || input.reason !== "issue_commented" || input.idempotencyKey || input.durableReceipt)
     return null;
-  const payloadKeys = new Set(["issueId", "commentId", "mutation", "_paperclipWakeContext"]);
-  const contextKeys = new Set(["issueId", "taskId", "taskKey", "commentId", "wakeCommentId", "wakeCommentIds", "wakeReason", "wakeSource", "wakeTriggerDetail", "projectId", "source"]);
+  const payloadKeys = new Set(["issueId", "commentId", "mutation", "_paperclipWakeContext", "resumeIntent", "followUpRequested"]);
+  const contextKeys = new Set(["issueId", "taskId", "taskKey", "commentId", "wakeCommentId", "wakeCommentIds", "wakeReason", "wakeSource", "wakeTriggerDetail", "projectId", "source", "resumeIntent", "followUpRequested"]);
   const ordinaryContext = (context: Record<string, unknown>) =>
     (context.source === undefined || context.source === "issue.comment") &&
     (context.wakeReason === undefined || context.wakeReason === "issue_commented") &&
@@ -1029,6 +1029,12 @@ export async function appendQueuedComment(scope: TransactionScope, input: Append
       run.scheduledRetryAttempt > 0 || run.continuationAttempt > 0 || wake.runId !== run.id || run.wakeupRequestId !== wake.id)
     return null;
   if (wake.payload?.issueId !== issue.id || run.contextSnapshot?.issueId !== issue.id) return null;
+  const sameResumeIntent = (incoming: Record<string, unknown>, existing: Record<string, unknown>) =>
+    ["resumeIntent", "followUpRequested"].every(key =>
+      (incoming[key] === undefined || typeof incoming[key] === "boolean") && incoming[key] === existing[key]);
+  if (!sameResumeIntent(input.payload ?? {}, wake.payload ?? {}) ||
+      !sameResumeIntent(input.contextSnapshot, run.contextSnapshot ?? {})) return null;
+
   if (typeof run.contextSnapshot?.reviewerAssignmentGeneration === "string" &&
       run.contextSnapshot.reviewerAssignmentGeneration !== issueExecutionGeneration(issue)) return null;
   const [comment] = await tx.select().from(issueComments).where(and(

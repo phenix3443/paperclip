@@ -1,4 +1,4 @@
-import { createAdmissionTransactionScope, createWakeAdmissionReader, createWakeAdmissionWriter } from "../modules/wake-queue/adapters/postgres.js";
+import { appendQueuedComment, createAdmissionTransactionScope, createWakeAdmissionReader, createWakeAdmissionWriter } from "../modules/wake-queue/adapters/postgres.js";
 import { createAdmitWakeBehindIssueExecution } from "../modules/wake-queue/application/use-cases.js";
 import { filterZombieCoalesceTarget } from "./heartbeat.js";
 import { mergeCoalescedContextSnapshot } from "./heartbeat/run-preparation.js";
@@ -1511,6 +1511,7 @@ describe("automatic retained workspace recovery", () => {
     await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id));
     const reader = createWakeAdmissionReader(), sameActor = vi.spyOn(reader, "matchesActiveWakeActor");
     queueDeps.wakeQueue.createAdmissionTransactionScope.mockImplementation(createAdmissionTransactionScope);
+    queueDeps.wakeQueue.appendQueuedComment.mockImplementation(appendQueuedComment);
     queueDeps.wakeQueue.admitWakeBehindIssueExecution.mockImplementation(createAdmitWakeBehindIssueExecution({
       reader, writer: createWakeAdmissionWriter(), helpers: { filterZombieCoalesceTarget, mergeCoalescedContextSnapshot,
         shouldDeferFollowupWakeForSameIssue, shouldQueueFollowupForRunningIssueWake },
@@ -1743,6 +1744,31 @@ describe("automatic retained workspace recovery", () => {
     expect(proofs.filter(receipt => receipt.payload?.commentId === first.id)).toHaveLength(1);
     expect(proofs.every(receipt => receipt.payload?.coalescedIntoWakeupRequestId === carrier.id)).toBe(true);
     expect(proofs.find(receipt => receipt.payload?.commentId === first.id)?.requestedByActorId).toBe("operator");
+  });
+
+  it.each(["missing_receipt", "wrong_user", "foreign_run", "foreign_company", "reviewer_namespace", "unrecorded_primary", "deleted_followup"] as const)("rejects inline-appended Stop recovery authority forgery: %s", async fault => {
+    const t = await ordinaryMixedQueuedFixture("active");
+    const { f, wake, queued, deps, execution, queueDeps, queue, followup } = t;
+    try {
+      const [receipt] = await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.runId, queued.id), eq(agentWakeupRequests.status, "coalesced"),
+        sql`${agentWakeupRequests.payload}->>'commentId' = ${followup.id}`));
+      expect(receipt).toBeDefined();
+      await recordRequiredWorkspaceRestoreFailure(db, await run(f.runId), { workspaceRestoreFailure: "restore_failed" }, f.lease);
+      deps.activeRunExecutions.delete(f.runId); execution.finish(); adapterExecutionControls.delete(f.runId);
+      if (fault === "missing_receipt") await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt.id));
+      if (fault === "wrong_user") await db.update(agentWakeupRequests).set({ requestedByActorId: "operator" }).where(eq(agentWakeupRequests.id, receipt.id));
+      if (fault === "foreign_run") await db.update(agentWakeupRequests).set({ runId: f.runId }).where(eq(agentWakeupRequests.id, receipt.id));
+      if (fault === "foreign_company") await db.update(agentWakeupRequests).set({ companyId: (await db.insert(companies).values({ name: "Other", issuePrefix: `IP${randomUUID().slice(0, 6)}` }).returning())[0].id }).where(eq(agentWakeupRequests.id, receipt.id));
+      if (fault === "reviewer_namespace") await db.update(agentWakeupRequests).set({ payload: { ...receipt.payload, _paperclipReviewerAssignmentContinuation: {} } }).where(eq(agentWakeupRequests.id, receipt.id));
+      if (fault === "unrecorded_primary") await db.update(agentWakeupRequests).set({ payload: { ...wake.payload, commentId: randomUUID() } }).where(eq(agentWakeupRequests.id, wake.id));
+      if (fault === "deleted_followup") await db.update(issueComments).set({ deletedAt: new Date() }).where(eq(issueComments.id, followup.id));
+      expect(await queue.claimQueuedRun(await run(queued.id))).toBeNull();
+      const [after] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id));
+      expect(after.status).toBe("skipped");
+      expect(queueDeps.executeRun).not.toHaveBeenCalled();
+      expect(deps.enqueueWakeup).not.toHaveBeenCalled();
+    } finally { deps.activeRunExecutions.delete(f.runId); execution.finish(); adapterExecutionControls.delete(f.runId); }
   });
 
   it.each(["missing_receipt", "wrong_receipt_run", "wrong_receipt_agent", "wrong_receipt_company", "wrong_receipt_user", "wrong_receipt_issue", "terminal_receipt", "foreign_comment_user", "deleted_followup", "unrecorded_comment", "unrecorded_original"] as const)("keeps coalesced Stop recovery input closed without saved receipt authority: %s", async fault => {

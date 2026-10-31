@@ -53,6 +53,11 @@ const support = await getEmbeddedPostgresTestSupport();
   }
 
   it.each([
+    { locked: false, count: 2, immutable: false, resume: "same" },
+    { locked: true, count: 2, immutable: false, resume: "same" },
+    { locked: false, count: 2, immutable: false, resume: "changed" },
+    { locked: true, count: 2, immutable: false, resume: "incoming" },
+    { locked: false, count: 2, immutable: false, resume: "changed-followup" },
     { locked: false, count: 2, immutable: true, interaction: true },
     { locked: false, count: 2, immutable: true, interaction: true, immutableIncoming: true },
     { locked: false, count: 2, immutable: false, routed: true },
@@ -77,13 +82,13 @@ const support = await getEmbeddedPostgresTestSupport();
     { locked: true, count: 3, immutable: false },
     { locked: false, count: 2, immutable: true },
     { locked: true, count: 2, immutable: true },
-  ])("preserves provider input ($locked, $count comments, immutable=$immutable, reordered=$reordered, scheduled=$scheduled, edited=$edited, deleted=$deleted, sameTask=$sameTask, duplicate=$duplicate, immutableIncoming=$immutableIncoming, claimFirst=$claimFirst, mergeFirst=$mergeFirst, routed=$routed, interaction=$interaction)", async ({ locked, count, immutable, reordered, scheduled, edited, deleted, sameTask, duplicate, immutableIncoming, claimFirst, mergeFirst, routed, interaction }) => {
+  ])("preserves provider input ($locked, $count comments, immutable=$immutable, reordered=$reordered, scheduled=$scheduled, edited=$edited, deleted=$deleted, sameTask=$sameTask, duplicate=$duplicate, immutableIncoming=$immutableIncoming, claimFirst=$claimFirst, mergeFirst=$mergeFirst, routed=$routed, interaction=$interaction, resume=$resume)", async ({ locked, count, immutable, reordered, scheduled, edited, deleted, sameTask, duplicate, immutableIncoming, claimFirst, mergeFirst, routed, interaction, resume }) => {
     const f = await seed();
     const [busy] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" }).returning();
     const dir = await mkdtemp(join(tmpdir(), "queued-inline-"));
     const marker = join(dir, "input.jsonl");
     const providerRelease = join(dir, "release");
-    const separate = immutable || scheduled || claimFirst;
+    const separate = immutable || scheduled || claimFirst || Boolean(resume && resume !== "same");
     const entered = deferred();
     const attempted = deferred();
     const release = deferred();
@@ -124,9 +129,11 @@ process.stdin.on("end", () => {
         interactionContext = { interactionId: answer.id, interactionKind: answer.kind, interactionStatus: answer.status,
           sourceRunId: source.id, sourceCommentId: comment.id, source: "issue.interaction.respond" };
       }
+      const resumeContext = resume && (resume === "same" || resume === "changed-followup" || (resume === "incoming" ? later : !later))
+        ? { resumeIntent: true, followUpRequested: !(resume === "changed-followup" && later) } : {};
       const run = await service.wakeup(f.agentId, { source: "automation", reason: "issue_commented",
-        payload: { ...(sameTask && later ? {} : { issueId: f.issueId }), commentId: comment.id, ...(routed ? { mutation: "comment" } : {}), ...interactionContext },
-        contextSnapshot: { wakeCommentId: comment.id, ...(routed ? { source: "issue.comment" } : {}), ...(sameTask && later ? { taskKey: f.issueId } : {}), ...interactionContext },
+        payload: { ...(sameTask && later ? {} : { issueId: f.issueId }), commentId: comment.id, ...(routed ? { mutation: "comment" } : {}), ...resumeContext, ...interactionContext },
+        contextSnapshot: { wakeCommentId: comment.id, ...(routed ? { source: "issue.comment" } : {}), ...(sameTask && later ? { taskKey: f.issueId } : {}), ...resumeContext, ...interactionContext },
         ...(immutableIncoming && later ? { idempotencyKey: "immutable-incoming" } :
           interaction && !immutableIncoming && !later ? { idempotencyKey: "immutable-root" } : {}),
         requestedByActorType: "user", requestedByActorId: "board" });
