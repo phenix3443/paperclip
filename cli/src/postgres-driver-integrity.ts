@@ -47,7 +47,7 @@ function assertPatchedDriver(packageRoot: string, label: string): void {
   }
 }
 
-function inventoryPostgresCopies(nodeModules: string, found: string[] = [], depth = 0): string[] {
+function inventoryPackageCopies(name: string, nodeModules: string, found: string[] = [], depth = 0): string[] {
   if (depth > 32 || !fs.existsSync(nodeModules)) return found;
   for (const entry of fs.readdirSync(nodeModules, { withFileTypes: true })) {
     if (entry.name.startsWith(".") || !entry.isDirectory()) continue;
@@ -56,8 +56,8 @@ function inventoryPostgresCopies(nodeModules: string, found: string[] = [], dept
       ? fs.readdirSync(directory, { withFileTypes: true }).filter((child) => child.isDirectory()).map((child) => path.join(directory, child.name))
       : [directory];
     for (const packageDirectory of packages) {
-      if (path.basename(packageDirectory) === "postgres" && !entry.name.startsWith("@")) found.push(packageDirectory);
-      inventoryPostgresCopies(path.join(packageDirectory, "node_modules"), found, depth + 1);
+      if (path.relative(nodeModules, packageDirectory) === name) found.push(packageDirectory);
+      inventoryPackageCopies(name, path.join(packageDirectory, "node_modules"), found, depth + 1);
     }
   }
   return found;
@@ -66,29 +66,43 @@ function inventoryPostgresCopies(nodeModules: string, found: string[] = [], dept
 export async function verifyPostgresDriverPayload(payloadPath: string): Promise<PostgresDriverResolution[]> {
   const payloadRoot = fs.realpathSync(payloadPath);
   const nodeModules = path.join(payloadRoot, "node_modules");
-  const copies = inventoryPostgresCopies(nodeModules);
+  const copies = inventoryPackageCopies("postgres", nodeModules);
   if (copies.length === 0) throw new Error(`Payload ${payloadPath} contains no postgres driver.`);
-  for (const copy of copies) assertPatchedDriver(copy, `Payload driver ${path.relative(payloadRoot, copy)}`);
+  const rootCopy = path.join(nodeModules, "postgres");
+  const extra = copies.filter((copy) => copy !== rootCopy);
+  if (extra.length > 0 || !copies.includes(rootCopy)) {
+    throw new Error(`Payload must contain exactly one postgres driver at node_modules/postgres; found ${copies.map((copy) => path.relative(payloadRoot, copy)).join(", ")}.`);
+  }
+  if (fs.lstatSync(rootCopy).isSymbolicLink() || !inside(payloadRoot, fs.realpathSync(rootCopy))) {
+    throw new Error(`Payload driver node_modules/postgres must be a real directory inside the payload.`);
+  }
+  assertPatchedDriver(rootCopy, "Payload driver node_modules/postgres");
+  const callers: { caller: string; directory: string }[] = POSTGRES_DRIVER_CALLERS.map((caller) => ({ caller, directory: path.join(nodeModules, caller) }));
+  for (const caller of callers) {
+    if (!fs.existsSync(path.join(caller.directory, "package.json"))) throw new Error(`Payload is missing postgres caller ${caller.caller}.`);
+  }
+  const drizzleDrivers = inventoryPackageCopies("drizzle-orm", nodeModules)
+    .map((copy) => path.join(copy, "postgres-js"))
+    .filter((directory) => fs.existsSync(path.join(directory, "driver.js")));
+  if (drizzleDrivers.length === 0) throw new Error(`Payload ${payloadPath} contains no drizzle-orm postgres-js driver.`);
+  for (const directory of drizzleDrivers) callers.push({ caller: path.relative(payloadRoot, path.join(directory, "driver.js")), directory });
   const env = { ...process.env };
   delete env.NODE_PATH;
   delete env.NODE_OPTIONS;
+  const expectedRoot = fs.realpathSync(rootCopy);
   const resolutions: PostgresDriverResolution[] = [];
-  for (const caller of POSTGRES_DRIVER_CALLERS) {
-    const callerDirectory = path.join(nodeModules, caller);
-    if (!fs.existsSync(path.join(callerDirectory, "package.json"))) throw new Error(`Payload is missing postgres caller ${caller}.`);
-    const { stdout } = await execFileAsync(process.execPath, ["--input-type=module", "-e", RESOLVE_SCRIPT], { cwd: callerDirectory, env, encoding: "utf8", timeout: 30_000 });
+  for (const { caller, directory } of callers) {
+    const { stdout } = await execFileAsync(process.execPath, ["--input-type=module", "-e", RESOLVE_SCRIPT], { cwd: directory, env, encoding: "utf8", timeout: 30_000 });
     const resolved = JSON.parse(stdout) as { import: string; require: string };
     const importPath = fs.realpathSync(new URL(resolved.import));
     const requirePath = fs.realpathSync(resolved.require);
-    const packageRoot = path.dirname(path.dirname(importPath));
     if (!inside(payloadRoot, importPath) || !inside(payloadRoot, requirePath)) {
       throw new Error(`${caller} resolves postgres outside the payload: ${importPath}, ${requirePath}.`);
     }
-    if (importPath !== path.join(packageRoot, "src", "index.js") || requirePath !== path.join(packageRoot, "cjs", "src", "index.js")) {
-      throw new Error(`${caller} resolves postgres ESM and CommonJS entrypoints from different copies: ${importPath}, ${requirePath}.`);
+    if (importPath !== path.join(expectedRoot, "src", "index.js") || requirePath !== path.join(expectedRoot, "cjs", "src", "index.js")) {
+      throw new Error(`${caller} does not resolve the payload's patched postgres driver ESM and CommonJS entrypoints: ${importPath}, ${requirePath}.`);
     }
-    assertPatchedDriver(packageRoot, `${caller} postgres driver`);
-    resolutions.push({ caller, import: importPath, require: requirePath, packageRoot });
+    resolutions.push({ caller, import: importPath, require: requirePath, packageRoot: expectedRoot });
   }
   return resolutions;
 }

@@ -17,11 +17,15 @@ const PATCHED_POSTGRES_SOURCE = path.resolve(
 );
 
 function addPatchedPostgres(payloadPath: string): void {
-  fs.cpSync(PATCHED_POSTGRES_SOURCE, path.join(payloadPath, "node_modules", "paperclipai", "node_modules", "postgres"), { recursive: true, dereference: true });
-  const dbRoot = path.join(payloadPath, "node_modules", "@paperclipai", "db");
+  const nodeModules = path.join(payloadPath, "node_modules");
+  const dbRoot = path.join(nodeModules, "@paperclipai", "db");
   fs.mkdirSync(dbRoot, { recursive: true });
   fs.writeFileSync(path.join(dbRoot, "package.json"), JSON.stringify({ name: "@paperclipai/db", version: "0.3.1" }));
-  fs.cpSync(PATCHED_POSTGRES_SOURCE, path.join(dbRoot, "node_modules", "postgres"), { recursive: true, dereference: true });
+  const drizzleRoot = path.join(nodeModules, "drizzle-orm");
+  fs.mkdirSync(path.join(drizzleRoot, "postgres-js"), { recursive: true });
+  fs.writeFileSync(path.join(drizzleRoot, "package.json"), JSON.stringify({ name: "drizzle-orm", version: "0.45.2" }));
+  fs.writeFileSync(path.join(drizzleRoot, "postgres-js", "driver.js"), "import pgClient from \"postgres\";\n");
+  fs.cpSync(PATCHED_POSTGRES_SOURCE, path.join(nodeModules, "postgres"), { recursive: true, dereference: true });
 }
 
 function record(payloadPath: string, version: string, channel: "latest" | "canary" | "pinned" = "latest"): InstallRecord {

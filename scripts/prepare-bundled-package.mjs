@@ -357,39 +357,6 @@ export function selectBundledDependencyPatches(
   return selectedPatches;
 }
 
-export function pinPatchedBundledDependencies(installManifest, bundledDependencies, patchedDependencies) {
-  const result = structuredClone(installManifest);
-  for (const packageName of new Set(bundledDependencies)) {
-    const versions = Object.keys(patchedDependencies)
-      .filter(specifier => patchedDependencyPackageName(specifier) === packageName)
-      .map(specifier => specifier.slice(packageName.length + 1));
-    if (versions.length !== 1 || !versions[0] || typeof result.dependencies?.[packageName] !== "string") continue;
-    if (!patchedVersionFitsSpec(versions[0], result.dependencies[packageName])) {
-      throw new Error(`${packageName}@${versions[0]} patch does not satisfy the declared range ${result.dependencies[packageName]}`);
-    }
-    result.dependencies[packageName] = versions[0];
-  }
-  return result;
-}
-
-function parseVersion(value) {
-  const match = /^(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?$/.exec(value);
-  return match ? { core: [Number(match[1]), Number(match[2]), Number(match[3])], prerelease: match[4] } : null;
-}
-
-export function patchedVersionFitsSpec(version, spec) {
-  if (version === spec) return true;
-  const range = /^([\^~])(.+)$/.exec(spec);
-  if (range?.[2] === version) return true;
-  const base = range && parseVersion(range[2]);
-  const candidate = parseVersion(version);
-  if (!base || !candidate || candidate.prerelease) return false;
-  const order = candidate.core.findIndex((part, index) => part !== base.core[index]);
-  if (order !== -1 && candidate.core[order] < base.core[order]) return false;
-  const fixedParts = range[1] === "~" ? 2 : base.core[0] > 0 ? 1 : base.core[1] > 0 ? 2 : 3;
-  return candidate.core.slice(0, fixedParts).every((part, index) => part === base.core[index]);
-}
-
 export function applyBundledDependencyPatches(destinationDir, bundledDependencies, sourceRoot = repoRoot) {
   const rootPackage = JSON.parse(readFileSync(resolve(sourceRoot, "package.json"), "utf8"));
   const patchedDependencies = rootPackage.pnpm?.patchedDependencies ?? {};
@@ -455,10 +422,7 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
   const { installManifest, profiles } = configureBundledProviderOverrides(
     createBundledInstallManifest(publishManifest, bundledDependencies), bundledDependencies, rootPackage, profileData,
   );
-  const pinnedInstallManifest = pinPatchedBundledDependencies(
-    installManifest, bundledDependencies, rootPackage.pnpm?.patchedDependencies ?? {},
-  );
-  writeFileSync(deployedPackagePath, `${JSON.stringify(pinnedInstallManifest, null, 2)}\n`);
+  writeFileSync(deployedPackagePath, `${JSON.stringify(installManifest, null, 2)}\n`);
 
   execFileSync(
     "npm",

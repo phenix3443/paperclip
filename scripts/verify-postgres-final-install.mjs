@@ -46,6 +46,11 @@ const expect = (control, ok) => { if (!ok) failures.push(control); return contro
 
 const resolutions = await verifyPostgresDriverPayload(prefix);
 const controls = [];
+const importScript = "await import('@paperclipai/db'); await import('@paperclipai/server'); process.stdout.write('IMPORTED');";
+const imported = spawnSync(process.execPath, ["--input-type=module", "-e", importScript], { cwd: prefix, env, encoding: "utf8", timeout: 120_000 });
+controls.push(expect({ entry: "import @paperclipai/db and @paperclipai/server", mode: "import", exit: imported.status, signal: imported.signal,
+  timedOut: imported.error?.code === "ETIMEDOUT", stdout: (imported.stdout ?? "").trim(), stderr: (imported.stderr ?? String(imported.error ?? "")).slice(0, 2000) },
+  imported.status === 0 && (imported.stdout ?? "").trim() === "IMPORTED"));
 for (const { import: esm, require: cjs } of resolutions) {
   for (const entry of [esm, cjs]) {
     const closed = runProbe(entry, "closed"), live = runProbe(entry, "live");
@@ -73,6 +78,8 @@ const report = {
   platform: `${process.platform}-${process.arch}`,
   source: { repo: manifest.repo, sha: manifest.sha, version: manifest.version },
   packages: manifest.files,
+  patchedDriverTarball: manifest.files.find(({ file }) => file === `postgres-${PATCHED_POSTGRES_DRIVER.version}.tgz`) ?? null,
+  registryDriverTarballSha256: sha256(join(registryDir, `postgres-${PATCHED_POSTGRES_DRIVER.version}.tgz`)),
   lockfileSha256: sha256(join(repoRoot, "pnpm-lock.yaml")),
   patch: { file: `patches/postgres@${PATCHED_POSTGRES_DRIVER.version}.patch`,
     sha256: sha256(join(repoRoot, `patches/postgres@${PATCHED_POSTGRES_DRIVER.version}.patch`)) },
@@ -83,6 +90,8 @@ const report = {
   controls: controls.map(control => ({ ...control, entry: control.entry.replace(prefix, "<payload>").replace(registryDir, "<registry>") })),
   failures: failures.length,
 };
+if (!report.patchedDriverTarball) failures.push("payload lists no patched postgres tarball");
+report.failures = failures.length;
 writeFileSync(join(workDir, "report.json"), `${JSON.stringify(report, null, 2)}\n`);
 console.log(JSON.stringify(report, null, 2));
 rmSync(join(workDir, "npm-cache"), { recursive: true, force: true });

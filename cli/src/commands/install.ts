@@ -22,7 +22,9 @@ import {
   type InstallChannel,
   type InstallRecord,
 } from "../install-store.js";
-import { verifyPostgresDriverPayload } from "../postgres-driver-integrity.js";
+import { PATCHED_POSTGRES_DRIVER, verifyPostgresDriverPayload } from "../postgres-driver-integrity.js";
+
+const PATCHED_POSTGRES_TARBALL = `postgres-${PATCHED_POSTGRES_DRIVER.version}.tgz`;
 
 const execFileAsync = promisify(execFile);
 export const PUBLIC_NPM_REGISTRY = "https://registry.npmjs.org";
@@ -312,25 +314,21 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
         await runCommand("corepack", ["pnpm", "--dir", workspacePackage.dir, "pack", "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
       }
     }
-    const cliDir = path.join(checkoutPath, "cli");
-    const cliPackageJson = JSON.parse(fs.readFileSync(path.join(cliDir, "package.json"), "utf8")) as { bundleDependencies?: string[]; bundledDependencies?: string[] };
-    if ((cliPackageJson.bundleDependencies ?? cliPackageJson.bundledDependencies ?? []).length > 0) {
-      const stagedCli = path.join(stagingRoot, "cli-package");
-      await runCommand(process.execPath, [path.join(checkoutPath, "scripts", "prepare-bundled-package.mjs"), cliDir, stagedCli], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
-      await runCommand("npm", ["pack", stagedCli, "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
-    } else {
-      await runCommand("npm", ["pack", "--pack-destination", stagingRoot], { cwd: cliDir, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
-    }
+    await runCommand("npm", ["pack", "--pack-destination", stagingRoot], { cwd: path.join(checkoutPath, "cli"), env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
+    const patchedPostgres = fs.realpathSync(path.join(checkoutPath, "packages", "db", "node_modules", "postgres"));
+    await runCommand("npm", ["pack", patchedPostgres, "--pack-destination", stagingRoot, "--ignore-scripts"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
     const tarballs = fs.readdirSync(stagingRoot).filter((entry) => entry.endsWith(".tgz"));
     const cliTarball = tarballs.find((entry) => entry === `paperclipai-${metadata.version}.tgz`);
-    const workspaceTarballs = tarballs.filter((entry) => entry !== cliTarball);
+    const postgresTarball = tarballs.find((entry) => entry === PATCHED_POSTGRES_TARBALL);
+    const workspaceTarballs = tarballs.filter((entry) => entry !== cliTarball && entry !== postgresTarball);
+    if (!postgresTarball) throw new Error(`Git install packaging did not produce ${PATCHED_POSTGRES_TARBALL}.`);
     if (!cliTarball || workspaceTarballs.length !== workspacePackages.length) {
       throw new Error(`Git install packaging produced ${workspaceTarballs.length} workspace tarballs; expected ${workspacePackages.length}.`);
     }
-    await runCommand("npm", ["install", "--prefix", stagedPayload, path.join(stagingRoot, cliTarball), ...workspaceTarballs.map((entry) => path.join(stagingRoot, entry)), "--no-audit", "--no-fund"], { cwd: stagingRoot, maxBuffer: 32 * 1024 * 1024 });
+    await runCommand("npm", ["install", "--prefix", stagedPayload, path.join(stagingRoot, cliTarball), path.join(stagingRoot, postgresTarball), ...workspaceTarballs.map((entry) => path.join(stagingRoot, entry)), "--no-audit", "--no-fund"], { cwd: stagingRoot, maxBuffer: 32 * 1024 * 1024 });
     await verifyPayload(stagedPayload);
     await smokePayload(stagedPayload, metadata.version, runCommand);
-    exportGitPayloadPackages(stagingRoot, [cliTarball, ...workspaceTarballs], { repo, sha, version: metadata.version });
+    exportGitPayloadPackages(stagingRoot, [cliTarball, postgresTarball, ...workspaceTarballs], { repo, sha, version: metadata.version });
     fs.renameSync(stagedPayload, payloadPath);
     return { payloadPath, reused: false, version: metadata.version };
   } finally { fs.rmSync(stagingRoot, { recursive: true, force: true }); }

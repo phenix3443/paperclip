@@ -1,14 +1,13 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { PATCHED_POSTGRES_DRIVER } from "../cli/src/postgres-driver-integrity.ts";
-import { patchedVersionFitsSpec, pinPatchedBundledDependencies, prepareBundledPackage } from "./prepare-bundled-package.mjs";
 
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const rootPackage = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"));
@@ -25,39 +24,18 @@ function tempDirectory(t, prefix) {
   return directory;
 }
 
-test("db and generated CLI manifests bundle the patched postgres driver", t => {
+test("db and the generated CLI manifest keep postgres an ordinary dependency", t => {
   const db = JSON.parse(readFileSync(join(repoRoot, "packages/db/package.json"), "utf8"));
-  assert.ok(db.bundleDependencies.includes("postgres"));
+  assert.equal(db.bundleDependencies.includes("postgres"), false);
+  assert.equal(typeof db.dependencies.postgres, "string");
   const output = join(tempDirectory(t, "paperclip-cli-manifest-"), "package.json");
   execFileSync(process.execPath, [join(repoRoot, "scripts/generate-npm-package-json.mjs"), "--output", output], { stdio: "pipe" });
   const cli = JSON.parse(readFileSync(output, "utf8"));
-  assert.deepEqual(cli.bundleDependencies, ["postgres"]);
-  assert.equal(typeof cli.dependencies.postgres, "string");
+  assert.equal((cli.bundleDependencies ?? []).includes("postgres"), false);
 });
 
-test("producer installs pin a bundled dependency to its single patched version", () => {
-  const pinned = pinPatchedBundledDependencies(
-    { dependencies: { postgres: "^3.4.9", acpx: "^0.13.0", other: "^1.0.0" } },
-    ["postgres", "acpx", "other"],
-    { "postgres@3.4.9": "patches/postgres.patch", "acpx@0.12.0": "a.patch", "acpx@0.13.1": "b.patch" },
-  );
-  assert.deepEqual(pinned.dependencies, { postgres: "3.4.9", acpx: "^0.13.0", other: "^1.0.0" });
-});
-
-test("producer installs refuse a patched version outside the declared range", () => {
-  assert.throws(
-    () => pinPatchedBundledDependencies({ dependencies: { postgres: "^3.4.10" } }, ["postgres"], { "postgres@3.4.9": "patches/postgres.patch" }),
-    /postgres@3\.4\.9 patch does not satisfy the declared range \^3\.4\.10/,
-  );
-  for (const [version, spec, fits] of [
-    ["3.4.9", "3.4.9", true], ["3.4.9", "^3.4.9", true], ["3.5.0", "^3.4.9", true], ["4.0.0", "^3.4.9", false],
-    ["3.4.9", "~3.4.0", true], ["3.5.0", "~3.4.0", false], ["0.2.1", "^0.2.0", true], ["0.3.0", "^0.2.0", false],
-    ["18.1.0-beta.16", "^18.1.0-beta.16", true], ["18.1.0-beta.17", "^18.1.0-beta.16", false], ["18.1.0", "^18.1.0-beta.16", true], ["3.4.9", ">=3.0.0", false],
-  ]) assert.equal(patchedVersionFitsSpec(version, spec), fits, `${version} vs ${spec}`);
-});
-
-test("staged package carries the repository-patched postgres files", { timeout: 240_000 }, t => {
-  const root = tempDirectory(t, "paperclip-postgres-bundle-");
+test("the packed workspace driver carries the repository-patched postgres files", { timeout: 240_000 }, t => {
+  const root = tempDirectory(t, "paperclip-postgres-pack-");
   const reference = join(root, "reference");
   mkdirSync(reference);
   const tarball = execFileSync("npm", ["pack", `postgres@${postgresVersion}`, "--pack-destination", reference, "--silent"],
@@ -72,20 +50,13 @@ test("staged package carries the repository-patched postgres files", { timeout: 
   assert.equal(PATCHED_POSTGRES_DRIVER.version, postgresVersion);
   assert.deepEqual(PATCHED_POSTGRES_DRIVER.files, patchedHashes);
 
-  const source = join(root, "source");
-  mkdirSync(join(source, "dist"), { recursive: true });
-  writeFileSync(join(source, "dist/index.js"), "export {};\n");
-  writeFileSync(join(source, "package.json"), JSON.stringify({
-    name: "postgres-bundle-fixture", version: "1.0.0", type: "module", files: ["dist"],
-    dependencies: { postgres: "^3.4.9" }, bundleDependencies: ["postgres"],
-  }));
-  const staged = join(root, "staged");
-  prepareBundledPackage(source, staged, { sourceRoot: repoRoot });
-
-  const stagedManifest = JSON.parse(readFileSync(join(staged, "package.json"), "utf8"));
-  assert.deepEqual(stagedManifest.bundleDependencies, ["postgres"]);
-  assert.equal(stagedManifest.dependencies.postgres, "^3.4.9");
-  const installed = join(staged, "node_modules/postgres");
-  assert.equal(JSON.parse(readFileSync(join(installed, "package.json"), "utf8")).version, postgresVersion);
-  assert.deepEqual(hashes(installed), patchedHashes);
+  const workspaceDriver = realpathSync(join(repoRoot, "packages/db/node_modules/postgres"));
+  const packed = join(root, "packed");
+  mkdirSync(packed);
+  const packedTarball = execFileSync("npm", ["pack", workspaceDriver, "--pack-destination", packed, "--ignore-scripts", "--silent"],
+    { cwd: repoRoot, encoding: "utf8" }).trim().split("\n").at(-1);
+  assert.equal(packedTarball, `postgres-${postgresVersion}.tgz`);
+  execFileSync("tar", ["-xzf", join(packed, packedTarball), "-C", packed]);
+  assert.equal(JSON.parse(readFileSync(join(packed, "package/package.json"), "utf8")).version, postgresVersion);
+  assert.deepEqual(hashes(join(packed, "package")), patchedHashes);
 });

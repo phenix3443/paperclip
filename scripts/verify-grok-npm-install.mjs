@@ -241,14 +241,6 @@ try {
   // `workspace:` specs. The npm cache warm-up reads the same closure, so both
   // take it from one module.
   const { packages, needed } = publicInstallClosure(repo);
-  const generatedCliManifest = join(root, 'cli-publish-manifest.json');
-  run(process.execPath, [join(repo, 'scripts/generate-npm-package-json.mjs'), '--output', generatedCliManifest], repo);
-  const publishedCli = JSON.parse(readFileSync(generatedCliManifest, 'utf8'));
-  const cliBundled = publishedCli.bundleDependencies ?? [];
-  if (cliBundled.length) {
-    const cli = packages.get('paperclipai');
-    cli.manifest = { ...cli.manifest, dependencies: { ...cli.manifest.dependencies, ...Object.fromEntries(cliBundled.map(name => [name, publishedCli.dependencies[name]])) }, bundleDependencies: cliBundled };
-  }
   // release.sh also builds the standalone public packages (the sandbox-provider
   // plugins outside the pnpm workspace) before it stages anything, because it
   // publishes them. Nothing staged here reaches them: `needed` is closed under

@@ -36,15 +36,19 @@ const PATCHED_POSTGRES_SOURCE = path.resolve(
 );
 
 function writePatchedPayload(prefix: string): void {
-  const packageRoot = path.join(prefix, "node_modules", "paperclipai");
+  const nodeModules = path.join(prefix, "node_modules");
+  const packageRoot = path.join(nodeModules, "paperclipai");
   fs.mkdirSync(path.join(packageRoot, "dist"), { recursive: true });
   fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ name: "paperclipai", version: "0.3.1" }));
   fs.writeFileSync(path.join(packageRoot, "dist", "index.js"), "#!/usr/bin/env node\n");
-  fs.cpSync(PATCHED_POSTGRES_SOURCE, path.join(packageRoot, "node_modules", "postgres"), { recursive: true, dereference: true });
-  const dbRoot = path.join(prefix, "node_modules", "@paperclipai", "db");
+  const dbRoot = path.join(nodeModules, "@paperclipai", "db");
   fs.mkdirSync(dbRoot, { recursive: true });
   fs.writeFileSync(path.join(dbRoot, "package.json"), JSON.stringify({ name: "@paperclipai/db", version: "0.3.1" }));
-  fs.cpSync(PATCHED_POSTGRES_SOURCE, path.join(dbRoot, "node_modules", "postgres"), { recursive: true, dereference: true });
+  const drizzleRoot = path.join(nodeModules, "drizzle-orm");
+  fs.mkdirSync(path.join(drizzleRoot, "postgres-js"), { recursive: true });
+  fs.writeFileSync(path.join(drizzleRoot, "package.json"), JSON.stringify({ name: "drizzle-orm", version: "0.45.2" }));
+  fs.writeFileSync(path.join(drizzleRoot, "postgres-js", "driver.js"), "import pgClient from \"postgres\";\n");
+  fs.cpSync(PATCHED_POSTGRES_SOURCE, path.join(nodeModules, "postgres"), { recursive: true, dereference: true });
 }
 
 describe("managed install commands", () => {
@@ -159,6 +163,7 @@ describe("managed install commands", () => {
           fs.mkdirSync(path.join(checkout, workspacePackage.dir), { recursive: true });
           fs.writeFileSync(path.join(checkout, workspacePackage.dir, "package.json"), JSON.stringify(workspacePackage.packageJson));
         }
+        fs.mkdirSync(path.join(checkout, "packages", "db", "node_modules", "postgres"), { recursive: true });
         return { stdout: "", stderr: "" };
       }
       if (file === "corepack") {
@@ -172,8 +177,8 @@ describe("managed install commands", () => {
       }
       if (file === "bash") return { stdout: "", stderr: "" };
       if (file === "npm" && args[0] === "pack") {
-        const packageName = args[1]?.includes("workspace-package-") ? "paperclipai-db" : "paperclipai";
-        fs.writeFileSync(path.join(args[args.indexOf("--pack-destination") + 1], `${packageName}-0.3.1.tgz`), "package");
+        const tarball = args[1]?.endsWith(path.join("node_modules", "postgres")) ? "postgres-3.4.9.tgz" : `${args[1]?.includes("workspace-package-") ? "paperclipai-db" : "paperclipai"}-0.3.1.tgz`;
+        fs.writeFileSync(path.join(args[args.indexOf("--pack-destination") + 1], tarball), "package");
         return { stdout: "", stderr: "" };
       }
       if (file === "npm" && args[0] === "install") { writePatchedPayload(args[args.indexOf("--prefix") + 1]); return { stdout: "", stderr: "" }; }
@@ -198,32 +203,12 @@ describe("managed install commands", () => {
     expect(runCommand.mock.calls.filter(([command, args]) => command === "corepack" && args[1] === "install")).toHaveLength(1);
     expect(runCommand.mock.calls.filter(([command, args]) => command === "corepack" && args.includes("pack"))).toHaveLength(2);
     expect(runCommand.mock.calls.filter(([command, args]) => command === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs"))).toHaveLength(1);
-    expect(runCommand.mock.calls.filter(([command, args]) => command === "npm" && args[0] === "pack")).toHaveLength(2);
+    expect(runCommand.mock.calls.filter(([command, args]) => command === "npm" && args[0] === "pack")).toHaveLength(3);
+    const postgresPack = runCommand.mock.calls.find(([command, args]) => command === "npm" && args[0] === "pack" && args[1]?.endsWith(path.join("packages", "db", "node_modules", "postgres")));
+    expect(postgresPack).toBeDefined();
     const installCall = runCommand.mock.calls.find(([command, args]) => command === "npm" && args[0] === "install");
-    expect(installCall?.[1].filter((arg) => arg.endsWith(".tgz"))).toHaveLength(4);
-  });
-
-  it("stages a CLI that bundles npm dependencies before packing it", async () => {
-    const sha = "e".repeat(40);
-    const baseRunCommand = createGitCheckoutRunCommand(sha);
-    const runCommand = vi.fn(async (file: string, args: string[], options?: Parameters<CommandRunner>[2]) => {
-      const result = await baseRunCommand(file, args, options);
-      if (file === "tar") {
-        const checkout = args[args.indexOf("-C") + 1];
-        fs.writeFileSync(path.join(checkout, "cli", "package.json"), JSON.stringify({ version: "0.3.1", dependencies: { postgres: "^3.4.9" }, bundleDependencies: ["postgres"] }));
-      }
-      return result;
-    });
-    await expect(installGitPayload("paperclipai/paperclip", sha, runCommand, resolveInstallStorePaths())).resolves.toMatchObject({ version: "0.3.1", reused: false });
-    const prepareCalls = runCommand.mock.calls.filter(([command, args]) => command === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs"));
-    expect(prepareCalls.map(([, args]) => path.basename(args[1]!))).toEqual(["db", "cli"]);
-    const stagedCli = prepareCalls[1]![1][2]!;
-    expect(path.basename(stagedCli)).toBe("cli-package");
-    const cliPack = runCommand.mock.calls.find(([command, args]) => command === "npm" && args[0] === "pack" && args[1] === stagedCli);
-    expect(cliPack?.[2]?.env).not.toHaveProperty("NODE_ENV");
-    expect(runCommand.mock.calls.filter(([command, args]) => command === "npm" && args[0] === "pack" && !args[1]?.startsWith(path.dirname(stagedCli)))).toHaveLength(0);
-    const installCall = runCommand.mock.calls.find(([command, args]) => command === "npm" && args[0] === "install");
-    expect(installCall?.[1].filter((arg) => arg.endsWith(".tgz"))).toHaveLength(4);
+    expect(installCall?.[1].filter((arg) => arg.endsWith(".tgz"))).toHaveLength(5);
+    expect(installCall?.[1].some((arg) => path.basename(arg) === "postgres-3.4.9.tgz")).toBe(true);
   });
 
   it("builds git checkouts with NODE_ENV cleared so ambient production mode keeps devDependencies", async () => {
@@ -236,7 +221,7 @@ describe("managed install commands", () => {
       file === "corepack" ||
       (file === "npm" && args[0] === "pack") ||
       (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs")));
-    expect(buildCalls).toHaveLength(9);
+    expect(buildCalls).toHaveLength(10);
     for (const call of buildCalls) {
       const env = call[2]?.env;
       expect(env, `${call[0]} ${call[1].join(" ")} must run with an explicit env`).toBeDefined();
@@ -253,8 +238,8 @@ describe("managed install commands", () => {
     await installGitPayload("phenix3443/paperclip", sha, createGitCheckoutRunCommand(sha), resolveInstallStorePaths());
     const exported = JSON.parse(fs.readFileSync(path.join(destination, "payload-packages.json"), "utf8"));
     expect(exported).toMatchObject({ schemaVersion: 1, repo: "phenix3443/paperclip", sha, version: "0.3.1" });
-    expect(exported.files.map((entry: { file: string }) => entry.file)[0]).toBe("paperclipai-0.3.1.tgz");
-    expect(exported.files).toHaveLength(4);
+    expect(exported.files.map((entry: { file: string }) => entry.file).slice(0, 2)).toEqual(["paperclipai-0.3.1.tgz", "postgres-3.4.9.tgz"]);
+    expect(exported.files).toHaveLength(5);
     for (const entry of exported.files) {
       expect(fs.readFileSync(path.join(destination, entry.file), "utf8")).toBe("package");
       expect(entry.sha256).toMatch(/^[0-9a-f]{64}$/);
@@ -269,11 +254,11 @@ describe("managed install commands", () => {
     const runCommand = vi.fn(async (file: string, args: string[], options?: Parameters<CommandRunner>[2]) => {
       const result = await baseRunCommand(file, args, options);
       if (file === "npm" && args[0] === "install") {
-        fs.appendFileSync(path.join(args[args.indexOf("--prefix") + 1], "node_modules", "@paperclipai", "db", "node_modules", "postgres", "cjs", "src", "connection.js"), "\n");
+        fs.appendFileSync(path.join(args[args.indexOf("--prefix") + 1], "node_modules", "postgres", "cjs", "src", "connection.js"), "\n");
       }
       return result;
     });
-    await expect(installCommand({ ref: sha, repo: "phenix3443/paperclip", yes: true }, { runCommand })).rejects.toThrow(/@paperclipai\/db postgres driver cjs\/src\/connection\.js|Payload driver/);
+    await expect(installCommand({ ref: sha, repo: "phenix3443/paperclip", yes: true }, { runCommand })).rejects.toThrow(/Payload driver node_modules\/postgres cjs\/src\/connection\.js/);
     const paths = resolveInstallStorePaths();
     expect(fs.existsSync(destination)).toBe(false);
     expect(fs.existsSync(payloadPathFor(paths, "git", sha.slice(0, 12)))).toBe(false);
@@ -290,7 +275,7 @@ describe("managed install commands", () => {
     const currentBefore = fs.readlinkSync(paths.currentPath);
     const poisoned = payloadPathFor(paths, "git", poisonedSha.slice(0, 12));
     writePatchedPayload(poisoned);
-    fs.writeFileSync(path.join(poisoned, "node_modules", "paperclipai", "node_modules", "postgres", "src", "index.js"), "export default null;\n");
+    fs.writeFileSync(path.join(poisoned, "node_modules", "postgres", "src", "index.js"), "export default null;\n");
     const runCommand = createGitCheckoutRunCommand(poisonedSha);
     await expect(installCommand({ ref: poisonedSha, repo: "phenix3443/paperclip", yes: true }, { runCommand })).rejects.toThrow(/src\/index\.js/);
     expect(runCommand.mock.calls.filter(([command, args]) => command === "curl" && args.includes("--output"))).toHaveLength(0);
