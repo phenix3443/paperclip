@@ -215,4 +215,27 @@ describePostgres("membership writes notify connection delivery", () => {
     await pending();
     expect((await db.select().from(companyMemberships))[0]!.membershipRole).toBe("viewer");
   });
+
+  it.each([false, true])("combined agent grant replacement owns its notification (rollback=%s)", async rollback => {
+    const f = await fixture();
+    await db.update(companyMemberships).set({ membershipRole: "operator" });
+    const [member] = await db.insert(companyMemberships).values({
+      companyId: f.companyId, principalType: "agent", principalId: f.agentId, status: "active", membershipRole: "member",
+    }).returning();
+    await db.delete(principalPermissionGrants);
+    delivery = await startConnectionDelivery(db);
+    const baseline = delivery.sweeps;
+    const operation = db.transaction(async tx => {
+      await accessService(tx as unknown as typeof db).updateMemberAndPermissions(f.companyId, member!.id, {
+        grants: [{ permissionKey: "tools:use" }],
+      }, null);
+      if (rollback) throw new Error("rollback");
+    });
+    if (rollback) await expect(operation).rejects.toThrow("rollback");
+    else await operation;
+    await delivery.settle(baseline + 1);
+    if (!rollback) return retired(f.connection.id);
+    await pending();
+    expect(await db.select().from(principalPermissionGrants)).toHaveLength(0);
+  });
 });

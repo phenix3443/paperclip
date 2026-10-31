@@ -587,10 +587,10 @@ export function accessService(db: Db) {
       }
 
       const now = new Date();
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
       if (existing.status === "active" && nextStatus !== "active" && existing.principalType === "user") {
         await sweepMemberConnectionAccess(tx, companyId, existing.principalId, now);
       }
-      await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
       const updated = await tx
         .update(companyMemberships)
         .set({
@@ -1185,6 +1185,7 @@ export function accessService(db: Db) {
       }
 
       const now = new Date();
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
       if (
         existing.principalType === "user" &&
         existing.status !== "suspended" &&
@@ -1193,7 +1194,6 @@ export function accessService(db: Db) {
         await sweepMemberConnectionAccess(tx, companyId, existing.principalId, now);
       }
 
-      await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
       return tx
         .update(companyMemberships)
         .set({
