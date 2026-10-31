@@ -1,3 +1,5 @@
+# Build native packages for develop and the exact protected maintenance ref.
+# Maintenance packages require separate exact-source and artifact approval.
 # Build the deployable packages for each develop commit, so the service host
 # installs them instead of compiling from source (phenix3443/ai-team deploy.py).
 # The packages come from this commit's own `paperclipai install --ref`, which
@@ -6,12 +8,15 @@ name: deploy-packages
 
 on:
   push:
-    branches: [develop]
-  # Validates changes to the packaging itself; deploy.py only accepts push runs on develop.
+    branches: [develop, fix/maintenance-rework-151]
+  # PR builds validate packaging; they never receive maintenance provenance.
   pull_request:
     paths:
       - .github/workflows/deploy-packages.yml
       - cli/src/commands/install.ts
+      - .github/scripts/maintenance-package-provenance.mjs
+      - .github/scripts/tests/maintenance-package-provenance.test.mjs
+      - doc/maintenance-packages.md
   workflow_dispatch:
 
 permissions:
@@ -23,7 +28,14 @@ concurrency:
 
 jobs:
   packages:
-    if: github.repository == 'phenix3443/paperclip'
+    if: >-
+      github.repository == 'phenix3443/paperclip' &&
+      (github.ref != 'refs/heads/fix/maintenance-rework-151' ||
+       (github.event_name == 'push' && github.ref_protected == true &&
+        github.repository_id == '1420915320'))
+    permissions:
+      contents: read
+      actions: read
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
@@ -31,6 +43,9 @@ jobs:
       REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       # The packages are Node-version independent; the service host installs
       # them with its own Node, which also builds their native modules.
@@ -92,6 +107,19 @@ jobs:
           corepack enable
           corepack pnpm install --frozen-lockfile
 
+      - name: Test maintenance package provenance
+        run: node --test .github/scripts/tests/maintenance-package-provenance.test.mjs
+
+      - name: Check maintenance source types and unit and route tests
+        if: >-
+          github.ref == 'refs/heads/fix/maintenance-rework-151' ||
+          github.base_ref == 'fix/maintenance-rework-151'
+        run: |
+          corepack pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
+          corepack pnpm build
+          corepack pnpm -r typecheck
+          corepack pnpm test:run
+
       # A transient unit reports the peak memory of the whole build tree.
       # The token is imported by name so it never appears in process arguments,
       # which the memory sampler records.
@@ -118,6 +146,12 @@ jobs:
             console.log(`${manifest.files.length} packages for ${manifest.sha} (${manifest.version})`);
           '
           du -sh "$PACKAGES_DIR"
+
+      - name: Bind maintenance package provenance
+        if: github.ref == 'refs/heads/fix/maintenance-rework-151'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node .github/scripts/maintenance-package-provenance.mjs
 
       # Diagnostics only: the report never fails the job.
       - name: Report memory
@@ -381,7 +415,7 @@ jobs:
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: paperclip-payload-${{ github.sha }}
+          name: ${{ github.event_name == 'pull_request' && 'paperclip-validation' || 'paperclip-payload' }}-${{ github.sha }}
           path: ${{ runner.temp }}/packages
           retention-days: 30
           # The tarballs are already gzip-compressed.
