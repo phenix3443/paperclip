@@ -29,7 +29,7 @@ export async function seedPendingAccessRequest(db: Db, owner: string) {
   return { companyId, agentId, issueId, intent: intent!, connection: connection!, tool: tool! };
 }
 
-export async function startConnectionDelivery(db: Db, options: { canRun?: () => boolean; beforeSweep?: () => Promise<void> } = {}) {
+export async function startConnectionDelivery(db: Db, options: { canRun?: () => boolean; beforeSweep?: () => Promise<void>; afterSweep?: () => Promise<void> } = {}) {
   const startedAt = Date.now();
   const wakeup = vi.fn().mockResolvedValue(null);
   const service = connectionIntentDeliveryService(db, { wakeup });
@@ -47,7 +47,12 @@ export async function startConnectionDelivery(db: Db, options: { canRun?: () => 
       sweeps += 1;
       running += 1;
       sweeping = true;
-      try { await options.beforeSweep?.(); return await service.sweepPending(); }
+      try {
+        await options.beforeSweep?.();
+        const result = await service.sweepPending();
+        await options.afterSweep?.();
+        return result;
+      }
       catch (error) { sweeping = false; throw error; }
       finally { running -= 1; }
     } });
