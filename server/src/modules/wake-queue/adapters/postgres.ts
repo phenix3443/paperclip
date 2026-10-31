@@ -999,10 +999,10 @@ export async function appendQueuedComment(scope: TransactionScope, input: Append
     (context.source === undefined || context.source === "issue.comment") &&
     (context.wakeReason === undefined || context.wakeReason === "issue_commented") &&
     (context.wakeSource === undefined || context.wakeSource === "automation");
-  const ordinaryPayload = (payload: Record<string, unknown>) =>
+  const ordinaryPayload = (payload: Record<string, unknown>, root = false) =>
     (payload.mutation === undefined || payload.mutation === "comment") &&
     ordinaryContext(parseObject(payload._paperclipWakeContext)) &&
-    Object.keys(payload).every(key => payloadKeys.has(key)) &&
+    Object.keys(payload).every(key => payloadKeys.has(key) || (root && key === "_paperclipQueuedCommentRoot")) &&
     Object.keys(parseObject(payload._paperclipWakeContext)).every(key => contextKeys.has(key));
   if (!ordinaryPayload(input.payload ?? {}) || !ordinaryContext(input.contextSnapshot) || !Object.keys(input.contextSnapshot).every(key => contextKeys.has(key)) ||
       extractWakeCommentIds(input.contextSnapshot).some(id => id !== input.commentId) ||
@@ -1055,7 +1055,7 @@ export async function appendQueuedComment(scope: TransactionScope, input: Append
   }
   if (run.invocationSource !== "automation" || wake.source !== "automation" || wake.reason !== "issue_commented" || wake.idempotencyKey ||
       queuedCommentIdsFromWakePayload(wake.payload).length === 0 ||
-      wake.payload?.issueId !== issue.id || run.contextSnapshot?.issueId !== issue.id || !ordinaryPayload(parseObject(wake.payload)) ||
+      wake.payload?.issueId !== issue.id || run.contextSnapshot?.issueId !== issue.id || !ordinaryPayload(parseObject(wake.payload), true) ||
       !ordinaryContext(parseObject(run.contextSnapshot)) ||
       !Object.keys(parseObject(run.contextSnapshot)).every(key => contextKeys.has(key) || key === "reviewerAssignmentGeneration") ||
       (typeof run.contextSnapshot?.reviewerAssignmentGeneration === "string" &&
@@ -1066,7 +1066,7 @@ export async function appendQueuedComment(scope: TransactionScope, input: Append
   const ids = [...new Set([...queuedCommentIdsFromWakePayload(wake.payload), comment.id])];
   const now = new Date();
   const updatedWake = await tx.update(agentWakeupRequests).set({
-    payload: withQueuedCommentIdsInWakePayload(wake.payload, ids), updatedAt: now,
+    payload: withQueuedCommentIdsInWakePayload(wake.payload, ids, wake.id), updatedAt: now,
   }).where(and(eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.agentId, input.agentId),
     eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "queued"), eq(agentWakeupRequests.runId, run.id),
   )).returning({ id: agentWakeupRequests.id });

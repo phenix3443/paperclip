@@ -72,7 +72,7 @@ function buildTransaction(tx: Db, companyId: string, issueId: string, deps: Queu
     async updateWakeQueuedCommentIds({ wakeId, payload, ids, updatedAt }) {
       const row = await tx
         .update(agentWakeupRequests)
-        .set({ payload: withQueuedCommentIdsInWakePayload(payload, ids), updatedAt })
+        .set({ payload: withQueuedCommentIdsInWakePayload(payload, ids, wakeId), updatedAt })
         .where(and(ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.id, wakeId), eq(agentWakeupRequests.companyId, companyId)))
         .returning()
         .then((rows) => rows[0]);

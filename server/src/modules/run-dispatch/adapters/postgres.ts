@@ -4,7 +4,7 @@ import { hasRequiredWorkspaceRecovery } from "../../../services/workspace-restor
 import { readNativeWorkspaceSyncReference } from "../../../services/native-runtime/native-workspace-sync.js";
 import { isPreDispatchExecutionWaitVerified } from "../../../services/pre-dispatch-execution-wait.js";
 import { isUserCommentContinuationReason } from "../../../services/explicit-native-continuation.js";
-import { queuedCommentIdsFromWakePayload, queuedCommentIdsFromRunContext, withQueuedCommentIdsInWakePayload } from "../../../services/issue-queued-comment-queue.js";
+import { queuedCommentRootIdFromWakePayload, queuedCommentIdsFromRunContext, withQueuedCommentIdsInWakePayload } from "../../../services/issue-queued-comment-queue.js";
 import { notifyExternalAgentSettlement } from "../../external-agents/index.js";
 import { notifyUnsafeWorkspaceExportRecovery } from "../../../services/unsafe-workspace-export-notifications.js";
 import { notifyCancelledWorkspacePreservation } from "../../../services/cancelled-workspace-preservation-notifications.js";
@@ -1015,8 +1015,7 @@ export function createPostgresRunDispatchAdapter(
       inArray(issueComments.id, commentIds), eq(issueComments.authorType, "user"),
       sql`${issueComments.deletedAt} is null`, sql`${issueComments.createdByRunId} is null`,
     ));
-    const originalCommentId = comments.find(comment => comment.id === projectedCommentId)?.authorUserId === wake.requestedByActorId
-      ? projectedCommentId : queuedCommentIdsFromWakePayload(payload)[0];
+    const originalCommentId = queuedCommentRootIdFromWakePayload(payload, wake.id) ?? projectedCommentId;
     if (comments.length !== commentIds.length || comments.some(comment =>
       !comment.body.trim() || !comment.authorUserId) ||
       comments.find(comment => comment.id === originalCommentId)?.authorUserId !== wake.requestedByActorId) return null;

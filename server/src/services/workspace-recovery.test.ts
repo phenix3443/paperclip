@@ -1,4 +1,6 @@
 import { appendQueuedComment, createAdmissionTransactionScope, createWakeAdmissionReader, createWakeAdmissionWriter } from "../modules/wake-queue/adapters/postgres.js";
+import { createQueuedCommentQueue } from "../modules/wake-queue/index.js";
+import { queuedCommentQueueRevision } from "./issue-queued-comment-queue.js";
 import { createAdmitWakeBehindIssueExecution } from "../modules/wake-queue/application/use-cases.js";
 import { filterZombieCoalesceTarget } from "./heartbeat.js";
 import { mergeCoalescedContextSnapshot } from "./heartbeat/run-preparation.js";
@@ -1501,7 +1503,7 @@ describe("automatic retained workspace recovery", () => {
     return { followup, receipt };
   }
 
-  async function ordinaryMixedQueuedFixture(kind: "active" | "deferred" | "deferred-different" | "system-deferred") {
+  async function ordinaryMixedQueuedFixture(kind: "active" | "deferred" | "deferred-different" | "system-deferred", reordered = false) {
     const t = await queuedResetFixture(true, kind !== "active"), { f, original, reset, wake, queued, queueDeps, queue, control } = t;
     await db.update(issues).set({ conversationAgentId: null, conversationUserId: null, conversationState: null,
       executionRunId: null, executionAgentNameKey: null, executionLockedAt: null }).where(eq(issues.id, f.issueId));
@@ -1563,6 +1565,22 @@ describe("automatic retained workspace recovery", () => {
       expect(last.createdAt.getTime()).toBeGreaterThan((await run(f.runId)).finishedAt!.getTime());
       ids.push(last.id); admitted = await enqueue(last);
     }
+    if (reordered) {
+      const [third] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+        authorType: "user", authorUserId: "third-user", body: "Preserve the third author's input after reordering." }).returning();
+      expect((await enqueue(third))?.id).toBe(admitted!.id);
+      const currentTask = (await db.select().from(issues).where(eq(issues.id, f.issueId)))[0];
+      const currentRun = await run(admitted!.id);
+      await createQueuedCommentQueue(db, {
+        syncCommentReferences: async () => {}, deleteCommentReferenceSource: async () => {}, syncCommentExternalObjectsSafely: async () => {},
+      }).reorderQueuedComments({ issue: currentTask,
+        actor: { actorType: "user", actorId: "operator", agentId: null, runId: null, agentApiKeyId: null },
+        queueId: currentRun.wakeupRequestId!,
+        revision: queuedCommentQueueRevision({ queueId: currentRun.wakeupRequestId!, comments: [reset, followup, third] }),
+        orderedCommentIds: [followup.id, reset.id, third.id], now: new Date(),
+      });
+      ids.splice(0, ids.length, followup.id, reset.id, third.id);
+    }
     expect(admitted?.status).toBe("queued");
     const current = await run(admitted!.id);
     const [claimedWake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, current.wakeupRequestId!));
@@ -1570,11 +1588,11 @@ describe("automatic retained workspace recovery", () => {
     expect(sameActor).not.toHaveBeenCalled();
     expect(queueDeps.wakeQueue.admitWakeBehindIssueExecution.mock.calls.every(([, input]) => input.durableReceipt === undefined)).toBe(true);
     expect(queueDeps.executeRun).not.toHaveBeenCalled();
-    return { ...t, queued: current, wake: claimedWake, followup, expectedIds: ids, latestAuthor: kind === "deferred-different" ? "third-user" : kind === "active" ? "second-user" : "operator" };
+    return { ...t, queued: current, wake: claimedWake, followup, expectedIds: ids, latestAuthor: reordered ? "third-user" : kind === "deferred-different" ? "third-user" : kind === "active" ? "second-user" : "operator" };
   }
 
-  async function exerciseQueuedReset(nativeDescriptor: boolean, coalesced = false, ordinary?: "active" | "deferred" | "deferred-different" | "system-deferred") {
-    const mixed = ordinary ? await ordinaryMixedQueuedFixture(ordinary) : null;
+  async function exerciseQueuedReset(nativeDescriptor: boolean, coalesced = false, ordinary?: "active" | "deferred" | "deferred-different" | "system-deferred", reordered = false) {
+    const mixed = ordinary ? await ordinaryMixedQueuedFixture(ordinary, reordered) : null;
     const t = mixed ?? await queuedResetFixture(nativeDescriptor);
     const { f, original, reset, wake, queued, deps, control, execution, queueDeps, queue } = t;
     const followup = coalesced ? (await coalesceQueuedReset(t)).followup : null;
@@ -1671,6 +1689,10 @@ describe("automatic retained workspace recovery", () => {
 
   it("preserves each ordinary mixed-author comment across queued Stop and native copyback", async () => {
     await exerciseQueuedReset(true, false, "active");
+  }, 30_000);
+
+  it("preserves a reordered three-author queue across Stop and native copyback", async () => {
+    await exerciseQueuedReset(true, false, "active", true);
   }, 30_000);
 
   it("preserves merged-deferred mixed-author comments across queued Stop and native copyback", async () => {
