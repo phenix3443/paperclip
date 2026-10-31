@@ -1,0 +1,90 @@
+#!/usr/bin/env node
+// Install exported payload tarballs into an empty prefix, as the deployment
+// host does, then prove every postgres caller loads the patched driver and the
+// close/live probe behaves as expected against patched and registry drivers.
+import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { PATCHED_POSTGRES_DRIVER, verifyPostgresDriverPayload } from "../cli/src/postgres-driver-integrity.ts";
+
+const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
+const probe = join(repoRoot, "scripts/postgres-close-probe.mjs");
+const PROBE_SHA256 = "95954494ea5d673cf945fdc77e97ff1fb0ac965de7582b603ceeaf2fe91ac48c";
+const sha256 = file => createHash("sha256").update(readFileSync(file)).digest("hex");
+
+const [packagesArg, workArg, ...extra] = process.argv.slice(2);
+if (!packagesArg || !workArg || extra.length) {
+  console.error("Usage: verify-postgres-final-install.mjs <packages-dir> <empty-work-dir>");
+  process.exit(2);
+}
+const packagesDir = resolve(packagesArg), workDir = resolve(workArg);
+mkdirSync(workDir, { recursive: true });
+if (readdirSync(workDir).length) throw new Error(`${workDir} must be empty`);
+if (sha256(probe) !== PROBE_SHA256) throw new Error("close/live probe differs from the reviewed fixture");
+
+const manifest = JSON.parse(readFileSync(join(packagesDir, "payload-packages.json"), "utf8"));
+for (const { file, sha256: expected } of manifest.files) {
+  if (sha256(join(packagesDir, file)) !== expected) throw new Error(`checksum mismatch: ${file}`);
+}
+
+const env = { ...process.env, npm_config_cache: join(workDir, "npm-cache"), npm_config_userconfig: join(workDir, "npmrc") };
+delete env.NODE_PATH;
+delete env.NODE_OPTIONS;
+writeFileSync(env.npm_config_userconfig, "");
+const prefix = join(workDir, "payload");
+const npmArgs = ["install", "--prefix", prefix, ...manifest.files.map(({ file }) => join(packagesDir, file)), "--no-audit", "--no-fund"];
+execFileSync("npm", npmArgs, { cwd: workDir, env, stdio: "inherit", timeout: 20 * 60_000 });
+
+function runProbe(entry, mode) {
+  const result = spawnSync(process.execPath, [probe, entry, mode], { env, encoding: "utf8", timeout: 15_000 });
+  return { entry, mode, exit: result.status, signal: result.signal, stdout: result.stdout.trim(),
+    nullWrite: /Immediate\.nextWrite|reading 'write'/.test(result.stderr) };
+}
+const failures = [];
+const expect = (control, ok) => { if (!ok) failures.push(control); return control; };
+
+const resolutions = await verifyPostgresDriverPayload(prefix);
+const controls = [];
+for (const { import: esm, require: cjs } of resolutions) {
+  for (const entry of [esm, cjs]) {
+    const closed = runProbe(entry, "closed"), live = runProbe(entry, "live");
+    controls.push(expect(closed, closed.exit === 0 && closed.stdout === "CONNECTION_CLOSED" && !closed.nullWrite));
+    controls.push(expect(live, live.exit === 0 && live.stdout === "OK"));
+  }
+}
+
+const registryDir = join(workDir, "registry");
+mkdirSync(registryDir);
+execFileSync("npm", ["pack", `postgres@${PATCHED_POSTGRES_DRIVER.version}`, "--pack-destination", registryDir, "--silent"],
+  { cwd: registryDir, env, stdio: ["ignore", "ignore", "inherit"], timeout: 120_000 });
+execFileSync("tar", ["-xzf", join(registryDir, `postgres-${PATCHED_POSTGRES_DRIVER.version}.tgz`), "-C", registryDir]);
+for (const entry of ["src/index.js", "cjs/src/index.js"].map(file => join(registryDir, "package", file))) {
+  const closed = runProbe(entry, "closed"), live = runProbe(entry, "live");
+  controls.push(expect(closed, closed.exit === 1 && closed.nullWrite));
+  controls.push(expect(live, live.exit === 0 && live.stdout === "OK"));
+}
+
+const report = {
+  node: process.version,
+  npm: execFileSync("npm", ["--version"], { env, encoding: "utf8" }).trim(),
+  platform: `${process.platform}-${process.arch}`,
+  source: { repo: manifest.repo, sha: manifest.sha, version: manifest.version },
+  packages: manifest.files,
+  patch: { file: "patches/postgres@3.4.9.patch", sha256: sha256(join(repoRoot, "patches/postgres@3.4.9.patch")) },
+  expectedDriver: PATCHED_POSTGRES_DRIVER,
+  npmArgs: npmArgs.map(arg => arg.replace(packagesDir, "<packages>").replace(workDir, "<work>")),
+  resolutions: resolutions.map(entry => ({ ...entry, import: entry.import.replace(prefix, "<payload>"),
+    require: entry.require.replace(prefix, "<payload>"), packageRoot: entry.packageRoot.replace(prefix, "<payload>") })),
+  controls: controls.map(control => ({ ...control, entry: control.entry.replace(prefix, "<payload>").replace(registryDir, "<registry>") })),
+  failures: failures.length,
+};
+writeFileSync(join(workDir, "report.json"), `${JSON.stringify(report, null, 2)}\n`);
+console.log(JSON.stringify(report, null, 2));
+rmSync(join(workDir, "npm-cache"), { recursive: true, force: true });
+if (failures.length) {
+  console.error(`${failures.length} postgres final-install controls failed`);
+  process.exit(1);
+}

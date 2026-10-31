@@ -12,6 +12,13 @@ on:
     paths:
       - .github/workflows/deploy-packages.yml
       - cli/src/commands/install.ts
+      - cli/src/postgres-driver-integrity.ts
+      - packages/db/package.json
+      - patches/postgres@*.patch
+      - scripts/generate-npm-package-json.mjs
+      - scripts/postgres-close-probe.mjs
+      - scripts/prepare-bundled-package.mjs
+      - scripts/verify-postgres-final-install.mjs
   workflow_dispatch:
 
 permissions:
@@ -118,6 +125,33 @@ jobs:
             console.log(`${manifest.files.length} packages for ${manifest.sha} (${manifest.version})`);
           '
           du -sh "$PACKAGES_DIR"
+
+      # The service host installs the exported tarballs again with plain npm.
+      # Repeat that install twice in empty prefixes, on a pinned toolchain, and
+      # fail before upload unless every postgres caller loads the patched driver
+      # and the close/live probe passes (and still fails on the registry driver).
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24.22.1
+
+      - name: Verify postgres in clean final installs
+        run: |
+          umask 022
+          npm install --global npm@11.19.0 --no-audit --no-fund
+          node --version && npm --version
+          for attempt in 1 2; do
+            HOME="$RUNNER_TEMP/final-home-$attempt" node scripts/verify-postgres-final-install.mjs \
+              "$PACKAGES_DIR" "$RUNNER_TEMP/final-install-$attempt" 2>&1 | tee "$RUNNER_TEMP/final-install-$attempt.log"
+          done
+          node -e '
+            const fs = require("node:fs");
+            const pick = report => JSON.stringify({ expectedDriver: report.expectedDriver, resolutions: report.resolutions,
+              controls: report.controls.map(({ entry, mode, exit, stdout, nullWrite }) => ({ entry, mode, exit, stdout, nullWrite })) });
+            const [first, second] = [1, 2].map(attempt => JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/final-install-${attempt}/report.json`, "utf8")));
+            if (first.failures || second.failures || pick(first) !== pick(second)) throw new Error("clean final installs disagree");
+            console.log(JSON.stringify(first, null, 2));
+          ' | tee "$RUNNER_TEMP/postgres-final-install.json"
+          { echo "## Postgres final install"; echo; echo '```json'; cat "$RUNNER_TEMP/postgres-final-install.json"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
       # Diagnostics only: the report never fails the job.
       - name: Report memory
