@@ -10,6 +10,8 @@ import {
   companyMemberships,
   costEvents,
   createDb,
+  applyPendingMigrations,
+  EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
   documentRevisions,
   documents,
   environmentLeases,
@@ -25,6 +27,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { truncateTablesWithDeadlockRetry } from "./helpers/truncate-with-deadlock-retry.js";
 import {
@@ -59,7 +62,8 @@ vi.mock("../adapters/index.ts", async () => {
   };
 });
 
-const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const external = resolveExternalTestDatabaseUrl("PAPERCLIP_STALE_QUEUE_TEST_DATABASE_URL");
+const embeddedPostgresSupport = external ? { supported: true, reason: undefined } : await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
 if (!embeddedPostgresSupport.supported) {
@@ -147,8 +151,9 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     mockAdapterExecute.mock.calls.filter(([context]) => context?.runId === runId).length;
 
   beforeAll(async () => {
-    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-stale-queue-");
-    db = createDb(tempDb.connectionString);
+    if (external) await applyPendingMigrations(external);
+    else tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-stale-queue-");
+    db = createDb(external ?? tempDb!.connectionString);
     heartbeat = heartbeatService(db, {
       runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "false" },
       beforeResolvedInteractionContinuationDispatchCheck: async (input) => {
@@ -159,7 +164,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       },
     });
     await ensureIssueRelationsTable(db);
-  }, 20_000);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
   afterEach(async () => {
     beforeContinuationDispatchCheck = null;
@@ -942,7 +947,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(countExecuteCallsForRun(runId)).toBe(0);
   });
 
-  it("rate-limits skipped generic timer wakes by advancing the timer baseline", async () => {
+  it("leaves ineligible timers disarmed without writing skipped wakes or moving their baseline", async () => {
     const { agentId } = await seedCompanyAndAgent({
       heartbeatConfig: {
         enabled: true,
@@ -959,7 +964,8 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     const firstTick = await heartbeat.tickTimers(now);
     const secondTick = await heartbeat.tickTimers(now);
 
-    expect(firstTick.skipped).toBe(1);
+    expect(firstTick.skipped).toBe(0);
+    expect(await heartbeat.nextAgentTimerAt()).toBeNull();
     expect(secondTick.skipped).toBe(0);
     expect(mockAdapterExecute).not.toHaveBeenCalled();
 
@@ -972,10 +978,9 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       .from(agents)
       .where(eq(agents.id, agentId));
 
-    expect(wakeups).toHaveLength(1);
-    expect(wakeups[0]?.reason).toBe("heartbeat.timer.no_actionable_work");
+    expect(wakeups).toEqual([]);
     expect(agent?.lastHeartbeatAt).toBeInstanceOf(Date);
-    expect(agent?.lastHeartbeatAt?.getTime()).toBeGreaterThan(now.getTime() - 120_000);
+    expect(agent?.lastHeartbeatAt?.getTime()).toBe(now.getTime() - 120_000);
   });
 
   it("atomically claims a due timer interval across overlapping scheduler ticks", async () => {
@@ -1791,8 +1796,22 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     const interactionId = randomUUID();
     const wakeCommentId = randomUUID();
     let claimedIssue: { status: string; executionRunId: string | null } | null = null;
+    let resumedRunId: string | undefined;
+    let signalAdapterStarted!: () => void;
+    const adapterStarted = new Promise<void>(resolve => { signalAdapterStarted = resolve; });
+    const execute = mockAdapterExecute.getMockImplementation()!;
+    mockAdapterExecute.mockImplementation(async (...args: unknown[]) => {
+      if ((args[0] as { runId: string }).runId === resumedRunId) {
+        signalAdapterStarted();
+        // A claimed continuation can finish after the old terminal poll.
+        if (interactionStatus === "rejected" && interactionKind === "connection_intent") {
+          await new Promise(resolve => setTimeout(resolve, 3100));
+        }
+      }
+      return execute();
+    });
     afterContinuationDispatchCheck = async ({ runId: checkedRunId, issueId: checkedIssueId }) => {
-      if (checkedIssueId !== issueId) return;
+      if (checkedIssueId !== issueId || checkedRunId !== resumedRunId) return;
       claimedIssue = await db
         .select({ status: issues.status, executionRunId: issues.executionRunId })
         .from(issues)
@@ -1826,13 +1845,14 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       contextExtras: { interactionId, interactionKind, interactionStatus, wakeCommentId,
         originCommentIds: [wakeCommentId],
         interactionResolvedAt: new Date().toISOString(), mutation: "interaction", source: `${interactionKind}.resolved`, forceFreshSession: true } });
+    resumedRunId = runId;
     await heartbeat.resumeQueuedRuns();
-    expect(await waitForCondition(async () => (await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]?.status === "succeeded")).toBe(true);
-    // Terminal status precedes completion bookkeeping. Drain those writes before
-    // afterEach truncates the fixture, otherwise PostgreSQL can deadlock.
+    // Adapter entry guarantees this exact execution is registered. Await its
+    // owning completion barrier before terminal assertions and fixture cleanup.
+    await adapterStarted;
     await heartbeat.waitForRunExecutionDrain(runId);
+    expect((await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]?.status).toBe("succeeded");
     expect(countExecuteCallsForRun(runId)).toBe(1);
-    await waitForCondition(async () => claimedIssue !== null);
     expect(claimedIssue).toEqual({ status: "in_progress", executionRunId: runId });
   });
 });

@@ -1,3 +1,4 @@
+import { observeStoppedWorkspaceRecovery } from "../workspace-recovery.js";
 import { notifyScheduledRetryCancellation } from "../scheduled-retry-cancellation-notifications.js";
 import { notifyChatInboundWakeNotices } from "../chat-inbound-wake-notice-notifications.js";
 import { resumeDeferredChatWake } from "../durable-chat-wakeup.js";
@@ -361,6 +362,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     status: string | null | undefined;
     failureReason?: string | null;
     providerResourceDisposition?: ProviderResourceDisposition;
+    respectCleanupDeadlines?: boolean;
     nativeLifecycleTelemetry?: {
       provider: string;
       harness: string;
@@ -466,6 +468,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         status: leaseReleaseStatusForRunStatus(status),
         failureReason: input.failureReason ?? undefined,
         providerResourceDisposition,
+        ...(input.respectCleanupDeadlines ? { respectCleanupDeadlines: true } : {}),
         nativeLifecycleTelemetry: input.nativeLifecycleTelemetry,
       })
       .catch((err) => {
@@ -543,11 +546,12 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     )) : [];
     // The ordinary path still enforces task holds, ownership, and native session
     // cleanup before starting a provider.
-    const stoppedNativeContinuation = currentRun && isAcknowledgedNativeStop(currentRun) &&
+    const stoppedNativeExecution = currentRun && isAcknowledgedNativeStop(currentRun) &&
       !activeRunExecutions.has(run.id) && !coordinator?.leaseOwner &&
       ["terminal_failure", "applied"].includes(coordinator?.phase ?? "") &&
-      await acknowledgedNativeStopExecutionHasStopped(db, currentRun) &&
-      !(await getExecutionBlocker(db, run.companyId, issueId));
+      await acknowledgedNativeStopExecutionHasStopped(db, currentRun);
+    if (stoppedNativeExecution) await observeStoppedWorkspaceRecovery(db, { companyId: run.companyId, issueId, runId: run.id });
+    const stoppedNativeContinuation = stoppedNativeExecution && !(await getExecutionBlocker(db, run.companyId, issueId));
     const legacyContinuation = run.runtimeMode === "legacy" &&
       hasConversationContinuationPolicy((await getRunExecutionWait(run.companyId, run.id))?.resultJson) &&
       !(await getExecutionBlocker(db, run.companyId, issueId));
@@ -726,7 +730,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
             or(isNull(environmentLeases.releasedAt), inArray(environmentLeases.status, ["active", "retained", "pending_cleanup"])),
           )).limit(1);
           if (otherOwner) continue;
-          await notifyEnvironmentCleanup(tx);
+          await notifyEnvironmentCleanup(tx, { companyId: lease.companyId, runId: lease.heartbeatRunId ?? undefined });
           await tx.update(environmentLeases).set({ status: "pending_cleanup", updatedAt: new Date() })
             .where(eq(environmentLeases.id, lease.id));
         }

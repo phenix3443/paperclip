@@ -1,3 +1,5 @@
+import { notifyIssueRecovery } from "./issue-recovery-notifications.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { notifyUnsafeWorkspaceExportRecovery } from "./unsafe-workspace-export-notifications.js";
 import { FAST_RESPONSE_AGENT_GUIDANCE, fastResponseHistoryBody } from "@paperclipai/shared";
 import {
@@ -268,6 +270,8 @@ export async function prepareConversationTurn(
         context.conversationReplayThroughCommentId = replayThrough?.id ?? commentId;
       }
     }
+    await notifyDeliveryWork(tx, DELIVERY_QUEUES.issueMonitors);
+    await notifyDeliveryWork(tx, DELIVERY_QUEUES.agentTimers);
     await tx
       .update(issues)
       .set({
@@ -386,6 +390,8 @@ export async function settleConversationTurn(
       issue.conversationState === conversationState
     )
       return true;
+    await notifyDeliveryWork(tx, DELIVERY_QUEUES.issueMonitors);
+    await notifyDeliveryWork(tx, DELIVERY_QUEUES.agentTimers);
     if (status === "in_review") await notifyUnsafeWorkspaceExportRecovery(tx, { companyId: issue.companyId, issueId: issue.id });
     await tx
       .update(issues)
@@ -521,6 +527,9 @@ export async function undeliveredConversationComments(
         eq(issueComments.companyId, companyId),
         eq(issueComments.issueId, issueId),
         isNull(issueComments.deletedAt),
+        sql`${issueComments.authorUserId} is not null`,
+        isNull(issueComments.authorAgentId),
+        eq(issueComments.origin, "comment"),
         sql`${issueComments.clientRequestId} is not null`,
         sql`not exists (select 1 from ${agentWakeupRequests} where ${agentWakeupRequests.companyId} = ${companyId}
       and ${agentWakeupRequests.idempotencyKey} = 'conversation-comment:' || ${issueComments.id}::text)`,
@@ -539,6 +548,7 @@ export async function resumeConversationForReset(db: Db, comment: typeof issueCo
       eq(issues.id, comment.issueId), eq(issues.companyId, comment.companyId),
     )).for("update");
     if (!isConversation(issue) || comment.conversationSessionGeneration != null) return;
+    await notifyIssueRecovery(tx, { companyId: issue.companyId });
     const released = await tx.update(issueTreeHolds).set({
       status: "released", releasedAt: new Date(), updatedAt: new Date(),
       releasedByActorType: "user", releasedByUserId: comment.authorUserId,
