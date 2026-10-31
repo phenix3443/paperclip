@@ -8,8 +8,8 @@ import { DELIVERY_QUEUES } from "../../services/delivery-work-notifications.js";
 
 const RETRY_MS = 600_000;
 
-export async function seedPendingAccessRequest(db: Db, owner: string) {
-  const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+export async function seedPendingAccessRequest(db: Db, owner: string, companyId = randomUUID()) {
+  const agentId = randomUUID(), issueId = randomUUID();
   await db.insert(companies).values({ id: companyId, name: "Connections", issuePrefix: "CON", defaultResponsibleUserId: owner });
   await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: owner, status: "active", membershipRole: "member" });
   await db.insert(agents).values({ id: agentId, companyId, name: "Assignee", role: "engineer", adapterType: "claude_local", status: "idle", runtimeConfig: { heartbeat: { wakeOnDemand: true } } });
@@ -34,9 +34,28 @@ export async function startConnectionDelivery(db: Db, options: { canRun?: () => 
   const service = connectionIntentDeliveryService(db, { wakeup });
   const errors: unknown[] = [];
   let sweeps = 0, running = 0;
+  let barrier: { enter: () => void; wait: Promise<void> } | undefined;
+  const releases: Array<() => void> = [];
   const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: options.canRun ?? (() => true), onError: error => { errors.push(error); } });
-  const worker = coordinator.register(DELIVERY_QUEUES.connection, { retryMs: RETRY_MS, nextRunAt: () => null, hasPending: () => service.hasPending(),
-    run: async () => { sweeps += 1; running += 1; try { return await service.sweepPending(); } finally { running -= 1; } } });
+  const worker = coordinator.register(DELIVERY_QUEUES.connection, {
+    retryMs: RETRY_MS,
+    nextRunAt: () => null,
+    hasPending: async () => {
+      running += 1;
+      try { return await service.hasPending(); } finally { running -= 1; }
+    },
+    run: async () => {
+      sweeps += 1;
+      running += 1;
+      try {
+        const held = barrier;
+        barrier = undefined;
+        held?.enter();
+        await held?.wait;
+        return await service.sweepPending();
+      } finally { running -= 1; }
+    },
+  });
   const quiet = () => running === 0 && !databaseWorkPending(db, DELIVERY_QUEUES.connection)
     && (coordinator.nextWakeAt() ?? Infinity) > Date.now() + RETRY_MS / 2;
   async function settle(minSweeps = 0) {
@@ -51,7 +70,16 @@ export async function startConnectionDelivery(db: Db, options: { canRun?: () => 
   return {
     wakeup, wake: worker.wake, settle,
     get sweeps() { return sweeps; },
+    hold() {
+      let enter!: () => void, release!: () => void;
+      const entered = new Promise<void>(resolve => { enter = resolve; });
+      const wait = new Promise<void>(resolve => { release = resolve; });
+      barrier = { enter, wait };
+      releases.push(release);
+      return { entered, release };
+    },
     async stop() {
+      releases.forEach(release => release());
       await coordinator.stop();
       expect(errors).toEqual([]);
     },
