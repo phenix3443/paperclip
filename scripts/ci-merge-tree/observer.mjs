@@ -27,8 +27,15 @@ export function wrapPostgres(original, capture) {
         if (key === 'unsafe') return (query, values, ...rest) => {
           const result = target.unsafe(query, values, ...rest);
           if (!cleanupQuery(query, values)) return result;
-          const then = result.then.bind(result);
-          result.then = (resolve, reject) => snapshot('before_cleanup').then(() => then(resolve, reject));
+          if (typeof result.handler === 'function') {
+            const originalHandler = result.handler;
+            result.handler = Object.assign(query => {
+              snapshot('before_cleanup').then(() => originalHandler(query)).catch(error => query.reject(error));
+            }, originalHandler);
+          } else {
+            const then = result.then.bind(result);
+            result.then = (resolve, reject) => snapshot('before_cleanup').then(() => then(resolve, reject));
+          }
           return result;
         };
         return Reflect.get(target, key);
