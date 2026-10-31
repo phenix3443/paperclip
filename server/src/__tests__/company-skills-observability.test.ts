@@ -120,7 +120,8 @@ describeDatabase("runtime skill observability", () => {
     expect(acquisition.status.code).not.toBe(SpanStatusCode.ERROR);
     // SDK timestamps can differ by less than a millisecond at this boundary.
     // Observe actual lifecycle order instead of comparing rounded wall clocks.
-    expect(lifecycle.indexOf("end:skills.cache.acquire")).toBeLessThan(lifecycle.indexOf("start:skills.rows"));
+    // Rows and installed directories are read before the company-wide lock; only publication happens under it.
+    expect(lifecycle.indexOf("end:skills.rows")).toBeLessThan(lifecycle.indexOf("start:skills.cache.acquire"));
     expect(new Set(spans.map(value => value.spanContext().traceId)).size).toBe(1);
     expect(spans.every(value => Object.keys(value.attributes).every(key => [
       "paperclip.task.run.run_id", "paperclip.execution.fileCount", "paperclip.execution.bytes",
@@ -148,7 +149,8 @@ describeDatabase("runtime skill observability", () => {
       expect(acquisitions[0]!.status.code).toBe(SpanStatusCode.ERROR);
       const configuration = spans.find(span => span.name === "heartbeat.prepare.configuration_skills");
       expect(acquisitions[0]!.parentSpanContext?.spanId).toBe(configuration?.spanContext().spanId);
-      expect(spans.some(span => span.name === "skills.rows")).toBe(false);
+      // The rows were read before the lock; nothing was consumed after the failed acquisition.
+      expect(spans.some(span => span.name === "skills.consume")).toBe(false);
     } finally { release.resolve(); await holder; }
     expect(await f.service.listRuntimeSkillEntries(f.companyId, f.options)).toMatchObject([{ sourceStatus: "available" }]);
   }, 30_000);
