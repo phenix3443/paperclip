@@ -3829,6 +3829,7 @@ async function listIssueBlockerAttentionMap(
   dbOrTx: any,
   companyId: string,
   issueRows: IssueBlockerAttentionInputNode[],
+  options: { truncatePerRoot?: boolean } = {},
 ): Promise<Map<string, IssueBlockerAttention>> {
   const roots = issueRows.filter(
     (row) => row.companyId === companyId && row.status === "blocked",
@@ -3968,13 +3969,38 @@ async function listIssueBlockerAttentionMap(
       }
     }
 
-    if (nodesById.size > BLOCKER_ATTENTION_MAX_NODES) {
+    if (!options.truncatePerRoot && nodesById.size > BLOCKER_ATTENTION_MAX_NODES) {
       truncated = true;
       break;
     }
     frontier = [...nextFrontier];
   }
   if (frontier.length > 0) truncated = true;
+  const graphTruncated = truncated;
+
+  // Replays the single-root walk over the shared graph, so one root's deep or
+  // wide chain does not mark every other root in the batch as truncated.
+  const isRootTruncated = (rootId: string): boolean => {
+    const seen = new Set([rootId]);
+    let rootFrontier = [rootId];
+    for (
+      let depth = 0;
+      rootFrontier.length > 0 && depth < BLOCKER_ATTENTION_MAX_DEPTH;
+      depth += 1
+    ) {
+      const next: string[] = [];
+      for (const issueId of rootFrontier) {
+        for (const edge of edgesByIssueId.get(issueId) ?? []) {
+          if (seen.has(edge.blockerIssueId)) continue;
+          seen.add(edge.blockerIssueId);
+          next.push(edge.blockerIssueId);
+        }
+      }
+      if (seen.size > BLOCKER_ATTENTION_MAX_NODES) return true;
+      rootFrontier = next;
+    }
+    return rootFrontier.length > 0;
+  };
 
   const nodeIds = [...nodesById.keys()];
   const activeIssueIds = new Set<string>();
@@ -4036,6 +4062,20 @@ async function listIssueBlockerAttentionMap(
     for (const row of wakeRows) {
       if (row.issueId) activeIssueIds.add(row.issueId);
     }
+
+    // A scheduled monitor is how a member waits for CI or another timed re-check; its due wake is the live path.
+    const monitorRows: Array<{ id: string }> = await dbOrTx
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          inArray(issues.id, chunk),
+          inArray(issues.status, ["in_progress", "in_review"]),
+          gt(issues.monitorNextCheckAt, new Date()),
+        ),
+      );
+    for (const row of monitorRows) activeIssueIds.add(row.id);
   }
 
   const explicitWaitCandidateIds = [...nodesById.values()]
@@ -4424,6 +4464,9 @@ async function listIssueBlockerAttentionMap(
   };
 
   for (const root of roots) {
+    truncated = options.truncatePerRoot
+      ? isRootTruncated(root.id)
+      : graphTruncated;
     const topLevelEdges = (edgesByIssueId.get(root.id) ?? []).filter((edge) => {
       const blocker = nodesById.get(edge.blockerIssueId);
       return (
@@ -6118,6 +6161,12 @@ async function listIssueBlockedInboxAttentionMap(
       row.issueId ? [row.issueId] : [],
     ),
   );
+  const blockerAttentionByIssueId = await listIssueBlockerAttentionMap(
+    dbOrTx,
+    companyId,
+    issueRows.filter((row) => row.status === "blocked" && !row.hiddenAt),
+    { truncatePerRoot: true },
+  );
 
   for (const row of issueRows) {
     if (
@@ -6365,12 +6414,7 @@ async function listIssueBlockedInboxAttentionMap(
       continue;
     }
 
-    const blockerAttention = await listIssueBlockerAttentionMap(
-      dbOrTx,
-      companyId,
-      [row],
-    );
-    const blockerState = blockerAttention.get(row.id);
+    const blockerState = blockerAttentionByIssueId.get(row.id);
     if (
       row.status === "blocked" &&
       (blockerState?.state === "needs_attention" ||

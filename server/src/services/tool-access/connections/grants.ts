@@ -11,6 +11,7 @@ import { agents, connectionGrantMembers, connectionGrantDelegations, connectionG
 import { badRequest, conflict, forbidden, notFound, unprocessable } from "../../../errors.js";
 import { isPaperclipCloudConnectorStrategy } from "../../paperclip-cloud-connector.js";
 import { vercelTokenRequest, type VercelConnectClient } from "../../vercel-connect.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../delivery-work-notifications.js";
 
 import type { createConnectionCredentialValidation } from "./credential-validation.js";
 type GrantDependencies = {
@@ -232,6 +233,7 @@ replaceConnectionGrantMembers: async (
           .for("update");
         const existingUserSet = new Set(existingUserIds);
         if (requested.length === existingUserSet.size && requested.every(id => existingUserSet.has(id))) return existingAudience;
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
         await tx
           .delete(connectionGrantMembers)
           .where(
@@ -356,6 +358,7 @@ replaceConnectionGrantMembers: async (
           )
           .limit(1);
         if (existing) return existing;
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
         const [delegation] = await tx
           .insert(connectionGrantDelegations)
           .values({
@@ -397,6 +400,7 @@ replaceConnectionGrantMembers: async (
         if (!target) return undefined;
         await tx.select({ id: agents.id }).from(agents)
           .where(and(eq(agents.companyId, connection.companyId), eq(agents.id, target.agentId))).for("no key update");
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
         const [removed] = await tx
           .delete(connectionGrantDelegations)
           .where(
@@ -438,33 +442,36 @@ replaceConnectionGrantMembers: async (
         connection.companyId,
         input.credentialSecretRefs ?? [],
       );
-      if (input.isDefault) {
-        await db
-          .update(connectionGrants)
-          .set({ isDefault: false, updatedAt: new Date() })
-          .where(
-            and(
-              eq(connectionGrants.connectionId, connection.id),
-              eq(connectionGrants.kind, "organization"),
-            ),
-          );
-      }
       const binding = actorBinding(actor);
-      const [grant] = await db
-        .insert(connectionGrants)
-        .values({
-          companyId: connection.companyId,
-          connectionId: connection.id,
-          kind: "organization",
-          providerTenant: input.providerTenant,
-          credentialSecretRefs: input.credentialSecretRefs ?? [],
-          status: "active",
-          isDefault: input.isDefault ?? false,
-          createdByAgentId:
-            binding.actorType === "agent" ? binding.actorId : null,
-          createdByUserId: connectionActorUserId(actor),
-        })
-        .returning();
+      const [grant] = await db.transaction(async (tx) => {
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
+        if (input.isDefault) {
+          await tx
+            .update(connectionGrants)
+            .set({ isDefault: false, updatedAt: new Date() })
+            .where(
+              and(
+                eq(connectionGrants.connectionId, connection.id),
+                eq(connectionGrants.kind, "organization"),
+              ),
+            );
+        }
+        return tx
+          .insert(connectionGrants)
+          .values({
+            companyId: connection.companyId,
+            connectionId: connection.id,
+            kind: "organization",
+            providerTenant: input.providerTenant,
+            credentialSecretRefs: input.credentialSecretRefs ?? [],
+            status: "active",
+            isDefault: input.isDefault ?? false,
+            createdByAgentId:
+              binding.actorType === "agent" ? binding.actorId : null,
+            createdByUserId: connectionActorUserId(actor),
+          })
+          .returning();
+      });
       if (!grant) throw new Error("Failed to create connection installation");
       await db.insert(toolAccessAuditEvents).values({
         companyId: connection.companyId,
@@ -544,6 +551,7 @@ replaceConnectionGrantMembers: async (
         await tx.select({ id: agents.id }).from(agents)
           .where(and(eq(agents.companyId, connection.companyId), notInArray(agents.status, ["pending_approval", "terminated"])))
           .orderBy(agents.id).for("no key update");
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
         const removedDelegations = await tx
           .delete(connectionGrantDelegations)
           .where(

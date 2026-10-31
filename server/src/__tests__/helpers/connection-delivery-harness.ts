@@ -56,9 +56,11 @@ export async function startConnectionDelivery(db: Db, options: { canRun?: () => 
     && (coordinator.nextWakeAt() ?? Infinity) > Date.now() + RETRY_MS / 2;
   async function settle(minSweeps = 0) {
     const limit = Date.now() + 5_000;
+    await new Promise<void>(resolve => setImmediate(resolve));
     while (!quiet() || sweeps < minSweeps) {
       if (Date.now() > limit) throw new Error("Connection delivery did not settle");
       await new Promise(resolve => setTimeout(resolve, 10));
+      await new Promise<void>(resolve => setImmediate(resolve));
     }
     accountedSweeps = sweeps;
   }
@@ -70,6 +72,7 @@ export async function startConnectionDelivery(db: Db, options: { canRun?: () => 
     async stop() {
       await coordinator.stop();
       expect(sweeps).toBe(accountedSweeps);
+      expect(running).toBe(0);
       expect(errors).toEqual([]);
       expect(Date.now() - startedAt).toBeLessThan(RETRY_MS / 2);
     },
