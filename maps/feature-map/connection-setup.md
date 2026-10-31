@@ -191,6 +191,7 @@ The connection-intents browser suite above exercises fixture-backed continuation
 [Membership delivery tests](../../server/src/__tests__/access-connection-delivery.test.ts)
 exercise retirement after access restoration commits, rollback, races and drain
 through the real PostgreSQL notification path.
+[Trust-rule revocation delivery tests](../../server/src/__tests__/tool-trust-rule-revocation-delivery.test.ts) exercise immediate exact-request rechecks, narrowing, rollback of both audits, and grant/revoke races on real PostgreSQL; they do not verify provider calls.
 
 Manual: ask an agent to use an unavailable app, open its request as the named
 user, and complete setup in the dialog. Verify the card settles, the exact task
