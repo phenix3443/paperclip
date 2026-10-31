@@ -29,7 +29,7 @@ export async function seedPendingAccessRequest(db: Db, owner: string, companyId:
   return { companyId, agentId, issueId, intent: intent!, connection: connection!, tool: tool! };
 }
 
-export async function startConnectionDelivery(db: Db, options: { canRun?: () => boolean; beforeSweep?: () => Promise<void> } = {}) {
+export async function startConnectionDelivery(db: Db, options: { canRun?: () => boolean; beforeSweep?: () => Promise<void>; afterSweep?: () => Promise<void> } = {}) {
   const startedAt = Date.now();
   const wakeup = vi.fn<() => Promise<null>>().mockResolvedValue(null);
   const service = connectionIntentDeliveryService(db, { wakeup });
@@ -50,8 +50,11 @@ export async function startConnectionDelivery(db: Db, options: { canRun?: () => 
       sweeping = true;
       try {
         await options.beforeSweep?.();
-        return await service.sweepPending();
-      } catch (error) { sweeping = false; throw error; }
+        const result = await service.sweepPending();
+        await options.afterSweep?.();
+        return result;
+      }
+      catch (error) { sweeping = false; throw error; }
       finally { running -= 1; }
     },
   });
@@ -81,6 +84,7 @@ export async function startConnectionDelivery(db: Db, options: { canRun?: () => 
       await coordinator.stop();
       expect(sweeps).toBe(accountedSweeps);
       expect(running).toBe(0);
+      expect(sweeping).toBe(false);
       expect(errors).toEqual([]);
       expect(Date.now() - startedAt).toBeLessThan(RETRY_MS / 2);
     },
