@@ -83,7 +83,6 @@ import { NATIVE_PROVIDER_SLUGS, nativeProviderCatalogFor } from "./native-provid
 import { connectorToolPolicy } from "./connectors/tool-policy.js";
 
 import { notifyChatEndpointWork } from "./chat-work-notifications.js";
-import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 
 import { defaultConnectionAgentInstructions } from "@paperclipai/shared";
 
