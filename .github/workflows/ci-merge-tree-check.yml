@@ -1,0 +1,27 @@
+name: Diagnostic helper checks
+on:
+  pull_request:
+    branches: [develop]
+    paths:
+      - scripts/ci-merge-tree/**
+      - .github/workflows/ci-merge-tree-*.yml
+permissions:
+  contents: read
+jobs:
+  helper:
+    if: github.repository == 'phenix3443/paperclip'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24.11.0
+          package-manager-cache: false
+      - name: Install isolated pinned driver for consumer checks
+        run: npm install --prefix "$RUNNER_TEMP/diagnostic-driver" --no-package-lock --ignore-scripts postgres@3.4.9
+      - run: node --test scripts/ci-merge-tree/*.test.mjs
+        env:
+          PAPERCLIP_DIAGNOSTIC_POSTGRES_ROOT: ${{ runner.temp }}/diagnostic-driver/node_modules/postgres

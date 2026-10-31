@@ -64,3 +64,40 @@ It emits a file/size/SHA-256 manifest. At the cap, the final seal omits auxiliar
 files with explicit gap records. Assertion records are never silently truncated.
 Raw data stays in the disposable runner's private directory and is never an
 upload input.
+
+## Workflow integration (draft; not approved for execution)
+
+The diagnostic workflow is `ci-merge-tree-comparison.yml`. It has only manual
+dispatch, four fixed matrix rows, max-parallel 1, fail-fast false and 25 minutes
+per job. It rejects rerun attempts, unapproved control refs and execution keys.
+It grants only contents read and uploads only the sealed staging directory with
+seven-day retention. `ci-merge-tree-check.yml` runs synthetic helper checks on
+PRs; it does not execute the comparison.
+
+The control checkout and immutable source checkout are separate. A fresh private
+home/store is used for each job. Frozen installation has no lockfile repair or
+cache fallback. After setup, a private PID/mount/network namespace keeps source
+fixtures local, maps their hardcoded `/tmp` into the job temp root, and blocks
+external provider traffic. The test process receives an explicit environment
+allowlist. The source trees and their original test fixtures remain unchanged.
+The original full chat shard and ordered E2E spec list remain fixed. E2E appends
+trace=on, retries=0, an external results directory and the external reporter.
+
+The execution deadline is 20 minutes from the initial job step. Packaging and
+termination reserve two minutes; upload has the remaining job budget. Phase exits,
+signals, setup failures, timeouts and capture gaps remain explicit. A successful
+upload cannot turn a failed test or missing evidence into success. Runner loss
+can prevent evidence upload; the operational report must retain that missing row.
+
+Before execution, the assigned operator must receive the exact independently
+approved implementation SHA and helper digest, create and verify an immutable
+`ci-merge-tree-*` tag at those bytes, confirm included capacity and log retention,
+and record the single intent and fixed execution key. Log retention above seven
+days requires authorized per-run deletion at day seven. Reconcile a lost dispatch
+receipt before any further action. This implementation task does not dispatch,
+create the execution tag, approve upstream changes, or expand any rerun budget.
+
+Review and merge the identity, capture and integration slices in that order.
+Retarget the later PRs to `develop` after their predecessors merge. Each final
+head and the full stack require the designated independent review. Do not infer
+approval from this document or from synthetic test passes.
