@@ -8,7 +8,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { PATCHED_POSTGRES_DRIVER } from "../cli/src/postgres-driver-integrity.ts";
-import { pinPatchedBundledDependencies, prepareBundledPackage } from "./prepare-bundled-package.mjs";
+import { patchedVersionFitsSpec, pinPatchedBundledDependencies, prepareBundledPackage } from "./prepare-bundled-package.mjs";
 
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const rootPackage = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"));
@@ -42,6 +42,18 @@ test("producer installs pin a bundled dependency to its single patched version",
     { "postgres@3.4.9": "patches/postgres.patch", "acpx@0.12.0": "a.patch", "acpx@0.13.1": "b.patch" },
   );
   assert.deepEqual(pinned.dependencies, { postgres: "3.4.9", acpx: "^0.13.0", other: "^1.0.0" });
+});
+
+test("producer installs refuse a patched version outside the declared range", () => {
+  assert.throws(
+    () => pinPatchedBundledDependencies({ dependencies: { postgres: "^3.4.10" } }, ["postgres"], { "postgres@3.4.9": "patches/postgres.patch" }),
+    /postgres@3\.4\.9 patch does not satisfy the declared range \^3\.4\.10/,
+  );
+  for (const [version, spec, fits] of [
+    ["3.4.9", "3.4.9", true], ["3.4.9", "^3.4.9", true], ["3.5.0", "^3.4.9", true], ["4.0.0", "^3.4.9", false],
+    ["3.4.9", "~3.4.0", true], ["3.5.0", "~3.4.0", false], ["0.2.1", "^0.2.0", true], ["0.3.0", "^0.2.0", false],
+    ["18.1.0-beta.16", "^18.1.0-beta.16", true], ["18.1.0-beta.17", "^18.1.0-beta.16", false], ["18.1.0", "^18.1.0-beta.16", true], ["3.4.9", ">=3.0.0", false],
+  ]) assert.equal(patchedVersionFitsSpec(version, spec), fits, `${version} vs ${spec}`);
 });
 
 test("staged package carries the repository-patched postgres files", { timeout: 240_000 }, t => {
