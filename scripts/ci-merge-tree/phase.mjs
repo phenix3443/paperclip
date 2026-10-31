@@ -41,4 +41,3 @@ export async function runPhase({ name, command, args, env, cwd, deadline, privat
     end: new Date().toISOString() }); onChange(entry);
   return entry;
 }
-

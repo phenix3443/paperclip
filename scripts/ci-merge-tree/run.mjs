@@ -1,3 +1,4 @@
+import { boundedProcess } from './process-tree.mjs';
 import { isolatedCommand } from './namespace.mjs';
 import { runPhase } from './phase.mjs';
 import { execFileSync } from 'node:child_process';
@@ -118,8 +119,8 @@ try {
   const budget = Math.min(120000, Number(started) + 22 * 60 * 1000 - Date.now());
   try {
     if (budget <= 0) throw new Error('packaging_deadline');
-    execFileSync(process.execPath, [path.join(control, 'finalize.mjs'), output], {
-      env: { PATH: process.env.PATH }, stdio: ['ignore', 'pipe', 'pipe'], timeout: budget, killSignal: 'SIGKILL',
+    await boundedProcess(process.execPath, [path.join(control, 'finalize.mjs'), output], {
+      env: { PATH: process.env.PATH }, deadline: Date.now() + budget,
     });
     Object.assign(status, JSON.parse(readFileSync(path.join(stage, 'status.json'), 'utf8')));
   } catch {

@@ -119,4 +119,4 @@ jobs:
           UPLOAD_OUTCOME: ${{ steps.upload.outcome }}
         run: |
           [[ "$EXECUTION_OUTCOME" == 'success' && "$UPLOAD_OUTCOME" == 'success' ]]
-          node -e 'const fs=require("node:fs");const s=JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP+"/ci-merge-tree/sanitized/status.json"));if(s.evidence==="incomplete")process.exit(1)' 
+          node -e 'const fs=require("node:fs");const s=JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP+"/ci-merge-tree/sanitized/status.json"));if(s.evidence==="incomplete")process.exit(1)'

@@ -43,3 +43,18 @@ test('external preload captures fixture rows before deletion without editing the
   assert.doesNotMatch(JSON.stringify(rows), /SECRET|private-id|postgres:\/\//);
   assert.equal(readFileSync(target, 'utf8'), source);
 });
+
+test('preload intercepts the actual Playwright shell:true spawn boundary without launching the product', t => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'merge-tree-spawn-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const result = execFileSync(process.execPath, ['--input-type=module', '-e', `
+    import childProcess from 'node:child_process';
+    childProcess.spawn = (command, args, options) => { console.log(JSON.stringify({command,args,shell:options.shell}));return {}; };
+    await import(${JSON.stringify(new URL('./preload.mjs', import.meta.url).href)});
+    const { ORIGINAL_SERVER_COMMAND } = await import(${JSON.stringify(new URL('./commands.mjs', import.meta.url).href)});
+    childProcess.spawn(ORIGINAL_SERVER_COMMAND, [], {shell:true});
+  `], { env: { PATH: process.env.PATH, PAPERCLIP_FIXED_CI_PRIVATE: root }, encoding: 'utf8', timeout: 10000 });
+  const observed = JSON.parse(result);
+  assert.match(observed.command, /webserver\.mjs/); assert.doesNotMatch(observed.command, /ui build/);
+  assert.equal(observed.shell, true); assert.deepEqual(observed.args, []);
+});

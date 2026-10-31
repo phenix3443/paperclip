@@ -28,10 +28,10 @@ if (root) {
       argv = [...argv, '--reporter=default', `--reporter=${new URL('./vitest-reporter.mjs', import.meta.url).pathname}`];
       options = { ...options, env: { ...(options?.env ?? process.env), PAPERCLIP_FIXED_CI_CONTEXT: context } };
     }
-    if (Array.isArray(argv) && argv.includes(ORIGINAL_SERVER_COMMAND)) {
-      argv = argv.map(arg => arg === ORIGINAL_SERVER_COMMAND
-        ? [process.execPath, new URL('./webserver.mjs', import.meta.url).pathname].map(value => "'" + value.replaceAll("'", "'\\''") + "'").join(' ') : arg);
-    }
+    const wrapper = [process.execPath, new URL('./webserver.mjs', import.meta.url).pathname]
+      .map(value => "'" + value.replaceAll("'", "'\\''") + "'").join(' ');
+    if (command === ORIGINAL_SERVER_COMMAND && options?.shell) command = wrapper;
+    if (Array.isArray(argv)) argv = argv.map(arg => arg === ORIGINAL_SERVER_COMMAND ? wrapper : arg);
     return original.call(this, command, argv, options);
   };
   syncBuiltinESMExports();
