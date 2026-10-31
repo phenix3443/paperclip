@@ -85,23 +85,27 @@ describePostgres("OAuth finalization wakes connection delivery from its own writ
     expect((await db.select().from(issueThreadInteractions))[0].result).toMatchObject({ connectionId: f.connection.id });
   });
 
-  it("the late install wakes delivery after earlier sweeps finish while its table is locked", async () => {
-    const f = await arrange();
-    await db.delete(toolConnectionInstalls);
-    await db.update(issueThreadInteractions).set({ payload: { ...f.intent.payload, accessRequest: undefined } });
+  it.each(["personal", "organization insert", "organization update", "late install"])("registers before the blocked %s write", async mode => {
+    const late = mode === "late install";
+    const f = await arrange(late ? "personal" : mode);
+    if (late) {
+      await db.delete(toolConnectionInstalls);
+      await db.update(issueThreadInteractions).set({ payload: { ...f.intent.payload, accessRequest: undefined } });
+    }
     delivery = await startConnectionDelivery(db);
     const baseline = delivery.sweeps;
     const lock = await db.$client.reserve();
     await lock`begin`;
-    await lock`lock table tool_connection_installs in exclusive mode`;
-    const completion = producer(db, async (...args) => {
+    const table = late ? "tool_connection_installs" : mode === "personal" ? "tool_connections" : "connection_grants";
+    await lock.unsafe(`lock table ${table} in ${late ? "exclusive" : "share"} mode`);
+    const completion = late ? producer(db, async (...args) => {
       await delivery!.settle(baseline + 1);
       await effects(false);
       return finishSetup(...args);
-    })(f.companyId, f.connection.id, { grantKind: "user" }, { actorType: "user", actorId: "owner" });
+    })(f.companyId, f.connection.id, { grantKind: "user" }, { actorType: "user", actorId: "owner" }) : produce(f, mode);
     void completion.catch(() => undefined);
     try {
-      await vi.waitFor(async () => expect(await db.execute(sql`select 1 from pg_locks where relation = 'tool_connection_installs'::regclass and not granted`)).toHaveLength(1));
+      await vi.waitFor(async () => expect(await db.execute(sql`select 1 from pg_locks where relation = ${table}::regclass and not granted`)).toHaveLength(1));
       expect(databaseWorkPending(db, DELIVERY_QUEUES.connection)).toBe(true);
       await effects(false);
     } finally {
@@ -109,7 +113,7 @@ describePostgres("OAuth finalization wakes connection delivery from its own writ
       lock.release();
       await completion;
     }
-    await delivery.settle(baseline + 2);
+    await delivery.settle(baseline + (late ? 2 : 1));
     await effects(true);
   });
 
@@ -139,7 +143,8 @@ describePostgres("OAuth finalization wakes connection delivery from its own writ
     const baseline = delivery.sweeps;
     if (mode === "install") await db.insert(toolConnectionInstalls).values({ companyId: f.companyId, connectionId: f.connection.id, targetType: "agent", targetId: f.agentId });
     else await db.update(toolConnections).set({ status: "active", enabled: true, credentialPolicy: mode === "personal" ? "per_user" : "shared" });
-    if (mode.startsWith("organization")) await db.insert(connectionGrants).values({ companyId: f.companyId, connectionId: f.connection.id, kind: "organization", status: "active" });
+    if (mode === "organization insert") await db.insert(connectionGrants).values({ companyId: f.companyId, connectionId: f.connection.id, kind: "organization", status: "active" });
+    if (mode === "organization update") await db.update(connectionGrants).set({ status: "active" });
     await new Promise(resolve => setTimeout(resolve, 100));
     expect(delivery.sweeps).toBe(baseline);
     await effects(false);
