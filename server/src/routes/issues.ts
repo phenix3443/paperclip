@@ -491,6 +491,38 @@ type NormalizedExecutionPolicy = NonNullable<
   ReturnType<typeof normalizeIssueExecutionPolicy>
 >;
 type IssueRouteSnapshot = typeof issueRows.$inferSelect;
+function buildDecisionActivityDetails(input: {
+  id: string;
+  issueId: string;
+  decision: NonNullable<ReturnType<typeof applyIssueExecutionPolicyTransition>["decision"]>;
+  commentId: string;
+  source: "patch" | "comment_auto_approval";
+  previous: Pick<IssueRouteSnapshot, "status" | "executionState">;
+  updated: Pick<IssueRouteSnapshot, "status" | "executionState"> & { changes?: Record<string, { from: unknown; to: unknown }> };
+}) {
+  const from = parseIssueExecutionState(input.previous.executionState);
+  const changes = {
+    ...input.updated.changes,
+    executionState: { from: input.previous.executionState, to: input.updated.executionState },
+    ...(input.previous.status !== input.updated.status
+      ? { status: { from: input.previous.status, to: input.updated.status } }
+      : {}),
+  };
+  return {
+    decision: {
+      id: input.id,
+      previousDecisionId: from?.lastDecisionId ?? null,
+      issueId: input.issueId,
+      stageId: input.decision.stageId,
+      stageType: input.decision.stageType,
+      outcome: input.decision.outcome,
+      participant: from?.currentParticipant ?? null,
+      commentId: input.commentId,
+      source: input.source,
+    },
+    changes,
+  };
+}
 type RecoveryRevalidationTrigger =
   "issue_update" | "comment" | "document" | "work_product" | "read_projection";
 type CompanySearchService = {
@@ -14878,6 +14910,12 @@ export function issueRoutes(
         }
         : undefined;
       const decisionId = transition.decision ? randomUUID() : null;
+      const decision =
+        transition.decision && decisionId ? transition.decision : null;
+      let transactionalComment: Awaited<ReturnType<typeof svc.addComment>> | null =
+        null;
+      let decisionExisting: IssueRouteSnapshot | null = null;
+
       if (decisionId) {
         const nextExecutionState = transition.patch.executionState;
         if (!nextExecutionState || typeof nextExecutionState !== "object") {
@@ -15062,7 +15100,7 @@ export function issueRoutes(
       const enteringReviewRequested =
         existing.status !== "in_review" && updateFields.status === "in_review";
       const persistReviewActivityTransactionally =
-        enteringReviewRequested || Boolean(reviewInteractionId);
+        enteringReviewRequested || Boolean(reviewInteractionId) || Boolean(decision);
 
       const nextAssigneeAgentId =
         updateFields.assigneeAgentId === undefined
@@ -15304,7 +15342,17 @@ export function issueRoutes(
         updated: NonNullable<Awaited<ReturnType<typeof svc.update>>>,
       ) => {
         if (!persistReviewActivityTransactionally) return;
-        const changes = updated.changes ?? {};
+        if (decision && (!decisionExisting || !transactionalComment || !decisionId)) {
+          throw new Error("Decision activity requires its transactional comment and issue snapshot");
+        }
+        const decisionDetails = decision && decisionId && decisionExisting && transactionalComment
+          ? buildDecisionActivityDetails({
+              id: decisionId, issueId: updated.id, decision,
+              commentId: transactionalComment.id, source: "patch",
+              previous: decisionExisting, updated,
+            })
+          : {};
+        const changes = decisionDetails.changes ?? updated.changes ?? {};
         const previous = Object.fromEntries(
           Object.entries(changes).map(([key, change]) => [key, change.from]),
         );
@@ -15325,6 +15373,7 @@ export function issueRoutes(
               ...updateFields,
               identifier: updated.identifier,
               authorizationReason: issueMutationAuthorizationReason,
+              ...decisionDetails,
               changes,
               ...(reviewInteractionId ? { reviewInteractionId } : {}),
               ...(commentBody ? { source: "comment" } : {}),
@@ -15376,14 +15425,10 @@ export function issueRoutes(
         generation: reopenedGeneration,
         finalIssueStatus: () => issue?.status,
       });
-      const decision =
-        transition.decision && decisionId ? transition.decision : null;
-      let transactionalComment: Awaited<ReturnType<typeof svc.addComment>> | null =
-        null;
       const commentWithAdapterOverrides = Boolean(
         commentBody && updateFields.assigneeAdapterOverrides !== undefined,
       );
-      const transactionalCommentSourceTrust = commentAttachmentIds?.length || commentWithAdapterOverrides
+      const transactionalCommentSourceTrust = commentAttachmentIds?.length || commentWithAdapterOverrides || decision
         ? await sourceTrustForActorWrite(existing, actor)
         : undefined;
       const shouldUseTransactionalIssueUpdate =
@@ -15396,6 +15441,10 @@ export function issueRoutes(
       try {
         if (shouldUseTransactionalIssueUpdate) {
           issue = await db.transaction(async (tx) => {
+            if (decision) {
+              decisionExisting = await svc.getByIdForUpdate(id, tx);
+              if (!decisionExisting) return null;
+            }
             if (
               reviewPolicySensitiveMutationRequested &&
               !(await assertLockedReviewPolicyAllowsMutation(tx))
@@ -15403,7 +15452,7 @@ export function issueRoutes(
               return null;
             const updated = await updateIssue(tx);
             if (!updated) return null;
-            if (commentAttachmentIds?.length || commentWithAdapterOverrides) {
+            if (commentAttachmentIds?.length || commentWithAdapterOverrides || decision) {
               // Adapter settings, reassignment, comment and upload binding commit together.
               // A failed comment or invalid receipt rolls back the issue update.
               transactionalComment = await svc.addComment(
@@ -19623,11 +19672,17 @@ export function issueRoutes(
         let txResult: {
           comment: Awaited<ReturnType<typeof svc.addComment>>;
           issue: NonNullable<Awaited<ReturnType<typeof svc.update>>>;
+          decisionRecorded: boolean;
         };
         const postCommitActivityPublications: ActivityPublication[] = [];
         const postCommitIssueActions: IssuePostCommitAction[] = [];
         try {
           txResult = await db.transaction(async (tx) => {
+            const lockedIssue = await svc.getByIdForUpdate(id, tx);
+            if (!lockedIssue) throw new AutoApprovalIssueMissingError();
+            if (executionPolicyTransitionInputFingerprint(lockedIssue) !== executionPolicyTransitionInputFingerprint(currentIssue)) {
+              throw conflict("The task changed while this update was prepared. Refresh and retry.", { code: "execution_policy_transition_stale" });
+            }
             const insertedComment = await svc.addComment(
               id,
               req.body.body,
@@ -19676,9 +19731,31 @@ export function issueRoutes(
                 body: transition.decision.body,
                 createdByRunId: actor.runId ?? null,
               });
+              await logActivity(tx as unknown as Db, {
+                companyId: updated.companyId,
+                actorType: actor.actorType,
+                actorId: actor.actorId,
+                agentId: actor.agentId,
+                runId: actor.runId,
+                agentApiKeyId: actor.agentApiKeyId,
+                action: "issue.updated",
+                entityType: "issue",
+                entityId: updated.id,
+                details: {
+                  status: updated.status,
+                  identifier: updated.identifier,
+                  source: "auto_approval_comment",
+                  _previous: { status: lockedIssue.status },
+                  ...buildDecisionActivityDetails({
+                    id: decisionId, issueId: updated.id,
+                    decision: transition.decision, commentId: insertedComment.id,
+                    source: "comment_auto_approval", previous: lockedIssue, updated,
+                  }),
+                },
+              }, postCommitActivityPublications);
             }
 
-            return { comment: insertedComment, issue: updated };
+            return { comment: insertedComment, issue: updated, decisionRecorded: Boolean(transition.decision) };
           });
         } catch (err) {
           if (err instanceof AutoApprovalIssueMissingError) {
@@ -19694,7 +19771,8 @@ export function issueRoutes(
         currentIssue = txResult.issue;
         // Mirror the normal status-change audit trail: every other in_review -> done path
         // emits an `issue.updated` activity, so emit one here too for the auto-approval path.
-        if (issueBeforeCommentDecision.status !== currentIssue.status) {
+        if (issueBeforeCommentDecision.status !== currentIssue.status &&
+            !txResult.decisionRecorded) {
           await logActivity(db, {
             companyId: currentIssue.companyId,
             actorType: actor.actorType,
