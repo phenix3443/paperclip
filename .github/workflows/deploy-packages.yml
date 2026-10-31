@@ -51,8 +51,21 @@ jobs:
         run: |
           corepack pnpm build
           corepack pnpm -r typecheck
+      - name: Archive the checked source build outputs
+        run: |
+          find packages server ui cli -type d \( -name node_modules -o -name target -o -name .git \) -prune -o \
+            -type d \( -name dist -o -name dist-browser -o -name dist-issue-thread -o -name dist-runtime -o -name ui-dist \) \
+            -print0 -prune > "$RUNNER_TEMP/maintenance-build-paths"
+          tar -cf "$RUNNER_TEMP/maintenance-build.tar" --null -T "$RUNNER_TEMP/maintenance-build-paths"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: maintenance-build-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/maintenance-build.tar
+          if-no-files-found: error
+          retention-days: 1
 
   maintenance_tests:
+    needs: maintenance_build
     name: Maintenance tests (${{ matrix.label }})
     if: >-
       github.repository == 'phenix3443/paperclip' &&
@@ -110,6 +123,19 @@ jobs:
           corepack enable
           corepack pnpm install --frozen-lockfile
           corepack pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: maintenance-build-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/maintenance-build
+      - name: Restore and verify the checked build outputs
+        run: |
+          tar -xf "$RUNNER_TEMP/maintenance-build/maintenance-build.tar"
+          test -x packages/paperclip-runner/dist/bin/paperclip-runnerd
+      - name: Build native test fixtures
+        if: matrix.group == 'general-server-native-runner'
+        run: |
+          corepack pnpm --filter @paperclipai/paperclip-runner build:rust
+          test -x packages/paperclip-runner/runner/target/debug/fake-codex-app-server
       - name: Run maintenance test selection
         env:
           MODE: ${{ matrix.mode }}

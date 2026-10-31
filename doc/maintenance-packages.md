@@ -15,7 +15,11 @@ The test matrix reuses `scripts/run-vitest-stable.mjs`: 12 server shards excludi
 chat and native-runner suites, 3 chat shards, 2 workspace-a shards, one each for
 workspace-b, workspace-c and native-runner suites, and 9 serialized route shards.
 All 29 matrix jobs retain the selector's isolation and per-file serial constraints.
-At most 4 test jobs run concurrently; build/typecheck is one additional job.
+Build/typecheck runs first and uploads its outputs as a tar archive. Each test
+runner restores the artifact named by the same SHA and run attempt. Tar retains
+executable modes; a missing executable Runner binary fails before test collection.
+The native-runner lane also builds and verifies its debug fake-provider fixture.
+At most 4 test jobs then run concurrently.
 Every job keeps a 90-minute limit. The packages job depends explicitly on both
 checks. Failure, cancellation or an unexpected skip blocks maintenance exports.
 Develop skips these maintenance checks and retains its existing packaging path.

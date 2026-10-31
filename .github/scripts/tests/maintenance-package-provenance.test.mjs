@@ -246,3 +246,19 @@ test('package admission rejects failed, cancelled or skipped maintenance prerequ
   assert.equal(admitted('skipped', 'success', pr), false);
   assert.equal(admitted('skipped', 'skipped', { ref: 'refs/heads/develop' }), true);
 });
+
+
+test('maintenance test runners receive the exact build outputs before test collection', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const source = await readFile(new URL('../../workflows/deploy-packages.yml', import.meta.url), 'utf8');
+  const build = source.match(/^  maintenance_build:\n([\s\S]*?)(?=^  \w+:)/m)?.[1];
+  const tests = source.match(/^  maintenance_tests:\n([\s\S]*?)(?=^  \w+:)/m)?.[1];
+  assert.match(tests, /needs: maintenance_build/);
+  const artifact = 'name: maintenance-build-${{ github.sha }}-${{ github.run_attempt }}';
+  assert.ok(build.includes(artifact));
+  assert.ok(tests.includes(artifact));
+  assert.ok(build.indexOf('corepack pnpm build') < build.indexOf('tar -cf'));
+  assert.ok(tests.indexOf('tar -xf') < tests.indexOf('node scripts/run-vitest-stable.mjs'));
+  assert.match(tests, /test -x packages\/paperclip-runner\/dist\/bin\/paperclip-runnerd/);
+  assert.match(tests, /corepack pnpm --filter @paperclipai\/paperclip-runner build:rust/);
+});
