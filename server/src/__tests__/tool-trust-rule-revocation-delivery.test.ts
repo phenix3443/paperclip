@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { activityLog, authUsers, connectionIntentDeliveries, createDb, issueThreadInteractions,
   connectionGrants, toolConnections, toolConnectionInstalls, toolAccessAuditEvents, toolCallEvents, toolPolicies } from "@paperclipai/db";
 import { toolAccessPolicyService } from "../services/tool-access-policy.js";
@@ -24,7 +24,6 @@ describePostgres("trust rule revocation notifies connection delivery", () => {
   afterEach(async () => {
     await delivery?.stop();
     delivery = null;
-    vi.restoreAllMocks();
   });
   afterAll(async () => { await db.$client.end({ timeout: 1 }); await temp?.cleanup(); });
 
@@ -129,34 +128,20 @@ describePostgres("trust rule revocation notifies connection delivery", () => {
 
   it.each([false, true])("preserves changes while a sweep holds its read barrier (widening=%s)", async (widening) => {
     const f = await seedRule(widening, widening);
-    delivery = await startConnectionDelivery(db);
-    const baseline = delivery.sweeps;
-    let entered!: () => void;
     let release!: () => void;
-    const started = new Promise<void>(resolve => { entered = resolve; });
+    let hold = false, blocked = false;
     const barrier = new Promise<void>(resolve => { release = resolve; });
-    const select = db.select.bind(db);
-    let held = false;
-    const read = vi.spyOn(db, "select").mockImplementation((...args) => {
-      const query = select(...args);
-      const from = query.from.bind(query);
-      query.from = ((table: Parameters<typeof from>[0]) => {
-        const builder = from(table);
-        if (!held && table === issueThreadInteractions) {
-          held = true;
-          const then = builder.then.bind(builder);
-          builder.then = ((resolve, reject) => {
-            entered();
-            return barrier.then(() => then(resolve, reject));
-          }) as typeof builder.then;
-        }
-        return builder;
-      }) as typeof query.from;
-      return query;
-    });
+    delivery = await startConnectionDelivery(db, { beforeSweep: async () => {
+      if (!hold) return;
+      hold = false;
+      blocked = true;
+      await barrier;
+    } });
+    const baseline = delivery.sweeps;
     try {
+      hold = true;
       delivery.wake();
-      await started;
+      await expect.poll(() => blocked, { timeout: 5_000 }).toBe(true);
       if (!widening) {
         await db.update(toolPolicies).set({ enabled: true }).where(eq(toolPolicies.id, f.rule.id));
       }
@@ -167,7 +152,7 @@ describePostgres("trust rule revocation notifies connection delivery", () => {
       else await expectPending();
     } finally {
       release();
-      read.mockRestore();
+      await delivery.settle();
     }
   });
 });
