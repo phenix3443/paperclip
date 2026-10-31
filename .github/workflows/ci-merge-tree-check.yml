@@ -4,6 +4,7 @@ on:
     branches: [develop]
     paths:
       - scripts/ci-merge-tree/**
+      - scripts/check-node-version-policy.mjs
       - .github/workflows/ci-merge-tree-*.yml
 permissions:
   contents: read

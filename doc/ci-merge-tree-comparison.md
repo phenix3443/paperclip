@@ -74,6 +74,10 @@ It grants only contents read and uploads only the sealed staging directory with
 seven-day retention. `ci-merge-tree-check.yml` runs synthetic helper checks on
 PRs; it does not execute the comparison.
 
+Both diagnostic workflows pin Node 24.11.0. The Node-version policy permits
+that exact version only in these two files, so helper checks use the same Node
+as the comparison. Other workflows retain the Node 24 major policy.
+
 The control checkout and immutable source checkout are separate. A fresh private
 home/store is used for each job. Frozen installation has no lockfile repair or
 cache fallback. After setup, a private PID/mount/network namespace keeps source
