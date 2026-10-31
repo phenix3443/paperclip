@@ -35,3 +35,32 @@ node --test scripts/ci-merge-tree/identity.test.mjs
 ```
 
 No model, instance, deployment or runtime access is part of this helper.
+
+## Capture boundary
+
+The second slice owns synthetic fixture observation and sanitized evidence.
+An external Node preload wraps the pinned `postgres` driver's ESM entry. It
+captures an allowlisted projection before company deletion, fixture retirement
+and client close. It also wraps transaction callbacks. Capture errors create
+explicit gaps and do not replace the original query failure or suppress cleanup.
+The synthetic preload test proves ordering without changing a source module.
+This is instrumentation: extra reads and trace capture can change timing.
+
+Only aliased IDs, known lifecycle states and timestamps enter projections.
+The field allowlist is `FIELDS` in `evidence.mjs`; every other field is excluded.
+Bodies, names, credentials, connection URLs, arbitrary SQL and payloads are not
+copied. Worker-local aliases use a worker PID namespace. Test location/report
+records provide case correlation; absent correlation is an explicit capture gap.
+
+Trace archives are parsed as ZIP and JSON. Only recognized structural action
+records remain. DOM snapshots, network data, storage state, images and opaque
+attachments are omitted and listed in `capture-gaps.json`. This deliberately
+limits visual and payload inspection. Unknown log text is replaced by character
+counts; known failure signatures and source locations remain. The original run
+is still the authoritative source for its original assertions and traces.
+
+The upload staging gate rejects unknown entries, links and a total above 100 MiB.
+It emits a file/size/SHA-256 manifest. At the cap, the final seal omits auxiliary
+files with explicit gap records. Assertion records are never silently truncated.
+Raw data stays in the disposable runner's private directory and is never an
+upload input.
