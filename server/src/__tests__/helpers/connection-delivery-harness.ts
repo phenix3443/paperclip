@@ -46,8 +46,13 @@ export async function startConnectionDelivery(db: Db, options: { canRun?: () => 
       await new Promise(resolve => setTimeout(resolve, 10));
     }
   }
-  await worker.ready;
-  await settle(1);
+  try {
+    await worker.ready;
+    await settle(1);
+  } catch (error) {
+    await coordinator.stop();
+    throw error;
+  }
   return {
     wakeup, wake: worker.wake, settle,
     get sweeps() { return sweeps; },
