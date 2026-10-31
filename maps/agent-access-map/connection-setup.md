@@ -350,6 +350,10 @@ Gaps: This individual operation has source review but no recorded HTTP verificat
 
 Capability ID: `connection-setup/task-request`.
 
+Membership restoration wakes existing connection delivery after commit.
+[Service tests](../../server/src/__tests__/access-connection-delivery.test.ts) cover
+transaction settlement; this does not grant agents authority to resolve requests.
+
 Review: `operation-reviewed`.
 
 ### `post-runtime-tools-connections-request`

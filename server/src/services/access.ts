@@ -587,6 +587,7 @@ export function accessService(db: Db) {
       }
 
       const now = new Date();
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
       if (existing.status === "active" && nextStatus !== "active" && existing.principalType === "user") {
         await sweepMemberConnectionAccess(tx, companyId, existing.principalId, now);
       }
@@ -731,6 +732,7 @@ export function accessService(db: Db) {
       await assertAssignableArchiveTarget(companyId, input.reassignment, tx);
 
       const now = new Date();
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
       await sweepMemberConnectionAccess(tx, companyId, existing.principalId, now);
       const assignmentPatch = {
         assigneeAgentId: input.reassignment?.assigneeAgentId ?? null,
@@ -877,6 +879,7 @@ export function accessService(db: Db) {
       }
       if (toArchive.length > 0) {
         const now = new Date();
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
         for (const membership of toArchive) {
           await sweepMemberConnectionAccess(tx, membership.companyId, membership.principalId, now);
         }
@@ -899,6 +902,7 @@ export function accessService(db: Db) {
         const existingMembership = existingByCompany.get(companyId);
         if (existingMembership) {
           if (existingMembership.status !== "active") {
+            await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
             if (existingMembership.membershipRole !== "viewer") await notifyChatCompanyAuthorityChange(tx, { companyId });
             await tx
               .update(companyMemberships)
@@ -911,6 +915,7 @@ export function accessService(db: Db) {
           }
           continue;
         }
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
         await notifyChatCompanyAuthorityChange(tx, { companyId });
         await tx.insert(companyMemberships).values({
           companyId,
@@ -943,6 +948,7 @@ export function accessService(db: Db) {
             && (existing.status !== "active" || existing.membershipRole === "viewer")) {
             await notifyChatCompanyAuthorityChange(tx, { companyId });
           }
+          await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
           const updated = await tx
             .update(companyMemberships)
             .set({ status, membershipRole, updatedAt: new Date() })
@@ -957,6 +963,7 @@ export function accessService(db: Db) {
       if (principalType === "user" && status === "active" && membershipRole !== "viewer") {
         await notifyChatCompanyAuthorityChange(tx, { companyId });
       }
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
       return tx
         .insert(companyMemberships)
         .values({
@@ -1178,6 +1185,7 @@ export function accessService(db: Db) {
       }
 
       const now = new Date();
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
       if (
         existing.principalType === "user" &&
         existing.status !== "suspended" &&
