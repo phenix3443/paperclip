@@ -2969,36 +2969,8 @@ describe("issue comment reopen routes", () => {
     expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
   });
 
-  it("commits a PATCH decision, required comment and linked audit in one transaction", async () => {
-    const reviewer = "33333333-3333-4333-8333-333333333333";
-    const issue = createReviewIssue((await createAgentReviewPolicy(reviewer))!, reviewer);
-    Object.assign(issue.executionState, { lastDecisionId: "99999999-9999-4999-8999-999999999999" });
-    mockIssueService.addComment.mockImplementation(async (_id, body) => ({
-      id: "decision-comment", issueId: issue.id, companyId: issue.companyId, body, createdAt: new Date(),
-    }));
-    mockIssueService.getById.mockResolvedValue(issue);
-    mockIssueService.update.mockImplementation(async (_id, patch) => ({ ...issue, ...patch }));
-    const res = await request(await installActor(createApp(), {
-      type: "agent", agentId: reviewer, companyId: "company-1", source: "agent_key", runId: "review-run",
-    })).patch(`/api/issues/${issue.id}`).send({ status: "done", comment: "  Approved  " });
-    expect(res.status).toBe(200);
-    expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
-    expect(mockIssueService.addComment.mock.calls[0]?.[4]).toBe(mockTx);
-    const activities = mockLogActivity.mock.calls.filter(([, entry]) => entry.action === "issue.updated");
-    expect(activities).toHaveLength(1);
-    expect(activities[0][0]).toBe(mockTx);
-    const decision = mockTxInsertValues.mock.calls[0][0];
-    expect(activities[0][1].details).toMatchObject({
-      decision: { id: decision.id, previousDecisionId: "99999999-9999-4999-8999-999999999999", issueId: issue.id,
-        stageId: issue.executionState.currentStageId, stageType: "review", outcome: "approved",
-        participant: issue.executionState.currentParticipant, commentId: res.body.comment.id, source: "patch" },
-      changes: { executionState: { from: issue.executionState, to: res.body.executionState } },
-    });
-    expect(res.body.comment.body.trim()).toBe(decision.body);
-  });
-
   describe("decision audit contract", () => {
-    async function fixture(stageCount = 1, failure?: "comment" | "activity") {
+    async function fixture(stageCount = 1, failure?: "comment" | "activity", redactedBody?: string) {
       const reviewer = "33333333-3333-4333-8333-333333333333";
       const policy = (await normalizePolicy({ stages: Array.from({ length: stageCount }, (_, index) => ({
         id: index === 0 ? "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" : "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
@@ -3026,7 +2998,7 @@ describe("issue comment reopen routes", () => {
       mockIssueService.addComment.mockImplementation(async (_id, body, _actor, _options, tx) => {
         if (failure === "comment") throw new Error("injected comment failure");
         const store = tx === mockTx ? pending : committed;
-        const comment = { id: `comment-${store.comments.length + 1}`, body };
+        const comment = { id: `comment-${store.comments.length + 1}`, body: redactedBody ?? body };
         store.comments.push(comment);
         return { ...comment, issueId: initial.id, companyId: initial.companyId, createdAt: new Date() };
       });
@@ -3059,8 +3031,18 @@ describe("issue comment reopen routes", () => {
       expect(comments[0].body.trim()).toBe(decisions[0].body);
       expect(activities[0]).toMatchObject({ actorType: "agent", agentId: "33333333-3333-4333-8333-333333333333", runId: "review-run",
         details: { decision: { id: decisions[0].id, previousDecisionId: null, commentId: comments[0].id,
-          source: method === "patch" ? "patch" : "comment_auto_approval", outcome: "approved" },
+          source: method === "patch" ? "patch" : "comment_auto_approval", outcome: "approved",
+          issueId: issue.id, stageId: f.initial.executionState.currentStageId,
+          stageType: "review", participant: f.initial.executionState.currentParticipant },
           changes: { status: { from: "in_review", to: "done" }, executionState: { from: f.initial.executionState, to: issue.executionState } } } });
+    });
+
+    it.each(["patch", "post"] as const)("uses the saved comment body for a redacted %s decision", async method => {
+      const savedBody = "kind: review\ndecision: approved\nsummary: <redacted>";
+      const f = await fixture(1, undefined, savedBody);
+      expect((await f.send(method, "done", undefined, "kind: review\ndecision: approved\nsummary: private reviewer")).status).toBe(method === "patch" ? 200 : 201);
+      expect(f.read().comments[0].body).toBe(savedBody);
+      expect(f.read().decisions[0].body).toBe(savedBody);
     });
 
     it.each([["patch", "patch"], ["post", "patch"], ["patch", "post"], ["post", "post"]] as const)(
@@ -3107,7 +3089,12 @@ describe("issue comment reopen routes", () => {
     it("keeps changes-requested and resubmitted decisions in the same chain", async () => {
       const f = await fixture();
       expect((await f.send("patch", "in_progress")).status).toBe(200);
-      expect(f.read().activities[0].details).toMatchObject({ decision: { outcome: "changes_requested" } });
+      expect([f.read().comments.length, f.read().decisions.length, f.read().activities.length]).toEqual([1, 1, 1]);
+      expect(f.read().comments[0].body.trim()).toBe(f.read().decisions[0].body);
+      expect(f.read().activities[0].details).toMatchObject({
+        decision: { id: f.read().decisions[0].id, commentId: f.read().comments[0].id, previousDecisionId: null, outcome: "changes_requested" },
+        changes: { executionState: { from: f.initial.executionState, to: f.read().issue.executionState } },
+      });
       const previousId = f.read().decisions[0].id;
       expect((await f.send("patch")).status).toBe(200);
       expect(f.read().decisions).toHaveLength(1);
@@ -3159,6 +3146,9 @@ describe("issue comment reopen routes", () => {
       },
     };
     mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.addComment.mockImplementation(async (_id, body) => ({
+      id: "comment-1", issueId: issue.id, companyId: issue.companyId, body, createdAt: new Date(),
+    }));
     mockIssueService.update.mockImplementation(
       async (_id: string, patch: Record<string, unknown>, tx?: unknown) => ({
         ...issue,

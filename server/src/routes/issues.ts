@@ -15490,7 +15490,7 @@ export function issueRoutes(
                 actorAgentId: actor.agentId ?? null,
                 actorUserId: actor.actorType === "user" ? actor.actorId : null,
                 outcome: decision.outcome,
-                body: decision.body,
+                body: transactionalComment!.body.trim(),
                 createdByRunId: actor.runId ?? null,
               });
             }
@@ -19728,7 +19728,7 @@ export function issueRoutes(
                 actorAgentId: actor.agentId ?? null,
                 actorUserId: actor.actorType === "user" ? actor.actorId : null,
                 outcome: transition.decision.outcome,
-                body: transition.decision.body,
+                body: insertedComment.body.trim(),
                 createdByRunId: actor.runId ?? null,
               });
               await logActivity(tx as unknown as Db, {
