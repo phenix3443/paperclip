@@ -2233,45 +2233,48 @@ export function toolAccessPolicyService(db: Pick<Db, "select" | "insert" | "upda
     const now = new Date();
     const config = policyConfig(existing);
     const rule = trustRuleConfig(existing) ?? {};
-    const [updated] = await db
-      .update(toolPolicies)
-      .set({
-        enabled: false,
-        config: {
-          ...config,
-          trustRule: {
-            ...rule,
-            revokedAt: rule.revokedAt ?? now.toISOString(),
-            revokedByAgentId: input.actor?.agentId ?? null,
-            revokedByUserId: input.actor?.userId ?? null,
-            revocationReason: input.body.reason ?? null,
+    return db.transaction(async (tx) => {
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
+      const [updated] = await tx
+        .update(toolPolicies)
+        .set({
+          enabled: false,
+          config: {
+            ...config,
+            trustRule: {
+              ...rule,
+              revokedAt: rule.revokedAt ?? now.toISOString(),
+              revokedByAgentId: input.actor?.agentId ?? null,
+              revokedByUserId: input.actor?.userId ?? null,
+              revocationReason: input.body.reason ?? null,
+            },
           },
-        },
-        updatedAt: now,
-      })
-      .where(eq(toolPolicies.id, existing.id))
-      .returning();
-    await db.insert(toolAccessAuditEvents).values({
-      companyId: input.companyId,
-      actorType: input.actor?.agentId ? "agent" : input.actor?.userId ? "user" : "system",
-      actorId: input.actor?.agentId ?? input.actor?.userId ?? null,
-      action: "tool_access.trust_rule_revoked",
-      outcome: "success",
-      reasonCode: "trust_rule_revoked",
-      details: { policyId: existing.id, reason: input.body.reason ?? null },
+          updatedAt: now,
+        })
+        .where(eq(toolPolicies.id, existing.id))
+        .returning();
+      await tx.insert(toolAccessAuditEvents).values({
+        companyId: input.companyId,
+        actorType: input.actor?.agentId ? "agent" : input.actor?.userId ? "user" : "system",
+        actorId: input.actor?.agentId ?? input.actor?.userId ?? null,
+        action: "tool_access.trust_rule_revoked",
+        outcome: "success",
+        reasonCode: "trust_rule_revoked",
+        details: { policyId: existing.id, reason: input.body.reason ?? null },
+      });
+      await tx.insert(toolCallEvents).values({
+        companyId: input.companyId,
+        eventType: "trust_rule_revoked",
+        actorType: input.actor?.agentId ? "agent" : input.actor?.userId ? "user" : "system",
+        actorId: input.actor?.agentId ?? input.actor?.userId ?? null,
+        decision: "deny",
+        matchedPolicyIds: [existing.id],
+        reasonCode: "trust_rule_revoked",
+        outcome: "success",
+        metadata: { reason: input.body.reason ?? null },
+      });
+      return updated;
     });
-    await db.insert(toolCallEvents).values({
-      companyId: input.companyId,
-      eventType: "trust_rule_revoked",
-      actorType: input.actor?.agentId ? "agent" : input.actor?.userId ? "user" : "system",
-      actorId: input.actor?.agentId ?? input.actor?.userId ?? null,
-      decision: "deny",
-      matchedPolicyIds: [existing.id],
-      reasonCode: "trust_rule_revoked",
-      outcome: "success",
-      metadata: { reason: input.body.reason ?? null },
-    });
-    return updated;
   }
 
   return {
