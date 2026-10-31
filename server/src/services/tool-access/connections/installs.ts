@@ -9,6 +9,7 @@ import { toolAccessAuditEvents, toolConnectionInstalls, toolConnections, toolPro
 import type { ToolConnection, ToolConnectionInstall, ToolConnectionInstallSnapshot, PutToolConnectionInstalls } from "@paperclipai/shared";
 import { unprocessable } from "../../../errors.js";
 import { logActivity } from "../../activity-log.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../delivery-work-notifications.js";
 
 type InstallDependencies = {
   now: () => Date;
@@ -179,6 +180,7 @@ export function createConnectionInstalls(db: Db, { now, getConnectionRow, assert
       }> = [];
       await db.transaction(async (tx) => {
         await lockToolConnectionRuntimeInputs(tx, connection.companyId, connection.id);
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
         if (markMcpAccessConfigured) {
           // Preserve an explicit zero-agent selection through OAuth. Merge the
           // marker in SQL so concurrent credential/config changes are retained.
