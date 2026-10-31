@@ -1018,7 +1018,8 @@ export function createPostgresRunDispatchAdapter(
     const originalCommentId = queuedCommentRootIdFromWakePayload(payload, wake.id) ?? projectedCommentId;
     if (comments.length !== commentIds.length || comments.some(comment =>
       !comment.body.trim() || !comment.authorUserId) ||
-      comments.find(comment => comment.id === originalCommentId)?.authorUserId !== wake.requestedByActorId) return null;
+      (commentIds.includes(originalCommentId) &&
+        comments.find(comment => comment.id === originalCommentId)?.authorUserId !== wake.requestedByActorId)) return null;
     const sourceIds = context.queuedCommentSourceWakeIds;
     if (sourceIds !== undefined && (!Array.isArray(sourceIds) || sourceIds.some(id => typeof id !== "string" || !isUuidLike(id)))) return null;
     const sourceWakeIds = Array.isArray(sourceIds) ? [...new Set(sourceIds as string[])] : [];
@@ -1030,12 +1031,23 @@ export function createPostgresRunDispatchAdapter(
     )).for("update") : [];
     if (adopted.length !== sourceWakeIds.length) return null;
     const mergeTargets = [wake.id, ...adopted.map(receipt => receipt.id)];
+    const previousRuns = adopted.length ? await tx.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.agentId, run.agentId),
+      inArray(heartbeatRuns.wakeupRequestId, adopted.map(receipt => receipt.id)),
+      eq(heartbeatRuns.status, "cancelled"), eq(heartbeatRuns.errorCode, "execution_reconciliation_required"),
+      sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+    )) : [];
+    const verifiedPreviousRuns: typeof previousRuns = [];
+    for (const previous of previousRuns) {
+      if (await isPreDispatchExecutionWaitVerified(tx, previous)) verifiedPreviousRuns.push(previous);
+    }
+    const receiptRunIds = [run.id, ...verifiedPreviousRuns.map(previous => previous.id)];
     const coalesced = await tx.select().from(agentWakeupRequests).where(and(
       ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
       eq(agentWakeupRequests.status, "coalesced"), eq(agentWakeupRequests.requestedByActorType, "user"),
       sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
-      or(and(eq(agentWakeupRequests.runId, run.id), eq(agentWakeupRequests.reason, "issue_execution_same_name")),
-        and(eq(agentWakeupRequests.runId, run.id), eq(agentWakeupRequests.reason, "issue_commented"),
+      or(and(inArray(agentWakeupRequests.runId, receiptRunIds), eq(agentWakeupRequests.reason, "issue_execution_same_name")),
+        and(inArray(agentWakeupRequests.runId, receiptRunIds), eq(agentWakeupRequests.reason, "issue_commented"),
           eq(agentWakeupRequests.source, "automation"), isNull(agentWakeupRequests.idempotencyKey),
           or(sql`${agentWakeupRequests.payload}->>'mutation' is null`, sql`${agentWakeupRequests.payload}->>'mutation' = 'comment'`)),
         and(or(isNull(agentWakeupRequests.runId), eq(agentWakeupRequests.runId, run.id)),
@@ -1044,7 +1056,9 @@ export function createPostgresRunDispatchAdapter(
     const authors = new Map(comments.map(comment => [comment.id, comment.authorUserId]));
     const recordedCommentIds = new Set([wake, ...adopted, ...coalesced].flatMap(receipt => {
       const recordedPayload = parseObject(receipt.payload), actorId = readNonEmptyString(receipt.requestedByActorId);
-      const recordedCommentId = receipt.id === wake.id ? originalCommentId : readNonEmptyString(recordedPayload.commentId);
+      const recordedCommentId = queuedCommentRootIdFromWakePayload(recordedPayload, receipt.id) ?? readNonEmptyString(recordedPayload.commentId);
+      const previous = verifiedPreviousRuns.find(previous => previous.id === receipt.runId);
+      if (previous && (!recordedCommentId || !queuedCommentIdsFromRunContext(previous.contextSnapshot).includes(recordedCommentId))) return [];
       return receipt.requestedByActorType === "user" && recordedPayload.issueId === issueId && actorId &&
         recordedCommentId && authors.get(recordedCommentId) === actorId ? [recordedCommentId] : [];
     }));

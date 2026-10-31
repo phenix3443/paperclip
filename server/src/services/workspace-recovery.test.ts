@@ -100,11 +100,13 @@ describe("automatic retained workspace recovery", () => {
     if (priorHome === undefined) delete process.env.PAPERCLIP_HOME; else process.env.PAPERCLIP_HOME = priorHome;
     if (priorInstance === undefined) delete process.env.PAPERCLIP_INSTANCE_ID; else process.env.PAPERCLIP_INSTANCE_ID = priorInstance;
   });
-  async function seed(mode = "native", nativeDescriptor = true, resourceDisposition: "destroy" | "keep_running" = "destroy", reusable = false, ephemeral = false) {
-    const companyId = randomUUID(), issueId = randomUUID(), agentId = randomUUID(), runId = randomUUID(), actionId: string = randomUUID();
-    await db.insert(companies).values({ id: companyId, name: "Workspace recovery", defaultResponsibleUserId: "board", issuePrefix: `R${companyId.slice(0, 6)}` });
-    await db.insert(agents).values({ id: agentId, companyId, name: "Worker", adapterType: "paperclip_runner", status: "idle", runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } });
-    await db.insert(issues).values({ id: issueId, companyId, assigneeAgentId: agentId, status: "blocked", title: "Recover existing work" });
+  async function seed(mode = "native", nativeDescriptor = true, resourceDisposition: "destroy" | "keep_running" = "destroy", reusable = false, ephemeral = false, scope?: { companyId: string; issueId: string; agentId: string }) {
+    const companyId = scope?.companyId ?? randomUUID(), issueId = scope?.issueId ?? randomUUID(), agentId = scope?.agentId ?? randomUUID(), runId = randomUUID(), actionId: string = randomUUID();
+    if (!scope) {
+      await db.insert(companies).values({ id: companyId, name: "Workspace recovery", defaultResponsibleUserId: "board", issuePrefix: `R${companyId.slice(0, 6)}` });
+      await db.insert(agents).values({ id: agentId, companyId, name: "Worker", adapterType: "paperclip_runner", status: "idle", runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } });
+      await db.insert(issues).values({ id: issueId, companyId, assigneeAgentId: agentId, status: "blocked", title: "Recover existing work" });
+    }
     await db.insert(heartbeatRuns).values({ id: runId, companyId, issueId, nativeIssueId: mode === "native" ? issueId : null,
       agentId, runtimeMode: mode, status: "failed", finishedAt: new Date(), errorCode: "execution_interrupted", contextSnapshot: { issueId } });
     if (mode === "legacy") await db.update(heartbeatRuns).set({ runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } } }).where(eq(heartbeatRuns.id, runId));
@@ -1503,7 +1505,7 @@ describe("automatic retained workspace recovery", () => {
     return { followup, receipt };
   }
 
-  async function ordinaryMixedQueuedFixture(kind: "active" | "deferred" | "deferred-different" | "system-deferred", reordered = false) {
+  async function ordinaryMixedQueuedFixture(kind: "active" | "deferred" | "deferred-different" | "system-deferred", mutation?: "reorder" | "discard-root" | "duplicate-root") {
     const t = await queuedResetFixture(true, kind !== "active"), { f, original, reset, wake, queued, queueDeps, queue, control } = t;
     await db.update(issues).set({ conversationAgentId: null, conversationUserId: null, conversationState: null,
       executionRunId: null, executionAgentNameKey: null, executionLockedAt: null }).where(eq(issues.id, f.issueId));
@@ -1539,8 +1541,9 @@ describe("automatic retained workspace recovery", () => {
     })).toBeNull();
     const first = await enqueue(reset);
     const [followup] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
-      authorType: "user", authorUserId: "second-user", body: "Please also preserve the second user's input." }).returning();
+      authorType: "user", authorUserId: mutation === "discard-root" ? "operator" : "second-user", body: "Please also preserve the second user's input." }).returning();
     const second = await enqueue(followup);
+    if (mutation === "duplicate-root") expect((await enqueue(reset))?.id).toBe(first!.id);
     const ids = [reset.id, followup.id];
     let admitted = first;
     if (kind === "active") { expect(first?.status).toBe("queued"); expect(second?.id).toBe(first!.id); }
@@ -1565,7 +1568,7 @@ describe("automatic retained workspace recovery", () => {
       expect(last.createdAt.getTime()).toBeGreaterThan((await run(f.runId)).finishedAt!.getTime());
       ids.push(last.id); admitted = await enqueue(last);
     }
-    if (reordered) {
+    if (mutation === "reorder") {
       const [third] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
         authorType: "user", authorUserId: "third-user", body: "Preserve the third author's input after reordering." }).returning();
       expect((await enqueue(third))?.id).toBe(admitted!.id);
@@ -1581,6 +1584,18 @@ describe("automatic retained workspace recovery", () => {
       });
       ids.splice(0, ids.length, followup.id, reset.id, third.id);
     }
+    if (mutation === "discard-root") {
+      const currentTask = (await db.select().from(issues).where(eq(issues.id, f.issueId)))[0];
+      const currentRun = await run(admitted!.id);
+      await createQueuedCommentQueue(db, {
+        syncCommentReferences: async () => {}, deleteCommentReferenceSource: async () => {}, syncCommentExternalObjectsSafely: async () => {},
+      }).discardQueuedComment({ issue: currentTask,
+        actor: { actorType: "user", actorId: "operator", agentId: null, runId: null, agentApiKeyId: null },
+        queueId: currentRun.wakeupRequestId!, commentId: reset.id,
+        revision: queuedCommentQueueRevision({ queueId: currentRun.wakeupRequestId!, comments: [reset, followup] }), now: new Date(),
+      });
+      ids.splice(0, 1);
+    }
     expect(admitted?.status).toBe("queued");
     const current = await run(admitted!.id);
     const [claimedWake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, current.wakeupRequestId!));
@@ -1588,11 +1603,11 @@ describe("automatic retained workspace recovery", () => {
     expect(sameActor).not.toHaveBeenCalled();
     expect(queueDeps.wakeQueue.admitWakeBehindIssueExecution.mock.calls.every(([, input]) => input.durableReceipt === undefined)).toBe(true);
     expect(queueDeps.executeRun).not.toHaveBeenCalled();
-    return { ...t, queued: current, wake: claimedWake, followup, expectedIds: ids, latestAuthor: reordered ? "third-user" : kind === "deferred-different" ? "third-user" : kind === "active" ? "second-user" : "operator" };
+    return { ...t, queued: current, wake: claimedWake, followup, expectedIds: ids, latestAuthor: mutation === "discard-root" ? "operator" : mutation === "reorder" ? "third-user" : kind === "deferred-different" ? "third-user" : kind === "active" ? "second-user" : "operator" };
   }
 
-  async function exerciseQueuedReset(nativeDescriptor: boolean, coalesced = false, ordinary?: "active" | "deferred" | "deferred-different" | "system-deferred", reordered = false) {
-    const mixed = ordinary ? await ordinaryMixedQueuedFixture(ordinary, reordered) : null;
+  async function exerciseQueuedReset(nativeDescriptor: boolean, coalesced = false, ordinary?: "active" | "deferred" | "deferred-different" | "system-deferred", mutation?: "reorder" | "discard-root" | "duplicate-root" | "replay-stop", previousReceiptFault?: "prior_started" | "missing_receipt" | "wrong_user" | "foreign_run") {
+    const mixed = ordinary ? await ordinaryMixedQueuedFixture(ordinary, mutation === "replay-stop" ? "reorder" : mutation) : null;
     const t = mixed ?? await queuedResetFixture(nativeDescriptor);
     const { f, original, reset, wake, queued, deps, control, execution, queueDeps, queue } = t;
     const followup = coalesced ? (await coalesceQueuedReset(t)).followup : null;
@@ -1669,6 +1684,42 @@ describe("automatic retained workspace recovery", () => {
         sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${f.issueId}`, eq(heartbeatRuns.status, "queued")));
       expect(successors).toHaveLength(1);
       expect(successors[0].contextSnapshot?.wakeCommentIds).toEqual(expectedIds);
+      if (mutation === "replay-stop") {
+        const successor = successors[0];
+        expect(successor.wakeupRequestId).not.toBe(wake.id);
+        const [currentTask] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+        const comments = await db.select().from(issueComments).where(inArray(issueComments.id, expectedIds));
+        const ordered = expectedIds.map(id => comments.find(comment => comment.id === id)!);
+        await createQueuedCommentQueue(db, {
+          syncCommentReferences: async () => {}, deleteCommentReferenceSource: async () => {}, syncCommentExternalObjectsSafely: async () => {},
+        }).reorderQueuedComments({ issue: currentTask,
+          actor: { actorType: "user", actorId: "operator", agentId: null, runId: null, agentApiKeyId: null },
+          queueId: successor.wakeupRequestId!,
+          revision: queuedCommentQueueRevision({ queueId: successor.wakeupRequestId!, comments: ordered }),
+          orderedCommentIds: [...expectedIds].reverse(), now: new Date(),
+        });
+        const nextSource = await seed("native", true, "keep_running", false, false,
+          { companyId: f.companyId, issueId: f.issueId, agentId: original.agentId });
+        await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "cancelled" }).where(eq(heartbeatRuns.id, nextSource.runId));
+        await recordRequiredWorkspaceRestoreFailure(db, await run(nextSource.runId), { workspaceRestoreFailure: "restore_failed" }, nextSource.lease);
+        if (previousReceiptFault === "prior_started") {
+          await db.update(heartbeatRuns).set({ startedAt: new Date() }).where(eq(heartbeatRuns.id, queued.id));
+        } else if (previousReceiptFault) {
+          const priorReceipt = and(eq(agentWakeupRequests.runId, queued.id), eq(agentWakeupRequests.status, "coalesced"),
+            sql`${agentWakeupRequests.payload}->>'commentId' = ${mixed!.followup.id}`);
+          if (previousReceiptFault === "missing_receipt") await db.delete(agentWakeupRequests).where(priorReceipt);
+          if (previousReceiptFault === "wrong_user") await db.update(agentWakeupRequests).set({ requestedByActorId: "operator" }).where(priorReceipt);
+          if (previousReceiptFault === "foreign_run") await db.update(agentWakeupRequests).set({ runId: nextSource.runId }).where(priorReceipt);
+        }
+        expect(await queue.claimQueuedRun(await run(successor.id))).toBeNull();
+        const [saved] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, successor.wakeupRequestId!));
+        expect(saved.status).toBe(previousReceiptFault ? "skipped" : "deferred_issue_execution");
+        if (!previousReceiptFault) {
+          expect(saved.payload?._paperclipWakeContext).toMatchObject({ wakeCommentIds: [...expectedIds].reverse() });
+          expect(saved.payload?._paperclipQueuedCommentRoot).toEqual({ wakeId: successor.wakeupRequestId, commentId: expectedIds.at(-1) });
+        }
+        expect(await isPreDispatchExecutionWaitVerified(db, await run(successor.id))).toBe(true);
+      }
       if (mixed) expect(deps.enqueueWakeup).toHaveBeenCalledWith(original.agentId, expect.objectContaining({ requestedByActorType: "user", requestedByActorId: mixed.latestAuthor }), wake.id);
       await recover(db);
       expect(scheduleRecoveryRetry).not.toHaveBeenCalledWith(queued.id);
@@ -1691,8 +1742,24 @@ describe("automatic retained workspace recovery", () => {
     await exerciseQueuedReset(true, false, "active");
   }, 30_000);
 
+  it("preserves independently receipted input after its queued root is discarded across Stop and copyback", async () => {
+    await exerciseQueuedReset(true, false, "active", "discard-root");
+  }, 30_000);
+
+  it("preserves a duplicate original root wake across Stop and native copyback", async () => {
+    await exerciseQueuedReset(true, false, "active", "duplicate-root");
+  }, 30_000);
+
+  it("preserves a replayed carrier after public reordering and a second Stop", async () => {
+    await exerciseQueuedReset(true, false, "active", "replay-stop");
+  }, 30_000);
+
+  it.each(["prior_started", "missing_receipt", "wrong_user", "foreign_run"] as const)("rejects replayed carrier Stop without valid original run receipts: %s", async fault => {
+    await exerciseQueuedReset(true, false, "active", "replay-stop", fault);
+  }, 30_000);
+
   it("preserves a reordered three-author queue across Stop and native copyback", async () => {
-    await exerciseQueuedReset(true, false, "active", true);
+    await exerciseQueuedReset(true, false, "active", "reorder");
   }, 30_000);
 
   it("preserves merged-deferred mixed-author comments across queued Stop and native copyback", async () => {
@@ -1768,8 +1835,11 @@ describe("automatic retained workspace recovery", () => {
     expect(proofs.find(receipt => receipt.payload?.commentId === first.id)?.requestedByActorId).toBe("operator");
   });
 
-  it.each(["missing_receipt", "wrong_user", "foreign_run", "foreign_company", "reviewer_namespace", "unrecorded_primary", "deleted_followup"] as const)("rejects inline-appended Stop recovery authority forgery: %s", async fault => {
-    const t = await ordinaryMixedQueuedFixture("active");
+  it.each([
+    ...(["missing_receipt", "wrong_user", "foreign_run", "foreign_company", "reviewer_namespace", "unrecorded_primary", "deleted_followup"] as const).map(fault => ({ fault, discardRoot: false })),
+    ...(["missing_receipt", "wrong_user", "foreign_run"] as const).map(fault => ({ fault, discardRoot: true })),
+  ])("rejects inline-appended Stop recovery authority forgery: $fault (discarded root: $discardRoot)", async ({ fault, discardRoot }) => {
+    const t = await ordinaryMixedQueuedFixture("active", discardRoot ? "discard-root" : undefined);
     const { f, wake, queued, deps, execution, queueDeps, queue, followup } = t;
     try {
       const [receipt] = await db.select().from(agentWakeupRequests).where(and(
@@ -1779,7 +1849,7 @@ describe("automatic retained workspace recovery", () => {
       await recordRequiredWorkspaceRestoreFailure(db, await run(f.runId), { workspaceRestoreFailure: "restore_failed" }, f.lease);
       deps.activeRunExecutions.delete(f.runId); execution.finish(); adapterExecutionControls.delete(f.runId);
       if (fault === "missing_receipt") await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt.id));
-      if (fault === "wrong_user") await db.update(agentWakeupRequests).set({ requestedByActorId: "operator" }).where(eq(agentWakeupRequests.id, receipt.id));
+      if (fault === "wrong_user") await db.update(agentWakeupRequests).set({ requestedByActorId: discardRoot ? "other-user" : "operator" }).where(eq(agentWakeupRequests.id, receipt.id));
       if (fault === "foreign_run") await db.update(agentWakeupRequests).set({ runId: f.runId }).where(eq(agentWakeupRequests.id, receipt.id));
       if (fault === "foreign_company") await db.update(agentWakeupRequests).set({ companyId: (await db.insert(companies).values({ name: "Other", issuePrefix: `IP${randomUUID().slice(0, 6)}` }).returning())[0].id }).where(eq(agentWakeupRequests.id, receipt.id));
       if (fault === "reviewer_namespace") await db.update(agentWakeupRequests).set({ payload: { ...receipt.payload, _paperclipReviewerAssignmentContinuation: {} } }).where(eq(agentWakeupRequests.id, receipt.id));
