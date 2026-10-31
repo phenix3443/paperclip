@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { activityLog, authUsers, connectionGrants, connectionIntentDeliveries, createDb, databaseWorkPending, issueThreadInteractions,
@@ -71,36 +72,74 @@ describePostgres("default organization grant writes notify the connection delive
     await expectRetired(f.connection.id);
   });
 
-  it("notifies from the savepoint but publishes only when the caller transaction commits", async () => {
+  it.each([["insert", false], ["update", true]] as const)(
+    "notifies from the %s branch savepoint but publishes only when the caller transaction commits",
+    async (_branch, revokedGrant) => {
+      const f = await seed(revokedGrant);
+      delivery = await startConnectionDelivery(db);
+      const baseline = delivery.sweeps;
+      await db.transaction(async (tx) => {
+        await createOrganizationGrantStore(db)(f.connection, tx);
+        expect(databaseWorkPending(db, DELIVERY_QUEUES.connection)).toBe(true);
+        await pause();
+        expect(delivery!.sweeps).toBe(baseline);
+        expect((await card()).status).toBe("pending");
+      });
+      await delivery.settle(baseline + 1);
+      await expectRetired(f.connection.id);
+    },
+  );
+
+  it("notifies before the write even when the write fails inside the savepoint", async () => {
     const f = await seed();
     delivery = await startConnectionDelivery(db);
     const baseline = delivery.sweeps;
     await db.transaction(async (tx) => {
-      await createOrganizationGrantStore(db)(f.connection, tx);
+      expect(databaseWorkPending(db, DELIVERY_QUEUES.connection)).toBe(false);
+      await expect(createOrganizationGrantStore(db)({ ...f.connection, id: randomUUID() }, tx)).rejects.toThrow();
       expect(databaseWorkPending(db, DELIVERY_QUEUES.connection)).toBe(true);
-      await pause();
-      expect(delivery!.sweeps).toBe(baseline);
-      expect((await card()).status).toBe("pending");
     });
     await delivery.settle(baseline + 1);
-    await expectRetired(f.connection.id);
+    expect((await card()).status).toBe("pending");
+    expect(await db.select().from(connectionGrants).where(eq(connectionGrants.kind, "organization"))).toHaveLength(0);
   });
 
-  it("keeps the card pending with no durable effect when the caller transaction rolls back", async () => {
-    const f = await seed(true);
+  it.each([["insert", false], ["update", true]] as const)(
+    "keeps the card pending with no durable effect when the caller transaction rolls back the %s branch",
+    async (_branch, revokedGrant) => {
+      const f = await seed(revokedGrant);
+      delivery = await startConnectionDelivery(db);
+      const baseline = delivery.sweeps;
+      const before = await orgGrants(f.connection.id);
+      await expect(db.transaction(async (tx) => {
+        await createOrganizationGrantStore(db)(f.connection, tx);
+        expect(databaseWorkPending(db, DELIVERY_QUEUES.connection)).toBe(true);
+        throw new Error("rollback");
+      })).rejects.toThrow("rollback");
+      await delivery.settle(baseline + 1);
+      expect((await card()).status).toBe("pending");
+      expect(await orgGrants(f.connection.id)).toEqual(before);
+      expect(await db.select().from(connectionIntentDeliveries)).toHaveLength(0);
+      expect(await db.select().from(activityLog).where(eq(activityLog.action, "issue.thread_interaction_resolved"))).toHaveLength(0);
+      expect(delivery.wakeup).not.toHaveBeenCalled();
+    },
+  );
+
+  it("retires once when the grant commits while a sweep is held before its read", async () => {
+    const f = await seed();
     delivery = await startConnectionDelivery(db);
     const baseline = delivery.sweeps;
-    await expect(db.transaction(async (tx) => {
-      await createOrganizationGrantStore(db)(f.connection, tx);
-      expect(databaseWorkPending(db, DELIVERY_QUEUES.connection)).toBe(true);
-      throw new Error("rollback");
-    })).rejects.toThrow("rollback");
-    await delivery.settle(baseline + 1);
-    expect((await card()).status).toBe("pending");
-    expect(await orgGrants(f.connection.id)).toEqual([expect.objectContaining({ status: "revoked" })]);
-    expect(await db.select().from(connectionIntentDeliveries)).toHaveLength(0);
-    expect(await db.select().from(activityLog).where(eq(activityLog.action, "issue.thread_interaction_resolved"))).toHaveLength(0);
-    expect(delivery.wakeup).not.toHaveBeenCalled();
+    const locker = createDb(temp.connectionString);
+    try {
+      await locker.transaction(async (lock) => {
+        await lock.execute(sql`lock table issue_thread_interactions in access exclusive mode`);
+        delivery!.wake();
+        while (delivery!.sweeps === baseline) await new Promise(resolve => setTimeout(resolve, 10));
+        await createOrganizationGrantStore(db)(f.connection);
+      });
+    } finally { await locker.$client.end({ timeout: 1 }); }
+    await delivery.settle(baseline + 2);
+    await expectRetired(f.connection.id);
   });
 
   it("retires once when the insert and the active update branch commit back to back", async () => {
