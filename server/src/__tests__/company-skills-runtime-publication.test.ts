@@ -51,13 +51,7 @@ describeDatabase("runtime publication revalidation", () => {
     return { companyId, service, skill, directory, options: { onlyKeys: new Set([skill.key]), snapshotLatest: true } };
   }
   it("concurrent identical captures publish only one version", async () => {
-    const companyId = randomUUID();
-    await db.insert(companies).values({ id: companyId, name: "Publication fixture", issuePrefix: `RP${companyId.slice(0, 6)}` });
-    const service = companySkillService(db);
-    const skill = await service.createLocalSkill(companyId, { name: "Publication skill" });
-    const directory = path.basename(skill.sourceLocator!) === "SKILL.md" ? path.dirname(skill.sourceLocator!) : skill.sourceLocator!;
-    await fs.writeFile(path.join(directory, "notes.md"), "OLD\n");
-    const options = { onlyKeys: new Set([skill.key]), snapshotLatest: true };
+    const { companyId, service, skill, options } = await fixture();
     const initial = await service.listVersions(companyId, skill.id);
     let competing: Awaited<ReturnType<typeof service.listRuntimeSkillEntries>> = [];
     beforeLock = async () => { competing = await service.listRuntimeSkillEntries(companyId, options); };
@@ -66,12 +60,7 @@ describeDatabase("runtime publication revalidation", () => {
     expect(await service.listVersions(companyId, skill.id)).toHaveLength(initial.length + 1);
   }, 60_000);
   it("reprepares a directory changed without advancing the version", async () => {
-    const companyId = randomUUID();
-    await db.insert(companies).values({ id: companyId, name: "Directory fixture", issuePrefix: `RD${companyId.slice(0, 6)}` });
-    const service = companySkillService(db);
-    const skill = await service.createLocalSkill(companyId, { name: "Directory skill" });
-    const directory = path.basename(skill.sourceLocator!) === "SKILL.md" ? path.dirname(skill.sourceLocator!) : skill.sourceLocator!;
-    await fs.writeFile(path.join(directory, "notes.md"), "OLD\n");
+    const { companyId, service, skill, directory } = await fixture();
     const replacement = path.join(home, randomUUID());
     await fs.cp(directory, replacement, { recursive: true });
     await fs.writeFile(path.join(replacement, "notes.md"), "NEW\n");
@@ -195,6 +184,36 @@ describeDatabase("runtime publication revalidation", () => {
     expect(restored).toMatchObject({ versionId: captured!.versionId, sourceStatus: "available" });
     const [missing] = await f.service.listRuntimeSkillEntries(f.companyId, { ...f.options, versionSelections: new Map([[f.skill.key, randomUUID()]]) });
     expect(missing).toMatchObject({ sourceStatus: "missing", missingDetail: "The selected skill version no longer exists." });
+  });
+
+  it("publishes two skills with identical packages without waiting on its own transaction", async () => {
+    const f = await fixture();
+    const first = await f.service.createLocalSkill(f.companyId, { name: "Shared A", markdown: "# Shared\n" });
+    const second = await f.service.createLocalSkill(f.companyId, { name: "Shared B", markdown: "# Shared\n" });
+    for (const skill of [first, second]) {
+      const directory = path.basename(skill.sourceLocator!) === "SKILL.md" ? path.dirname(skill.sourceLocator!) : skill.sourceLocator!;
+      await fs.writeFile(path.join(directory, "notes.md"), "SHARED\n");
+    }
+    const databaseName = new URL(database.connectionString).pathname.slice(1);
+    expect(databaseName).toMatch(/^[a-zA-Z0-9_-]+$/);
+    await db.$client.unsafe(`ALTER DATABASE "${databaseName}" SET lock_timeout TO '1s'`);
+    try {
+      const entries = await f.service.listRuntimeSkillEntries(f.companyId, { onlyKeys: new Set([first.key, second.key]), snapshotLatest: true });
+      expect(entries).toHaveLength(2);
+      expect(entries.every(entry => entry.sourceStatus === "available")).toBe(true);
+      for (const entry of entries) expect(await fs.readFile(path.join(entry.source, "notes.md"), "utf8")).toBe("SHARED\n");
+    } finally { await db.$client.unsafe(`ALTER DATABASE "${databaseName}" RESET lock_timeout`); }
+  }, 30_000);
+
+  it.each(["sourceType", "sourceRef", "metadata"])("reprepares after only %s changes", async field => {
+    const f = await fixture();
+    beforeLock = async () => {
+      await fs.writeFile(path.join(f.directory, "notes.md"), "NEW\n");
+      const update = field === "sourceType" ? { sourceType: "catalog" } : field === "sourceRef" ? { sourceRef: "next" } : { metadata: { sourceKind: "fixture" } };
+      await db.update(companySkills).set(update).where(eq(companySkills.id, f.skill.id));
+    };
+    const [entry] = await f.service.listRuntimeSkillEntries(f.companyId, f.options);
+    expect(await fs.readFile(path.join(entry!.source, "notes.md"), "utf8")).toBe("NEW\n");
   });
 
 });

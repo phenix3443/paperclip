@@ -413,6 +413,7 @@ type BundledSkillReleaseManifestEntry = {
 };
 
 type CreateVersionOptions = {
+  preparedPackage?: { id: string; fileMap: SkillPackageFileMapping[] | null };
   repositorySnapshotId?: string;
   repositorySkillPath?: string;
   packageSnapshotId?: string;
@@ -3730,13 +3731,13 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
     const previousVersion = options.fileInventory === undefined && skill.currentVersionId ? await readVersionMetadata(companyId, skill.id, skill.currentVersionId) : null;
     // Shipped release rows retain their existing validation contract. All user
     // snapshots use the package store; source imports prepare before their transaction.
-    let packageFileMap = options.packageFileMap ?? null;
+    let packageFileMap = options.preparedPackage?.fileMap ?? options.packageFileMap ?? null;
     const preparePackage = async (store: ReturnType<typeof skillPackageStore>) => {
       const id = await store.prepare(companyId, fileInventory);
       packageFileMap = skillVersionFileMap(fileInventory, await store.manifest(companyId, id));
       return id;
     };
-    const packageSnapshotId = options.packageSnapshotId ?? (options.release || !skillPackageStorageEnabled() ? null : options.database
+    const packageSnapshotId = options.preparedPackage?.id ?? options.packageSnapshotId ?? (options.release || !skillPackageStorageEnabled() ? null : options.database
       ? await withDedicatedDbConnection(packageDb, connection => preparePackage(skillPackageStore(connection)))
       : await preparePackage(packages));
     if (options.packageSnapshotId) {
@@ -6453,7 +6454,8 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
         }
       }
       const published: Array<{ skill: CompanySkill; installedResolution: RuntimeSkillSourceResolution | null }> = [];
-      for (let skill of skills) {
+      const publications = new Map<string, Pick<CreateVersionOptions, "fileInventory" | "preparedPackage">>();
+      for (const skill of skills) {
         if (selectedKeys && !selectedKeys.has(skill.key)) continue;
         let installedResolution: RuntimeSkillSourceResolution | null = null;
         const unpinned = !options.versionSelections?.get(skill.key);
@@ -6481,13 +6483,23 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
                 : previous ? skillSnapshotHash(await packages.versionFiles(previous)) : null;
             }
             if (previousHash !== inventoryHash) {
-              const version = await createVersion(companyId, skill.id, { label: "Execution snapshot" }, { type: "system" },
-                { skipInventoryRefresh: true, skill, fileInventory: inventory, database: tx });
-              skill = { ...skill, currentVersionId: version.id };
+              const preparedPackage = skillPackageStorageEnabled() ? await withDedicatedDbConnection(packageDb, async connection => {
+                const store = skillPackageStore(connection);
+                const id = await store.prepare(companyId, inventory);
+                return { id, fileMap: skillVersionFileMap(inventory, await store.manifest(companyId, id)) };
+              }) : undefined;
+              publications.set(skill.id, { fileInventory: inventory, preparedPackage });
             }
           } else installedResolution = installed;
         }
         published.push({ skill, installedResolution });
+      }
+      for (const item of published) {
+        const publication = publications.get(item.skill.id);
+        if (!publication) continue;
+        const version = await createVersion(companyId, item.skill.id, { label: "Execution snapshot" }, { type: "system" },
+          { skipInventoryRefresh: true, skill: item.skill, ...publication, database: tx });
+        item.skill = { ...item.skill, currentVersionId: version.id };
       }
       return published;
     });
