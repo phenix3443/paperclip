@@ -1,5 +1,6 @@
 import { connectionActorUserId } from "../actor.js";
 import { lockManagedAppPolicies, lockToolAssignmentAgents } from "../assignment-locks.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../delivery-work-notifications.js";
 import type { ActorInfo, ToolAccessMutationDb } from "../types.js";
 import { and, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -257,6 +258,10 @@ export function createCatalogDefaultAccess(db: Db) {
       }
     }
     const askFirstIds = new Set(input.askFirstEntries.map((entry) => entry.id));
+    const write = <T>(run: (tx: ToolAccessMutationDb) => Promise<T>) => (dbClient as Db).transaction(async (tx) => {
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
+      return run(tx);
+    });
     const results: ToolPolicy[] = [];
     for (const entry of input.askFirstEntries) {
       const config = {
@@ -266,7 +271,7 @@ export function createCatalogDefaultAccess(db: Db) {
       };
       const existing = policiesByCatalogEntryId.get(entry.id);
       if (existing) {
-        const [updated] = await dbClient
+        const [updated] = await write((tx) => tx
           .update(toolPolicies)
           .set({
             name: policyNameForApp(input.connection, entry),
@@ -277,10 +282,10 @@ export function createCatalogDefaultAccess(db: Db) {
             updatedAt: new Date(),
           })
           .where(eq(toolPolicies.id, existing.id))
-          .returning();
+          .returning());
         results.push(toPolicy(updated));
       } else {
-        const [created] = await dbClient
+        const [created] = await write((tx) => tx
           .insert(toolPolicies)
           .values({
             companyId: input.companyId,
@@ -298,7 +303,7 @@ export function createCatalogDefaultAccess(db: Db) {
             createdByUserId:
               connectionActorUserId(input.actor),
           })
-          .returning();
+          .returning());
         results.push(toPolicy(created));
       }
     }
@@ -311,10 +316,10 @@ export function createCatalogDefaultAccess(db: Db) {
         );
       });
       for (const policy of stalePolicies) {
-        await dbClient
+        await write((tx) => tx
           .update(toolPolicies)
           .set({ enabled: false, updatedAt: new Date() })
-          .where(eq(toolPolicies.id, policy.id));
+          .where(eq(toolPolicies.id, policy.id)));
       }
     }
     return results;
