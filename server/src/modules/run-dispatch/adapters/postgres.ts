@@ -1025,23 +1025,51 @@ export function createPostgresRunDispatchAdapter(
     const sourceWakeIds = Array.isArray(sourceIds) ? [...new Set(sourceIds as string[])] : [];
     const adopted = sourceWakeIds.length ? await tx.select().from(agentWakeupRequests).where(and(
       ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
-      eq(agentWakeupRequests.runId, run.id), eq(agentWakeupRequests.status, "coalesced"),
+      eq(agentWakeupRequests.status, "coalesced"),
       inArray(agentWakeupRequests.id, sourceWakeIds),
       sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
     )).for("update") : [];
     if (adopted.length !== sourceWakeIds.length) return null;
-    const mergeTargets = [wake.id, ...adopted.map(receipt => receipt.id)];
-    const previousRuns = adopted.length ? await tx.select().from(heartbeatRuns).where(and(
-      eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.agentId, run.agentId),
-      inArray(heartbeatRuns.wakeupRequestId, adopted.map(receipt => receipt.id)),
-      eq(heartbeatRuns.status, "cancelled"), eq(heartbeatRuns.errorCode, "execution_reconciliation_required"),
-      sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
-    )) : [];
-    const verifiedPreviousRuns: typeof previousRuns = [];
-    for (const previous of previousRuns) {
-      if (await isPreDispatchExecutionWaitVerified(tx, previous)) verifiedPreviousRuns.push(previous);
+    const authorizedWakeIds = new Set(adopted.filter(receipt => receipt.runId === run.id).map(receipt => receipt.id));
+    const authorizedRunIds = new Set([run.id]);
+    const receiptsById = new Map(adopted.map(receipt => [receipt.id, receipt]));
+    const verifiedPreviousRuns: HeartbeatRun[] = [];
+    let pendingWakeIds = [...authorizedWakeIds];
+    while (pendingWakeIds.length) {
+      const previousRuns = await tx.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.agentId, run.agentId),
+        inArray(heartbeatRuns.wakeupRequestId, pendingWakeIds),
+        eq(heartbeatRuns.status, "cancelled"), eq(heartbeatRuns.errorCode, "execution_reconciliation_required"),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+      ));
+      pendingWakeIds = [];
+      for (const previous of previousRuns) {
+        if (!await isPreDispatchExecutionWaitVerified(tx, previous)) continue;
+        authorizedRunIds.add(previous.id);
+        verifiedPreviousRuns.push(previous);
+        const previousSources = parseObject(previous.contextSnapshot).queuedCommentSourceWakeIds;
+        if (previousSources === undefined) continue;
+        if (!Array.isArray(previousSources) || previousSources.some(id => typeof id !== "string" || !isUuidLike(id))) return null;
+        const ids = [...new Set(previousSources as string[])];
+        if (!ids.length) continue;
+        const sources = await tx.select().from(agentWakeupRequests).where(and(
+          ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
+          eq(agentWakeupRequests.status, "coalesced"), eq(agentWakeupRequests.runId, previous.id),
+          inArray(agentWakeupRequests.id, ids), sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+        )).for("update");
+        if (sources.length !== ids.length) return null;
+        for (const receipt of sources) {
+          receiptsById.set(receipt.id, receipt);
+          if (authorizedWakeIds.has(receipt.id)) continue;
+          authorizedWakeIds.add(receipt.id);
+          pendingWakeIds.push(receipt.id);
+        }
+      }
     }
-    const receiptRunIds = [run.id, ...verifiedPreviousRuns.map(previous => previous.id)];
+    if (adopted.some(receipt => !authorizedWakeIds.has(receipt.id))) return null;
+    const authorizedReceipts = [...receiptsById.values()];
+    const mergeTargets = [wake.id, ...authorizedReceipts.map(receipt => receipt.id)];
+    const receiptRunIds = [...authorizedRunIds];
     const coalesced = await tx.select().from(agentWakeupRequests).where(and(
       ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
       eq(agentWakeupRequests.status, "coalesced"), eq(agentWakeupRequests.requestedByActorType, "user"),
@@ -1054,7 +1082,7 @@ export function createPostgresRunDispatchAdapter(
           inArray(sql<string>`${agentWakeupRequests.payload}->>'coalescedIntoWakeupRequestId'`, mergeTargets))),
     )).for("update");
     const authors = new Map(comments.map(comment => [comment.id, comment.authorUserId]));
-    const recordedCommentIds = new Set([wake, ...adopted, ...coalesced].flatMap(receipt => {
+    const recordedCommentIds = new Set([wake, ...authorizedReceipts, ...coalesced].flatMap(receipt => {
       const recordedPayload = parseObject(receipt.payload), actorId = readNonEmptyString(receipt.requestedByActorId);
       const recordedCommentId = queuedCommentRootIdFromWakePayload(recordedPayload, receipt.id) ?? readNonEmptyString(recordedPayload.commentId);
       const previous = verifiedPreviousRuns.find(previous => previous.id === receipt.runId);
