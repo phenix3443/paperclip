@@ -1,3 +1,6 @@
+import { observeStoppedWorkspaceRecovery } from "../workspace-recovery.js";
+import { notifyScheduledRetryCancellation } from "../scheduled-retry-cancellation-notifications.js";
+import { notifyChatInboundWakeNotices } from "../chat-inbound-wake-notice-notifications.js";
 import { resumeDeferredChatWake } from "../durable-chat-wakeup.js";
 import { notifyEnvironmentCleanup } from "../environment-cleanup-notifications.js";
 import { readNativeStopExecutionEvidence } from "./native-stop-evidence-read.js";
@@ -295,6 +298,7 @@ export type CancelRunOptions = {
 function runCancellationFenceSql(input: {
   cancellation: ReturnType<typeof requestedRunCancellation>;
   errorCode: string;
+  attribution?: Pick<Record<string, unknown>, "cancelledByActorType" | "cancelledByUserId">;
   reassignmentStopRequested?: boolean;
   preserveCancellation?: boolean;
   budgetEnforcement?: BudgetEnforcementScope;
@@ -320,6 +324,7 @@ function runCancellationFenceSql(input: {
       coalesce(nullif(${heartbeatRuns.resultJson}->'startupCancellation'->'budgetEnforcement', 'null'::jsonb), ${intent}::jsonb))`;
   }
   return sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ||
+    ${JSON.stringify(input.attribution ?? {})}::jsonb ||
     ${JSON.stringify(input.reassignmentStopRequested ? { reassignmentStopRequested: true } : {})}::jsonb ||
     jsonb_build_object('cancellation', ${input.preserveCancellation
       ? sql`coalesce(${heartbeatRuns.resultJson}->'cancellation', ${cancellation}::jsonb)`
@@ -361,6 +366,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     status: string | null | undefined;
     failureReason?: string | null;
     providerResourceDisposition?: ProviderResourceDisposition;
+    respectCleanupDeadlines?: boolean;
     nativeLifecycleTelemetry?: {
       provider: string;
       harness: string;
@@ -466,6 +472,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         status: leaseReleaseStatusForRunStatus(status),
         failureReason: input.failureReason ?? undefined,
         providerResourceDisposition,
+        ...(input.respectCleanupDeadlines ? { respectCleanupDeadlines: true } : {}),
         nativeLifecycleTelemetry: input.nativeLifecycleTelemetry,
       })
       .catch((err) => {
@@ -543,11 +550,12 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     )) : [];
     // The ordinary path still enforces task holds, ownership, and native session
     // cleanup before starting a provider.
-    const stoppedNativeContinuation = currentRun && isAcknowledgedNativeStop(currentRun) &&
+    const stoppedNativeExecution = currentRun && isAcknowledgedNativeStop(currentRun) &&
       !activeRunExecutions.has(run.id) && !coordinator?.leaseOwner &&
       ["terminal_failure", "applied"].includes(coordinator?.phase ?? "") &&
-      await acknowledgedNativeStopExecutionHasStopped(db, currentRun) &&
-      !(await getExecutionBlocker(db, run.companyId, issueId));
+      await acknowledgedNativeStopExecutionHasStopped(db, currentRun);
+    if (stoppedNativeExecution) await observeStoppedWorkspaceRecovery(db, { companyId: run.companyId, issueId, runId: run.id });
+    const stoppedNativeContinuation = stoppedNativeExecution && !(await getExecutionBlocker(db, run.companyId, issueId));
     const legacyContinuation = run.runtimeMode === "legacy" &&
       hasConversationContinuationPolicy((await getRunExecutionWait(run.companyId, run.id))?.resultJson) &&
       !(await getExecutionBlocker(db, run.companyId, issueId));
@@ -726,7 +734,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
             or(isNull(environmentLeases.releasedAt), inArray(environmentLeases.status, ["active", "retained", "pending_cleanup"])),
           )).limit(1);
           if (otherOwner) continue;
-          await notifyEnvironmentCleanup(tx);
+          await notifyEnvironmentCleanup(tx, { companyId: lease.companyId, runId: lease.heartbeatRunId ?? undefined });
           await tx.update(environmentLeases).set({ status: "pending_cleanup", updatedAt: new Date() })
             .where(eq(environmentLeases.id, lease.id));
         }
@@ -1020,6 +1028,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
 
     if (wakeupIds.length === 0) return 0;
 
+    await notifyChatInboundWakeNotices(tx, { companyId: scope.companyId });
     await tx
       .update(agentWakeupRequests)
       .set({
@@ -1132,13 +1141,19 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     let run = await getRun(runId);
     if (!run) throw notFound("Heartbeat run not found");
     if (options.expectedStatus && run.status !== options.expectedStatus) return null;
+
+
+    const attribution = {
+      cancelledByActorType: options.resultJson?.cancelledByActorType,
+      cancelledByUserId: options.resultJson?.cancelledByUserId,
+    };
     const handoffIssueId = run.nativeIssueId ?? run.issueId ?? (typeof run.contextSnapshot?.issueId === "string" ? run.contextSnapshot.issueId : null);
     const supersedesCaseHandoff = options.resultJson?.cancelledByActorType === "user" || options.errorCode === "issue_reassigned";
     let cancellationClaimed = false;
     let caseHandoffRetryClaimed = false;
     if (handoffIssueId && (supersedesCaseHandoff || options.reviewerIntentDisposition === "retire") && options.resultJson?.caseHandoffYieldStop !== true) {
       const publications: ActivityPublication[] = [];
-      const supersessionApplied = await db.transaction(async tx => {
+      const applySupersession = () => db.transaction(async tx => {
         const [issue] = await tx.select({ id: issues.id, executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId,
           assigneeAgentId: issues.assigneeAgentId, assigneeUserId: issues.assigneeUserId }).from(issues)
           .where(and(eq(issues.companyId, run!.companyId), eq(issues.id, handoffIssueId))).for("update");
@@ -1177,9 +1192,10 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
           startupCancellation: { requestedAt, beforeNativeSelection: currentRun.runtimeMode === "legacy" && !currentRun.runtimeModeResolvedAt
             && currentRun.executionStage === "preparing" && parseObject(currentRun.runnerProfileJson?.adapterDispatch).adapterType === "paperclip_runner" },
         } : {};
+        await notifyScheduledRetryCancellation(tx, { companyId: run!.companyId, runId });
         const [fenced] = await tx.update(heartbeatRuns).set({
           resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
-            executionCancellation: { state: "requested", requestedAt }, ...guardedCancellation,
+            ...attribution, executionCancellation: { state: "requested", requestedAt }, ...guardedCancellation,
           })}::jsonb`,
         }).where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, run!.companyId),
           inArray(heartbeatRuns.status, cancellableStatuses))).returning();
@@ -1197,7 +1213,27 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         await cancelCaseHandoffsForIssue(tx as unknown as Db, { companyId: run!.companyId, issueId: handoffIssueId,
           sourceRunId: runId, includeUnboundTerminalIntent: Boolean(fenced && ownsTask), reason, publications });
         return true;
-      }).catch(rethrowNativeCancellationLockConflict);
+      });
+      let supersessionApplied = false;
+      for (let attempt = 0; ; attempt++) {
+        const previousRun = run;
+        try {
+          supersessionApplied = await applySupersession();
+          break;
+        } catch (error) {
+          const value = parseObject(error);
+          const deadlock = value.code === "40P01" || parseObject(value.cause).code === "40P01";
+          if (!deadlock || attempt >= 2) rethrowNativeCancellationLockConflict(error);
+          // PostgreSQL aborted the entire transaction. Discard its local
+          // receipts before re-reading current authority under fresh locks.
+          // Provider Stop and publication happen only after this boundary.
+          run = previousRun;
+          cancellationClaimed = false;
+          caseHandoffRetryClaimed = false;
+          publications.length = 0;
+          await new Promise(resolve => setTimeout(resolve, 25 * (attempt + 1)));
+        }
+      }
       publications.forEach(publishActivity);
       if (!supersessionApplied) return null;
     }
@@ -1265,10 +1301,11 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     // additional durable fence before its existing cancellation path.
     if (!committedBudgetCancellation && (options.expectedStatus || options.budgetEnforcement || (!options.cancellationRequestId && (run.runtimeMode === "native" || (!run.runtimeModeResolvedAt && !running && !control))))) {
       const fence = async (tx: Db) => {
+        await notifyScheduledRetryCancellation(tx, { companyId: run!.companyId, runId });
         const [fenced] = await tx.update(heartbeatRuns).set({
           // Record handoff intent before native cancellation can finalize and release
           // the run. Only its audited stop acknowledgement suppresses recovery.
-          resultJson: runCancellationFenceSql({ cancellation, errorCode,
+          resultJson: runCancellationFenceSql({ cancellation, errorCode, attribution,
             reassignmentStopRequested: options.errorCode === "issue_reassigned" && options.resultJson?.reassignmentStopConfirmed === true }),
         }).where(and(eq(heartbeatRuns.id, runId), inArray(heartbeatRuns.status,
           options.expectedStatus ? [options.expectedStatus] : pendingNativeRetry ? [...CANCELLABLE_HEARTBEAT_RUN_STATUSES, "failed"] : [...CANCELLABLE_HEARTBEAT_RUN_STATUSES],
@@ -1279,7 +1316,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       try {
         fenced = options.budgetEnforcement
           ? await withCurrentBudgetEnforcement(db, options.budgetEnforcement, fence)
-          : await fence(db);
+          : await db.transaction(tx => fence(tx as unknown as Db));
       } catch (error) {
         stopOwnership?.release();
         throw error;
@@ -1572,35 +1609,29 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     );
     if (uniqueAgentIds.length === 0) return 0;
 
-    const now = new Date();
-    const wakeupIds = await db
-      .select({ id: agentWakeupRequests.id })
-      .from(agentWakeupRequests)
-      .where(
-        and(
+    return db.transaction(async tx => {
+      const wakeups = await tx
+        .select({ id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId })
+        .from(agentWakeupRequests)
+        .where(and(
           ordinaryWakeRequestPredicate(), inArray(agentWakeupRequests.agentId, uniqueAgentIds),
-          inArray(agentWakeupRequests.status, [
-            "queued",
-            "deferred_issue_execution",
-          ]),
-          sql`${agentWakeupRequests.runId} is null`,
-        ),
-      )
-      .then((rows) => rows.map((row) => row.id));
-
-    if (wakeupIds.length === 0) return 0;
-
-    await db
-      .update(agentWakeupRequests)
-      .set({
-        status: "cancelled",
-        finishedAt: now,
-        error: reason,
-        updatedAt: now,
-      })
-      .where(and(ordinaryWakeRequestPredicate(), inArray(agentWakeupRequests.id, wakeupIds)));
-
-    return wakeupIds.length;
+          inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
+          isNull(agentWakeupRequests.runId),
+        ));
+      if (!wakeups.length) return 0;
+      for (const companyId of new Set(wakeups.map(row => row.companyId))) {
+        await notifyChatInboundWakeNotices(tx, { companyId });
+      }
+      const now = new Date();
+      const cancelled = await tx.update(agentWakeupRequests).set({
+        status: "cancelled", finishedAt: now, error: reason, updatedAt: now,
+      }).where(and(
+        ordinaryWakeRequestPredicate(), inArray(agentWakeupRequests.id, wakeups.map(row => row.id)),
+        inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
+        isNull(agentWakeupRequests.runId),
+      )).returning({ id: agentWakeupRequests.id });
+      return cancelled.length;
+    });
   }
 
   async function cancelInvocationsForAgentsInternal(
@@ -1668,6 +1699,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
           inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES]),
         )).then((rows) => rows.map((row) => row.id));
       if (!candidates.length) return [];
+      await notifyScheduledRetryCancellation(tx, { companyId: scope.companyId });
       return tx.update(heartbeatRuns).set({ resultJson: runCancellationFenceSql({
         cancellation: requestedRunCancellation({}, reason), errorCode: "cancelled", preserveCancellation: true, budgetEnforcement: scope,
       }) }).where(and(eq(heartbeatRuns.companyId, scope.companyId), inArray(heartbeatRuns.id, candidates),

@@ -82,7 +82,7 @@ function git(args) {
   return execFileSync('git', ['--no-replace-objects', ...args], { encoding: 'utf8' }).trim();
 }
 
-function trustedMergeFiles(baseSha, headSha, trustedSha, files) {
+export function trustedMergeFiles(baseSha, headSha, trustedSha, files) {
   if (git(['rev-parse', '--is-shallow-repository']) !== 'false') {
     throw new Error('Incomplete history: fetch full base, head, and trusted master history.');
   }

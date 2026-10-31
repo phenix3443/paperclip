@@ -54,6 +54,9 @@ export const issueComments = pgTable(
       .on(table.companyId, table.issueId, table.authorAgentId, table.clientRequestId)
       .where(sql`${table.authorAgentId} IS NOT NULL AND ${table.clientRequestId} IS NOT NULL`),
     issueIdx: index("issue_comments_issue_idx").on(table.issueId),
+    reviewResponseReceiptIdx: index("issue_comments_review_response_receipt_idx").on(
+      table.createdByRunId, table.companyId, table.issueId, table.authorAgentId,
+    ).where(sql`${table.authorType} = 'agent' AND ${table.metadata}->>'authorizationReason' = 'allow_chat_run_presentation'`),
     companyIdx: index("issue_comments_company_idx").on(table.companyId),
     companyIssueCreatedAtIdx: index("issue_comments_company_issue_created_at_idx").on(
       table.companyId,

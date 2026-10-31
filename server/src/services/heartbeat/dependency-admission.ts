@@ -1,3 +1,4 @@
+import { notifyChatInboundWakeNotices } from "../chat-inbound-wake-notice-notifications.js";
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { and, asc, eq, exists, inArray, isNotNull, isNull, like, or, sql } from "drizzle-orm";
@@ -251,12 +252,14 @@ export function createDependencyAdmission(db: Db, schedulingGate: () => Promise<
           if (previous.runId || previous.status !== "skipped" || !reversible
             || wait?.requestedIdempotencyKey !== current.idempotencyKey || !matchesReceipt(normalized, current, binding))
             throw new Error("Legacy dependency receipt binding conflicts with durable input");
+          await notifyChatInboundWakeNotices(tx, { companyId: current.companyId, issueId: binding.issueId });
           await tx.update(agentWakeupRequests).set({ reason: current.reason, idempotencyKey: current.idempotencyKey,
             status: "deferred_issue_execution", finishedAt: null, updatedAt: new Date() }).where(observed(previous));
         }
       }
       const receipt = await receiptFor(tx, current, binding);
       if (receipt?.runId) {
+        await notifyChatInboundWakeNotices(tx, { companyId: current.companyId, issueId: binding.issueId });
         await tx.update(agentWakeupRequests).set({ status: "completed", runId: receipt.runId,
           payload: { ...current.payload, [markerKey]: binding }, finishedAt: receipt.finishedAt ?? new Date(), updatedAt: new Date() })
           .where(observed(current));
@@ -265,6 +268,7 @@ export function createDependencyAdmission(db: Db, schedulingGate: () => Promise<
       if (receipt && receipt.status !== "deferred_issue_execution") throw new Error("Dependency receipt without a run requires explicit repair");
       const eligibility = await inspect(tx, current);
       if (eligibility.kind === "retired") {
+        await notifyChatInboundWakeNotices(tx, { companyId: current.companyId, issueId: binding.issueId });
         if (receipt) await tx.update(agentWakeupRequests).set({ status: "skipped", error: eligibility.reason,
           finishedAt: new Date(), updatedAt: new Date() }).where(observed(receipt));
         await tx.update(agentWakeupRequests).set({ status: "skipped", error: eligibility.reason,
@@ -274,11 +278,13 @@ export function createDependencyAdmission(db: Db, schedulingGate: () => Promise<
       if (eligibility.kind === "waiting") {
         const status = receipt ? "coalesced" : "deferred_issue_execution";
         if (current.status !== status || !reservation(current)) {
+          await notifyChatInboundWakeNotices(tx, { companyId: current.companyId, issueId: binding.issueId });
           await tx.update(agentWakeupRequests).set({ status,
             payload: { ...current.payload, [markerKey]: binding }, finishedAt: null, error: eligibility.gate, updatedAt: new Date() }).where(observed(current));
         }
         return null;
       }
+      await notifyChatInboundWakeNotices(tx, { companyId: current.companyId, issueId: binding.issueId });
       const [claimed] = await tx.update(agentWakeupRequests).set({ status: "claimed",
         claimedAt: sql`greatest(date_trunc('milliseconds', clock_timestamp()), coalesce(${agentWakeupRequests.claimedAt} + interval '1 millisecond', '-infinity'::timestamptz))`,
         payload: { ...current.payload, [markerKey]: binding }, finishedAt: null, error: null, updatedAt: new Date() })
@@ -298,6 +304,7 @@ export function createDependencyAdmission(db: Db, schedulingGate: () => Promise<
   async function settle(tx: Db, claim: DependencyClaim, outcome: DependencyOutcome) {
     const receipt = await authorize(tx, claim);
     const runId = receipt?.runId ?? (outcome.kind === "admitted" ? outcome.runId : null);
+    await notifyChatInboundWakeNotices(tx, { companyId: claim.intent.companyId, issueId: claim.reservation.issueId });
     await tx.update(agentWakeupRequests).set({
       status: runId ? "completed" : receipt?.status === "deferred_issue_execution" ? "coalesced"
         : outcome.kind === "retired" ? "skipped" : outcome.kind === "retryableFailure" ? "queued" : "deferred_issue_execution",
@@ -310,6 +317,7 @@ export function createDependencyAdmission(db: Db, schedulingGate: () => Promise<
 
   async function promoteReceipt(tx: Db, claim: DependencyClaim, receipt: Wake) {
     await authorize(tx, claim);
+    await notifyChatInboundWakeNotices(tx, { companyId: claim.intent.companyId, issueId: claim.reservation.issueId });
     const [promoted] = await tx.update(agentWakeupRequests).set({ status: "queued", error: null, updatedAt: new Date() })
       .where(observed(receipt)).returning();
     return promoted;
@@ -334,6 +342,7 @@ export function createDependencyAdmission(db: Db, schedulingGate: () => Promise<
       const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, candidate.companyId),
         eq(heartbeatRuns.id, runId), inArray(heartbeatRuns.status, terminalRunStatuses)));
       if (!run) return false;
+      await notifyChatInboundWakeNotices(tx, { companyId: candidate.companyId, issueId: binding.issueId });
       const [settled] = await tx.update(agentWakeupRequests).set({ status: run.status === "succeeded" ? "completed" : run.status,
         finishedAt: run.finishedAt, error: run.error, updatedAt: new Date() }).where(observed(current)).returning({ id: agentWakeupRequests.id });
       return Boolean(settled);

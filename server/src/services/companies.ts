@@ -1,6 +1,7 @@
 import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { retireReviewerIntents } from "./heartbeat/reviewer-assignment-continuation.js";
 import { lockExecutionReconciliationAuthority } from "./execution-reconciliation-authority-lock.js";
+import { notifyChatInboundWakeNotices } from "./chat-inbound-wake-notice-notifications.js";
 import { notifyCompanyRetentionWork } from "./retention-work-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { isRunnerApiResponseAsset } from "./asset-content-access.js";
@@ -71,6 +72,7 @@ export function companyService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
         inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
       ));
 
+    await notifyChatInboundWakeNotices(tx, { companyId: id });
     await tx
       .update(agentWakeupRequests)
       .set({
@@ -340,8 +342,12 @@ export function companyService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
         const renamedPrefix = await resolveRenamedIssuePrefix(tx, id, companyPatch);
 
         if (companyPatch.status !== undefined && companyPatch.status !== existing.status) {
+          await notifyDeliveryWork(tx, DELIVERY_QUEUES.agentTimers);
           await notifyDeliveryWork(tx, DELIVERY_QUEUES.skillSourceSync);
+          await notifyDeliveryWork(tx, DELIVERY_QUEUES.routineSchedules);
+          await notifyDeliveryWork(tx, DELIVERY_QUEUES.issueMonitors);
           await notifyCompanyRetentionWork(tx, id);
+          await notifyChatInboundWakeNotices(tx, { companyId: id });
           await notifyDeliveryWork(tx, DELIVERY_QUEUES.agentLifecycle, id);
         }
         const updated = await tx
@@ -492,8 +498,12 @@ export function companyService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
         const wasAlreadyArchived = existing.status === "archived";
 
         if (!wasAlreadyArchived) {
+          await notifyDeliveryWork(tx, DELIVERY_QUEUES.agentTimers);
           await notifyDeliveryWork(tx, DELIVERY_QUEUES.skillSourceSync);
+          await notifyDeliveryWork(tx, DELIVERY_QUEUES.routineSchedules);
+          await notifyDeliveryWork(tx, DELIVERY_QUEUES.issueMonitors);
           await notifyCompanyRetentionWork(tx, id);
+          await notifyChatInboundWakeNotices(tx, { companyId: id });
           await notifyDeliveryWork(tx, DELIVERY_QUEUES.agentLifecycle, id);
           await tx
             .update(companies)

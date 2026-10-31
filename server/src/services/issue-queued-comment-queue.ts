@@ -3,6 +3,7 @@ import type { IssueComment, IssueQueuedCommentQueue } from "@paperclipai/shared"
 
 const QUEUE_CONTEXT_KEY = "_paperclipWakeContext";
 const QUEUE_IDS_KEY = "wakeCommentIds";
+const QUEUE_ROOT_KEY = "_paperclipQueuedCommentRoot";
 
 function record(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -30,12 +31,23 @@ export function queuedCommentIdsFromRunContext(contextValue: unknown): string[] 
   return uniqueIds(record(contextValue)[QUEUE_IDS_KEY]);
 }
 
+export function queuedCommentRootIdFromWakePayload(payloadValue: unknown, wakeId: string): string | null {
+  const root = record(record(payloadValue)[QUEUE_ROOT_KEY]);
+  return root.wakeId === wakeId && typeof root.commentId === "string" ? root.commentId : null;
+}
+
 export function withQueuedCommentIdsInWakePayload(
   payloadValue: unknown,
   ids: string[],
+  rootWakeId?: string,
 ): Record<string, unknown> {
   const payload = { ...record(payloadValue) };
   const context = { ...record(payload[QUEUE_CONTEXT_KEY]) };
+  const root = record(payload[QUEUE_ROOT_KEY]);
+  if (rootWakeId && (root.wakeId !== rootWakeId || typeof root.commentId !== "string")) {
+    payload[QUEUE_ROOT_KEY] = { wakeId: rootWakeId, commentId: payload.commentId };
+  }
+
   if (ids.length > 0) {
     const latestId = ids[ids.length - 1]!;
     context[QUEUE_IDS_KEY] = ids;

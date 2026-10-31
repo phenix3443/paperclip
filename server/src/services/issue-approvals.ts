@@ -129,7 +129,7 @@ export function issueApprovalService(db: Db) {
       await writeApprovalChange(db, issue.companyId, tx => insertIssueApprovalLinks(tx, {
         companyId: issue.companyId, approvalId, issueIds: [issueId],
         linkedByAgentId: actor?.agentId, linkedByUserId: actor?.userId,
-      }));
+      }), { issueIds: [issueId] });
 
       return db
         .select()
@@ -142,7 +142,7 @@ export function issueApprovalService(db: Db) {
       const { issue } = await assertIssueAndApprovalSameCompany(issueId, approvalId);
       await writeApprovalChange(db, issue.companyId, tx => tx
         .delete(issueApprovals)
-        .where(and(eq(issueApprovals.issueId, issueId), eq(issueApprovals.approvalId, approvalId))));
+        .where(and(eq(issueApprovals.issueId, issueId), eq(issueApprovals.approvalId, approvalId))), { issueIds: [issueId] });
     },
 
     linkManyForApproval: async (approvalId: string, issueIds: string[], actor?: LinkActor) => {
@@ -173,7 +173,7 @@ export function issueApprovalService(db: Db) {
       await writeApprovalChange(db, approval.companyId, tx => insertIssueApprovalLinks(tx, {
         companyId: approval.companyId, approvalId, issueIds: uniqueIssueIds,
         linkedByAgentId: actor?.agentId, linkedByUserId: actor?.userId,
-      }));
+      }), { issueIds: uniqueIssueIds });
     },
   };
 }
