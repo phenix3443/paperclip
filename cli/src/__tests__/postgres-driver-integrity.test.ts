@@ -77,7 +77,9 @@ describe("postgres driver payload verifier", () => {
   });
 
   it("rejects a payload whose only driver is nested instead of at the root", async () => {
-    fs.renameSync(rootDriver(), path.join(payload, "node_modules", "@paperclipai", "db", "node_modules", "postgres"));
+    const nested = path.join(payload, "node_modules", "@paperclipai", "db", "node_modules", "postgres");
+    fs.mkdirSync(path.dirname(nested), { recursive: true });
+    fs.renameSync(rootDriver(), nested);
     await expect(verifyPostgresDriverPayload(payload)).rejects.toThrow(/exactly one postgres driver/);
   });
 
