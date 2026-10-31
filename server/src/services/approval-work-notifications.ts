@@ -13,7 +13,7 @@ export async function notifyApprovalWork(transaction: object, companyId: string,
   await notifyApprovalQueueWork(transaction, companyId);
   const issueIds = new Set(scope?.issueIds);
   if (scope?.approvalId) {
-
+    await notifyIssueReviewState(transaction, { companyId });
     const links = await (transaction as Db).select({ issueId: issueApprovals.issueId }).from(issueApprovals)
       .where(and(eq(issueApprovals.companyId, companyId), eq(issueApprovals.approvalId, scope.approvalId)));
     for (const link of links) issueIds.add(link.issueId);

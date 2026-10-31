@@ -1,3 +1,4 @@
+import { approvalRecords } from "../services/approvals.js";
 import { createDependencyAdmission } from "../services/heartbeat/dependency-admission.js";
 import { seedNativeDependency } from "./helpers/native-dependency-fixture.js";
 import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
@@ -29,7 +30,7 @@ import express from "express";
 import request from "supertest";
 import { issueRoutes } from "../routes/issues.js";
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog, agents, agentWakeupRequests, approvals, chatConversations, chatEndpoints,
@@ -262,6 +263,45 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
       try { await vi.advanceTimersByTimeAsync(120_000); await delay(10); expect(queries).toEqual([]); }
       finally { db.$client.options.debug = prior; }
     }
+    it("settles a concurrently linked issue after approval cancellation commits", async () => {
+      const f = await fixture();
+      await db.update(issues).set({ executionRunId: f.runId }).where(eq(issues.id, f.issueId));
+      const [other] = await db.insert(issues).values({ companyId: f.companyId, title: "Existing approval task" }).returning();
+      const [approval] = await db.insert(approvals).values({ companyId: f.companyId, type: "hire_agent", status: "pending", payload: {} }).returning();
+      await issueApprovalService(db).link(other.id, approval.id);
+      await start(); await flush();
+      let ready!: () => void, release!: () => void;
+      const locked = new Promise<void>(resolve => { ready = resolve; });
+      const proceed = new Promise<void>(resolve => { release = resolve; });
+      const holding = db.transaction(async tx => {
+        await tx.select().from(issues).where(eq(issues.id, other.id)).for("update");
+        ready(); await proceed;
+      });
+      await locked;
+      const cancelling = approvalRecords(db).cancel(approval.id, "Concurrency proof");
+      const committedHints: string[] = [];
+      let unsubscribe = () => {};
+      try {
+        await vi.waitFor(async () => {
+          const rows = await db.execute(sql`select 1 from pg_stat_activity where datname = current_database()
+            and pid <> pg_backend_pid() and wait_event_type = 'Lock' and query like '%"issues"%'`);
+          expect(rows.length).toBeGreaterThan(0);
+        });
+        await issueApprovalService(db).link(f.issueId, approval.id);
+        await issueService(db).update(f.issueId, { executionRunId: null });
+        await vi.advanceTimersByTimeAsync(2000);
+        await delay(20);
+        expect(await state(f)).toMatchObject({ status: "in_progress", externalConversationState: "active" });
+        unsubscribe = subscribeDatabaseWork(db, DELIVERY_QUEUES.externalConversationSettlement, (event, hints) => {
+          if (event === "settled") committedHints.push(...(hints ?? []));
+        });
+      } finally { release(); await Promise.all([holding, cancelling]); unsubscribe(); }
+      expect(committedHints.map(hint => JSON.parse(hint))).toContainEqual({ companyId: f.companyId });
+      await flush();
+      expect(await state(f)).toMatchObject({ status: "in_review", externalConversationState: "waiting" });
+      await quiet();
+    });
+
     it("settles after dependency receipt recovery only when the outer transaction commits", async () => {
       const dependency = await seedNativeDependency(db);
       const f = await fixture(false, dependency.issueId, dependency);
