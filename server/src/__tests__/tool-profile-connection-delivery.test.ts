@@ -149,12 +149,14 @@ describePostgres("tool profile writes notify the connection delivery worker", ()
     const f = await seedPendingAccessRequest(db, "owner");
     const p = await reads();
     let gate: Promise<void> | null = null, entered!: () => void, release!: () => void;
-    delivery = await startConnectionDelivery(db, { beforeSweep: async () => { if (gate) { entered(); await gate; } } });
+    delivery = await startConnectionDelivery(db, { afterSweep: async () => { if (gate) { entered(); await gate; } } });
     const baseline = delivery.sweeps;
     const reached = new Promise<void>(resolve => { entered = resolve; });
     gate = new Promise<void>(resolve => { release = resolve; });
     delivery.wake();
     await reached;
+    expect((await card()).status).toBe("pending");
+    expect(delivery.wakeup).not.toHaveBeenCalled();
     const added = await svc().addProfileEntry(p.id, include(f));
     if (name === "grant then revoke") await svc().deleteProfileEntry(added.id);
     gate = null;
