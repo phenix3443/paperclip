@@ -51,10 +51,23 @@ const support = await getEmbeddedPostgresTestSupport();
     return { signIn, member, card, companyId: f.companyId, connectionId: f.connection.id };
   }
 
-  async function start(options: Parameters<typeof startConnectionDelivery>[1] = {}) {
-    const worker = await startConnectionDelivery(db, options);
-    stop = worker.stop;
-    return worker;
+  async function start(options: { canRun?: () => boolean } = {}) {
+    const entered = deferred(), release = deferred();
+    let held = false;
+    const worker = await startConnectionDelivery(db, {
+      ...options,
+      beforeSweep: async () => {
+        if (!held) return;
+        held = false;
+        entered.resolve();
+        await release.promise;
+      },
+    });
+    stop = async () => { release.resolve(); await worker.stop(); };
+    return Object.assign(worker, { hold() {
+      held = true;
+      return { entered: entered.promise, release: release.resolve };
+    } });
   }
 
   async function effects(companyId: string, count: number, wakeup: ReturnType<typeof vi.fn>) {

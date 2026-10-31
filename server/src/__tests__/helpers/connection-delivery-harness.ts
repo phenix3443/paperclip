@@ -29,13 +29,12 @@ export async function seedPendingAccessRequest(db: Db, owner: string, companyId:
   return { companyId, agentId, issueId, intent: intent!, connection: connection!, tool: tool! };
 }
 
-export async function startConnectionDelivery(db: Db, options: { canRun?: () => boolean } = {}) {
+export async function startConnectionDelivery(db: Db, options: { canRun?: () => boolean; beforeSweep?: () => Promise<void> } = {}) {
+  const startedAt = Date.now();
   const wakeup = vi.fn<() => Promise<null>>().mockResolvedValue(null);
   const service = connectionIntentDeliveryService(db, { wakeup });
   const errors: unknown[] = [];
-  let sweeps = 0, running = 0;
-  let barrier: { enter: () => void; wait: Promise<void> } | undefined;
-  const releases: Array<() => void> = [];
+  let sweeps = 0, running = 0, accountedSweeps = 0;
   const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: options.canRun ?? (() => true), onError: error => { errors.push(error); } });
   const worker = coordinator.register(DELIVERY_QUEUES.connection, {
     retryMs: RETRY_MS,
@@ -48,10 +47,7 @@ export async function startConnectionDelivery(db: Db, options: { canRun?: () => 
       sweeps += 1;
       running += 1;
       try {
-        const held = barrier;
-        barrier = undefined;
-        held?.enter();
-        await held?.wait;
+        await options.beforeSweep?.();
         return await service.sweepPending();
       } finally { running -= 1; }
     },
@@ -64,24 +60,18 @@ export async function startConnectionDelivery(db: Db, options: { canRun?: () => 
       if (Date.now() > limit) throw new Error("Connection delivery did not settle");
       await new Promise(resolve => setTimeout(resolve, 10));
     }
+    accountedSweeps = sweeps;
   }
   await worker.ready;
   await settle(1);
   return {
-    wakeup, wake: worker.wake, settle,
+    wakeup, wake: worker.wake, settle, nextWakeAt: () => coordinator.nextWakeAt(),
     get sweeps() { return sweeps; },
-    hold() {
-      let enter!: () => void, release!: () => void;
-      const entered = new Promise<void>(resolve => { enter = resolve; });
-      const wait = new Promise<void>(resolve => { release = resolve; });
-      barrier = { enter, wait };
-      releases.push(release);
-      return { entered, release };
-    },
     async stop() {
-      releases.forEach(release => release());
       await coordinator.stop();
+      expect(sweeps).toBe(accountedSweeps);
       expect(errors).toEqual([]);
+      expect(Date.now() - startedAt).toBeLessThan(RETRY_MS / 2);
     },
   };
 }
