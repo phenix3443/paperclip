@@ -278,7 +278,6 @@ export function createConnectionInstalls(db: Db, { now, getConnectionRow, assert
           );
         }
         if (requested.size > 0 && connection.connectionPurpose !== "ai") {
-          await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
           const profile = await appProfileForConnection(tx, connection);
           for (const install of additions) {
             const [binding] = await tx

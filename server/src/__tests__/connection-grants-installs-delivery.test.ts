@@ -43,6 +43,15 @@ describe.skipIf(!support.supported)("connection grant and install writes notify 
     const grants = organizationGrants ? await db.insert(connectionGrants).values(Array.from({ length: organizationGrants }, () => orgGrant(f))).returning() : [];
     return { ...f, grants };
   }
+  async function seedAppInstall(): Promise<Seeded> {
+    const f = await seedPendingAccessRequest(db, "owner");
+    const [profile] = await db.insert(toolProfiles).values({ companyId: f.companyId, profileKey: `app:${f.connection.id}`, name: "App", defaultAction: "deny", status: "active" }).returning();
+    await db.insert(toolProfileEntries).values({ companyId: f.companyId, profileId: profile!.id, selectorType: "catalog_entry", effect: "include", catalogEntryId: f.tool.id, connectionId: f.connection.id });
+    await db.delete(toolConnectionInstalls);
+    await db.update(toolConnections).set({ config: { sourceTemplateKey: "sentry", mcpAgentAccessConfigured: true } });
+    return { ...f, grants: await db.select().from(connectionGrants) };
+  }
+  const count = async (table: string) => (await db.execute<{ n: number }>(sql`select count(*)::int as n from ${sql.identifier(table)}`))[0]!.n;
   async function expectRetiredOnce(connectionId: string) {
     expect(await card()).toMatchObject({ status: "expired", result: expect.objectContaining({ connectionId }) });
     expect(await db.select().from(connectionIntentDeliveries)).toHaveLength(1);
@@ -55,14 +64,16 @@ describe.skipIf(!support.supported)("connection grant and install writes notify 
     expect(delivery!.wakeup).not.toHaveBeenCalled();
   }
   const widening = [
-    ["addConnectionInstallation adds the only organization identity", 0, "connection_grants",
+    ["addConnectionInstallation adds the only organization identity", () => seed(0), "connection_grants",
       (f: Seeded, client?: Db) => svc(client).addConnectionInstallation(f.connection.id, {})],
-    ["revokeConnectionGrant removes an ambiguous organization identity", 2, "connection_grant_delegations",
+    ["revokeConnectionGrant removes an ambiguous organization identity", () => seed(2), "connection_grant_delegations",
       (f: Seeded, client?: Db) => svc(client).revokeConnectionGrant(f.connection.id, f.grants[0]!.id)],
+    ["putConnectionInstalls installs the agent and binds the app profile", seedAppInstall, "tool_connection_installs",
+      (f: Seeded, client?: Db) => svc(client).putConnectionInstalls(f.connection.id, { installs: [{ targetType: "agent", targetId: f.agentId }] })],
   ] as const;
 
-  it.each(widening)("retires an exact access request when %s, before any maintenance tick", async (_name, grants, _table, produce) => {
-    const f = await seed(grants);
+  it.each(widening)("retires an exact access request when %s, before any maintenance tick", async (_name, setup, _table, produce) => {
+    const f = await setup();
     delivery = await startConnectionDelivery(db);
     expect((await card()).status).toBe("pending");
     const baseline = delivery.sweeps;
@@ -71,21 +82,9 @@ describe.skipIf(!support.supported)("connection grant and install writes notify 
     await expectRetiredOnce(f.connection.id);
   });
 
-  it("retires an exact access request when putConnectionInstalls binds the app profile that includes the tool", async () => {
-    const f = await seedPendingAccessRequest(db, "owner");
-    const [profile] = await db.insert(toolProfiles).values({ companyId: f.companyId, profileKey: `app:${f.connection.id}`, name: "App", defaultAction: "deny", status: "active" }).returning();
-    await db.insert(toolProfileEntries).values({ companyId: f.companyId, profileId: profile!.id, selectorType: "catalog_entry", effect: "include", catalogEntryId: f.tool.id, connectionId: f.connection.id });
-    await db.delete(toolConnectionInstalls);
-    delivery = await startConnectionDelivery(db);
-    expect((await card()).status).toBe("pending");
-    const baseline = delivery.sweeps;
-    await svc().putConnectionInstalls(f.connection.id, { installs: [{ targetType: "agent", targetId: f.agentId }] });
-    await delivery.settle(baseline + 1);
-    await expectRetiredOnce(f.connection.id);
-  });
-
-  it.each(widening)("registers the notification before the write when %s", async (_name, grants, table, produce) => {
-    const f = await seed(grants);
+  it.each(widening)("registers the notification before the write when %s", async (_name, setup, table, produce) => {
+    const f = await setup();
+    const before = await count(table);
     delivery = await startConnectionDelivery(db);
     const baseline = delivery.sweeps;
     const locker = createDb(temp.connectionString);
@@ -96,6 +95,7 @@ describe.skipIf(!support.supported)("connection grant and install writes notify 
         produced = produce(f);
         await until(() => databaseWorkPending(db, DELIVERY_QUEUES.connection));
         expect(await db.select().from(connectionGrants)).toEqual(f.grants);
+        expect(await count(table)).toBe(before);
       });
     } finally { await locker.$client.end({ timeout: 1 }); }
     await produced;
@@ -158,8 +158,8 @@ describe.skipIf(!support.supported)("connection grant and install writes notify 
     await expectRetiredOnce(f.connection.id);
   });
 
-  it.each(widening)("publishes the savepoint only when the caller's transaction commits when %s", async (_name, grants, _table, produce) => {
-    const f = await seed(grants);
+  it.each(widening)("publishes the savepoint only when the caller's transaction commits when %s", async (_name, setup, _table, produce) => {
+    const f = await setup();
     delivery = await startConnectionDelivery(db);
     const baseline = delivery.sweeps;
     await db.transaction(async (tx) => {
@@ -172,8 +172,9 @@ describe.skipIf(!support.supported)("connection grant and install writes notify 
     await expectRetiredOnce(f.connection.id);
   });
 
-  it.each(widening)("keeps the card pending with no durable effect when the caller rolls back after %s", async (_name, grants, _table, produce) => {
-    const f = await seed(grants);
+  it.each(widening)("keeps the card pending with no durable effect when the caller rolls back after %s", async (_name, setup, table, produce) => {
+    const f = await setup();
+    const before = await count(table);
     delivery = await startConnectionDelivery(db);
     await expect(db.transaction(async (tx) => {
       await produce(f, tx as unknown as Db);
@@ -181,6 +182,7 @@ describe.skipIf(!support.supported)("connection grant and install writes notify 
     })).rejects.toThrow("rollback");
     await delivery.settle();
     expect(await db.select().from(connectionGrants)).toEqual(f.grants);
+    expect(await count(table)).toBe(before);
     await expectNoDurableEffect();
   });
 

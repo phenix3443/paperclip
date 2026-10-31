@@ -443,7 +443,7 @@ replaceConnectionGrantMembers: async (
         input.credentialSecretRefs ?? [],
       );
       const binding = actorBinding(actor);
-      const grant = await db.transaction(async (tx) => {
+      const [grant] = await db.transaction(async (tx) => {
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
         if (input.isDefault) {
           await tx
@@ -456,7 +456,7 @@ replaceConnectionGrantMembers: async (
               ),
             );
         }
-        const [created] = await tx
+        return tx
           .insert(connectionGrants)
           .values({
             companyId: connection.companyId,
@@ -471,7 +471,6 @@ replaceConnectionGrantMembers: async (
             createdByUserId: connectionActorUserId(actor),
           })
           .returning();
-        return created;
       });
       if (!grant) throw new Error("Failed to create connection installation");
       await db.insert(toolAccessAuditEvents).values({
