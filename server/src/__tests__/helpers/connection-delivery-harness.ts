@@ -51,6 +51,7 @@ export async function startConnectionDelivery(db: Db, options: { canRun?: () => 
   return {
     wakeup, wake: worker.wake, settle,
     get sweeps() { return sweeps; },
+    get running() { return running; },
     async stop() {
       await coordinator.stop();
       expect(errors).toEqual([]);
