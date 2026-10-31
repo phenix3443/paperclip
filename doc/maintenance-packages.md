@@ -19,6 +19,9 @@ Build/typecheck runs first and uploads its outputs as a tar archive. Each test
 runner restores the artifact named by the same SHA and run attempt. Tar retains
 executable modes; a missing executable Runner binary fails before test collection.
 The native-runner lane also builds and verifies its debug fake-provider fixture.
+Rerun the full workflow, including build, when a test fails. A failed-jobs-only
+rerun has a new attempt number but no matching build archive; it fails closed
+rather than restoring an earlier attempt's outputs.
 At most 4 test jobs then run concurrently.
 Every job keeps a 90-minute limit. The packages job depends explicitly on both
 checks. Failure, cancellation or an unexpected skip blocks maintenance exports.
