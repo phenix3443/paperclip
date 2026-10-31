@@ -152,3 +152,97 @@ test('CLI attaches provenance and refuses contradictory API/manifest evidence wi
     }
   }
 });
+
+
+test('maintenance checks cover the existing selector inventory before packaging', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const { spawnSync } = await import('node:child_process');
+  const source = await readFile(new URL('../../workflows/deploy-packages.yml', import.meta.url), 'utf8');
+  const tests = source.match(/^  maintenance_tests:\n([\s\S]*?)(?=^  \w+:)/m)?.[1];
+  assert.ok(tests, 'maintenance tests must have an independent job');
+  assert.match(tests, /timeout-minutes: 90/);
+  assert.match(tests, /max-parallel: 4/);
+  assert.match(tests, /fail-fast: false/);
+  const matrix = JSON.parse(tests.match(/include: (\[[\s\S]*?\])\n/)?.[1] ?? 'null');
+  assert.equal(matrix.length, 29);
+  const inventory = (args) => {
+    const result = spawnSync(process.execPath, ['scripts/run-vitest-stable.mjs', '--dry-run', ...args],
+      { encoding: 'utf8', timeout: 10_000 });
+    assert.equal(result.status, 0, result.stderr);
+    return JSON.parse(result.stdout);
+  };
+  const all = inventory([]);
+  const server = [], serialized = [], projects = [], chat = [];
+  const groups = new Map();
+  for (const lane of matrix) {
+    const args = ['--mode', lane.mode];
+    if (lane.group) args.push('--group', lane.group);
+    if (lane.shard_count) args.push('--shard-index', String(lane.shard_index), '--shard-count', String(lane.shard_count));
+    const selected = inventory(args);
+    if (lane.mode === 'serialized') {
+      assert.ok(selected.selectedSerializedSuites.length > 0, lane.label);
+      serialized.push(...selected.selectedSerializedSuites);
+    } else {
+      const lanes = groups.get(lane.group) ?? [];
+      lanes.push(lane); groups.set(lane.group, lanes);
+      if (selected.selectedGeneralServerSuites) {
+        assert.ok(selected.selectedGeneralServerSuites.length > 0, lane.label);
+        server.push(...selected.selectedGeneralServerSuites);
+      }
+      if (selected.workspaceProjects) projects.push(...selected.workspaceProjects);
+      if (selected.chatVitestShards) chat.push(...selected.chatVitestShards);
+    }
+  }
+  assert.equal(new Set(server).size, server.length, 'server suites must not overlap');
+  const fullServer = inventory(['--mode', 'general', '--group', 'general-server', '--shard-index', '0', '--shard-count', '1']);
+  assert.deepEqual([...server, 'server/src/__tests__/chat-channels.integration.test.ts'].sort(),
+    fullServer.selectedGeneralServerSuites.sort());
+  assert.equal(new Set(serialized).size, serialized.length, 'serialized suites must not overlap');
+  assert.deepEqual(serialized.sort(), all.selectedSerializedSuites.sort());
+  assert.deepEqual([...groups.keys()].sort(), [
+    'general-server-without-chat-or-native-runner', 'general-chat', 'general-server-native-runner',
+    'general-workspaces-a', 'general-workspaces-b', 'general-workspaces-c',
+  ].sort());
+  for (const [group, lanes] of groups) {
+    const count = lanes[0].shard_count || 1;
+    assert.equal(lanes.length, count, group);
+    assert.deepEqual(lanes.map(lane => lane.shard_index || 0).sort((a, b) => a - b),
+      Array.from({ length: count }, (_, index) => index), group);
+    assert.ok(lanes.every(lane => (lane.shard_count || 1) === count), group);
+  }
+  assert.deepEqual(chat.map(shard => shard.index).sort((a, b) => a - b), [0, 1, 2, 3, 4, 5]);
+  assert.ok(chat.every(shard => shard.count === 6));
+  const workspaces = ['general-workspaces-a', 'general-workspaces-b', 'general-workspaces-c']
+    .flatMap(group => inventory(['--mode', 'general', '--group', group]).workspaceProjects);
+  assert.deepEqual([...new Set(projects)].sort(), workspaces.sort());
+  assert.match(tests, /node scripts\/run-vitest-stable\.mjs --mode "\$MODE"/);
+  assert.match(tests, /--shard-index "\$SHARD_INDEX" --shard-count "\$SHARD_COUNT"/);
+});
+
+test('package admission rejects failed, cancelled or skipped maintenance prerequisites', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const { runInNewContext } = await import('node:vm');
+  const source = await readFile(new URL('../../workflows/deploy-packages.yml', import.meta.url), 'utf8');
+  const job = source.match(/^  packages:\n([\s\S]*?)(?:    permissions:)/m)?.[1];
+  assert.match(job ?? '', /needs: \[maintenance_build, maintenance_tests\]/);
+  const expression = job.match(/if: >-\n([\s\S]*)/)?.[1].trim();
+  const admitted = (build, tests, context = {}) => runInNewContext(expression, {
+    always: () => true,
+    github: { repository: 'phenix3443/paperclip', repository_id: '1420915320',
+      ref: 'refs/heads/fix/maintenance-rework-151', base_ref: '', event_name: 'push',
+      ref_protected: true, ...context },
+    needs: { maintenance_build: { result: build }, maintenance_tests: { result: tests } },
+  });
+  assert.equal(admitted('success', 'success'), true);
+  for (const result of ['failure', 'cancelled', 'skipped', '']) {
+    assert.equal(admitted(result, 'success'), false, result);
+    assert.equal(admitted('success', result), false, result);
+  }
+  assert.equal(admitted('success', 'success', { ref_protected: false }), false);
+  assert.equal(admitted('success', 'success', { event_name: 'workflow_dispatch' }), false);
+  assert.equal(admitted('success', 'success', { repository: 'other/paperclip' }), false);
+  const pr = { event_name: 'pull_request', ref: 'refs/pull/310/merge', base_ref: 'fix/maintenance-rework-151' };
+  assert.equal(admitted('success', 'success', pr), true);
+  assert.equal(admitted('skipped', 'success', pr), false);
+  assert.equal(admitted('skipped', 'skipped', { ref: 'refs/heads/develop' }), true);
+});

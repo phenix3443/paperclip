@@ -10,7 +10,20 @@ The maintenance job requires a protected push. Checkout uses the event's full
 SHA with no persisted credentials. Both workspace and native installer dependency
 resolution use frozen lockfiles. The native installer receives the full SHA as
 `--ref` and `PAPERCLIP_BUILD_COMMIT`. Maintenance push and maintenance-target PR
-builds run build, typecheck and unit/route tests before package export. PRs upload
+builds require independent build/typecheck and test jobs before package export.
+The test matrix reuses `scripts/run-vitest-stable.mjs`: 12 server shards excluding
+chat and native-runner suites, 3 chat shards, 2 workspace-a shards, one each for
+workspace-b, workspace-c and native-runner suites, and 9 serialized route shards.
+All 29 matrix jobs retain the selector's isolation and per-file serial constraints.
+At most 4 test jobs run concurrently; build/typecheck is one additional job.
+Every job keeps a 90-minute limit. The packages job depends explicitly on both
+checks. Failure, cancellation or an unexpected skip blocks maintenance exports.
+Develop skips these maintenance checks and retains its existing packaging path.
+
+The earlier serial check reached the 90-minute limit before native export
+([run 41232994050](https://github.com/phenix3443/paperclip/actions/runs/41232994050)).
+Partial test success in that attempt is not complete-test or package evidence.
+The split jobs must succeed on the new exact source before acceptance. PRs upload
 `paperclip-validation-<sha>`, with no maintenance provenance. Dispatch on the
 maintenance ref cannot run the package job. Tag, foreign-repository and alternate
 events cannot mint maintenance provenance. Develop's existing manifest stays
