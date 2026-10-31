@@ -1,5 +1,3 @@
-# Build native packages for develop and the exact protected maintenance ref.
-# Maintenance packages require separate exact-source and artifact approval.
 # Build the deployable packages for each develop commit, so the service host
 # installs them instead of compiling from source (phenix3443/ai-team deploy.py).
 # The packages come from this commit's own `paperclipai install --ref`, which
@@ -9,7 +7,7 @@ name: deploy-packages
 on:
   push:
     branches: [develop, fix/maintenance-rework-151]
-  # PR builds validate packaging; they never receive maintenance provenance.
+  # Validates changes to the packaging itself; deploy.py only accepts push runs on develop.
   pull_request:
     paths:
       - .github/workflows/deploy-packages.yml

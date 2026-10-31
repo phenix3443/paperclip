@@ -90,3 +90,65 @@ test('workflow pins source/actions and separates PR validation from maintenance 
   }
   assert.doesNotMatch(source, /secrets\.|pull_request_target:|workflow_run:/);
 });
+
+test('CLI attaches provenance and refuses contradictory API/manifest evidence without modifying bytes', async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { spawnSync } = await import('node:child_process');
+  const script = new URL('../maintenance-package-provenance.mjs', import.meta.url);
+  const f = fixture();
+  const contextEnv = {
+    GITHUB_REPOSITORY: f.context.repository, GITHUB_REPOSITORY_ID: f.context.repository_id,
+    GITHUB_EVENT_NAME: 'push', GITHUB_REF: ref, GITHUB_REF_PROTECTED: 'true',
+    GITHUB_SHA: sha, GITHUB_WORKFLOW_REF: f.context.workflow_ref,
+    GITHUB_WORKFLOW_SHA: sha, GITHUB_RUN_ID: '100', GITHUB_RUN_ATTEMPT: '2',
+  };
+  for (const scenario of ['valid', 'newer attempt', 'truncated jobs', 'API failure', 'wrong manifest', 'existing provenance']) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'maintenance-provenance-'));
+    try {
+      const manifestPath = path.join(dir, 'payload-packages.json');
+      const manifest = { repo: repository.full_name, sha: scenario === 'wrong manifest' ? 'b'.repeat(40) : sha, files: [] };
+      if (scenario === 'existing provenance') manifest.ciProvenance = { version: 0 };
+      const original = JSON.stringify(manifest);
+      fs.writeFileSync(manifestPath, original);
+      fs.writeFileSync(path.join(dir, 'event.json'), JSON.stringify(f.event));
+      const responses = {
+        'actions/runs/100/attempts/2': f.run,
+        'actions/runs/100': { ...f.run, run_attempt: scenario === 'newer attempt' ? 3 : 2 },
+        'actions/workflows/deploy-packages.yml': f.workflow,
+        'branches/fix%2Fmaintenance-rework-151': f.branch,
+        'actions/runs/100/attempts/2/jobs?per_page=100': { jobs: f.jobs, total_count: scenario === 'truncated jobs' ? 101 : 1 },
+      };
+      const preload = path.join(dir, 'fetch.mjs');
+      fs.writeFileSync(preload, `
+        const responses = ${JSON.stringify(responses)};
+        globalThis.fetch = async (url, options) => {
+          if (options.headers.Authorization !== 'Bearer fixture-token') throw new Error('missing token');
+          const prefix = 'https://api.github.com/repos/phenix3443/paperclip/';
+          if (!url.startsWith(prefix)) throw new Error('wrong API repository');
+          const endpoint = url.slice(prefix.length);
+          if (!Object.hasOwn(responses, endpoint)) throw new Error('unexpected endpoint: ' + endpoint);
+          return { ok: ${scenario !== 'API failure'}, status: 403, json: async () => responses[endpoint] };
+        };
+      `);
+      const result = spawnSync(process.execPath, ['--import', preload, script.pathname], {
+        env: { ...process.env, ...contextEnv, GITHUB_TOKEN: 'fixture-token', GITHUB_EVENT_PATH: path.join(dir, 'event.json'), PACKAGES_DIR: dir },
+        encoding: 'utf8', timeout: 10_000,
+      });
+      assert.equal(result.error, undefined);
+      if (scenario === 'valid') {
+        assert.equal(result.status, 0, result.stderr);
+        const written = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+        assert.deepEqual(written.ciProvenance, maintenanceProvenance(f));
+        delete written.ciProvenance;
+        assert.deepEqual(written, manifest);
+      } else {
+        assert.equal(result.status, 1, scenario);
+        assert.equal(fs.readFileSync(manifestPath, 'utf8'), original, scenario);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
