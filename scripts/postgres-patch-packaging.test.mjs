@@ -7,6 +7,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { PATCHED_POSTGRES_DRIVER } from "../cli/src/postgres-driver-integrity.ts";
 import { pinPatchedBundledDependencies, prepareBundledPackage } from "./prepare-bundled-package.mjs";
 
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
@@ -56,6 +57,8 @@ test("staged package carries the repository-patched postgres files", { timeout: 
     { input: readFileSync(join(repoRoot, patchedDependencies[postgresSpecifier])), stdio: ["pipe", "pipe", "inherit"] });
   const patchedHashes = hashes(referencePackage);
   for (const file of driverFiles) assert.notEqual(patchedHashes[file], registryHashes[file], `${file} must be patched`);
+  assert.equal(PATCHED_POSTGRES_DRIVER.version, postgresVersion);
+  assert.deepEqual(PATCHED_POSTGRES_DRIVER.files, patchedHashes);
 
   const source = join(root, "source");
   mkdirSync(join(source, "dist"), { recursive: true });

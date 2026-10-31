@@ -22,6 +22,7 @@ import {
   type InstallChannel,
   type InstallRecord,
 } from "../install-store.js";
+import { verifyPostgresDriverPayload } from "../postgres-driver-integrity.js";
 
 const execFileAsync = promisify(execFile);
 export const PUBLIC_NPM_REGISTRY = "https://registry.npmjs.org";
@@ -258,12 +259,15 @@ function gitBuildEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return env;
 }
 
-export async function installGitPayload(repo: string, sha: string, runCommand: CommandRunner, paths = resolveInstallStorePaths()): Promise<{ payloadPath: string; reused: boolean; version: string }> {
+export type PayloadVerifier = (payloadPath: string) => Promise<unknown>;
+
+export async function installGitPayload(repo: string, sha: string, runCommand: CommandRunner, paths = resolveInstallStorePaths(), verifyPayload: PayloadVerifier = verifyPostgresDriverPayload): Promise<{ payloadPath: string; reused: boolean; version: string }> {
   const identifier = sha.slice(0, 12);
   const payloadPath = payloadPathFor(paths, "git", identifier);
   if (fs.existsSync(payloadPath)) {
     const metadata = JSON.parse(fs.readFileSync(path.join(payloadPath, "node_modules", "paperclipai", "package.json"), "utf8")) as { version: string };
     await smokePayload(payloadPath, metadata.version, runCommand);
+    await verifyPayload(payloadPath);
     return { payloadPath, reused: true, version: metadata.version };
   }
   const sourceRoot = path.dirname(payloadPath);
@@ -325,6 +329,7 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     }
     await runCommand("npm", ["install", "--prefix", stagedPayload, path.join(stagingRoot, cliTarball), ...workspaceTarballs.map((entry) => path.join(stagingRoot, entry)), "--no-audit", "--no-fund"], { cwd: stagingRoot, maxBuffer: 32 * 1024 * 1024 });
     await smokePayload(stagedPayload, metadata.version, runCommand);
+    await verifyPayload(stagedPayload);
     exportGitPayloadPackages(stagingRoot, [cliTarball, ...workspaceTarballs], { repo, sha, version: metadata.version });
     fs.renameSync(stagedPayload, payloadPath);
     return { payloadPath, reused: false, version: metadata.version };

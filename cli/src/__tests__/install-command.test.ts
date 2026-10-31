@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createRequire } from "node:module";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   type CommandRunner,
@@ -29,6 +30,22 @@ import { resolveCliVersion } from "../version.js";
 import { systemdServiceName } from "../services/service-manager.js";
 
 const ORIGINAL_ENV = { ...process.env };
+const PATCHED_POSTGRES_SOURCE = path.resolve(
+  path.dirname(createRequire(path.resolve(__dirname, "../../../packages/db/package.json")).resolve("postgres")),
+  "../..",
+);
+
+function writePatchedPayload(prefix: string): void {
+  const packageRoot = path.join(prefix, "node_modules", "paperclipai");
+  fs.mkdirSync(path.join(packageRoot, "dist"), { recursive: true });
+  fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ name: "paperclipai", version: "0.3.1" }));
+  fs.writeFileSync(path.join(packageRoot, "dist", "index.js"), "#!/usr/bin/env node\n");
+  fs.cpSync(PATCHED_POSTGRES_SOURCE, path.join(packageRoot, "node_modules", "postgres"), { recursive: true, dereference: true });
+  const dbRoot = path.join(prefix, "node_modules", "@paperclipai", "db");
+  fs.mkdirSync(dbRoot, { recursive: true });
+  fs.writeFileSync(path.join(dbRoot, "package.json"), JSON.stringify({ name: "@paperclipai/db", version: "0.3.1" }));
+  fs.cpSync(PATCHED_POSTGRES_SOURCE, path.join(dbRoot, "node_modules", "postgres"), { recursive: true, dereference: true });
+}
 
 describe("managed install commands", () => {
   let root: string;
@@ -116,10 +133,7 @@ describe("managed install commands", () => {
     const sha = "b".repeat(40);
     const paths = resolveInstallStorePaths();
     const payloadPath = payloadPathFor(paths, "git", sha.slice(0, 12));
-    const packageRoot = path.join(payloadPath, "node_modules", "paperclipai");
-    fs.mkdirSync(path.join(packageRoot, "dist"), { recursive: true });
-    fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ version: "0.3.1" }));
-    fs.writeFileSync(path.join(packageRoot, "dist", "index.js"), "#!/usr/bin/env node\n");
+    writePatchedPayload(payloadPath);
     const runCommand = vi.fn(async (_file: string, _args: string[]) => ({ stdout: "0.3.1\n", stderr: "" }));
     await expect(installGitPayload("paperclipai/paperclip", sha, runCommand, paths)).resolves.toEqual({ payloadPath, reused: true, version: "0.3.1" });
     expect(runCommand).toHaveBeenCalledOnce();
@@ -162,7 +176,7 @@ describe("managed install commands", () => {
         fs.writeFileSync(path.join(args[args.indexOf("--pack-destination") + 1], `${packageName}-0.3.1.tgz`), "package");
         return { stdout: "", stderr: "" };
       }
-      if (file === "npm" && args[0] === "install") { const prefix = args[args.indexOf("--prefix") + 1]; const packageRoot = path.join(prefix, "node_modules", "paperclipai"); fs.mkdirSync(path.join(packageRoot, "dist"), { recursive: true }); fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ version: "0.3.1" })); fs.writeFileSync(path.join(packageRoot, "dist", "index.js"), "#!/usr/bin/env node\n"); return { stdout: "", stderr: "" }; }
+      if (file === "npm" && args[0] === "install") { writePatchedPayload(args[args.indexOf("--prefix") + 1]); return { stdout: "", stderr: "" }; }
       if (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs")) {
         fs.mkdirSync(args[2], { recursive: true });
         fs.writeFileSync(path.join(args[2], "package.json"), JSON.stringify({ name: "@paperclipai/db", version: "0.3.1" }));
@@ -245,6 +259,44 @@ describe("managed install commands", () => {
       expect(fs.readFileSync(path.join(destination, entry.file), "utf8")).toBe("package");
       expect(entry.sha256).toMatch(/^[0-9a-f]{64}$/);
     }
+  });
+
+  it("rejects a git payload whose installed postgres driver lost the patch before export or activation", async () => {
+    const sha = "1".repeat(40);
+    const destination = path.join(root, "packages");
+    process.env.PAPERCLIP_INSTALL_PACKAGES_DIR = destination;
+    const baseRunCommand = createGitCheckoutRunCommand(sha);
+    const runCommand = vi.fn(async (file: string, args: string[], options?: Parameters<CommandRunner>[2]) => {
+      const result = await baseRunCommand(file, args, options);
+      if (file === "npm" && args[0] === "install") {
+        fs.appendFileSync(path.join(args[args.indexOf("--prefix") + 1], "node_modules", "@paperclipai", "db", "node_modules", "postgres", "cjs", "src", "connection.js"), "\n");
+      }
+      return result;
+    });
+    await expect(installCommand({ ref: sha, repo: "phenix3443/paperclip", yes: true }, { runCommand })).rejects.toThrow(/@paperclipai\/db postgres driver cjs\/src\/connection\.js|Payload driver/);
+    const paths = resolveInstallStorePaths();
+    expect(fs.existsSync(destination)).toBe(false);
+    expect(fs.existsSync(payloadPathFor(paths, "git", sha.slice(0, 12)))).toBe(false);
+    expect(readInstallManifest(paths)).toBeNull();
+    expect(fs.existsSync(paths.currentPath)).toBe(false);
+  });
+
+  it("refuses to reuse a poisoned cached git payload and keeps the current selection", async () => {
+    const goodSha = "2".repeat(40);
+    const poisonedSha = "3".repeat(40);
+    await installCommand({ ref: goodSha, repo: "phenix3443/paperclip", yes: true }, { runCommand: createGitCheckoutRunCommand(goodSha) });
+    const paths = resolveInstallStorePaths();
+    const before = readInstallManifest(paths);
+    const currentBefore = fs.readlinkSync(paths.currentPath);
+    const poisoned = payloadPathFor(paths, "git", poisonedSha.slice(0, 12));
+    writePatchedPayload(poisoned);
+    fs.writeFileSync(path.join(poisoned, "node_modules", "paperclipai", "node_modules", "postgres", "src", "index.js"), "export default null;\n");
+    const runCommand = createGitCheckoutRunCommand(poisonedSha);
+    await expect(installCommand({ ref: poisonedSha, repo: "phenix3443/paperclip", yes: true }, { runCommand })).rejects.toThrow(/src\/index\.js/);
+    expect(runCommand.mock.calls.filter(([command, args]) => command === "curl" && args.includes("--output"))).toHaveLength(0);
+    expect(readInstallManifest(paths)).toEqual(before);
+    expect(fs.readlinkSync(paths.currentPath)).toBe(currentBefore);
+    expect(fs.existsSync(poisoned)).toBe(true);
   });
 
   it("exports nothing without a packages directory", async () => {
