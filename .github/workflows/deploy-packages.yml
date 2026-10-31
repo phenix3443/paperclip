@@ -130,17 +130,14 @@ jobs:
       # Repeat that install twice in empty prefixes, on a pinned toolchain, and
       # fail before upload unless every postgres caller loads the patched driver
       # and the close/live probe passes (and still fails on the registry driver).
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
-        with:
-          node-version: 24.22.1
-
       - name: Verify postgres in clean final installs
         run: |
           umask 022
           npm install --global npm@11.19.0 --no-audit --no-fund
-          node --version && npm --version
+          pinned_node() { npm exec --yes --package=node@24.22.1 -- node "$@"; }
+          pinned_node --version && npm --version
           for attempt in 1 2; do
-            HOME="$RUNNER_TEMP/final-home-$attempt" node scripts/verify-postgres-final-install.mjs \
+            HOME="$RUNNER_TEMP/final-home-$attempt" pinned_node scripts/verify-postgres-final-install.mjs \
               "$PACKAGES_DIR" "$RUNNER_TEMP/final-install-$attempt" 2>&1 | tee "$RUNNER_TEMP/final-install-$attempt.log"
           done
           node -e '
