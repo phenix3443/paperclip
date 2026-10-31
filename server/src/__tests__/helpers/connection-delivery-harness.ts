@@ -29,14 +29,14 @@ export async function seedPendingAccessRequest(db: Db, owner: string) {
   return { companyId, agentId, issueId, intent: intent!, connection: connection!, tool: tool! };
 }
 
-export async function startConnectionDelivery(db: Db, options: { canRun?: () => boolean } = {}) {
+export async function startConnectionDelivery(db: Db, options: { canRun?: () => boolean; beforeSweep?: () => Promise<void> } = {}) {
   const wakeup = vi.fn().mockResolvedValue(null);
   const service = connectionIntentDeliveryService(db, { wakeup });
   const errors: unknown[] = [];
   let sweeps = 0, running = 0;
   const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: options.canRun ?? (() => true), onError: error => { errors.push(error); } });
   const worker = coordinator.register(DELIVERY_QUEUES.connection, { retryMs: RETRY_MS, nextRunAt: () => null, hasPending: () => service.hasPending(),
-    run: async () => { sweeps += 1; running += 1; try { return await service.sweepPending(); } finally { running -= 1; } } });
+    run: async () => { sweeps += 1; running += 1; try { await options.beforeSweep?.(); return await service.sweepPending(); } finally { running -= 1; } } });
   const quiet = () => running === 0 && !databaseWorkPending(db, DELIVERY_QUEUES.connection)
     && (coordinator.nextWakeAt() ?? Infinity) > Date.now() + RETRY_MS / 2;
   async function settle(minSweeps = 0) {
