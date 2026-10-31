@@ -51,7 +51,15 @@ describePostgres("hire approval notifies connection delivery", () => {
   function gate() {
     let release!: () => void;
     const promise = new Promise<void>(resolve => { release = resolve; });
-    return { promise, release };
+    async function wait() {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([promise, new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("Barrier did not open")), 5_000);
+        })]);
+      } finally { clearTimeout(timer); }
+    }
+    return { wait, release };
   }
   async function pendingWithoutEffects() {
     expect((await card()).status).toBe("pending");
@@ -91,10 +99,10 @@ describePostgres("hire approval notifies connection delivery", () => {
         finally { spy.mockRestore(); }
       });
       inserted.release();
-      await commit.promise;
+      await commit.wait();
     });
     try {
-      await Promise.race([inserted.promise, outer.then(() => { throw new Error("outer ended before barrier"); })]);
+      await Promise.race([inserted.wait(), outer.then(() => { throw new Error("outer ended before barrier"); })]);
       expect(databaseWorkPending(db, DELIVERY_QUEUES.connection)).toBe(true);
       await pause();
       expect(delivery.sweeps).toBe(baseline);
@@ -159,10 +167,10 @@ describePostgres("hire approval notifies connection delivery", () => {
     delivery = await startConnectionDelivery(db, { beforeSweep: async () => { await beforeSweep?.(); } });
     const baseline = delivery.sweeps;
     const entered = gate(), read = gate();
-    beforeSweep = async () => { beforeSweep = undefined; entered.release(); await read.promise; };
+    beforeSweep = async () => { beforeSweep = undefined; entered.release(); await read.wait(); };
     delivery.wake();
     try {
-      await entered.promise;
+      await entered.wait();
       await approve(f);
       if (revoked) await db.transaction(async tx => {
         await notifications.notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);

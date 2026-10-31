@@ -34,7 +34,7 @@ export async function startConnectionDelivery(db: Db, options: { canRun?: () => 
   const wakeup = vi.fn().mockResolvedValue(null);
   const service = connectionIntentDeliveryService(db, { wakeup });
   const errors: unknown[] = [];
-  let sweeps = 0, running = 0;
+  let sweeps = 0, running = 0, accountedSweeps = 0;
   const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: options.canRun ?? (() => true), onError: error => { errors.push(error); } });
   const worker = coordinator.register(DELIVERY_QUEUES.connection, { retryMs: RETRY_MS, nextRunAt: () => null, hasPending: () => service.hasPending(),
     run: async () => { sweeps += 1; running += 1; try { await options.beforeSweep?.(); return await service.sweepPending(); } finally { running -= 1; } } });
@@ -46,6 +46,7 @@ export async function startConnectionDelivery(db: Db, options: { canRun?: () => 
       if (Date.now() > limit) throw new Error("Connection delivery did not settle");
       await new Promise(resolve => setTimeout(resolve, 10));
     }
+    accountedSweeps = sweeps;
   }
   await worker.ready;
   await settle(1);
@@ -54,6 +55,7 @@ export async function startConnectionDelivery(db: Db, options: { canRun?: () => 
     get sweeps() { return sweeps; },
     async stop() {
       await coordinator.stop();
+      expect(sweeps).toBe(accountedSweeps);
       expect(errors).toEqual([]);
       expect(Date.now() - startedAt).toBeLessThan(RETRY_MS / 2);
     },
