@@ -51,6 +51,14 @@ describe.skipIf(!support.supported)("connection grant and install writes notify 
     await db.update(toolConnections).set({ config: { sourceTemplateKey: "sentry", mcpAgentAccessConfigured: true } });
     return { ...f, grants: await db.select().from(connectionGrants) };
   }
+  async function seedLegacyInclude(): Promise<Seeded> {
+    const f = await seed(0);
+    const [profile] = await db.insert(toolProfiles).values({ companyId: f.companyId, profileKey: `app:${f.connection.id}`, name: "App", defaultAction: "deny", status: "active" }).returning();
+    await db.insert(toolProfileEntries).values({ companyId: f.companyId, profileId: profile!.id, selectorType: "connection", effect: "include", connectionId: f.connection.id });
+    await db.update(toolConnections).set({ config: { sourceTemplateKey: "sentry", mcpAgentAccessConfigured: true } });
+    return f;
+  }
+  const putSameInstall = (f: Seeded, client?: Db) => svc(client).putConnectionInstalls(f.connection.id, { installs: [{ targetType: "agent", targetId: f.agentId }] });
   const count = async (table: string) => (await db.execute<{ n: number }>(sql`select count(*)::int as n from ${sql.identifier(table)}`))[0]!.n;
   async function expectRetiredOnce(connectionId: string) {
     expect(await card()).toMatchObject({ status: "expired", result: expect.objectContaining({ connectionId }) });
@@ -127,6 +135,28 @@ describe.skipIf(!support.supported)("connection grant and install writes notify 
     expect(delivery.wakeup).not.toHaveBeenCalled();
   });
 
+  it("notifies before putConnectionInstalls drops a legacy include and publishes only when the caller commits", async () => {
+    const f = await seedLegacyInclude();
+    delivery = await startConnectionDelivery(db);
+    const baseline = delivery.sweeps;
+    const locker = createDb(temp.connectionString);
+    let produced!: Promise<unknown>;
+    try {
+      await locker.transaction(async (ltx) => {
+        await ltx.execute(sql`lock table tool_profile_entries in exclusive mode`);
+        produced = db.transaction(tx => putSameInstall(f, tx as unknown as Db));
+        await until(() => databaseWorkPending(db, DELIVERY_QUEUES.connection));
+        expect(await count("tool_profile_entries")).toBe(1);
+        await pause(200);
+        expect(delivery!.sweeps).toBe(baseline);
+      });
+    } finally { await locker.$client.end({ timeout: 1 }); }
+    await produced;
+    await delivery.settle(baseline + 1);
+    expect([await count("tool_profile_entries"), await count("tool_connection_installs")]).toEqual([0, 1]);
+    await expectNoDurableEffect();
+  });
+
   it("does not notify when a replacement, delegation or install change writes nothing", async () => {
     const f = await seedPendingAccessRequest(db, "owner");
     const [personal] = await db.select().from(connectionGrants);
@@ -172,7 +202,7 @@ describe.skipIf(!support.supported)("connection grant and install writes notify 
     await expectRetiredOnce(f.connection.id);
   });
 
-  it.each(widening)("keeps the card pending with no durable effect when the caller rolls back after %s", async (_name, setup, table, produce) => {
+  it.each([...widening, ["putConnectionInstalls drops a legacy include with an unchanged install set", seedLegacyInclude, "tool_profile_entries", putSameInstall] as const])("keeps the card pending with no durable effect when the caller rolls back after %s", async (_name, setup, table, produce) => {
     const f = await setup();
     const before = await count(table);
     delivery = await startConnectionDelivery(db);
