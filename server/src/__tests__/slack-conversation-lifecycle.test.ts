@@ -296,7 +296,8 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
           if (event === "settled") committedHints.push(...(hints ?? []));
         });
       } finally { release(); await Promise.all([holding, cancelling]); unsubscribe(); }
-      expect(committedHints.map(hint => JSON.parse(hint))).toContainEqual({ companyId: f.companyId });
+      expect(committedHints.map(hint => JSON.parse(hint))).toContainEqual({ companyId: f.companyId, issueId: f.issueId });
+      expect(committedHints.map(hint => JSON.parse(hint))).not.toContainEqual({ companyId: f.companyId });
       await flush();
       expect(await state(f)).toMatchObject({ status: "in_review", externalConversationState: "waiting" });
       await quiet();
