@@ -11,7 +11,7 @@ test('trace packaging drops secret-bearing attachments and nested archives, and 
   const input = path.join(root, 'input'); mkdirSync(input);
   execFileSync('python3', ['-c', `import zipfile,json,sys
 with zipfile.ZipFile(sys.argv[1], 'w') as z:
- z.writestr('0-trace.trace', json.dumps({'type':'before','apiName':'page.goto','params':{'url':'https://secret.invalid/?token=SECRET'}}))
+ z.writestr('0-trace.trace', json.dumps({'type':'before','apiName':'page.goto','params':{'url':'https://secret.invalid/?token=SECRET'}}) + '\\n' + json.dumps({'type':'after','error':{'message':'Expected: 200\\nReceived: 500\\nBearer SECRET'}}))
  z.writestr('resources/attachment.zip', 'SECRET')
  z.writestr('0-trace.network', 'Cookie: SECRET')
 `, path.join(input, 'trace.zip')]);
@@ -20,6 +20,7 @@ with zipfile.ZipFile(sys.argv[1], 'w') as z:
   execFileSync('python3', [script, input, output, gaps]);
   const content = execFileSync('python3', ['-c', 'import zipfile,sys;z=zipfile.ZipFile(sys.argv[1]);print([z.read(n).decode() for n in z.namelist()])', output], { encoding: 'utf8' });
   assert.match(content, /page.goto/);
+  assert.match(content, /actual.*500/); assert.match(content, /expected.*200/);
   assert.doesNotMatch(content, /SECRET|secret.invalid|Cookie/);
   assert.equal(JSON.parse(readFileSync(gaps))[0].omittedEntries, 2);
   execFileSync('python3', ['-c', `import zipfile,sys

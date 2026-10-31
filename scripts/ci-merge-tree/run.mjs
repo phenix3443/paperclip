@@ -1,16 +1,19 @@
+import { isolatedCommand } from './namespace.mjs';
 import { runPhase } from './phase.mjs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { BASE, HEAD, SPECS, fixedRow, validateDispatch, verifySource } from './identity.mjs';
-import { sealStage } from './evidence.mjs';
 
 const control = path.dirname(fileURLToPath(import.meta.url));
 const [arm, lane, source, output, started] = process.argv.slice(2);
 const row = fixedRow(arm, lane);
+const sourceRoot = realpathSync(source);
+const outputRoot = existsSync(output) ? realpathSync(output) : path.join(realpathSync(path.dirname(output)), path.basename(output));
+if (!path.isAbsolute(output) || outputRoot === sourceRoot || outputRoot.startsWith(`${sourceRoot}${path.sep}`)) throw new Error('evidence_root_must_be_external');
 const privateRoot = path.join(output, 'private');
 const stage = path.join(output, 'sanitized');
 mkdirSync(privateRoot, { recursive: true, mode: 0o700 }); mkdirSync(stage, { recursive: true });
@@ -24,6 +27,7 @@ const env = {
   npm_config_store_dir: path.join(privateRoot, 'pnpm-store'),
   TURBO_TELEMETRY_DISABLED: '1', PAPERCLIP_TELEMETRY_ENABLED: 'false',
   PAPERCLIP_FIXED_CI_PRIVATE: privateRoot, PAPERCLIP_FIXED_CI_SOURCE: source,
+  PAPERCLIP_FIXED_CI_DEADLINE: String(endAt),
   PAPERCLIP_FIXED_CI_CONTEXT: path.join(privateRoot, 'context.json'),
 };
 for (const dir of [env.HOME, env.TMPDIR]) mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -49,12 +53,13 @@ try {
     try { return execFileSync(command, args, { env, stdio: ['ignore', 'pipe', 'pipe'], timeout: 10000 }).toString().trim(); }
     catch { return 'unavailable'; }
   };
-  json('environment.json', { node: process.version, pnpm: version('pnpm', ['--version']),
-    chrome: version('google-chrome', ['--version']), postgres: version('psql', ['--version']),
+  const environment = { node: process.version, pnpm: version('pnpm', ['--version']),
+    chrome: version('google-chrome', ['--version']), postgresClient: version('psql', ['--version']),
     os: os.release(), arch: os.arch(), cpus: os.cpus().length,
     imageOS: process.env.ImageOS, imageVersion: process.env.ImageVersion,
-    allowlistedChildEnvironment: env });
-  const files = readdirSync(control).filter(name => /\.(?:mjs|py)$/.test(name) && !name.includes('.test.')).sort();
+    allowlistedChildEnvironment: env };
+  json('environment.json', environment);
+  const files = readdirSync(control).filter(name => /\.(?:mjs|py|json)$/.test(name) && !name.includes('.test.')).sort();
   const hashes = files.map(name => ({ name, sha256: createHash('sha256').update(readFileSync(path.join(control, name))).digest('hex') }));
   json('instrumentation.json', { controlSha: process.env.GITHUB_SHA, files: hashes,
     digest: createHash('sha256').update(JSON.stringify(hashes)).digest('hex'),
@@ -73,47 +78,54 @@ try {
       status.result = 'setup_dependency_failure'; throw new Error('phase_failed');
     }
   }
+  environment.dependencies = readdirSync(path.join(source, 'node_modules/.pnpm')).flatMap(name => {
+    const match = name.match(/^(postgres|embedded-postgres|vitest|@playwright\+test|playwright-core|turbo)@([0-9][A-Za-z0-9.+-]*)(?:_|$)/);
+    return match ? [{ name: match[1].replace('+', '/'), version: match[2] }] : [];
+  });
+  json('environment.json', environment);
   identities.afterSetup = verifySource(source, expected); json('identity.json', identities);
   if (lane === 'chat' && !await phase('selection', 'node', ['scripts/run-vitest-stable.mjs', '--mode', 'general', '--group', 'general-chat', '--shard-index', '2', '--shard-count', '3', '--dry-run'])) {
     status.result = 'setup_selection_failure'; throw new Error('phase_failed');
   }
-  const testEnv = { ...env, NODE_OPTIONS: `--import=${path.join(control, 'preload.mjs')}` };
+  const testEnv = { ...env, NODE_OPTIONS: `--import=${pathToFileURL(path.join(control, 'preload.mjs')).href}` };
   const uid = os.userInfo();
-  const args = ['unshare', '--pid', '--fork', '--kill-child=KILL', '--mount', '--net', '--', '/bin/bash', '-c', 'mount --make-rprivate /; mount --bind "$1" /tmp; shift; ip link set lo up; exec "$@"', '--', env.TMPDIR,
-    'setpriv', `--reuid=${uid.uid}`, `--regid=${uid.gid}`, '--init-groups', '/usr/bin/env', '-i',
-    ...Object.entries(testEnv).map(([key, value]) => `${key}=${value}`),
-    process.execPath, path.join(control, 'lane.mjs'), lane, source, privateRoot];
-  const probeArgs = [...args.slice(0, args.indexOf(process.execPath)), '/usr/bin/true'];
+  const namespace = { env: testEnv, source, uid: uid.uid, gid: uid.gid,
+    seconds: Math.max(1, Math.floor((endAt - Date.now()) / 1000)) };
+  const args = isolatedCommand({ ...namespace, command: process.execPath,
+    args: [path.join(control, 'lane.mjs'), lane, source, privateRoot] });
+  const probeArgs = isolatedCommand({ ...namespace, command: '/usr/bin/true', args: [] });
   if (!await phase('isolation', 'sudo', probeArgs, { PATH: process.env.PATH }, source)) {
     status.result = 'setup_isolation_failure'; throw new Error('phase_failed');
   }
   const passed = await phase('test', 'sudo', args, { PATH: process.env.PATH }, source);
-  status.result = passed ? 'passed' : status.phases.at(-1).status === 'timed_out' ? 'timed_out' : 'test_failure';
+  let serverStages = [];
+  if (existsSync(path.join(privateRoot, 'webserver-status.json'))) {
+    serverStages = JSON.parse(readFileSync(path.join(privateRoot, 'webserver-status.json'), 'utf8'));
+    status.phases.push(...serverStages);
+  }
+  const events = existsSync(path.join(privateRoot, 'cases.jsonl')) ? readFileSync(path.join(privateRoot, 'cases.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse) : [];
+  status.result = serverStages.some(entry => entry.name === 'ui_build' && entry.status !== 'passed') ? 'setup_build_failure'
+    : events.some(event => event.kind === 'global_error') ? 'setup_or_infrastructure_failure'
+    : lane === 'e2e' && (!serverStages.length || !events.some(event => event.kind === 'start')) ? 'setup_webserver_failure'
+    : passed ? 'passed' : status.phases.find(entry => entry.name === 'test')?.status === 'timed_out' ? 'timed_out' : 'test_failure';
   identities.afterTest = verifySource(source, expected); json('identity.json', identities);
 } catch (error) {
   if (/source_(?:identity|integrity)/.test(error.message ?? '')) status.result = 'source_integrity_failure';
   else if (status.result === 'not_started') status.result = 'setup_or_integrity_failure';
   gaps.push({ kind: 'phase_incomplete' });
 } finally {
-  for (const [input, output] of [['projection.jsonl', 'projection.jsonl'], ['cases.jsonl', 'assertions.jsonl']]) {
-    if (existsSync(path.join(privateRoot, input))) copyFileSync(path.join(privateRoot, input), path.join(stage, output));
-    else gaps.push({ kind: input === 'cases.jsonl' ? 'test_report_missing' : 'fixture_projection_missing' });
-  }
-  if (existsSync(path.join(privateRoot, 'capture-gaps.jsonl'))) {
-    gaps.push(...readFileSync(path.join(privateRoot, 'capture-gaps.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse));
-  }
-  const resultRoot = path.join(privateRoot, 'results'); mkdirSync(resultRoot, { recursive: true });
-  const traceGaps = path.join(privateRoot, 'trace-gaps.json');
-  try {
-    execFileSync('python3', [path.join(control, 'sanitize-traces.py'), resultRoot, path.join(stage, 'trace.zip'), traceGaps], { stdio: 'pipe', timeout: 30000 });
-    gaps.push(...JSON.parse(readFileSync(traceGaps, 'utf8')));
-  } catch { gaps.push({ kind: 'trace_sanitization_failure' }); }
-  const cases = existsSync(path.join(stage, 'assertions.jsonl')) ? readFileSync(path.join(stage, 'assertions.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse) : [];
-  json('selection.json', { row, cases }); json('report.json', { status, cases });
-  writeFileSync(path.join(stage, 'report.html'), `<pre>${JSON.stringify({ status, cases }, null, 2).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')}</pre>`);
-  json('capture-gaps.json', gaps);
-  status.evidence = gaps.some(gap => gap.kind !== 'trace_payloads_removed') ? 'incomplete' : 'available_with_documented_redactions';
   checkpoint();
-  try { sealStage(stage); } catch { status.result = 'capture_failure'; checkpoint(); }
+  const budget = Math.min(120000, Number(started) + 22 * 60 * 1000 - Date.now());
+  try {
+    if (budget <= 0) throw new Error('packaging_deadline');
+    execFileSync(process.execPath, [path.join(control, 'finalize.mjs'), output], {
+      env: { PATH: process.env.PATH }, stdio: ['ignore', 'pipe', 'pipe'], timeout: budget, killSignal: 'SIGKILL',
+    });
+    Object.assign(status, JSON.parse(readFileSync(path.join(stage, 'status.json'), 'utf8')));
+  } catch {
+    status.evidence = 'incomplete'; status.packaging = 'failed_or_timed_out';
+    checkpoint(); json('capture-gaps.json', [{ kind: 'packaging_failure_or_deadline' }]);
+  }
 }
+
 process.exitCode = status.result === 'passed' && status.evidence !== 'incomplete' ? 0 : 1;

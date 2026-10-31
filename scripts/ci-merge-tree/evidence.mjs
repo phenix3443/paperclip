@@ -6,18 +6,21 @@ export const FIELDS = Object.freeze({
   companies: ['id', 'created_at', 'updated_at'],
   agents: ['id', 'company_id', 'status', 'created_at', 'updated_at'],
   issues: ['id', 'company_id', 'assignee_agent_id', 'parent_id', 'status', 'conversation_state', 'created_at', 'updated_at'],
-  issue_comments: ['id', 'company_id', 'issue_id', 'author_agent_id', 'created_at', 'updated_at'],
-  heartbeat_runs: ['id', 'company_id', 'agent_id', 'status', 'started_at', 'finished_at', 'created_at'],
-  agent_chat_messages: ['id', 'company_id', 'conversation_id', 'agent_id', 'parent_id', 'role', 'status', 'created_at', 'updated_at'],
-  chat_conversations: ['id', 'company_id', 'endpoint_id', 'agent_id', 'issue_id', 'state', 'created_at', 'updated_at'],
-  chat_message_links: ['id', 'company_id', 'conversation_id', 'issue_id', 'created_at'],
+  issue_comments: ['id', 'company_id', 'issue_id', 'author_agent_id', 'author_user_id', 'created_by_run_id', 'author_type', 'conversation_session_generation', 'created_at', 'updated_at'],
+  heartbeat_runs: ['id', 'company_id', 'agent_id', 'issue_id', 'retry_of_run_id', 'status', 'error_code', 'exit_code', 'started_at', 'finished_at', 'created_at'],
+  chat_endpoints: ['id', 'company_id', 'assigned_agent_id', 'status', 'created_at', 'updated_at'],
+  chat_conversations: ['id', 'company_id', 'endpoint_id', 'issue_id', 'state', 'created_at', 'updated_at'],
+  chat_message_links: ['id', 'company_id', 'endpoint_id', 'conversation_id', 'comment_id', 'delivery_id', 'publication_id', 'direction', 'created_at'],
   chat_deliveries: ['id', 'company_id', 'endpoint_id', 'conversation_id', 'state', 'created_at', 'updated_at'],
-  chat_actions: ['id', 'company_id', 'endpoint_id', 'conversation_id', 'status', 'created_at', 'updated_at'],
-  chat_publications: ['id', 'company_id', 'endpoint_id', 'conversation_id', 'state', 'created_at', 'updated_at'],
+  chat_actions: ['id', 'company_id', 'endpoint_id', 'conversation_id', 'delivery_id', 'status', 'created_at', 'updated_at'],
+  chat_publications: ['id', 'company_id', 'endpoint_id', 'conversation_id', 'issue_id', 'comment_id', 'state', 'created_at', 'updated_at'],
 });
 const STATES = new Set(['active', 'idle', 'waiting', 'completed', 'failed', 'cancelled', 'running',
   'pending', 'queued', 'received', 'processing', 'processed', 'retry', 'in_progress', 'in_review',
-  'backlog', 'todo', 'done', 'blocked', 'paused', 'archived', 'revoked', 'awaiting_consent', 'streaming', 'user', 'assistant', 'system', 'tool']);
+  'backlog', 'todo', 'done', 'blocked', 'paused', 'archived', 'revoked', 'awaiting_consent', 'streaming',
+  'user', 'agent', 'system', 'succeeded', 'timed_out', 'interrupted', 'draft', 'verifying', 'attention',
+  'unavailable', 'endpoint_removed', 'filtered', 'published', 'delivery_unknown', 'issued', 'inbound', 'outbound']);
+const ERROR_CODES = new Set(JSON.parse(readFileSync(new URL('./error-codes.json', import.meta.url), 'utf8')));
 
 export function projectFixture() {
   const aliases = new Map();
@@ -33,6 +36,8 @@ export function projectFixture() {
       const value = row[key];
       if (key === 'id' || key.endsWith('_id')) return [key, alias(value)];
       if (value === null) return [key, null];
+      if (key === 'exit_code' || key === 'conversation_session_generation') return [key, Number.isSafeInteger(value) ? value : '[redacted]'];
+      if (key === 'error_code') return [key, ERROR_CODES.has(value) ? value : { redacted: true, alias: alias(value) }];
       if (key.endsWith('_at')) {
         const date = new Date(value);
         return [key, Number.isNaN(date.getTime()) ? '[redacted]' : date.toISOString()];
@@ -42,7 +47,7 @@ export function projectFixture() {
   };
 }
 
-export function safeLog(input) {
+export function safeLog(input, sourceFiles = new Set()) {
   return String(input).split(/\r?\n/).map(line => {
     const signatures = [];
     if (/lock timeout/i.test(line)) signatures.push('lock_timeout');
@@ -53,15 +58,15 @@ export function safeLog(input) {
       if (line.includes(code)) signatures.push(code);
     }
     const locations = [...line.matchAll(/(?:server|tests|packages|scripts)\/[A-Za-z0-9_./-]+\.(?:ts|mjs|js):\d+(?::\d+)?/g)]
-      .map(match => match[0]).filter(value => !value.includes('..'));
+      .map(match => match[0]).filter(value => sourceFiles.has(value.replace(/:\d+(?::\d+)?$/, '')));
     return JSON.stringify({ signatures, locations, redactedCharacters: line.length });
   }).join('\n');
 }
 
 export function sealStage(root, limit = 100 * 1024 * 1024) {
   const allowed = new Set(['identity.json', 'environment.json', 'commands.json', 'selection.json',
-    'status.json', 'instrumentation.json', 'capture-gaps.json', 'projection.jsonl', 'assertions.jsonl',
-    'stdout.jsonl', 'stderr.jsonl', 'trace.zip', 'report.json', 'report.html']);
+    'database.jsonl', 'status.json', 'instrumentation.json', 'capture-gaps.json', 'projection.jsonl', 'assertions.jsonl',
+    'stdout.jsonl', 'stderr.jsonl', 'service-stdout.jsonl', 'service-stderr.jsonl', 'trace.zip', 'report.json', 'report.html']);
   let size = 0;
   const files = [];
   for (const name of readdirSync(root).sort()) {

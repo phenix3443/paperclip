@@ -39,3 +39,21 @@ test('upload staging rejects unknown files, links and aggregate size overflow', 
   assert.equal(files[0].name, 'status.json');
   assert.match(files[0].sha256, /^[a-f0-9]{64}$/);
 });
+
+test('log paths require an exact committed-source allowlist and never reveal path-shaped credentials', () => {
+  const safe = safeLog('credential=server/TOPSECRET.ts:42\n at server/src/example.ts:12:3', new Set(['server/src/example.ts']));
+  assert.doesNotMatch(safe, /TOPSECRET/);
+  assert.match(safe, /server\/src\/example.ts:12:3/);
+  assert.doesNotMatch(safeLog('server/src/example.ts:12'), /server\/src\/example/);
+});
+
+test('fixture state keeps successful and timed-out runs linked to their task and authored message', () => {
+  const project = projectFixture();
+  const task = project('issues', [{ id: 'task-1' }])[0];
+  const run = project('heartbeat_runs', [{ id: 'run-1', issue_id: 'task-1', status: 'succeeded', error_code: 'native_session_interrupted', retry_of_run_id: 'old-run' }])[0];
+  const comment = project('issue_comments', [{ id: 'comment-1', issue_id: 'task-1', created_by_run_id: 'run-1', author_type: 'agent' }])[0];
+  assert.equal(run.issue_id, task.id); assert.equal(comment.created_by_run_id, run.id);
+  assert.equal(comment.author_type, 'agent'); assert.equal(run.status, 'succeeded');
+  assert.equal(run.error_code, 'native_session_interrupted');
+  assert.equal(project('heartbeat_runs', [{ status: 'timed_out' }])[0].status, 'timed_out');
+});

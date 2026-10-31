@@ -25,3 +25,15 @@ test('real postgres Query captures before catch, finally, execute and forEach di
     assert.deepEqual(events, ['capture', 'cleanup'], entry);
   }
 });
+
+test('real driver rejection keeps its original error and emits a separate database observation', { skip: !existsSync(queryPath) }, async () => {
+  const { Query } = await import(pathToFileURL(queryPath));
+  const observed = [];
+  const expected = Object.assign(new Error('lock timeout'), { code: '55P03' });
+  const capture = async () => {};
+  capture.onError = error => observed.push(error.code);
+  const driver = () => Object.assign(() => {}, { unsafe: () => new Query(['select'], [], query => query.reject(expected)) });
+  const sql = wrapPostgres(driver, capture)('fixture');
+  await assert.rejects(sql.unsafe('select'), error => error === expected);
+  assert.deepEqual(observed, ['55P03']);
+});

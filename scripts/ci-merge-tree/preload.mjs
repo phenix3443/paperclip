@@ -2,6 +2,7 @@ import { registerHooks, syncBuiltinESMExports } from 'node:module';
 import childProcess from 'node:child_process';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
+import { ORIGINAL_SERVER_COMMAND } from './commands.mjs';
 import { randomUUID } from 'node:crypto';
 
 const root = process.env.PAPERCLIP_FIXED_CI_PRIVATE;
@@ -26,6 +27,10 @@ if (root) {
       const context = path.join(root, `context-${randomUUID()}.json`);
       argv = [...argv, '--reporter=default', `--reporter=${new URL('./vitest-reporter.mjs', import.meta.url).pathname}`];
       options = { ...options, env: { ...(options?.env ?? process.env), PAPERCLIP_FIXED_CI_CONTEXT: context } };
+    }
+    if (Array.isArray(argv) && argv.includes(ORIGINAL_SERVER_COMMAND)) {
+      argv = argv.map(arg => arg === ORIGINAL_SERVER_COMMAND
+        ? [process.execPath, new URL('./webserver.mjs', import.meta.url).pathname].map(value => "'" + value.replaceAll("'", "'\\''") + "'").join(' ') : arg);
     }
     return original.call(this, command, argv, options);
   };

@@ -21,7 +21,9 @@ jobs:
           node-version: 24.11.0
           package-manager-cache: false
       - name: Install isolated pinned driver for consumer checks
-        run: npm install --prefix "$RUNNER_TEMP/diagnostic-driver" --no-package-lock --ignore-scripts postgres@3.4.9
+        run: npm install --prefix "$RUNNER_TEMP/diagnostic-driver" --no-package-lock --ignore-scripts postgres@3.4.9 yaml@2.8.1
       - run: node --test scripts/ci-merge-tree/*.test.mjs
         env:
+          PAPERCLIP_DIAGNOSTIC_YAML_ROOT: ${{ runner.temp }}/diagnostic-driver/node_modules/yaml
+          PAPERCLIP_DIAGNOSTIC_NAMESPACE_SMOKE: 'true'
           PAPERCLIP_DIAGNOSTIC_POSTGRES_ROOT: ${{ runner.temp }}/diagnostic-driver/node_modules/postgres

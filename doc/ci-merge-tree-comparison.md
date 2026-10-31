@@ -101,3 +101,34 @@ Review and merge the identity, capture and integration slices in that order.
 Retarget the later PRs to `develop` after their predecessors merge. Each final
 head and the full stack require the designated independent review. Do not infer
 approval from this document or from synthetic test passes.
+
+## Failure evidence and safety checks
+
+The collector validates source locations against `git ls-tree HEAD`; a path-shaped
+credential is never retained merely because it resembles a source filename.
+Assertion records retain known matcher names, booleans, null and a small explicit
+set of common HTTP/status numbers. Other values retain only type, length and
+per-process aliases. This distinguishes a boolean assertion from a cleanup 500
+without exporting tokens or provider payloads. Trace errors use the same safe
+primitive policy; private trace paths map to framework test IDs before upload.
+
+The fixture projection includes run/task/comment/publication links and comment
+author roles. Unknown tables or columns are recorded. The error-code allowlist in
+`error-codes.json` contains literal named codes from the two fixed source trees;
+it is part of the control digest. PostgreSQL rejection codes and known failure
+signatures are recorded before the driver propagates the original error. These
+records contain no SQL or bound parameters. Snapshot metadata records the actual
+server version; the environment report identifies `psql` separately as a client.
+Resolved dependency versions are recorded after installation.
+
+E2E's original web-server command is observed externally as the same two ordered
+operations: UI build, then onboarding/server. Build exit and server process status
+remain separate; global Playwright startup errors are infrastructure evidence.
+The packaging subprocess has one overall two-minute bound and cannot consume the
+three-minute upload reserve. A minimal predefined safe report is still uploaded
+when control checkout fails.
+
+The helper CI also runs a synthetic hosted namespace smoke. It checks PID 1,
+absence of an external route, and termination of a writing detached descendant.
+It never runs the real comparison. Local helper results do not substitute for
+this hosted check or for the later authorized one-time comparison.

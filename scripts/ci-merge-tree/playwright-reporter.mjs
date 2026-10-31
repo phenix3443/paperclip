@@ -7,7 +7,7 @@ export default class {
     for (const test of suite.allTests()) {
       const id = ++this.index;
       this.cases.set(test.id, id);
-      record('cases.jsonl', { kind: 'selected', case: id, ...location(test.location.file, test.location.line, test.location.column) });
+      record('cases.jsonl', { kind: 'selected', case: id, testId: test.id, ...location(test.location.file, test.location.line, test.location.column) });
     }
   }
   onTestBegin(test) {
@@ -16,9 +16,15 @@ export default class {
     record('cases.jsonl', { kind: 'start', case: id });
   }
   onTestEnd(test, result) {
-    record('cases.jsonl', { kind: 'end', case: this.cases.get(test.id),
+    for (const attachment of result.attachments ?? []) {
+      if (attachment.name === 'trace' && attachment.path) record('trace-index.jsonl', { testId: test.id, path: attachment.path });
+    }
+    record('cases.jsonl', { kind: 'end', testId: test.id, case: this.cases.get(test.id),
       status: result.status, retry: result.retry, duration: result.duration,
       errors: result.errors.map(errorProjection) });
+  }
+  onError(error) {
+    record('cases.jsonl', { kind: 'global_error', phase: /webServer/.test(error.message ?? '') ? 'setup_webserver' : 'infrastructure', error: errorProjection(error) });
   }
   onStdOut() {}
   onStdErr() {}

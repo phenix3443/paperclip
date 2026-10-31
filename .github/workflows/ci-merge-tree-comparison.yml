@@ -84,9 +84,26 @@ jobs:
         env:
           CHECKOUT_OUTCOME: ${{ steps.source.outcome }}
         run: node control/scripts/ci-merge-tree/seal.mjs "$RUNNER_TEMP/ci-merge-tree/sanitized" "$CHECKOUT_OUTCOME"
+      - name: Seal minimal evidence when control checkout fails
+        id: fallback
+        if: always() && steps.control.outcome != 'success'
+        run: |
+          python3 - <<'PYCODE'
+          import os, json, hashlib
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'ci-merge-tree' / 'sanitized'
+          root.mkdir(parents=True, exist_ok=True)
+          files = {'status.json': {'result': 'control_checkout_failure', 'evidence': 'incomplete'}, 'capture-gaps.json': [{'kind': 'control_unavailable'}]}
+          manifest = []
+          for name, value in files.items():
+              data = json.dumps(value).encode()
+              (root / name).write_bytes(data)
+              manifest.append({'name': name, 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
+          (root / 'manifest.json').write_text(json.dumps({'schema': 1, 'files': manifest}))
+          PYCODE
       - name: Upload only sanitized evidence
         id: upload
-        if: always() && steps.seal.outcome == 'success'
+        if: always() && (steps.seal.outcome == 'success' || steps.fallback.outcome == 'success')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: original-ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.arm }}-${{ matrix.lane }}
