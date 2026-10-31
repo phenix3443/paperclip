@@ -1383,19 +1383,18 @@ export function toolAccessService(
     profileId: string,
     catalog: ToolCatalogEntry[],
   ): Promise<ToolProfileEntry[]> {
-    await writeConnectionAccess(tx => tx
+    const deleteEntries = (tx: Db) => tx
       .delete(toolProfileEntries)
       .where(
         and(
           eq(toolProfileEntries.companyId, companyId),
           eq(toolProfileEntries.profileId, profileId),
         ),
-      ));
+      );
     const readEntries = catalog.filter(
       (entry) => entry.riskLevel === "read" && entry.status === "active",
     );
-    if (readEntries.length === 0) return [];
-    const rows = await writeConnectionAccess(tx => tx
+    const insertEntries = (tx: Db) => tx
       .insert(toolProfileEntries)
       .values(
         readEntries.map((entry) => ({
@@ -1411,7 +1410,11 @@ export function toolAccessService(
           conditions: { source: "paperclip_example" },
         })),
       )
-      .returning());
+      .returning();
+    const rows = await writeConnectionAccess(async tx => {
+      await deleteEntries(tx);
+      return readEntries.length === 0 ? [] : insertEntries(tx);
+    });
     return rows.map(toProfileEntry);
   }
 

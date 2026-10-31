@@ -190,12 +190,22 @@ describePostgres("tool access writes notify the connection delivery worker", () 
     await expectRetired(f.connection.id);
   });
 
-  it("retires once for duplicate writes and waits for admission to reopen", async () => {
+  it("retires once through duplicate back-to-back writes", async () => {
+    const f = await seedDisabledConnection();
+    delivery = await startConnectionDelivery(db);
+    const baseline = delivery.sweeps;
+    await Promise.all([tools().updateConnection(f.connection.id, { enabled: true }), tools().updateConnection(f.connection.id, { enabled: true })]);
+    await tools().updateConnection(f.connection.id, { enabled: true });
+    await delivery.settle(baseline + 1);
+    await expectRetired(f.connection.id);
+  });
+
+  it("waits for admission to reopen before retiring", async () => {
     const f = await seedDisabledConnection();
     let open = true;
     delivery = await startConnectionDelivery(db, { canRun: () => open });
     open = false;
-    await Promise.all([tools().updateConnection(f.connection.id, { enabled: true }), tools().updateConnection(f.connection.id, { enabled: true })]);
+    await tools().updateConnection(f.connection.id, { enabled: true });
     await new Promise(resolve => setTimeout(resolve, 200));
     expect((await card()).status).toBe("pending");
     open = true;
