@@ -437,6 +437,8 @@ type RuntimeSkillSourceResolution =
   | { status: "available"; source: string }
   | { status: "missing"; source: string; detail: string };
 
+class RuntimeSkillPreparationChanged extends Error {}
+
 const skillInventoryRefreshPromises = new Map<string, Promise<void>>();
 
 function selectCompanySkillColumns() {
@@ -3404,13 +3406,15 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
     return readFullSkillRows(companyId);
   }
 
-  async function readFullSkillRows(companyId: string, keys?: Set<string>, unrestrictedOnly = false): Promise<CompanySkill[]> {
+  async function readFullSkillRows(companyId: string, keys?: Set<string>, transaction?: DbTransaction): Promise<CompanySkill[]> {
     if (!visibility().canReadCompany(companyId) || keys?.size === 0) return [];
-    const rows = await db
+    const database = transaction ?? db;
+    const query = database
       .select(selectCompanySkillColumns())
       .from(companySkills)
-      .where(and(eq(companySkills.companyId, companyId), keys ? inArray(companySkills.key, [...keys]) : undefined, unrestrictedOnly ? isNull(companySkills.accessSourceId) : await visibility().condition(companyId)))
+      .where(and(eq(companySkills.companyId, companyId), keys ? inArray(companySkills.key, [...keys]) : undefined, await visibility(database).condition(companyId)))
       .orderBy(asc(companySkills.name), asc(companySkills.key));
+    const rows = transaction ? await query.for("update") : await query;
     return rows.map((row) => toCompanySkill(row));
   }
 
@@ -6338,17 +6342,20 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
       }
     }
     const runtimeOptions = preparedSelection ? { ...options, onlyKeys: requested } : options;
-    const unrestrictedOnly = Boolean(preparedSelection && installed.every(skill => skill.accessSourceId === null));
-    return withSkillPackageReadScope(db, async () => {
-      // Directory walks, manifest checks and content hashes run before the company-wide lock; the lock holder
-      // re-reads the rows and only publishes snapshots that still differ. Reads that find nothing changed therefore
-      // never queue behind another agent's inventory work.
-      const prepared = await prepareRuntimeSnapshots(companyId, runtimeOptions, unrestrictedOnly);
-      return withSkillVersionCacheLock(db, companyId, async () => {
-        const entries = await listRuntimeSkillEntriesLocked(companyId, runtimeOptions, unrestrictedOnly, prepared);
-        return measureRunPhase("skills.consume", () => consume(entries));
-      });
-    });
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        return await withSkillPackageReadScope(db, async () => {
+          const prepared = await prepareRuntimeSnapshots(companyId, runtimeOptions);
+          return withSkillVersionCacheLock(db, companyId, async () => {
+            const entries = await listRuntimeSkillEntriesLocked(companyId, runtimeOptions, prepared);
+            return measureRunPhase("skills.consume", () => consume(entries));
+          });
+        });
+      } catch (error) {
+        if (!(error instanceof RuntimeSkillPreparationChanged)) throw error;
+      }
+    }
+    throw conflict("Skill sources changed during runtime preparation; retry the operation.");
   }
 
   async function selectRuntimeSkillKeys(companyId: string, options: RuntimeSkillEntryOptions): Promise<Set<string> | undefined> {
@@ -6359,17 +6366,14 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
     ) : undefined);
   }
 
-  /** What a runtime read found before taking the cache lock: the rows it read and one inspection per installed skill. */
   type PreparedRuntimeRead = {
     selectedKeys: Set<string> | undefined;
-    skills: CompanySkill[];
     snapshots: Map<string, PreparedRuntimeSnapshot>;
   };
 
   /** What a runtime read found for one installed skill before taking the cache lock. */
   type PreparedRuntimeSnapshot = {
-    /** The current version the preparation compared against; a lock holder that sees another re-inspects. */
-    currentVersionId: string | null;
+    identity: string;
     installedDirectory: string | null;
     installedVersion: StoredSkillVersion | null;
     installedUnchanged: boolean;
@@ -6378,6 +6382,16 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
     inventoryHash: string | null;
     previousHash: string | null;
   };
+
+  async function runtimeSkillPreparationIdentity(skill: CompanySkill): Promise<string> {
+    const directory = await resolveExistingSkillDirectory(normalizeSkillDirectory(skill));
+    const identity = directory ? await fs.lstat(directory) : null;
+    return JSON.stringify([skill.companyId, skill.id, skill.key, skill.slug, skill.currentVersionId,
+      skill.sourceType, skill.sourceLocator, skill.sourceRef, skill.accessSourceId, skill.metadata,
+      skill.markdown, skill.fileInventory, directory, identity?.dev, identity?.ino,
+      directory ? await fs.realpath(directory) : null,
+      directory ? await fs.realpath(path.join(directory, "SKILL.md")) : null]);
+  }
 
   async function inspectInstalledSkill(
     companyId: string,
@@ -6392,7 +6406,7 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
     const installedUnchanged = installedDirectory && installedVersion?.packageSnapshotId && !installedVersion.packageFileMap
       ? await verifyFileManifest(installedDirectory, (await packages.manifest(companyId, installedVersion.packageSnapshotId)).files)
       : false;
-    const snapshot: PreparedRuntimeSnapshot = { currentVersionId: skill.currentVersionId ?? null, installedDirectory, installedVersion,
+    const snapshot: PreparedRuntimeSnapshot = { identity: await runtimeSkillPreparationIdentity(skill), installedDirectory, installedVersion,
       installedUnchanged, inventory: null, inventoryHash: null, previousHash: null };
     if (installedUnchanged || !options.snapshotLatest || !unpinned || !installedDirectory) return snapshot;
     // Capture installed bytes only; a remote import without a directory is resolved by the lock holder.
@@ -6408,10 +6422,9 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
   async function prepareRuntimeSnapshots(
     companyId: string,
     options: RuntimeSkillEntryOptions,
-    unrestrictedOnly: boolean,
   ): Promise<PreparedRuntimeRead> {
     const selectedKeys = await selectRuntimeSkillKeys(companyId, options);
-    const skills = await measureRunPhase("skills.rows", () => readFullSkillRows(companyId, selectedKeys, unrestrictedOnly));
+    const skills = await measureRunPhase("skills.rows", () => readFullSkillRows(companyId, selectedKeys));
     await packages.prefetch(companyId, skills.flatMap(skill => {
       const id = options.versionSelections?.get(skill.key) ?? skill.currentVersionId;
       return id ? [id] : [];
@@ -6423,66 +6436,63 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
         snapshots.set(skill.id, await inspectInstalledSkill(companyId, skill, options));
       }
     }
-    return { selectedKeys, skills, snapshots };
+    return { selectedKeys, snapshots };
   }
 
   async function listRuntimeSkillEntriesLocked(
     companyId: string,
     options: RuntimeSkillEntryOptions,
-    unrestrictedOnly = false,
-    earlierRead?: PreparedRuntimeRead,
+    earlierRead: PreparedRuntimeRead,
   ): Promise<PaperclipSkillEntry[]> {
-    const prepared = earlierRead?.snapshots ?? new Map<string, PreparedRuntimeSnapshot>();
-    const selectedKeys = earlierRead ? earlierRead.selectedKeys : await selectRuntimeSkillKeys(companyId, options);
-    // Recheck scope on the full row read: a public-to-project change between the probe and consumption must fail
-    // closed. An unrestricted selection has no scope to recheck, so the rows read before the lock stand.
-    const skills = earlierRead && unrestrictedOnly ? earlierRead.skills
-      : await measureRunPhase("skills.rows", () => readFullSkillRows(companyId, selectedKeys, unrestrictedOnly));
-    if (!earlierRead) {
-      await packages.prefetch(companyId, skills.flatMap(skill => {
-        const id = options.versionSelections?.get(skill.key) ?? skill.currentVersionId;
-        return id ? [id] : [];
-      }));
-    }
-
-    const out: PaperclipSkillEntry[] = [];
-    for (let skill of skills) {
-      if (selectedKeys && !selectedKeys.has(skill.key)) continue;
-      let installedResolution: RuntimeSkillSourceResolution | null = null;
-      const unpinned = !options.versionSelections?.get(skill.key);
-      // Reuse what was inspected before the lock while the row still points at the version it was compared with;
-      // another holder may have published in between, in which case the skill is inspected again here.
-      const earlier = prepared.get(skill.id);
-      const inspected = earlier && earlier.currentVersionId === (skill.currentVersionId ?? null)
-        ? earlier : await inspectInstalledSkill(companyId, skill, options);
-      const { installedDirectory, installedUnchanged } = inspected;
-      if (!installedUnchanged && options.snapshotLatest && unpinned && (!skill.currentVersionId || installedDirectory)) {
-        // Capture installed bytes only. Older remote imports can have no
-        // version yet; execution must not fetch their missing files upstream.
-        const installed: RuntimeSkillSourceResolution | null = installedDirectory ? { status: "available", source: installedDirectory }
-          : await resolveRuntimeSkillSource(companyId, skill, { ...options, snapshotLatest: false, materializeMissing: false });
-        const inventory = installedDirectory && inspected.inventory
-          ? inspected.inventory
-          : installed?.status === "available"
-            ? await collectVersionFileInventoryFromDirectory(installed.source)
-            : skill.fileInventory.length === 1 && skill.fileInventory[0]?.path === "SKILL.md" && skill.markdown
-              ? [{ path: "SKILL.md", kind: "skill" as const, content: skill.markdown }] : null;
-        if (inventory) {
-          const inventoryHash = inventory === inspected.inventory && inspected.inventoryHash ? inspected.inventoryHash : skillSnapshotHash(inventory);
-          let previousHash = inventory === inspected.inventory ? inspected.previousHash : null;
-          if (inventory !== inspected.inventory) {
-            const previous = inspected.installedVersion ?? (skill.currentVersionId ? await readVersionMetadata(companyId, skill.id, skill.currentVersionId) : null);
-            previousHash = previous?.packageSnapshotId && !previous.packageFileMap
-              ? (await packages.descriptor(companyId, previous.packageSnapshotId)).contentHash
-              : previous ? skillSnapshotHash(await packages.versionFiles(previous)) : null;
-          }
-          if (previousHash !== inventoryHash) {
-            const version = await createVersion(companyId, skill.id, { label: "Execution snapshot" }, { type: "system" },
-              { skipInventoryRefresh: true, skill, fileInventory: inventory });
-            skill = { ...skill, currentVersionId: version.id };
-          }
-        } else installedResolution = installed;
+    const { snapshots: prepared, selectedKeys } = earlierRead;
+    const published = await db.transaction(async tx => {
+      const skills = await measureRunPhase("skills.rows", () => readFullSkillRows(companyId, selectedKeys, tx));
+      for (const skill of skills) {
+        if (options.snapshotLatest && prepared.get(skill.id)?.identity !== await runtimeSkillPreparationIdentity(skill)) {
+          throw new RuntimeSkillPreparationChanged();
+        }
       }
+      const published: Array<{ skill: CompanySkill; installedResolution: RuntimeSkillSourceResolution | null }> = [];
+      for (let skill of skills) {
+        if (selectedKeys && !selectedKeys.has(skill.key)) continue;
+        let installedResolution: RuntimeSkillSourceResolution | null = null;
+        const unpinned = !options.versionSelections?.get(skill.key);
+        const inspected = prepared.get(skill.id) ?? { installedDirectory: null, installedVersion: null, installedUnchanged: false,
+          inventory: null, inventoryHash: null, previousHash: null };
+        const { installedDirectory, installedUnchanged } = inspected;
+        if (!installedUnchanged && options.snapshotLatest && unpinned && (!skill.currentVersionId || installedDirectory)) {
+          // Capture installed bytes only. Older remote imports can have no
+          // version yet; execution must not fetch their missing files upstream.
+          const installed: RuntimeSkillSourceResolution | null = installedDirectory ? { status: "available", source: installedDirectory }
+            : await resolveRuntimeSkillSource(companyId, skill, { ...options, snapshotLatest: false, materializeMissing: false });
+          const inventory = installedDirectory && inspected.inventory
+            ? inspected.inventory
+            : installed?.status === "available"
+              ? await collectVersionFileInventoryFromDirectory(installed.source)
+              : skill.fileInventory.length === 1 && skill.fileInventory[0]?.path === "SKILL.md" && skill.markdown
+                ? [{ path: "SKILL.md", kind: "skill" as const, content: skill.markdown }] : null;
+          if (inventory) {
+            const inventoryHash = inventory === inspected.inventory && inspected.inventoryHash ? inspected.inventoryHash : skillSnapshotHash(inventory);
+            let previousHash = inventory === inspected.inventory ? inspected.previousHash : null;
+            if (inventory !== inspected.inventory) {
+              const previous = inspected.installedVersion ?? (skill.currentVersionId ? await readVersionMetadata(companyId, skill.id, skill.currentVersionId) : null);
+              previousHash = previous?.packageSnapshotId && !previous.packageFileMap
+                ? (await packages.descriptor(companyId, previous.packageSnapshotId)).contentHash
+                : previous ? skillSnapshotHash(await packages.versionFiles(previous)) : null;
+            }
+            if (previousHash !== inventoryHash) {
+              const version = await createVersion(companyId, skill.id, { label: "Execution snapshot" }, { type: "system" },
+                { skipInventoryRefresh: true, skill, fileInventory: inventory, database: tx });
+              skill = { ...skill, currentVersionId: version.id };
+            }
+          } else installedResolution = installed;
+        }
+        published.push({ skill, installedResolution });
+      }
+      return published;
+    });
+    const out: PaperclipSkillEntry[] = [];
+    for (const { skill, installedResolution } of published) {
       const sourceResolution = installedResolution ?? await resolveRuntimeSkillSource(companyId, skill, {
         ...options, ...(options.snapshotLatest ? { materializeMissing: false } : {}),
       });
