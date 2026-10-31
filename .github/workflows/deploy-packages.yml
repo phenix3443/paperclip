@@ -126,10 +126,6 @@ jobs:
           '
           du -sh "$PACKAGES_DIR"
 
-      # The service host installs the exported tarballs again with plain npm.
-      # Repeat that install twice in empty prefixes, on a pinned toolchain, and
-      # fail before upload unless every postgres caller loads the patched driver
-      # and the close/live probe passes (and still fails on the registry driver).
       - name: Verify postgres in clean final installs
         run: |
           set -o pipefail

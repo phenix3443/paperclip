@@ -51,6 +51,14 @@ const imported = spawnSync(process.execPath, ["--input-type=module", "-e", impor
 controls.push(expect({ entry: "import @paperclipai/db and @paperclipai/server", mode: "import", exit: imported.status, signal: imported.signal,
   timedOut: imported.error?.code === "ETIMEDOUT", stdout: (imported.stdout ?? "").trim(), stderr: (imported.stderr ?? String(imported.error ?? "")).slice(0, 2000) },
   imported.status === 0 && (imported.stdout ?? "").trim() === "IMPORTED"));
+const cliEntry = join(prefix, "node_modules/paperclipai/dist/index.js");
+const piSetup = spawnSync(process.execPath, [cliEntry, "runtime", "setup", "pi"], { cwd: prefix, env, encoding: "utf8", timeout: 10 * 60_000, maxBuffer: 16 * 1024 * 1024 });
+let piReceipt = null;
+try { piReceipt = JSON.parse((piSetup.stdout ?? "").trim()); } catch {}
+controls.push(expect({ entry: "paperclipai runtime setup pi", mode: "cli", exit: piSetup.status, signal: piSetup.signal,
+  timedOut: piSetup.error?.code === "ETIMEDOUT", stdout: piReceipt?.status ?? "", receipt: piReceipt,
+  stderr: (piSetup.stderr ?? String(piSetup.error ?? "")).slice(-2000) },
+  piSetup.status === 0 && piReceipt?.status === "installed_verified"));
 for (const { import: esm, require: cjs } of resolutions) {
   for (const entry of [esm, cjs]) {
     const closed = runProbe(entry, "closed"), live = runProbe(entry, "live");

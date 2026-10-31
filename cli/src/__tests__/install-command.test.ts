@@ -284,6 +284,29 @@ describe("managed install commands", () => {
     expect(fs.existsSync(poisoned)).toBe(true);
   });
 
+  it("refuses a cached git payload whose db links a drizzle-orm from outside the payload", async () => {
+    const goodSha = "4".repeat(40);
+    const linkedSha = "5".repeat(40);
+    await installCommand({ ref: goodSha, repo: "phenix3443/paperclip", yes: true }, { runCommand: createGitCheckoutRunCommand(goodSha) });
+    const paths = resolveInstallStorePaths();
+    const before = readInstallManifest(paths);
+    const currentBefore = fs.readlinkSync(paths.currentPath);
+    const cached = payloadPathFor(paths, "git", linkedSha.slice(0, 12));
+    writePatchedPayload(cached);
+    const outside = path.join(root, "outside");
+    writePatchedPayload(outside);
+    fs.writeFileSync(path.join(outside, "node_modules", "postgres", "src", "index.js"), "export default null;\n");
+    const dbModules = path.join(cached, "node_modules", "@paperclipai", "db", "node_modules");
+    fs.mkdirSync(dbModules, { recursive: true });
+    fs.symlinkSync(path.join(outside, "node_modules", "drizzle-orm"), path.join(dbModules, "drizzle-orm"));
+    const runCommand = createGitCheckoutRunCommand(linkedSha);
+    await expect(installCommand({ ref: linkedSha, repo: "phenix3443/paperclip", yes: true }, { runCommand })).rejects.toThrow(/must not contain linked packages/);
+    expect(runCommand.mock.calls.filter(([command, args]) => command === process.execPath && args.at(-1) === "--version")).toHaveLength(0);
+    expect(runCommand.mock.calls.filter(([command, args]) => command === "curl" && args.includes("--output"))).toHaveLength(0);
+    expect(readInstallManifest(paths)).toEqual(before);
+    expect(fs.readlinkSync(paths.currentPath)).toBe(currentBefore);
+  });
+
   it("exports nothing without a packages directory", async () => {
     const sha = "f".repeat(40);
     await installGitPayload("phenix3443/paperclip", sha, createGitCheckoutRunCommand(sha), resolveInstallStorePaths());

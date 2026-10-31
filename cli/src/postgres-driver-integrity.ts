@@ -47,26 +47,42 @@ function assertPatchedDriver(packageRoot: string, label: string): void {
   }
 }
 
-function inventoryPackageCopies(name: string, nodeModules: string, found: string[] = [], depth = 0): string[] {
-  if (depth > 32 || !fs.existsSync(nodeModules)) return found;
+type PackageInventory = { packages: { name: string; directory: string }[]; links: string[] };
+
+function inventoryPackages(nodeModules: string, inventory: PackageInventory = { packages: [], links: [] }, depth = 0): PackageInventory {
+  if (depth > 32 || !fs.existsSync(nodeModules)) return inventory;
+  if (fs.lstatSync(nodeModules).isSymbolicLink()) { inventory.links.push(nodeModules); return inventory; }
   for (const entry of fs.readdirSync(nodeModules, { withFileTypes: true })) {
-    if (entry.name.startsWith(".") || !entry.isDirectory()) continue;
+    if (entry.name.startsWith(".")) continue;
     const directory = path.join(nodeModules, entry.name);
-    const packages = entry.name.startsWith("@")
-      ? fs.readdirSync(directory, { withFileTypes: true }).filter((child) => child.isDirectory()).map((child) => path.join(directory, child.name))
-      : [directory];
+    if (entry.isSymbolicLink()) { inventory.links.push(directory); continue; }
+    if (!entry.isDirectory()) continue;
+    const packages: string[] = [];
+    if (entry.name.startsWith("@")) {
+      for (const child of fs.readdirSync(directory, { withFileTypes: true })) {
+        if (child.isSymbolicLink()) inventory.links.push(path.join(directory, child.name));
+        else if (child.isDirectory()) packages.push(path.join(directory, child.name));
+      }
+    } else packages.push(directory);
     for (const packageDirectory of packages) {
-      if (path.relative(nodeModules, packageDirectory) === name) found.push(packageDirectory);
-      inventoryPackageCopies(name, path.join(packageDirectory, "node_modules"), found, depth + 1);
+      inventory.packages.push({ name: path.relative(nodeModules, packageDirectory), directory: packageDirectory });
+      inventoryPackages(path.join(packageDirectory, "node_modules"), inventory, depth + 1);
     }
   }
-  return found;
+  return inventory;
 }
+
+const copiesOf = (inventory: PackageInventory, name: string) =>
+  inventory.packages.filter((entry) => entry.name === name).map((entry) => entry.directory);
 
 export async function verifyPostgresDriverPayload(payloadPath: string): Promise<PostgresDriverResolution[]> {
   const payloadRoot = fs.realpathSync(payloadPath);
   const nodeModules = path.join(payloadRoot, "node_modules");
-  const copies = inventoryPackageCopies("postgres", nodeModules);
+  const inventory = inventoryPackages(nodeModules);
+  if (inventory.links.length > 0) {
+    throw new Error(`Payload node_modules must not contain linked packages; found ${inventory.links.map((link) => path.relative(payloadRoot, link)).join(", ")}.`);
+  }
+  const copies = copiesOf(inventory, "postgres");
   if (copies.length === 0) throw new Error(`Payload ${payloadPath} contains no postgres driver.`);
   const rootCopy = path.join(nodeModules, "postgres");
   const extra = copies.filter((copy) => copy !== rootCopy);
@@ -81,7 +97,7 @@ export async function verifyPostgresDriverPayload(payloadPath: string): Promise<
   for (const caller of callers) {
     if (!fs.existsSync(path.join(caller.directory, "package.json"))) throw new Error(`Payload is missing postgres caller ${caller.caller}.`);
   }
-  const drizzleDrivers = inventoryPackageCopies("drizzle-orm", nodeModules)
+  const drizzleDrivers = copiesOf(inventory, "drizzle-orm")
     .map((copy) => path.join(copy, "postgres-js"))
     .filter((directory) => fs.existsSync(path.join(directory, "driver.js")));
   if (drizzleDrivers.length === 0) throw new Error(`Payload ${payloadPath} contains no drizzle-orm postgres-js driver.`);
