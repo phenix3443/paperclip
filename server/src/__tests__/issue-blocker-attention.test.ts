@@ -103,6 +103,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     description?: string | null;
     unblockDescriptor?: { owner: { agentId: string } | { userId: string } | "board"; action: string } | null;
     visibility?: "open" | "private";
+    monitorNextCheckAt?: Date | null;
   }) {
     const id = input.id ?? randomUUID();
     await db.insert(issues).values({
@@ -122,6 +123,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       description: input.description ?? null,
       unblockDescriptor: input.unblockDescriptor ?? null,
       visibility: input.visibility ?? "open",
+      monitorNextCheckAt: input.monitorNextCheckAt ?? null,
     });
     return id;
   }
@@ -906,6 +908,38 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     await activeRun({ companyId, agentId, issueId: blockerId });
 
     expect(await svc.list(companyId, { attention: "blocked" })).toEqual([]);
+  });
+
+  it("treats a leaf waiting on a scheduled monitor as progressing", async () => {
+    const { companyId, agentId } = await createCompany("BIM");
+    const parentId = await insertIssue({ companyId, identifier: "BIM-1", title: "Blocked source", status: "blocked" });
+    const waitingId = await insertIssue({
+      companyId,
+      identifier: "BIM-2",
+      title: "Waiting for CI",
+      status: "in_progress",
+      assigneeAgentId: agentId,
+      monitorNextCheckAt: new Date(Date.now() + 10 * 60_000),
+    });
+    await block({ companyId, blockerIssueId: waitingId, blockedIssueId: parentId });
+    const overdueParentId = await insertIssue({ companyId, identifier: "BIM-3", title: "Blocked source", status: "blocked" });
+    const overdueId = await insertIssue({
+      companyId,
+      identifier: "BIM-4",
+      title: "Monitor already due",
+      status: "in_progress",
+      assigneeAgentId: agentId,
+      monitorNextCheckAt: new Date(Date.now() - 10 * 60_000),
+    });
+    await block({ companyId, blockerIssueId: overdueId, blockedIssueId: overdueParentId });
+
+    const rows = await svc.list(companyId, { attention: "blocked" });
+
+    expect(rows.map((row) => row.id)).toEqual([overdueParentId]);
+    expect(rows[0]?.blockedInboxAttention).toMatchObject({
+      reason: "blocked_chain_stalled",
+      owner: { type: "agent", agentId },
+    });
   });
 
   it("classifies assigned backlog and invalid review leaves for blocked inbox attention", async () => {
