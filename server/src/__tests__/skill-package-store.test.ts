@@ -499,7 +499,7 @@ describe.skipIf(!support.supported)("external skill packages", () => {
     try { expect(await f.resolve()).toEqual(cold); }
     finally { db.$client.options.debug = oldDebug; }
     expect(read).not.toHaveBeenCalled();
-    expect(sql.length).toBeLessThanOrEqual(6);
+    expect(sql.length, "Warm preparation includes a transaction and current skill access revalidation").toBeLessThanOrEqual(7);
     for (const query of sql.filter(query => /from "company_skill_(repository_snapshots|versions)"/.test(query))) {
       // Bundled release validation returns only a DB-side digest.
       if (!query.includes("encode(sha256(")) expect(query).not.toMatch(/"file_inventory"/);

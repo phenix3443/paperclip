@@ -142,6 +142,15 @@ No permission result is shared or kept between requests. The
 [concurrency tests](../../server/src/__tests__/company-skills-runtime-concurrency.test.ts)
 cover separate actors and project-access revocation; this adds no agent API.
 
+Before publication, runtime preparation rechecks current visibility, version and
+source/directory identity under the cache lock and skill-row locks. All selected
+snapshots pass this check before any version is written. A mismatch restarts
+preparation outside the cache lock, with at most three attempts and a conflict on
+exhaustion. Consumer callbacks and durable pinning retain cache exclusion.
+[Publication regressions](../../server/src/__tests__/company-skills-runtime-publication.test.ts)
+exercise controlled interleavings with isolated PostgreSQL and synthetic actors;
+these are service tests, not live execution acceptance.
+
 ## `policy`
 
 Capability ID: `skills/policy`.
