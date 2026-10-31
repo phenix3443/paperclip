@@ -1185,4 +1185,80 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       svc.count(companyId, { attention: "blocked", assigneeAgentId: "not-a-uuid" }),
     ).rejects.toThrow(/assigneeAgentId/i);
   });
+
+  it("builds the blocked inbox blocker graph once per request and keeps each row's per-row result", async () => {
+    async function seedInbox(prefix: string, chainCount: number) {
+      const { companyId, agentId } = await createCompany(prefix);
+      const roots: Array<{ id: string; assigneeAgentId: string }> = [];
+      for (let index = 0; index < chainCount; index += 1) {
+        const assigneeAgentId = randomUUID();
+        await db.insert(agents).values({
+          id: assigneeAgentId,
+          companyId,
+          name: `${prefix} Owner ${index}`,
+          role: "engineer",
+          status: "idle",
+        });
+        const rootId = await insertIssue({
+          companyId,
+          identifier: `${prefix}-${index * 20 + 1}`,
+          title: `Blocked source ${index}`,
+          status: "blocked",
+          assigneeAgentId,
+        });
+        // The last chain is deeper than BLOCKER_ATTENTION_MAX_DEPTH, so only its own walk is truncated.
+        const depth = index === chainCount - 1 ? 10 : 1;
+        const covered = index % 2 === 1;
+        let blockedIssueId = rootId;
+        for (let level = 1; level <= depth; level += 1) {
+          const isLeaf = level === depth;
+          const blockerIssueId = await insertIssue({
+            companyId,
+            identifier: `${prefix}-${index * 20 + 1 + level}`,
+            title: isLeaf ? `Leaf ${index}` : `Link ${index}.${level}`,
+            status: isLeaf && !covered ? "in_review" : "todo",
+            assigneeAgentId: isLeaf && !covered ? null : agentId,
+            executionState:
+              isLeaf && !covered ? { status: "pending", currentParticipant: { type: "agent", agentId } } : null,
+          });
+          await block({ companyId, blockerIssueId, blockedIssueId });
+          if (isLeaf && covered) await activeRun({ companyId, agentId, issueId: blockerIssueId });
+          blockedIssueId = blockerIssueId;
+        }
+        roots.push({ id: rootId, assigneeAgentId });
+      }
+      return { companyId, roots };
+    }
+
+    async function countQueries<T>(run: () => Promise<T>) {
+      let count = 0;
+      const debug = db.$client.options.debug;
+      db.$client.options.debug = () => {
+        count += 1;
+      };
+      try {
+        return { result: await run(), count };
+      } finally {
+        db.$client.options.debug = debug;
+      }
+    }
+
+    const small = await seedInbox("BGA", 2);
+    const large = await seedInbox("BGB", 12);
+
+    const smallList = await countQueries(() => svc.list(small.companyId, { attention: "blocked" }));
+    const largeList = await countQueries(() => svc.list(large.companyId, { attention: "blocked" }));
+
+    // Five covered chains stay out of the inbox; six stalled chains and the truncated deep chain stay in.
+    expect(largeList.result).toHaveLength(7);
+    expect(largeList.count - smallList.count).toBeLessThan(10);
+
+    // Filtering by assignee leaves one candidate row, so its attention is computed from its own graph alone.
+    for (const root of large.roots) {
+      const alone = await svc.list(large.companyId, { attention: "blocked", assigneeAgentId: root.assigneeAgentId });
+      expect(largeList.result.find((row) => row.id === root.id)?.blockedInboxAttention).toEqual(
+        alone.find((row) => row.id === root.id)?.blockedInboxAttention,
+      );
+    }
+  });
 });
