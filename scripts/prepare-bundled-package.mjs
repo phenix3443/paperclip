@@ -357,8 +357,6 @@ export function selectBundledDependencyPatches(
   return selectedPatches;
 }
 
-// npm consumers do not receive pnpm patches, so a patched bundled dependency
-// must be installed at exactly the version its single configured patch targets.
 export function pinPatchedBundledDependencies(installManifest, bundledDependencies, patchedDependencies) {
   const result = structuredClone(installManifest);
   for (const packageName of new Set(bundledDependencies)) {

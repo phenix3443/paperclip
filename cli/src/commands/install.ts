@@ -266,8 +266,8 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
   const payloadPath = payloadPathFor(paths, "git", identifier);
   if (fs.existsSync(payloadPath)) {
     const metadata = JSON.parse(fs.readFileSync(path.join(payloadPath, "node_modules", "paperclipai", "package.json"), "utf8")) as { version: string };
-    await smokePayload(payloadPath, metadata.version, runCommand);
     await verifyPayload(payloadPath);
+    await smokePayload(payloadPath, metadata.version, runCommand);
     return { payloadPath, reused: true, version: metadata.version };
   }
   const sourceRoot = path.dirname(payloadPath);
@@ -328,8 +328,8 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
       throw new Error(`Git install packaging produced ${workspaceTarballs.length} workspace tarballs; expected ${workspacePackages.length}.`);
     }
     await runCommand("npm", ["install", "--prefix", stagedPayload, path.join(stagingRoot, cliTarball), ...workspaceTarballs.map((entry) => path.join(stagingRoot, entry)), "--no-audit", "--no-fund"], { cwd: stagingRoot, maxBuffer: 32 * 1024 * 1024 });
-    await smokePayload(stagedPayload, metadata.version, runCommand);
     await verifyPayload(stagedPayload);
+    await smokePayload(stagedPayload, metadata.version, runCommand);
     exportGitPayloadPackages(stagingRoot, [cliTarball, ...workspaceTarballs], { repo, sha, version: metadata.version });
     fs.renameSync(stagedPayload, payloadPath);
     return { payloadPath, reused: false, version: metadata.version };

@@ -1,7 +1,4 @@
 #!/usr/bin/env node
-// Install exported payload tarballs into an empty prefix, as the deployment
-// host does, then prove every postgres caller loads the patched driver and the
-// close/live probe behaves as expected against patched and registry drivers.
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
@@ -40,8 +37,9 @@ execFileSync("npm", npmArgs, { cwd: workDir, env, stdio: "inherit", timeout: 20 
 
 function runProbe(entry, mode) {
   const result = spawnSync(process.execPath, [probe, entry, mode], { env, encoding: "utf8", timeout: 15_000 });
-  return { entry, mode, exit: result.status, signal: result.signal, stdout: result.stdout.trim(),
-    nullWrite: /Immediate\.nextWrite|reading 'write'/.test(result.stderr) };
+  const stderr = result.stderr ?? String(result.error ?? "");
+  return { entry, mode, exit: result.status, signal: result.signal, timedOut: result.error?.code === "ETIMEDOUT",
+    stdout: (result.stdout ?? "").trim(), stderr: stderr.slice(0, 2000), nullWrite: /Immediate\.nextWrite|reading 'write'/.test(stderr) };
 }
 const failures = [];
 const expect = (control, ok) => { if (!ok) failures.push(control); return control; };
@@ -70,10 +68,14 @@ for (const entry of ["src/index.js", "cjs/src/index.js"].map(file => join(regist
 const report = {
   node: process.version,
   npm: execFileSync("npm", ["--version"], { env, encoding: "utf8" }).trim(),
+  pnpm: execFileSync("corepack", ["pnpm", "--version"], { cwd: repoRoot, env, encoding: "utf8" }).trim(),
+  toolchainNote: "Final-install node/npm versions are an experimental pin, not recovered historical host versions.",
   platform: `${process.platform}-${process.arch}`,
   source: { repo: manifest.repo, sha: manifest.sha, version: manifest.version },
   packages: manifest.files,
-  patch: { file: "patches/postgres@3.4.9.patch", sha256: sha256(join(repoRoot, "patches/postgres@3.4.9.patch")) },
+  lockfileSha256: sha256(join(repoRoot, "pnpm-lock.yaml")),
+  patch: { file: `patches/postgres@${PATCHED_POSTGRES_DRIVER.version}.patch`,
+    sha256: sha256(join(repoRoot, `patches/postgres@${PATCHED_POSTGRES_DRIVER.version}.patch`)) },
   expectedDriver: PATCHED_POSTGRES_DRIVER,
   npmArgs: npmArgs.map(arg => arg.replace(packagesDir, "<packages>").replace(workDir, "<work>")),
   resolutions: resolutions.map(entry => ({ ...entry, import: entry.import.replace(prefix, "<payload>"),

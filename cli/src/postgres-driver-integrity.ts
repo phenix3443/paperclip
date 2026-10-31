@@ -6,8 +6,6 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
-// Registry postgres@3.4.9 with patches/postgres@3.4.9.patch applied. CI
-// recomputes these from the registry tarball and the patch file.
 export const PATCHED_POSTGRES_DRIVER = {
   version: "3.4.9",
   files: {
@@ -65,8 +63,6 @@ function inventoryPostgresCopies(nodeModules: string, found: string[] = [], dept
   return found;
 }
 
-// Every caller in the payload must load the patched driver through Node's real
-// ESM and CommonJS resolution; any unpatched copy in the payload fails the gate.
 export async function verifyPostgresDriverPayload(payloadPath: string): Promise<PostgresDriverResolution[]> {
   const payloadRoot = fs.realpathSync(payloadPath);
   const nodeModules = path.join(payloadRoot, "node_modules");

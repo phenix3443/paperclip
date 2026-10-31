@@ -132,6 +132,7 @@ jobs:
       # and the close/live probe passes (and still fails on the registry driver).
       - name: Verify postgres in clean final installs
         run: |
+          set -o pipefail
           umask 022
           npm install --global npm@11.19.0 --no-audit --no-fund
           pinned_node() { npm exec --yes --package=node@24.22.1 -- node "$@"; }
