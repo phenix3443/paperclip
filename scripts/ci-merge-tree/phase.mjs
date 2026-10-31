@@ -36,8 +36,11 @@ export async function runPhase({ name, command, args, env, cwd, deadline, privat
   });
   signal?.removeEventListener('abort', abort);
   clearTimeout(timer); clearTimeout(killTimer); terminate('SIGKILL');
+  const rootDeadlineExpired = command === 'sudo' && args[0] === 'timeout'
+    && Date.now() - Date.parse(entry.start) >= Number(args[3]?.replace(/s$/, '')) * 1000
+    && (result.code === 124 || result.code === 137 || result.signal === 'SIGKILL');
   Object.assign(entry, { exit: result.code, signal: result.signal,
-    status: signal?.aborted ? 'cancelled' : timedOut || (command === 'sudo' && args[0] === 'timeout' && result.code === 124) ? 'timed_out' : result.code === 0 ? 'passed' : result.spawnError ? 'setup_failure' : 'failed',
+    status: signal?.aborted ? 'cancelled' : timedOut || rootDeadlineExpired ? 'timed_out' : result.code === 0 ? 'passed' : result.spawnError ? 'setup_failure' : 'failed',
     end: new Date().toISOString() }); onChange(entry);
   return entry;
 }
