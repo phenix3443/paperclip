@@ -188,6 +188,7 @@ task-bound OAuth, popup handoff, and verifying a saved connection before closing
 Withdrawn requests render a terminal acknowledgement with no setup action; the
 interaction-body test and narrow Storybook journey cover this recovery state.
 The connection-intents browser suite above exercises fixture-backed continuation.
+[Trust-rule revocation delivery tests](../../server/src/__tests__/tool-trust-rule-revocation-delivery.test.ts) exercise immediate exact-request rechecks, narrowing, rollback of both audits, and grant/revoke races on real PostgreSQL; they do not verify provider calls.
 
 Manual: ask an agent to use an unavailable app, open its request as the named
 user, and complete setup in the dialog. Verify the card settles, the exact task
