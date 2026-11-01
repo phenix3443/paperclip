@@ -3161,17 +3161,21 @@ export function createPluginWorkerHandle(
   }
 
   function scheduleRestart(): void {
+    const token = startToken;
     const delay = computeBackoffMs();
     nextRestartAt = Date.now() + delay;
 
     setStatus("backoff");
+    if (token !== startToken) {
+      nextRestartAt = null;
+      return;
+    }
 
     log.info(
       { delayMs: delay, consecutiveCrashes },
       "scheduling restart with backoff",
     );
 
-    const token = startToken;
     backoffTimer = setTimeout(async () => {
       backoffTimer = null;
       nextRestartAt = null;

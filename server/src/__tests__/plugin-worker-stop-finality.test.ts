@@ -286,6 +286,36 @@ describe("plugin worker stop finality", () => {
     expect(gate.spawned()).toBe(1);
   });
 
+  it.each(["stop", "revoke"] as const)("a %s issued from the backoff status callback leaves no retry", async (action) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const gate = await createGate();
+    closeGate = gate.close;
+    manager = createPluginWorkerManager();
+    const workers = manager;
+    const handle = await workers.startWorker("gated.plugin", startOptions(gate.socketPath, ""));
+    let stopping: Promise<void> | null = null;
+    const backedOff = new Promise<void>((resolve) => {
+      handle.on("status", ({ status }) => {
+        if (status !== "backoff") return;
+        if (action === "stop") stopping ??= workers.stopWorker("gated.plugin");
+        else workers.revokeStarts!("gated.plugin");
+        resolve();
+      });
+    });
+
+    gate.crash();
+    await backedOff;
+    await stopping;
+    expect(handle.diagnostics().nextRestartAt).toBeNull();
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(handle.status).toBe(action === "stop" ? "stopped" : "crashed");
+    expect(handle.diagnostics().pid).toBeNull();
+    expect(handle.diagnostics().nextRestartAt).toBeNull();
+    expect(workers.getWorker("gated.plugin") !== undefined).toBe(action === "revoke");
+    expect(gate.spawned()).toBe(1);
+  });
+
   it("N7e: normal crash recovery still restarts the worker", async () => {
     const { gate, handle } = await startThenCrash("");
     expect(handle.status).toBe("backoff");
