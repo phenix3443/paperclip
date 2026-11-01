@@ -245,7 +245,7 @@ describe("detached repository custody", () => {
     if (rolledBack) expect(git(base, "worktree", "list", "--porcelain")).not.toContain("locked");
   });
 
-  it.each(["before_rename", "after_rename", "after_lock", "during_rollback"])("recovers a real process crash %s", async crash => {
+  it.each(["before_rename", "after_rename", "after_lock", "during_rollback", "before_reverse_rename"])("recovers a real process crash %s", async crash => {
     const base = path.join(root, "base"); await fs.rename(source, base);
     git(base, "worktree", "add", "-qb", "paperclip/123456789abc/private", source);
     await fs.writeFile(path.join(source, "tracked"), "private work");
@@ -256,6 +256,7 @@ import { existsSync } from "node:fs";
       const source = ${JSON.stringify(source)}, crash = ${JSON.stringify(crash)};
       const rename = fs.rename.bind(fs), open = fs.open.bind(fs);
       fs.rename = async (from, to) => {
+        if (crash === "before_reverse_rename" && to === source) process.kill(process.pid, "SIGKILL");
         if (crash === "before_rename" && from === source) process.kill(process.pid, "SIGKILL");
         await rename(from, to);
         if (crash === "after_rename" && from === source || crash === "during_rollback" && to === source) process.kill(process.pid, "SIGKILL");
@@ -268,7 +269,7 @@ import { existsSync } from "node:fs";
       let checks = 0;
       await preserveDetachedRepositories({ cwd: ${JSON.stringify(cwd)}, active: new Set(), retention: {
         companyId: "company", executionWorkspaceId: "workspace", withLifecycleLock: async work => work(async () => {
-          if (crash === "during_rollback" && ++checks === 3) throw new Error("queued run");
+          if (["during_rollback", "before_reverse_rename"].includes(crash) && ++checks === 3) throw new Error("queued run");
         }) } });
       process.exitCode = 2;
     `;
@@ -278,9 +279,10 @@ import { existsSync } from "node:fs";
     expect(child.signal, child.stderr).toBe("SIGKILL");
     const pending = await receipt(); expect(pending.value.state).toBe("pending");
     const history = pending.value.history;
-    expect(await preserveDetachedRepositories({ cwd, active: new Set(), retention: scope })).toEqual([]);
+    const warnings = await preserveDetachedRepositories({ cwd, active: new Set(), retention: scope });
+    expect(warnings.length).toBe(crash === "before_reverse_rename" ? 1 : 0);
     const { value } = await receipt();
-    expect(value.state).toBe(crash === "before_rename" ? "aborted" : crash === "during_rollback" ? "rolled_back" : "retained");
+    expect(value.state).toBe(crash === "before_rename" ? "aborted" : crash === "during_rollback" ? "rolled_back" : crash === "before_reverse_rename" ? "rollback_failed" : "retained");
     expect(value.history.slice(0, history.length)).toEqual(history);
     const location = ["before_rename", "during_rollback"].includes(crash) ? source : value.destination;
     expect((await fs.stat(location)).ino).toBe(inode);

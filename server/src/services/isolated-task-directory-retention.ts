@@ -1,4 +1,5 @@
-import { assertWorkspaceRetentionAllowsRemoval } from "./detached-repository-retention-guard.js";
+import { inspectLocalDetachedRepositories } from "./detached-repository-retention.js";
+import { assertWorkspaceRetentionAllowsRemoval, DetachedRepositoryRetentionBlocksRemoval } from "./detached-repository-retention-guard.js";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -509,6 +510,10 @@ async function inspectTaskDirectoryFolder(db: Db, companyId: string, name: strin
       const current = await folderRows(db, folder);
       if (current.some(row => !["archived", "cleanup_failed"].includes(row.status) || row.closedAt === null)) throw new Error("live_workspace");
       for (const workspace of current) await assertWorkspaceRetentionAllowsRemoval(db, workspace);
+      if (!current.some(workspace => workspace.cwd === folder || workspace.providerRef === folder)) {
+        const reasons = await inspectLocalDetachedRepositories(folder);
+        if (reasons.length) throw new DetachedRepositoryRetentionBlocksRemoval(reasons);
+      }
       if (current.some(row => hasPendingTaskDirectoryRetention(row))) throw new Error("retention_pending");
       const [currentIssue] = await db.select({ executionWorkspaceId: issues.executionWorkspaceId }).from(issues)
         .where(and(eq(issues.companyId, companyId), eq(issues.id, name)));

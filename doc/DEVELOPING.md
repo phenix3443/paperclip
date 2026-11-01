@@ -2105,8 +2105,8 @@ custody and pending-receipt recovery, and `detached-repository-retention-guard.t
 for the shared destructive-path refusal. Preparation holds source, lifecycle,
 then nested-base locks; reopen reuses its transaction. Lifecycle generation and
 reopen-pending readers live in `execution-workspace-lifecycle-state.ts` and remain
-exported from the workspace service. Retention history causes no background scan
-or removal deadline. See [the retention contract](detached-repository-retention.md).
+exported from the workspace service. Receipt reconciliation runs only during normal workspace preparation; this fix
+adds no background job. See [the retention contract](detached-repository-retention.md).
 
 Run preparation is in `server/src/services/heartbeat/run-preparation.ts`. It owns
 issue and wake context, responsible-user resolution, routine environment snapshots,

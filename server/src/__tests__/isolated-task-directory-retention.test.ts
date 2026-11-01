@@ -156,7 +156,7 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
     return { companyId, issueId, workspaceId, agentId, cwd, row, ledger, service, expire, reopen };
   }
 
-  it.each(["running_before", "issue_column_before", "queued_during", "archive_first", "generation_before", "reopen_pending", "live_service", "move_first", "two_preparations"])("serializes detached retention with native consumers (%s)", async scenario => {
+  it.each(["running_before", "issue_column_before", "native_peer_before", "queued_during", "archive_first", "generation_before", "reopen_pending", "live_service", "move_first", "two_preparations"])("serializes detached retention with native consumers (%s)", async scenario => {
     const f = await fixture();
     const source = path.join(f.cwd, ".paperclip-repositories", "removed"); await fs.mkdir(source, { recursive: true });
     await fs.writeFile(path.join(source, "unique"), "keep");
@@ -165,6 +165,11 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
       nativeIssueId: f.issueId, status: "running" });
     if (scenario === "issue_column_before") await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.agentId,
       issueId: f.issueId, status: "running" });
+    if (scenario === "native_peer_before") {
+      const peer = randomUUID(); await db.insert(issues).values({ id: peer, companyId: f.companyId, title: "Workspace peer",
+        executionWorkspaceId: f.workspaceId, status: "in_progress" });
+      await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.agentId, nativeIssueId: peer, status: "queued" });
+    }
     if (scenario === "archive_first") await f.service().archiveWorkspaceUnderLifecycleLock({ id: f.workspaceId, closedAt: new Date(), patch: { status: "archived" } });
     if (scenario === "generation_before" || scenario === "reopen_pending") await db.update(executionWorkspaces).set({ metadata: {
       ...(await f.row()).metadata, ...(scenario === "generation_before" ? { lifecycleGeneration: 1 } : { reopenPendingConsumption: true }) } })
@@ -204,7 +209,7 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
     } else await prepare(false);
     const directory = resolveDetachedRepositoryRetentionDir({ companyId: f.companyId, executionWorkspaceId: f.workspaceId });
     const files = (await fs.readdir(directory)).filter(name => name.endsWith(".json"));
-    if (["running_before", "issue_column_before", "archive_first", "generation_before", "reopen_pending", "live_service"].includes(scenario)) { expect(files).toEqual([]); expect(await fs.readFile(path.join(source, "unique"), "utf8")).toBe("keep"); }
+    if (["running_before", "issue_column_before", "native_peer_before", "archive_first", "generation_before", "reopen_pending", "live_service"].includes(scenario)) { expect(files).toEqual([]); expect(await fs.readFile(path.join(source, "unique"), "utf8")).toBe("keep"); }
     else {
       expect(files).toHaveLength(1);
       const receipt = JSON.parse(await fs.readFile(path.join(directory, files[0]!), "utf8"));
@@ -474,6 +479,16 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
       await age(cwd, new Date(Date.now() - (options.modifiedDaysAgo ?? 10) * DAY_MS));
       return { companyId, issueId, cwd };
     }
+
+    it.each(["refused", "legacy"])("keeps orphan %s retention content without a native row", async kind => {
+      const o = await orphan();
+      const directory = path.join(o.cwd, kind === "refused" ? ".paperclip-repositories" : ".paperclip-runtime/detached-repositories");
+      await fs.mkdir(path.join(directory, "kept"), { recursive: true }); await fs.writeFile(path.join(directory, "kept", "unique"), "orphan bytes");
+      await age(o.cwd, new Date(Date.now() - 10 * DAY_MS));
+      const batch = await sweep();
+      expect(batch.results).toMatchObject([{ issueId: o.issueId, outcome: "skipped", reason: "detached_repository_retention" }]);
+      expect(await fs.readFile(path.join(directory, "kept", "unique"), "utf8")).toBe("orphan bytes");
+    });
 
     it("removes an orphan whose issue is gone after the grace period", async () => {
       const o = await orphan();

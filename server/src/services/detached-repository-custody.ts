@@ -192,6 +192,7 @@ async function reconcile(file: string, receipt: Receipt, guard: () => Promise<vo
   const ours = (entry: Awaited<ReturnType<typeof stat>>) => entry?.isDirectory() && !entry.isSymbolicLink() && entry.dev === receipt.dev && entry.ino === receipt.ino;
   if (source && destination) return transition(file, receipt, "conflict");
   if (ours(destination)) {
+    if (receipt.rollbackStartedAt) return transition(file, receipt, "rollback_failed", "Rollback was interrupted before the original checkout was restored");
     if (receipt.base) {
       try { await proveReceiptLinkedAdministration(receipt, receipt.destination); }
       catch (error) { return transition(file, receipt, "unknown", error); }
