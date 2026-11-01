@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import type { PluginStatus } from "@paperclipai/shared";
 import { HttpError } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import type { PluginLoader } from "./plugin-loader.js";
@@ -52,6 +53,14 @@ export class PluginLifecycleBusyError extends HttpError {
   }
 }
 
+export class PluginActivationError extends Error {
+  readonly code = "plugin_activation_failed";
+  constructor(message: string) {
+    super(message);
+    this.name = "PluginActivationError";
+  }
+}
+
 export class LeaseReleasedError extends Error {
   constructor(pluginKey: string) {
     super(`Lifecycle lease for plugin ${pluginKey} was already released`);
@@ -64,6 +73,47 @@ export class LeaseKeyMismatchError extends Error {
     super(`Lifecycle lease for plugin ${leaseKey} cannot be used for plugin ${targetKey}`);
     this.name = "LeaseKeyMismatchError";
   }
+}
+
+export interface PluginLifecycleEventGeneration {
+  epoch?: number;
+  kind?: PluginLifecycleOpKind;
+}
+
+export interface PluginLifecycleEvents {
+  /** Emitted after a plugin is loaded (installed → ready). */
+  "plugin.loaded": { pluginId: string; pluginKey: string } & PluginLifecycleEventGeneration;
+  /** Emitted after a plugin transitions to ready (enabled). */
+  "plugin.enabled": { pluginId: string; pluginKey: string } & PluginLifecycleEventGeneration;
+  /** Emitted after a plugin is disabled (ready → disabled). */
+  "plugin.disabled": { pluginId: string; pluginKey: string; reason?: string } & PluginLifecycleEventGeneration;
+  /** Emitted after a plugin is unloaded (any → uninstalled). */
+  "plugin.unloaded": { pluginId: string; pluginKey: string; removeData: boolean } & PluginLifecycleEventGeneration;
+  /** Emitted on any status change. */
+  "plugin.status_changed": {
+    pluginId: string;
+    pluginKey: string;
+    previousStatus: PluginStatus;
+    newStatus: PluginStatus;
+  } & PluginLifecycleEventGeneration;
+  /** Emitted when a plugin enters an error state. */
+  "plugin.error": { pluginId: string; pluginKey: string; error: string } & PluginLifecycleEventGeneration;
+  /** Emitted when a plugin enters upgrade_pending. */
+  "plugin.upgrade_pending": { pluginId: string; pluginKey: string } & PluginLifecycleEventGeneration;
+  /** Emitted when a plugin worker process has been started. */
+  "plugin.worker_started": { pluginId: string; pluginKey: string } & PluginLifecycleEventGeneration;
+  /** Emitted when a plugin worker process has been stopped. */
+  "plugin.worker_stopped": { pluginId: string; pluginKey: string } & PluginLifecycleEventGeneration;
+}
+
+export interface PluginLifecycleOpOptions {
+  lease?: PluginLifecycleLease;
+  deadlineAt?: number;
+}
+
+export interface PluginLifecycleExclusiveOptions {
+  deadlineAt?: number;
+  pluginId?: () => string | undefined;
 }
 
 export interface PluginLoadOptions {

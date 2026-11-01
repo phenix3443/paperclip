@@ -47,20 +47,26 @@ import type { PluginWorkerManager, WorkerStartOptions } from "./plugin-worker-ma
 import { badRequest, notFound } from "../errors.js";
 import { PluginTeardownError } from "./plugin-teardown-error.js";
 import { logger } from "../middleware/logger.js";
+import { createPluginLifecycleIsolation, type PluginQuiesceTarget } from "./plugin-lifecycle-isolation.js";
 import {
   DEFAULT_PLUGIN_LIFECYCLE_RESPONSE_DEADLINE_MS,
   LeaseKeyMismatchError,
-  PluginLifecycleFencedError,
+  PluginActivationError,
   pluginLifecycleSharedFor,
-  type PluginLifecycleRunOptions,
+  type PluginLifecycleEventGeneration,
+  type PluginLifecycleEvents,
+  type PluginLifecycleExclusiveOptions,
   type PluginLifecycleLease,
+  type PluginLifecycleOpOptions,
   type PluginLifecycleOpKind,
   type PluginLifecycleTimings,
   type PluginLoadOptions,
   type PluginRestartOptions,
   type PluginRestartResult,
 } from "./plugin-lifecycle-shared.js";
-export type { PluginLoadOptions, PluginRestartOptions, PluginRestartResult };
+export { PluginActivationError };
+export type { PluginLifecycleEventGeneration, PluginLifecycleEvents, PluginLifecycleExclusiveOptions };
+export type { PluginLifecycleOpOptions, PluginLoadOptions, PluginRestartOptions, PluginRestartResult };
 
 const invalidTransition = (message: string) => badRequest(message, { code: "invalid_transition" });
 
@@ -108,14 +114,6 @@ function isValidTransition(from: PluginStatus, to: PluginStatus): boolean {
   return VALID_TRANSITIONS[from]?.includes(to) ?? false;
 }
 
-export class PluginActivationError extends Error {
-  readonly code = "plugin_activation_failed";
-  constructor(message: string) {
-    super(message);
-    this.name = "PluginActivationError";
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Lifecycle events
 // ---------------------------------------------------------------------------
@@ -125,37 +123,6 @@ export class PluginActivationError extends Error {
  * Consumers can subscribe to these for routing-table updates, UI refresh
  * notifications, and observability.
  */
-export interface PluginLifecycleEventGeneration {
-  epoch?: number;
-  kind?: PluginLifecycleOpKind;
-}
-
-export interface PluginLifecycleEvents {
-  /** Emitted after a plugin is loaded (installed → ready). */
-  "plugin.loaded": { pluginId: string; pluginKey: string } & PluginLifecycleEventGeneration;
-  /** Emitted after a plugin transitions to ready (enabled). */
-  "plugin.enabled": { pluginId: string; pluginKey: string } & PluginLifecycleEventGeneration;
-  /** Emitted after a plugin is disabled (ready → disabled). */
-  "plugin.disabled": { pluginId: string; pluginKey: string; reason?: string } & PluginLifecycleEventGeneration;
-  /** Emitted after a plugin is unloaded (any → uninstalled). */
-  "plugin.unloaded": { pluginId: string; pluginKey: string; removeData: boolean } & PluginLifecycleEventGeneration;
-  /** Emitted on any status change. */
-  "plugin.status_changed": {
-    pluginId: string;
-    pluginKey: string;
-    previousStatus: PluginStatus;
-    newStatus: PluginStatus;
-  } & PluginLifecycleEventGeneration;
-  /** Emitted when a plugin enters an error state. */
-  "plugin.error": { pluginId: string; pluginKey: string; error: string } & PluginLifecycleEventGeneration;
-  /** Emitted when a plugin enters upgrade_pending. */
-  "plugin.upgrade_pending": { pluginId: string; pluginKey: string } & PluginLifecycleEventGeneration;
-  /** Emitted when a plugin worker process has been started. */
-  "plugin.worker_started": { pluginId: string; pluginKey: string } & PluginLifecycleEventGeneration;
-  /** Emitted when a plugin worker process has been stopped. */
-  "plugin.worker_stopped": { pluginId: string; pluginKey: string } & PluginLifecycleEventGeneration;
-}
-
 type LifecycleEventName = keyof PluginLifecycleEvents;
 type LifecycleEventPayload<K extends LifecycleEventName> = PluginLifecycleEvents[K];
 
@@ -163,15 +130,6 @@ type LifecycleEventPayload<K extends LifecycleEventName> = PluginLifecycleEvents
 // PluginLifecycleManager
 // ---------------------------------------------------------------------------
 
-export interface PluginLifecycleOpOptions {
-  lease?: PluginLifecycleLease;
-  deadlineAt?: number;
-}
-
-export interface PluginLifecycleExclusiveOptions {
-  deadlineAt?: number;
-  pluginId?: () => string | undefined;
-}
 
 export interface PluginLifecycleManager {
   /**
@@ -473,81 +431,30 @@ export function pluginLifecycleManager(
     shared.emitAtRelease(op.lease, event, { ...payload, epoch: shared.currentEpoch(payload.pluginId), kind: op.kind });
   }
 
-  function fence(pluginId: string, reason: string): void {
-    shared.fenced.set(pluginId, reason);
-    shared.quiesced.add(pluginId);
-    workerManager?.revokeStarts?.(pluginId);
-    log.warn({ pluginId, reason }, "plugin lifecycle: plugin fenced");
-  }
-
-  function assertNotFenced(pluginId: string, pluginKey: string): void {
-    const reason = shared.fenced.get(pluginId);
-    if (reason !== undefined) throw new PluginLifecycleFencedError(pluginKey, reason);
-  }
-
-  function expiryHooks(
-    getPluginId: () => string | undefined,
-    kind: PluginLifecycleOpKind,
-  ): Pick<PluginLifecycleRunOptions, "onExpire" | "expiryCleanup"> {
-    let expiryStop: Promise<unknown> = Promise.resolve(null);
-    return {
-      onExpire() {
-        const pluginId = getPluginId();
-        if (!pluginId) return;
-        workerManager?.revokeStarts?.(pluginId);
-        shared.quiesced.add(pluginId);
-        shared.bumpEpoch(pluginId);
-        shared.withdraw(pluginId);
-        if (workerManager?.getWorker(pluginId)) {
-          expiryStop = workerManager.stopWorker(pluginId).then(() => null, (err: unknown) => err);
-        }
-      },
-      async expiryCleanup(lease, bodyError) {
-        const pluginId = getPluginId();
-        if (!pluginId) return;
-        const failures: unknown[] = [];
-        const stopError = await expiryStop;
-        if (stopError) failures.push(stopError);
-        const plugin = await registry.getById(pluginId).catch((err: unknown) => {
-          failures.push(err);
-          return null;
-        });
-        if (plugin) {
-          const op: LifecycleOp = { lease, kind: "Q" };
-          if (kind !== "Q" && isValidTransition(plugin.status, "error")) {
-            await runOp(pluginId, "Q", { lease }, async () => {
-              const teardownError = await tryDeactivatePluginRuntime(pluginId, plugin.pluginKey, op);
-              if (teardownError) failures.push(teardownError);
-              await transition(pluginId, "error", "lifecycle deadline expired", plugin, op);
-              emitDomain("plugin.error", { pluginId, pluginKey: plugin.pluginKey, error: "lifecycle deadline expired" }, op);
-            }).catch((err: unknown) => failures.push(err));
-          } else {
-            const teardownError = await tryDeactivatePluginRuntime(pluginId, plugin.pluginKey, op);
-            if (teardownError) failures.push(teardownError);
-            if (kind === "Q" && bodyError) failures.push(bodyError);
-          }
-        }
-        if (failures.length > 0) {
-          fence(pluginId, "lifecycle deadline expired and cleanup failed");
-          log.error({ pluginId, failures }, "plugin lifecycle: expiry cleanup failed");
-        } else {
-          shared.quiesced.add(pluginId);
-        }
-      },
-    };
-  }
+  const isolation = createPluginLifecycleIsolation({
+    shared,
+    workerManager,
+    log,
+    getPlugin: async (pluginId) => (await registry.getById(pluginId)) as PluginRecord | null,
+    deactivate: (pluginId, pluginKey, lease) => deactivatePluginRuntime(pluginId, pluginKey, { lease, kind: "Q" }),
+    async markExpired(pluginId, plugin, lease) {
+      const op: LifecycleOp = { lease, kind: "Q" };
+      await transition(pluginId, "error", "lifecycle deadline expired", plugin, op);
+      emitDomain("plugin.error", { pluginId, pluginKey: plugin.pluginKey, error: "lifecycle deadline expired" }, op);
+    },
+  });
 
   function exclusive<T>(
     pluginKey: string,
     kind: PluginLifecycleOpKind,
     fn: (lease: PluginLifecycleLease) => Promise<T>,
-    options?: PluginLifecycleExclusiveOptions,
+    options?: PluginLifecycleExclusiveOptions & { quiesceTarget?: PluginQuiesceTarget },
   ): Promise<T> {
     const getPluginId = options?.pluginId;
     return shared.exclusive(pluginKey, kind, fn, {
       queueWaitMs: lifecycleTimings?.queueWaitMs,
       deadlineAt: options?.deadlineAt,
-      ...(getPluginId ? expiryHooks(getPluginId, kind) : {}),
+      ...(getPluginId ? isolation.expiryHooks(getPluginId, kind, options?.quiesceTarget) : {}),
     });
   }
 
@@ -556,6 +463,7 @@ export function pluginLifecycleManager(
     kind: PluginLifecycleOpKind,
     options: PluginLifecycleOpOptions | undefined,
     body: (op: LifecycleOp) => Promise<T>,
+    quiesceTarget?: PluginQuiesceTarget,
   ): Promise<T> {
     const lease = options?.lease;
     if (lease) {
@@ -563,14 +471,14 @@ export function pluginLifecycleManager(
       else lease.assertActive();
       const target = await requirePlugin(pluginId);
       if (target.pluginKey !== lease.pluginKey) throw new LeaseKeyMismatchError(lease.pluginKey, target.pluginKey);
-      if (kind === "A") assertNotFenced(pluginId, target.pluginKey);
+      if (kind === "A") isolation.assertNotFenced(pluginId, target.pluginKey);
       return body({ lease, kind });
     }
     const plugin = await requirePlugin(pluginId);
     return exclusive(plugin.pluginKey, kind, (granted) => {
-      if (kind === "A") assertNotFenced(pluginId, plugin.pluginKey);
+      if (kind === "A") isolation.assertNotFenced(pluginId, plugin.pluginKey);
       return body({ lease: granted, kind });
-    }, { deadlineAt: options?.deadlineAt, pluginId: () => pluginId });
+    }, { deadlineAt: options?.deadlineAt, pluginId: () => pluginId, quiesceTarget });
   }
 
   function beginQuiescence(pluginId: string, op: LifecycleOp): void {
@@ -636,34 +544,6 @@ export function pluginLifecycleManager(
     }
 
     await stopWorkerIfRunning(pluginId, pluginKey, op);
-  }
-
-  async function tryDeactivatePluginRuntime(
-    pluginId: string,
-    pluginKey: string,
-    op: LifecycleOp,
-  ): Promise<unknown> {
-    try {
-      await deactivatePluginRuntime(pluginId, pluginKey, op);
-    } catch (err) {
-      return err ?? new Error(`Failed to deactivate plugin ${pluginKey}`);
-    }
-    if (workerManager?.getWorker(pluginId)) {
-      return new Error(`Worker for plugin ${pluginKey} is still registered after teardown`);
-    }
-    return null;
-  }
-
-  async function quiesceRuntime(
-    pluginId: string,
-    pluginKey: string,
-    op: LifecycleOp,
-  ): Promise<unknown> {
-    const teardownError = await tryDeactivatePluginRuntime(pluginId, pluginKey, op);
-    if (teardownError) {
-      fence(pluginId, teardownError instanceof Error ? teardownError.message : String(teardownError));
-    }
-    return teardownError;
   }
 
   // -----------------------------------------------------------------------
@@ -745,7 +625,7 @@ export function pluginLifecycleManager(
         }
 
         beginQuiescence(pluginId, op);
-        const teardownError = await quiesceRuntime(pluginId, plugin.pluginKey, op);
+        const teardownError = await isolation.quiesceRuntime(pluginId, plugin.pluginKey, op.lease);
         if (plugin.status === "disabled") {
           if (teardownError) throw new PluginTeardownError(plugin.pluginKey, teardownError);
           shared.fenced.delete(pluginId);
@@ -757,6 +637,8 @@ export function pluginLifecycleManager(
         if (teardownError) throw new PluginTeardownError(plugin.pluginKey, teardownError);
         shared.fenced.delete(pluginId);
         return result;
+      }, async (plugin, lease) => {
+        if (plugin.status === "ready") await transition(pluginId, "disabled", reason ?? null, plugin, { lease, kind: "Q" });
       });
     },
 
@@ -783,13 +665,13 @@ export function pluginLifecycleManager(
             shared.fenced.delete(pluginId);
             return deleted as PluginRecord | null;
           }
-          const teardownError = await quiesceRuntime(pluginId, plugin.pluginKey, op);
+          const teardownError = await isolation.quiesceRuntime(pluginId, plugin.pluginKey, op.lease);
           if (teardownError) throw new PluginTeardownError(plugin.pluginKey, teardownError);
           shared.fenced.delete(pluginId);
           return plugin;
         }
 
-        const teardownError = await quiesceRuntime(pluginId, plugin.pluginKey, op);
+        const teardownError = await isolation.quiesceRuntime(pluginId, plugin.pluginKey, op.lease);
         if (teardownError && removeData) throw teardownError;
         if (!teardownError) await pluginLoaderInstance.cleanupInstallArtifacts(plugin);
 
@@ -811,6 +693,8 @@ export function pluginLifecycleManager(
         if (teardownError) throw new PluginTeardownError(plugin.pluginKey, teardownError);
         shared.fenced.delete(pluginId);
         return result as PluginRecord | null;
+      }, removeData ? undefined : async (plugin) => {
+        if (plugin.status !== "uninstalled") await registry.uninstall(pluginId, false);
       });
     },
 
@@ -826,7 +710,7 @@ export function pluginLifecycleManager(
         // because we are intentionally taking the plugin offline.
         const plugin = await requirePlugin(pluginId);
         beginQuiescence(pluginId, op);
-        const teardownError = await quiesceRuntime(pluginId, plugin.pluginKey, op);
+        const teardownError = await isolation.quiesceRuntime(pluginId, plugin.pluginKey, op.lease);
 
         const result = await transition(pluginId, "error", error, plugin, op);
         emitDomain("plugin.error", { pluginId, pluginKey: result.pluginKey, error }, op);
