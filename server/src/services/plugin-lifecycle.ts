@@ -46,6 +46,7 @@ import { pluginRegistryService } from "./plugin-registry.js";
 import { pluginLoader, type PluginLoader } from "./plugin-loader.js";
 import type { PluginWorkerManager, WorkerStartOptions } from "./plugin-worker-manager.js";
 import { badRequest, notFound } from "../errors.js";
+import { PluginTeardownError } from "./plugin-teardown-error.js";
 import { logger } from "../middleware/logger.js";
 
 // ---------------------------------------------------------------------------
@@ -399,19 +400,11 @@ export function pluginLifecycleManager(
     pluginId: string,
     pluginKey: string,
   ): Promise<void> {
-    if (!workerManager) return;
-    if (!workerManager.isRunning(pluginId) && !workerManager.getWorker(pluginId)) return;
+    if (!workerManager?.getWorker(pluginId)) return;
 
-    try {
-      await workerManager.stopWorker(pluginId);
-      log.info({ pluginId, pluginKey }, "plugin lifecycle: worker stopped");
-      emitDomain("plugin.worker_stopped", { pluginId, pluginKey });
-    } catch (err) {
-      log.warn(
-        { pluginId, pluginKey, err: err instanceof Error ? err.message : String(err) },
-        "plugin lifecycle: failed to stop worker (best-effort)",
-      );
-    }
+    await workerManager.stopWorker(pluginId);
+    log.info({ pluginId, pluginKey }, "plugin lifecycle: worker stopped");
+    emitDomain("plugin.worker_stopped", { pluginId, pluginKey });
   }
 
   async function activateReadyPlugin(pluginId: string): Promise<void> {
@@ -445,6 +438,18 @@ export function pluginLifecycleManager(
     }
 
     await stopWorkerIfRunning(pluginId, pluginKey);
+  }
+
+  async function tryDeactivatePluginRuntime(
+    pluginId: string,
+    pluginKey: string,
+  ): Promise<unknown> {
+    try {
+      await deactivatePluginRuntime(pluginId, pluginKey);
+      return null;
+    } catch (err) {
+      return err ?? new Error(`Failed to deactivate plugin ${pluginKey}`);
+    }
   }
 
   // -----------------------------------------------------------------------
@@ -520,7 +525,7 @@ export function pluginLifecycleManager(
         );
       }
 
-      await deactivatePluginRuntime(pluginId, plugin.pluginKey);
+      const teardownError = await tryDeactivatePluginRuntime(pluginId, plugin.pluginKey);
 
       const result = await transition(pluginId, "disabled", reason ?? null, plugin);
       emitDomain("plugin.disabled", {
@@ -528,6 +533,7 @@ export function pluginLifecycleManager(
         pluginKey: result.pluginKey,
         reason,
       });
+      if (teardownError) throw new PluginTeardownError(plugin.pluginKey, teardownError);
       return result;
     },
 
@@ -541,6 +547,7 @@ export function pluginLifecycleManager(
       // If already uninstalled and removeData, hard-delete
       if (plugin.status === "uninstalled") {
         if (removeData) {
+          await deactivatePluginRuntime(pluginId, plugin.pluginKey);
           await pluginLoaderInstance.cleanupInstallArtifacts(plugin);
           const deleted = await registry.uninstall(pluginId, true);
           log.info(
@@ -560,8 +567,9 @@ export function pluginLifecycleManager(
         );
       }
 
-      await deactivatePluginRuntime(pluginId, plugin.pluginKey);
-      await pluginLoaderInstance.cleanupInstallArtifacts(plugin);
+      const teardownError = await tryDeactivatePluginRuntime(pluginId, plugin.pluginKey);
+      if (teardownError && removeData) throw teardownError;
+      if (!teardownError) await pluginLoaderInstance.cleanupInstallArtifacts(plugin);
 
       // Perform the uninstall via registry (handles soft/hard delete)
       const result = await registry.uninstall(pluginId, removeData);
@@ -583,6 +591,7 @@ export function pluginLifecycleManager(
         pluginKey: plugin.pluginKey,
         removeData,
       });
+      if (teardownError) throw new PluginTeardownError(plugin.pluginKey, teardownError);
 
       return result as PluginRecord | null;
     },
@@ -593,7 +602,7 @@ export function pluginLifecycleManager(
       // continue running. The worker manager's auto-restart is disabled
       // because we are intentionally taking the plugin offline.
       const plugin = await requirePlugin(pluginId);
-      await deactivatePluginRuntime(pluginId, plugin.pluginKey);
+      const teardownError = await tryDeactivatePluginRuntime(pluginId, plugin.pluginKey);
 
       const result = await transition(pluginId, "error", error, plugin);
       emitDomain("plugin.error", {
@@ -601,6 +610,7 @@ export function pluginLifecycleManager(
         pluginKey: result.pluginKey,
         error,
       });
+      if (teardownError) throw teardownError;
       return result;
     },
 
