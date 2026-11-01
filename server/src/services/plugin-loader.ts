@@ -51,6 +51,7 @@ import type { PluginJobScheduler } from "./plugin-job-scheduler.js";
 import type { PluginJobStore } from "./plugin-job-store.js";
 import type { PluginToolDispatcher } from "./plugin-tool-dispatcher.js";
 import type { PluginLifecycleManager } from "./plugin-lifecycle.js";
+import type { PluginLifecycleLease } from "./plugin-lifecycle-shared.js";
 import { pluginDatabaseService } from "./plugin-database.js";
 import { resolveBundledCatalogRoot } from "./bundled-plugins.js";
 
@@ -435,10 +436,13 @@ export interface PluginLoadSingleOptions {
    * torn down in this process.
    */
   markErrorOnFailure?: boolean;
+
+  lease?: PluginLifecycleLease;
 }
 
 interface PluginActivateOptions {
   markErrorOnFailure: boolean;
+  lease?: PluginLifecycleLease;
 }
 
 /**
@@ -539,6 +543,10 @@ export interface PluginLoader {
    * @see PLUGIN_SPEC.md §8.3 — Install Process
    */
   installPlugin(options: PluginInstallOptions): Promise<DiscoveredPlugin>;
+
+  prepareInstall(options: PluginInstallOptions): Promise<DiscoveredPlugin>;
+
+  persistInstall(discovered: DiscoveredPlugin): Promise<DiscoveredPlugin>;
 
   /**
    * Upgrade an already-installed plugin to a newer version.
@@ -1739,7 +1747,14 @@ export function pluginLoader(
     // -----------------------------------------------------------------------
 
     async installPlugin(installOptions: PluginInstallOptions): Promise<DiscoveredPlugin> {
-      const discovered = await fetchAndValidate(installOptions);
+      return this.persistInstall(await this.prepareInstall(installOptions));
+    },
+
+    prepareInstall(installOptions: PluginInstallOptions): Promise<DiscoveredPlugin> {
+      return fetchAndValidate(installOptions);
+    },
+
+    async persistInstall(discovered: DiscoveredPlugin): Promise<DiscoveredPlugin> {
       const manifest = discovered.manifest!;
 
       // Step 6: Persist install record and apply plugin-owned schema migrations
@@ -2087,7 +2102,7 @@ export function pluginLoader(
       // status) → activatePlugin(). We must NOT call activatePlugin() again here,
       // as that would double-start the worker and duplicate registrations.
       if (plugin.status === "installed") {
-        await runtimeServices.lifecycleManager.load(pluginId);
+        await runtimeServices.lifecycleManager.load(pluginId, { lease: options.lease });
         const updated = (await registry.getById(pluginId)) as PluginRecord | null;
         if (!updated) throw new Error(`Plugin not found after status update: ${pluginId}`);
         return {
@@ -2106,6 +2121,7 @@ export function pluginLoader(
 
       return activatePlugin(plugin, {
         markErrorOnFailure: options.markErrorOnFailure ?? true,
+        lease: options.lease,
       });
     },
 
@@ -2510,7 +2526,9 @@ export function pluginLoader(
         // lifecycle enable() path can revive it sooner by hand.
         // markError also deactivates the plugin runtime in this process.
         try {
-          await lifecycleManager.markError(pluginId, `Activation failed: ${errorMessage}`);
+          await lifecycleManager.markError(pluginId, `Activation failed: ${errorMessage}`, {
+            lease: options.lease,
+          });
         } catch (markErr) {
           log.error(
             {

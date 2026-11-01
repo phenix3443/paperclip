@@ -235,7 +235,6 @@ export function createPluginToolDispatcher(
   const registry = createPluginToolRegistry(workerManager);
 
   // Track lifecycle event listeners so we can remove them on teardown
-  let enabledListener: ((payload: { pluginId: string; pluginKey: string }) => void) | null = null;
   let disabledListener: ((payload: { pluginId: string; pluginKey: string; reason?: string }) => void) | null = null;
   let unloadedListener: ((payload: { pluginId: string; pluginKey: string; removeData: boolean }) => void) | null = null;
 
@@ -244,36 +243,6 @@ export function createPluginToolDispatcher(
   // -----------------------------------------------------------------------
   // Internal helpers
   // -----------------------------------------------------------------------
-
-  /**
-   * Attempt to register tools for a plugin by looking up its manifest
-   * from the DB. No-ops gracefully if the plugin or manifest is missing.
-   */
-  async function registerFromDb(pluginId: string): Promise<void> {
-    if (!db) {
-      log.warn(
-        { pluginId },
-        "cannot register tools from DB — no database connection configured",
-      );
-      return;
-    }
-
-    const pluginRegistry = pluginRegistryService(db);
-    const plugin = await pluginRegistry.getById(pluginId) as PluginRecord | null;
-
-    if (!plugin) {
-      log.warn({ pluginId }, "plugin not found in registry, cannot register tools");
-      return;
-    }
-
-    const manifest = plugin.manifestJson;
-    if (!manifest) {
-      log.warn({ pluginId }, "plugin has no manifest, cannot register tools");
-      return;
-    }
-
-    registry.registerPlugin(plugin.pluginKey, manifest, plugin.id);
-  }
 
   /**
    * Convert a `RegisteredTool` to an `AgentToolDescriptor`.
@@ -291,18 +260,6 @@ export function createPluginToolDispatcher(
   // -----------------------------------------------------------------------
   // Lifecycle event handlers
   // -----------------------------------------------------------------------
-
-  function handlePluginEnabled(payload: { pluginId: string; pluginKey: string }): void {
-    log.debug({ pluginId: payload.pluginId, pluginKey: payload.pluginKey }, "plugin enabled — registering tools");
-    // Async registration from DB — we fire-and-forget since the lifecycle
-    // event handler must be synchronous. Any errors are logged.
-    void registerFromDb(payload.pluginId).catch((err) => {
-      log.error(
-        { pluginId: payload.pluginId, err: err instanceof Error ? err.message : String(err) },
-        "failed to register tools after plugin enabled",
-      );
-    });
-  }
 
   function handlePluginDisabled(payload: { pluginId: string; pluginKey: string; reason?: string }): void {
     log.debug({ pluginId: payload.pluginId, pluginKey: payload.pluginKey }, "plugin disabled — unregistering tools");
@@ -334,6 +291,10 @@ export function createPluginToolDispatcher(
 
         let totalTools = 0;
         for (const plugin of readyPlugins) {
+          if (
+            lifecycleManager
+            && !lifecycleManager.isCurrentGeneration(plugin.id, lifecycleManager.currentEpoch(plugin.id))
+          ) continue;
           const manifest = plugin.manifestJson;
           if (manifest?.tools && manifest.tools.length > 0) {
             registry.registerPlugin(plugin.pluginKey, manifest, plugin.id);
@@ -349,11 +310,9 @@ export function createPluginToolDispatcher(
 
       // Step 2: Subscribe to lifecycle events for dynamic updates
       if (lifecycleManager) {
-        enabledListener = handlePluginEnabled;
         disabledListener = handlePluginDisabled;
         unloadedListener = handlePluginUnloaded;
 
-        lifecycleManager.on("plugin.enabled", enabledListener);
         lifecycleManager.on("plugin.disabled", disabledListener);
         lifecycleManager.on("plugin.unloaded", unloadedListener);
 
@@ -374,11 +333,9 @@ export function createPluginToolDispatcher(
 
       // Unsubscribe from lifecycle events
       if (lifecycleManager) {
-        if (enabledListener) lifecycleManager.off("plugin.enabled", enabledListener);
         if (disabledListener) lifecycleManager.off("plugin.disabled", disabledListener);
         if (unloadedListener) lifecycleManager.off("plugin.unloaded", unloadedListener);
 
-        enabledListener = null;
         disabledListener = null;
         unloadedListener = null;
       }

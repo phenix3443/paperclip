@@ -104,80 +104,7 @@ export function createPluginJobCoordinator(
   // -----------------------------------------------------------------------
 
   /**
-   * When a plugin is loaded (transitions to `ready`):
-   * 1. Look up the manifest from the registry
-   * 2. Sync job declarations from the manifest into the DB
-   * 3. Register the plugin with the scheduler (computes nextRunAt)
-   */
-  async function onPluginLoaded(payload: { pluginId: string; pluginKey: string }): Promise<void> {
-    const { pluginId, pluginKey } = payload;
-    log.info({ pluginId, pluginKey }, "plugin loaded — syncing jobs and registering with scheduler");
-
-    try {
-      // Get the manifest from the registry
-      const plugin = await registry.getById(pluginId);
-      if (!plugin?.manifestJson) {
-        log.warn({ pluginId, pluginKey }, "plugin loaded but no manifest found — skipping job sync");
-        return;
-      }
-
-      // Sync job declarations from the manifest
-      const manifest = plugin.manifestJson;
-      const jobDeclarations = manifest.jobs ?? [];
-
-      if (jobDeclarations.length > 0) {
-        log.info(
-          { pluginId, pluginKey, jobCount: jobDeclarations.length },
-          "syncing job declarations from manifest",
-        );
-      }
-      await jobStore.syncJobDeclarations(pluginId, jobDeclarations);
-
-      // Register with the scheduler (computes nextRunAt for active jobs)
-      await scheduler.registerPlugin(pluginId);
-    } catch (err) {
-      log.error(
-        {
-          pluginId,
-          pluginKey,
-          err: err instanceof Error ? err.message : String(err),
-        },
-        "failed to sync jobs or register plugin with scheduler",
-      );
-    }
-  }
-
-  /**
-   * When a plugin is disabled (transitions to `error` with "disabled by
-   * operator" or genuine error): unregister from the scheduler.
-   */
-  async function onPluginDisabled(payload: {
-    pluginId: string;
-    pluginKey: string;
-    reason?: string;
-  }): Promise<void> {
-    const { pluginId, pluginKey, reason } = payload;
-    log.info(
-      { pluginId, pluginKey, reason },
-      "plugin disabled — unregistering from scheduler",
-    );
-
-    try {
-      await scheduler.unregisterPlugin(pluginId);
-    } catch (err) {
-      log.error(
-        {
-          pluginId,
-          pluginKey,
-          err: err instanceof Error ? err.message : String(err),
-        },
-        "failed to unregister plugin from scheduler",
-      );
-    }
-  }
-
-  /**
-   * When a plugin is unloaded (uninstalled): unregister from the scheduler.
+   * When a plugin is purged: delete its job definitions and runs.
    */
   async function onPluginUnloaded(payload: {
     pluginId: string;
@@ -185,19 +112,11 @@ export function createPluginJobCoordinator(
     removeData: boolean;
   }): Promise<void> {
     const { pluginId, pluginKey, removeData } = payload;
-    log.info(
-      { pluginId, pluginKey, removeData },
-      "plugin unloaded — unregistering from scheduler",
-    );
+    if (!removeData) return;
 
     try {
-      await scheduler.unregisterPlugin(pluginId);
-
-      // If data is being purged, also delete all job definitions and runs
-      if (removeData) {
-        log.info({ pluginId, pluginKey }, "purging job data for uninstalled plugin");
-        await jobStore.deleteAllJobs(pluginId);
-      }
+      log.info({ pluginId, pluginKey }, "purging job data for uninstalled plugin");
+      await jobStore.deleteAllJobs(pluginId);
     } catch (err) {
       log.error(
         {
@@ -205,7 +124,7 @@ export function createPluginJobCoordinator(
           pluginKey,
           err: err instanceof Error ? err.message : String(err),
         },
-        "failed to unregister plugin from scheduler during unload",
+        "failed to purge job data during unload",
       );
     }
   }
@@ -220,12 +139,6 @@ export function createPluginJobCoordinator(
   // uses them for matching. We wrap the async handlers in sync wrappers
   // that fire-and-forget (swallowing unhandled rejections via the try/catch
   // inside each handler).
-  const boundOnLoaded = (payload: { pluginId: string; pluginKey: string }) => {
-    void onPluginLoaded(payload);
-  };
-  const boundOnDisabled = (payload: { pluginId: string; pluginKey: string; reason?: string }) => {
-    void onPluginDisabled(payload);
-  };
   const boundOnUnloaded = (payload: { pluginId: string; pluginKey: string; removeData: boolean }) => {
     void onPluginUnloaded(payload);
   };
@@ -239,8 +152,6 @@ export function createPluginJobCoordinator(
       if (attached) return;
       attached = true;
 
-      lifecycle.on("plugin.loaded", boundOnLoaded);
-      lifecycle.on("plugin.disabled", boundOnDisabled);
       lifecycle.on("plugin.unloaded", boundOnUnloaded);
 
       log.info("plugin job coordinator started — listening to lifecycle events");
@@ -250,8 +161,6 @@ export function createPluginJobCoordinator(
       if (!attached) return;
       attached = false;
 
-      lifecycle.off("plugin.loaded", boundOnLoaded);
-      lifecycle.off("plugin.disabled", boundOnDisabled);
       lifecycle.off("plugin.unloaded", boundOnUnloaded);
 
       log.info("plugin job coordinator stopped");
