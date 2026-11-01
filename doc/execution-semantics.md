@@ -1826,6 +1826,14 @@ inspect the matching decision under Recovery details, even when there is no
 active recovery action. Existing run inspection, verified continuation, new
 messages, and required-file repair remain the supported recovery paths.
 
+A pending review with an active `execution_review_participant_recovery` action
+cannot be restored by changing status alone. Resolving it as `restored` with
+`sourceIssueStatus=in_review` returns `409 recovery_review_continuation_unavailable`
+while no supported durable reviewer continuation exists. The refusal leaves the
+action, review history, dependencies, runs and issue revision unchanged and emits
+no activity or wake. Keep the action open for a bound reviewer continuation;
+this refusal does not itself recover the review.
+
 The board owns the recovery decision, not the source deliverable. Automatic recovery must preserve both source assignee fields. Only an explicit operator decision or applicable serious-failure policy may transfer the deliverable.
 
 An upgrade may encounter an already-active agent-owned recovery action. Paperclip keeps that record readable and resolvable for compatibility, but periodic reconciliation does not enqueue another takeover wake from it.

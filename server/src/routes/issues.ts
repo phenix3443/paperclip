@@ -10315,6 +10315,22 @@ export function issueRoutes(
           eq(issueRecoveryActions.sourceIssueId, lockedIssue.id),
           actionId ? eq(issueRecoveryActions.id, actionId) : inArray(issueRecoveryActions.status, ["active", "escalated"]),
         )).limit(1).for("update");
+        const recoveryReviewState = parseIssueExecutionState(lockedIssue.executionState);
+        if (
+          workspaceRepairAction?.cause === "execution_review_participant_recovery" &&
+          (workspaceRepairAction.status === "active" || workspaceRepairAction.status === "escalated") &&
+          outcome === "restored" &&
+          sourceIssueStatus === "in_review" &&
+          recoveryReviewState?.status === "pending" &&
+          recoveryReviewState.currentStageType === "review"
+        ) {
+          await requireRecoveryActionAuthority(req, lockedIssue, issueRecoveryActionReadModel(workspaceRepairAction),
+            { source: "recovery_action_resolution" });
+          throw conflict(
+            "Restoring this review would not dispatch the reviewer and would be reopened by the next recovery pass. Keep the recovery action open; a bound reviewer continuation is required.",
+            { code: "recovery_review_continuation_unavailable" },
+          );
+        }
         if (workspaceRepairAction && hasRequiredWorkspaceRecovery(workspaceRepairAction.evidence)) {
           if (admission) throw executionReconciliationRefusal("gate_closed:workspace", "Workspace repair is not an admission hand-back.");
           assertBoard(req);
