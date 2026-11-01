@@ -2082,6 +2082,12 @@ type IssueRelationSummaryMap = {
   blockedBy: IssueRelationIssueSummary[];
   blocks: IssueRelationIssueSummary[];
 };
+
+type ReadableIssueRelationOptions = {
+  readCondition: SQL<boolean> | undefined;
+  enrich?: (relations: IssueRelationSummaryMap) => Promise<IssueRelationSummaryMap>;
+};
+
 type IssueBlockerDiagnosticsIssueRow = {
   id: string;
   companyId: string;
@@ -2812,11 +2818,13 @@ async function listUnresolvedBlockerDetails(
   companyId: string,
   unresolvedBlockerIssueIds: string[],
   pendingFinalizeBlockerIssueIds: string[] = [],
+  proof?: { readCondition: SQL<boolean> | undefined; readableIds: Set<string> },
 ) {
   if (unresolvedBlockerIssueIds.length === 0) return [];
   const pendingFinalizeIds = new Set(pendingFinalizeBlockerIssueIds);
   const rows = await dbOrTx
     .select({
+      ...(proof ? { readable: sql<boolean>`${proof.readCondition ?? sql<boolean>`false`}` } : {}),
       issueId: issues.id,
       identifier: issues.identifier,
       title: issues.title,
@@ -2828,6 +2836,7 @@ async function listUnresolvedBlockerDetails(
         inArray(issues.id, unresolvedBlockerIssueIds),
       ),
     );
+  if (proof) for (const row of rows) if (row.readable === true) proof.readableIds.add(row.issueId);
   const rowsById = new Map(rows.map((row) => [row.issueId, row]));
   return unresolvedBlockerIssueIds.map((issueId) => {
     const row = rowsById.get(issueId);
@@ -3741,6 +3750,7 @@ async function terminalExplicitBlockersByRoot(
   companyId: string,
   roots: IssueRelationIssueSummary[],
   dbOrTx: DbReader,
+  proof?: { readCondition: SQL<boolean> | undefined; readableIds: Set<string> },
 ): Promise<Map<string, IssueRelationIssueSummary[]>> {
   const rootIds = [...new Set(roots.map((root) => root.id))];
   const terminalByRoot = new Map<string, IssueRelationIssueSummary[]>();
@@ -3763,6 +3773,7 @@ async function terminalExplicitBlockersByRoot(
     )) {
       const rows = await dbOrTx
         .select({
+          ...(proof ? { readable: sql<boolean>`${proof.readCondition ?? sql<boolean>`false`}` } : {}),
           currentIssueId: issueRelations.relatedIssueId,
           relatedId: issues.id,
           identifier: issues.identifier,
@@ -3785,6 +3796,7 @@ async function terminalExplicitBlockersByRoot(
         );
 
       for (const row of rows) {
+        if (proof && row.readable === true) proof.readableIds.add(row.relatedId);
         const existingEdges = edgesByIssueId.get(row.currentIssueId) ?? [];
         if (!existingEdges.includes(row.relatedId)) {
           existingEdges.push(row.relatedId);
@@ -7824,6 +7836,8 @@ export function issueService(db: Db) {
     companyId: string,
     issueIds: string[],
     dbOrTx: DbReader = db,
+    publicRead?: ReadableIssueRelationOptions,
+    readProof?: { readCondition: SQL<boolean> | undefined; readableIds: Set<string> },
   ): Promise<Map<string, IssueRelationSummaryMap>> {
     const uniqueIssueIds = [...new Set(issueIds)];
     const empty = new Map<string, IssueRelationSummaryMap>();
@@ -7832,9 +7846,14 @@ export function issueService(db: Db) {
     }
     if (uniqueIssueIds.length === 0) return empty;
 
+    const proof = readProof ?? (publicRead ? { ...publicRead, readableIds: new Set<string>() } : undefined);
+    const proofColumns = proof
+      ? { readable: sql<boolean>`${proof.readCondition ?? sql<boolean>`false`}` }
+      : {};
     const [blockedByRows, blockingRows] = await Promise.all([
       dbOrTx
         .select({
+          ...proofColumns,
           currentIssueId: issueRelations.relatedIssueId,
           relatedId: issues.id,
           identifier: issues.identifier,
@@ -7849,12 +7868,14 @@ export function issueService(db: Db) {
         .where(
           and(
             eq(issueRelations.companyId, companyId),
+            eq(issues.companyId, companyId),
             eq(issueRelations.type, "blocks"),
             inArray(issueRelations.relatedIssueId, uniqueIssueIds),
           ),
         ),
       dbOrTx
         .select({
+          ...proofColumns,
           currentIssueId: issueRelations.issueId,
           relatedId: issues.id,
           identifier: issues.identifier,
@@ -7869,6 +7890,7 @@ export function issueService(db: Db) {
         .where(
           and(
             eq(issueRelations.companyId, companyId),
+            eq(issues.companyId, companyId),
             eq(issueRelations.type, "blocks"),
             inArray(issueRelations.issueId, uniqueIssueIds),
           ),
@@ -7876,11 +7898,13 @@ export function issueService(db: Db) {
     ]);
 
     for (const row of blockedByRows) {
+      if (proof && row.readable === true) proof.readableIds.add(row.relatedId);
       empty
         .get(row.currentIssueId)
         ?.blockedBy.push(summarizeIssueRelationRow(row));
     }
     for (const row of blockingRows) {
+      if (proof && row.readable === true) proof.readableIds.add(row.relatedId);
       empty
         .get(row.currentIssueId)
         ?.blocks.push(summarizeIssueRelationRow(row));
@@ -7890,6 +7914,7 @@ export function issueService(db: Db) {
       companyId,
       [...empty.values()].flatMap((relations) => relations.blockedBy),
       dbOrTx,
+      proof,
     );
 
     for (const relations of empty.values()) {
@@ -7923,7 +7948,22 @@ export function issueService(db: Db) {
       summary.scheduledRetry = scheduledRetryByIssueId.get(summary.id) ?? null;
     }
 
-    return empty;
+    if (!publicRead || !proof) return empty;
+    if (publicRead.enrich) {
+      for (const [id, relations] of empty) empty.set(id, await publicRead.enrich(relations));
+    }
+    const project = (summary: IssueRelationIssueSummary): IssueRelationIssueSummary => ({
+      ...summary,
+      ...(summary.terminalBlockers ? {
+        terminalBlockers: summary.terminalBlockers
+          .filter(terminal => proof.readableIds.has(terminal.id))
+          .map(project),
+      } : {}),
+    });
+    return new Map([...empty].map(([id, relations]) => [id, {
+      blockedBy: relations.blockedBy.filter(row => proof.readableIds.has(row.id)).map(project),
+      blocks: relations.blocks.filter(row => proof.readableIds.has(row.id)).map(project),
+    }]));
   }
 
   async function withIssueRelationSummaries<T extends { id: string }>(
@@ -7986,13 +8026,15 @@ export function issueService(db: Db) {
     }
   }
 
-  async function syncBlockedByIssueIds(
+  async function validateBlockedByIssueIds(
     issueId: string,
     companyId: string,
     blockedByIssueIds: string[],
-    actor: { agentId?: string | null; userId?: string | null } = {},
-    dbOrTx: any = db,
+    dbOrTx: any,
+    publicRead?: { readCondition: SQL<boolean> | undefined; readableIds: Set<string>; existingIds: Set<string> },
+    cycleCandidates?: string[],
   ) {
+    const known = new Map<string, { id: string; status: string; identifier: string | null; title: string }>();
     const deduped = [...new Set(blockedByIssueIds)];
     if (deduped.some((candidate) => candidate === issueId)) {
       throw unprocessable("Issue cannot be blocked by itself");
@@ -8007,7 +8049,7 @@ export function issueService(db: Db) {
             FOR UPDATE`,
       );
       const relatedIssues = await dbOrTx
-        .select({ id: issues.id })
+        .select({ id: issues.id, status: issues.status, identifier: issues.identifier, title: issues.title, ...(publicRead ? { readable: sql<boolean>`${publicRead.readCondition ?? sql<boolean>`false`}` } : {}) })
         .from(issues)
         .where(
           and(eq(issues.companyId, companyId), inArray(issues.id, deduped)),
@@ -8017,8 +8059,30 @@ export function issueService(db: Db) {
           "Blocked-by issues must belong to the same company",
         );
       }
-      await assertNoBlockingCycles(companyId, issueId, deduped, dbOrTx);
+      for (const row of relatedIssues) known.set(row.id, row);
+      if (publicRead) {
+        for (const row of relatedIssues) {
+          if (row.readable === true) publicRead.readableIds.add(row.id);
+          else if (!publicRead.existingIds.has(row.id)) throw unprocessable("Blocked-by issue is not available");
+        }
+      }
+      await assertNoBlockingCycles(companyId, issueId, cycleCandidates ?? deduped, dbOrTx);
     }
+
+    return known;
+  }
+
+  async function syncBlockedByIssueIds(
+    issueId: string,
+    companyId: string,
+    blockedByIssueIds: string[],
+    actor: { agentId?: string | null; userId?: string | null } = {},
+    dbOrTx: any = db,
+    validated = false,
+    retainedIds: string[] = [],
+  ) {
+    const deduped = [...new Set(blockedByIssueIds)];
+    if (!validated) await validateBlockedByIssueIds(issueId, companyId, deduped, dbOrTx);
 
     await dbOrTx
       .delete(issueRelations)
@@ -8027,13 +8091,15 @@ export function issueService(db: Db) {
           eq(issueRelations.companyId, companyId),
           eq(issueRelations.relatedIssueId, issueId),
           eq(issueRelations.type, "blocks"),
+          ...(retainedIds.length > 0 ? [notInArray(issueRelations.issueId, retainedIds)] : []),
         ),
       );
 
-    if (deduped.length === 0) return;
+    const toWrite = deduped.filter(id => !retainedIds.includes(id));
+    if (toWrite.length === 0) return;
 
     await dbOrTx.insert(issueRelations).values(
-      deduped.map((blockerIssueId) => ({
+      toWrite.map((blockerIssueId) => ({
         companyId,
         issueId: blockerIssueId,
         relatedIssueId: issueId,
@@ -9224,6 +9290,20 @@ export function issueService(db: Db) {
       return relations.get(issueId) ?? { blockedBy: [], blocks: [] };
     },
 
+    getReadableRelationSummaries: async (
+      issueId: string,
+      publicRead: ReadableIssueRelationOptions,
+    ) => {
+      const issue = await db
+        .select({ id: issues.id, companyId: issues.companyId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then(rows => rows[0] ?? null);
+      if (!issue) throw notFound("Issue not found");
+      const relations = await getIssueRelationSummaryMap(issue.companyId, [issueId], db, publicRead);
+      return relations.get(issueId) ?? { blockedBy: [], blocks: [] };
+    },
+
     getBlockerDiagnostics: async (
       issueId: string,
       maxBlockers = ISSUE_BLOCKER_DIAGNOSTICS_MAX_BLOCKERS,
@@ -9772,6 +9852,13 @@ export function issueService(db: Db) {
     ) => {
       return listIssueBlockerAttentionMap(dbOrTx, companyId, issueRows);
     },
+
+    listReadableBlockerAttention: async (
+      companyId: string,
+      issueRows: IssueBlockerAttentionInputNode[],
+      publicRead: { readCondition: SQL<boolean> | undefined },
+      dbOrTx: any = db,
+    ) => listIssueBlockerAttentionMap(dbOrTx, companyId, issueRows, { publicRead }),
 
     listReviewAttention: async (
       companyId: string,
@@ -11417,7 +11504,7 @@ export function issueService(db: Db) {
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
       postCommitActions?: IssuePostCommitAction[],
-      options: { bindRuntimeSharedWorkspace?: boolean } = {},
+      options: { bindRuntimeSharedWorkspace?: boolean; publicRead?: { readCondition: SQL<boolean> | undefined } } = {},
     ) => {
       const ownedActivityPublications: ActivityPublication[] = [];
       const activityPublications =
@@ -11454,7 +11541,7 @@ export function issueService(db: Db) {
 
       const {
         labelIds: nextLabelIds,
-        blockedByIssueIds,
+        blockedByIssueIds: requestedBlockedByIssueIds,
         actorAgentId,
         actorRunId,
         caseHandoffId,
@@ -11467,6 +11554,7 @@ export function issueService(db: Db) {
         expectedExecutionPolicyTransition,
         ...issueData
       } = data;
+      let blockedByIssueIds = requestedBlockedByIssueIds;
       if (expectedStatusVersion !== undefined && (
         issueData.status !== "todo" || Object.keys(issueData).some(key => key !== "status") ||
         nextLabelIds !== undefined || blockedByIssueIds !== undefined || expectedExecutionPolicy !== undefined
@@ -11592,38 +11680,49 @@ export function issueService(db: Db) {
       ) {
         throw unprocessable("in_progress issues require an assignee");
       }
-      if (patch.status === "in_progress") {
+      const validateProgress = async (
+        reader: any,
+        readableIds?: Set<string>,
+        known?: Map<string, { id: string; status: string; identifier: string | null; title: string }>,
+      ) => {
+        if (patch.status !== "in_progress") return;
         const dependencyReadiness =
           blockedByIssueIds === undefined
             ? (
                 await listIssueDependencyReadinessMap(
-                  dbOrTx,
+                  reader,
                   existing.companyId,
                   [id],
                 )
               ).get(id)
             : null;
         const unresolvedBlockerIssueIds =
-          blockedByIssueIds !== undefined
+          known
+            ? (blockedByIssueIds ?? []).filter(id => known.get(id)?.status !== "done")
+            : blockedByIssueIds !== undefined
             ? await listUnresolvedBlockerIssueIds(
-                dbOrTx,
+                reader,
                 existing.companyId,
                 blockedByIssueIds,
               )
             : (dependencyReadiness?.unresolvedBlockerIssueIds ?? []);
         if (unresolvedBlockerIssueIds.length > 0) {
-          const unresolvedBlockers = await listUnresolvedBlockerDetails(
-            dbOrTx,
+          const unresolvedBlockers = known
+            ? unresolvedBlockerIssueIds.map(issueId => ({ issueId, identifier: known.get(issueId)?.identifier ?? null, title: known.get(issueId)?.title ?? null, reason: "not_done" as const }))
+            : await listUnresolvedBlockerDetails(
+            reader,
             existing.companyId,
             unresolvedBlockerIssueIds,
             dependencyReadiness?.pendingFinalizeBlockerIssueIds,
+            options.publicRead && readableIds ? { ...options.publicRead, readableIds } : undefined,
           );
           throw unprocessable("Issue is blocked by unresolved blockers", {
-            unresolvedBlockerIssueIds,
-            unresolvedBlockers,
+            unresolvedBlockerIssueIds: readableIds ? unresolvedBlockerIssueIds.filter(id => readableIds.has(id)) : unresolvedBlockerIssueIds,
+            unresolvedBlockers: readableIds ? unresolvedBlockers.filter(row => readableIds.has(row.issueId)) : unresolvedBlockers,
           });
         }
-      }
+      };
+      if (!options.publicRead) await validateProgress(dbOrTx);
       const shouldValidateNextAssignee =
         Boolean(nextAssigneeAgentId) &&
         (issueData.assigneeAgentId !== undefined ||
@@ -11818,6 +11917,27 @@ export function issueService(db: Db) {
           });
           assertLegacyRunTaskOwnership(actorRun, receiptExisting);
         }
+        const readProof = options.publicRead ? { ...options.publicRead, readableIds: new Set<string>() } : undefined;
+        let previousRelationSummaries = new Map<string, IssueRelationSummaryMap>();
+        if (readProof && blockedByIssueIds !== undefined) {
+          previousRelationSummaries = await getIssueRelationSummaryMap(existing.companyId, [id], tx, undefined, readProof);
+        }
+        let retainedBlockerIds: string[] = [];
+        let knownBlockers: Map<string, { id: string; status: string; identifier: string | null; title: string }> | undefined;
+        if (readProof && requestedBlockedByIssueIds !== undefined) {
+          const currentIds = (previousRelationSummaries.get(id)?.blockedBy ?? []).map(row => row.id);
+          retainedBlockerIds = currentIds.filter(id => !readProof.readableIds.has(id));
+          blockedByIssueIds = [...new Set([
+            ...retainedBlockerIds,
+            ...requestedBlockedByIssueIds,
+          ])].sort();
+          const requestedRows = await validateBlockedByIssueIds(id, receiptExisting.companyId, requestedBlockedByIssueIds, tx,
+            { ...readProof, existingIds: new Set(currentIds) }, blockedByIssueIds);
+          knownBlockers = new Map((previousRelationSummaries.get(id)?.blockedBy ?? []).map(row => [row.id, row]));
+          for (const [id, row] of requestedRows) knownBlockers.set(id, row);
+        }
+        if (readProof) await validateProgress(tx, readProof.readableIds, knownBlockers);
+
         if (blockedByIssueIds !== undefined) {
           await assertOnboardingFirstTaskDependenciesAllowed(tx as Db, {
             companyId: receiptExisting.companyId,
@@ -11832,14 +11952,15 @@ export function issueService(db: Db) {
           if (review) throw conflict("This task is waiting for a connection review. Finish unrelated work, then yield in_review without retrying the governed call.", { code: "tool_review_pending", actionRequestId: review.id });
         }
 
-        const [previousLabelsByIssueId, previousRelationSummaries] = await Promise.all([
+        const [previousLabelsByIssueId, rawPreviousRelations] = await Promise.all([
           nextLabelIds !== undefined
             ? labelMapForIssues(tx, [id])
             : Promise.resolve(new Map<string, IssueLabelRow[]>()),
-          blockedByIssueIds !== undefined
+          !readProof && blockedByIssueIds !== undefined
             ? getIssueRelationSummaryMap(existing.companyId, [id], tx)
-            : Promise.resolve(new Map<string, IssueRelationSummaryMap>()),
+            : Promise.resolve(previousRelationSummaries),
         ]);
+        previousRelationSummaries = rawPreviousRelations;
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, existing.companyId);
         const [currentProjectGoalId, nextProjectGoalId] = await Promise.all([
           getProjectDefaultGoalId(tx, existing.companyId, existing.projectId),
@@ -12161,6 +12282,8 @@ export function issueService(db: Db) {
               userId: actorUserId ?? null,
             },
             tx,
+            Boolean(options.publicRead),
+            retainedBlockerIds,
           );
         }
         if (
@@ -14472,6 +14595,15 @@ export function issueService(db: Db) {
   };
 
   type IssueServiceApi = typeof service & {
+    updateReadable: (
+      id: string,
+      data: Parameters<typeof service.update>[1],
+      publicRead: { readCondition: SQL<boolean> | undefined },
+      dbOrTx?: any,
+      postCommitActivityPublications?: ActivityPublication[],
+      postCommitActions?: IssuePostCommitAction[],
+    ) => ReturnType<typeof service.update>;
+
     updateForCompany: (
       id: string,
       companyId: string,
@@ -14502,6 +14634,9 @@ export function issueService(db: Db) {
       postCommitActions,
     );
   };
+
+  serviceApi.updateReadable = (id, data, publicRead, dbOrTx = db, publications, actions) =>
+    service.update(id, data, dbOrTx, publications, actions, { publicRead });
 
   return serviceApi;
 }

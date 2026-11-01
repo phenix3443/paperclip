@@ -409,7 +409,7 @@ describeEmbeddedPostgres("issue access grant and locked edge routes", { concurre
     }
   }, 20_000);
 
-  it("returns exact locked stubs only through visible blocker and mention edges", async () => {
+  it("omits hidden blockers while preserving locked mention references", async () => {
     const fixture = await seedFixture();
     const visibleIssue = await db.insert(issues).values({
       companyId: fixture.companyId,
@@ -440,9 +440,15 @@ describeEmbeddedPostgres("issue access grant and locked edge routes", { concurre
     const detail = await request(app).get(`/api/issues/${visibleIssue.id}`);
     expect(detail.status, JSON.stringify(detail.body)).toBe(200);
     const expectedStub = { id: fixture.privateIssueId, identifier: "PRV-1", locked: true };
-    expect(detail.body.blockedBy).toEqual([expectedStub]);
+    expect(detail.body.blockedBy).toEqual([]);
+    expect(detail.body.blockerAttention).toMatchObject({ directBlockerIssueId: null, terminalBlockerIssueId: null, terminalBlocker: null, sampleBlockerIdentifier: null });
     expect(detail.body.relatedWork.outbound[0].issue).toEqual(expectedStub);
     expect(JSON.stringify(detail.body)).not.toContain("Confidential root");
+
+    const heartbeat = await request(app).get(`/api/issues/${visibleIssue.id}/heartbeat-context`);
+    expect(heartbeat.status, JSON.stringify(heartbeat.body)).toBe(200);
+    expect(heartbeat.body.issue.blockedBy).toEqual([]);
+    expect(heartbeat.body.issue.blockerAttention).toEqual(detail.body.blockerAttention);
 
     const direct = await request(app).get(`/api/issues/${fixture.privateIssueId}`);
     expect(direct.status).toBe(404);
@@ -452,7 +458,8 @@ describeEmbeddedPostgres("issue access grant and locked edge routes", { concurre
     expect(list.status, JSON.stringify(list.body)).toBe(200);
     expect(list.body.map((row: { id: string }) => row.id)).not.toContain(fixture.privateIssueId);
     const visibleRow = list.body.find((row: { id: string }) => row.id === visibleIssue.id);
-    expect(visibleRow.blockedBy).toEqual([expectedStub]);
+    expect(visibleRow.blockedBy).toEqual([]);
+    expect(visibleRow.blockerAttention).toEqual(detail.body.blockerAttention);
 
     const search = await request(app)
       .get(`/api/companies/${fixture.companyId}/search?q=Confidential%20root&scope=issues`);

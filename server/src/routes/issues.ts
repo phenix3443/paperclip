@@ -5504,6 +5504,21 @@ export function issueRoutes(
     return { id: issue.id, identifier: issue.identifier, locked: true };
   }
 
+  function metadataReadCondition(req: Request) {
+    return issueReadSqlCondition(db, req.actor.isInstanceAdmin === false
+      ? { ...req.actor, ignoreInstanceAdmin: true }
+      : req.actor);
+  }
+
+  function readableRelationOptions(readCondition: Awaited<ReturnType<typeof issueReadSqlCondition>>, companyId: string) {
+    return {
+      readCondition,
+      enrich: async (relations: Awaited<ReturnType<typeof svc.getRelationSummaries>>) =>
+        withRecoveryActionsOnRelationSummaries(relations,
+          await relationRecoveryActionMap(recoveryActionsSvc, companyId, relations)),
+    };
+  }
+
   async function redactIssueRelationEdges(
     req: Request,
     companyId: string,
@@ -5551,40 +5566,6 @@ export function issueRoutes(
       outbound: redactItems(summary.outbound),
       inbound: redactItems(summary.inbound),
     };
-  }
-
-  async function redactIssueRelationEdgesOnRows<T extends {
-    id: string;
-    blockedBy?: IssueRelationIssueSummary[];
-    blocks?: IssueRelationIssueSummary[];
-  }>(req: Request, companyId: string, rows: T[]): Promise<T[]> {
-    const related = rows.flatMap((row) => [...(row.blockedBy ?? []), ...(row.blocks ?? [])]);
-    const edgeIds = new Set<string>();
-    const pending = [...related];
-    while (pending.length > 0) {
-      const issue = pending.pop()!;
-      if (edgeIds.has(issue.id)) continue;
-      edgeIds.add(issue.id);
-      pending.push(...(issue.terminalBlockers ?? []));
-    }
-    const readableIds = await readableIssueEdgeIds(req, companyId, [...edgeIds]);
-    const redact = (issue: IssueRelationIssueSummary, ancestors = new Set<string>()): IssueEdgeReference => {
-      if (!readableIds.has(issue.id)) return lockedIssueStub(issue);
-      const { terminalBlockers, ...visibleFields } = issue;
-      if (ancestors.has(issue.id)) return visibleFields as IssueRelationIssueSummary;
-      const nextAncestors = new Set(ancestors).add(issue.id);
-      return {
-        ...visibleFields,
-        ...(terminalBlockers
-          ? { terminalBlockers: terminalBlockers.map((child) => redact(child, nextAncestors)) as IssueRelationIssueSummary[] }
-          : {}),
-      };
-    };
-    return rows.map((row) => ({
-      ...row,
-      ...(row.blockedBy ? { blockedBy: row.blockedBy.map((issue) => redact(issue)) } : {}),
-      ...(row.blocks ? { blocks: row.blocks.map((issue) => redact(issue)) } : {}),
-    })) as T[];
   }
 
   async function assertIssueWriteInfluenceAllowed(
@@ -8987,7 +8968,7 @@ export function issueRoutes(
         const visibleRows = await actorCanReadCompanyScope(req, companyId)
           ? rawResult
           : await filterIssuesForActor(req, rawResult);
-        const result = await redactIssueRelationEdgesOnRows(req, companyId, visibleRows);
+        const result = visibleRows;
         if (view === "index") {
           const body = result.map((issue) => ({ ...toCompactIssue(issue), listProjection: "index" as const }));
           return { kind: "compact", body, etag: compactIssueListEtag(body), cacheControl: "private, must-revalidate" };
@@ -9395,6 +9376,7 @@ export function issueRoutes(
     );
     if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
+    const readCondition = await metadataReadCondition(req);
 
     const wakeCommentId =
       typeof req.query.wakeCommentId === "string" &&
@@ -9423,9 +9405,9 @@ export function issueRoutes(
       svc.getAncestors(issue.id),
       svc.getCommentCursor(issue.id),
       wakeCommentId ? svc.getComment(wakeCommentId) : null,
-      svc.getRelationSummaries(issue.id),
+      svc.getReadableRelationSummaries(issue.id, readableRelationOptions(readCondition, issue.companyId)),
       svc
-        .listBlockerAttention(issue.companyId, [issue])
+        .listReadableBlockerAttention(issue.companyId, [issue], { readCondition })
         .then((map) => map.get(issue.id) ?? null),
       svc
         .listReviewAttention(issue.companyId, [issue])
@@ -9440,16 +9422,7 @@ export function issueRoutes(
       recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id),
     ]);
     const visibleProject = await visibleIssueProject(req, project);
-    const recoveryActionsByRelationIssue = await relationRecoveryActionMap(
-      recoveryActionsSvc,
-      issue.companyId,
-      relations,
-    );
-    const relationsWithRecoveryActions = withRecoveryActionsOnRelationSummaries(
-      relations,
-      recoveryActionsByRelationIssue,
-    );
-    const visibleRelations = await redactIssueRelationEdges(req, issue.companyId, relationsWithRecoveryActions);
+    const visibleRelations = relations;
     const revalidatedActiveRecoveryAction = await revalidateActiveSourceRecoveryForRead({
         issue,
         trigger: "read_projection",
@@ -9730,6 +9703,7 @@ export function issueRoutes(
     );
     if (!issue) return;
     if (!(await timing.time("authorization", () => assertIssueReadAllowed(req, res, issue, { allowBreakGlass: true })))) return;
+    const readCondition = await metadataReadCondition(req);
     // Saved cards are structural conversation data. Include their local
     // projection before first paint, independently of slow recovery, workspace
     // and related-task enrichment. This never refreshes external providers.
@@ -9768,9 +9742,9 @@ export function issueRoutes(
       timing.time("ancestors", () => svc.getAncestors(issue.id)),
       timing.time("mentions", () => svc.findMentionedProjectIds(issue.id, { includeCommentBodies: false })),
       timing.time("documents", () => documentsSvc.getIssueDocumentPayload(issue)),
-      timing.time("relations", () => svc.getRelationSummaries(issue.id)),
+      timing.time("relations", () => svc.getReadableRelationSummaries(issue.id, readableRelationOptions(readCondition, issue.companyId))),
       timing.time("blockers", () => svc
-        .listBlockerAttention(issue.companyId, [issue])
+        .listReadableBlockerAttention(issue.companyId, [issue], { readCondition })
         .then((map) => map.get(issue.id) ?? null)),
       timing.time("review", () => svc
         .listReviewAttention(issue.companyId, [issue])
@@ -9787,8 +9761,7 @@ export function issueRoutes(
       timing.time("work_products", () => workProductsSvc.listForIssue(issue.id)),
       timing.time("created_from", () => resolveVisibleIssueCreationSource(req, issue)),
     ]);
-    const [recoveryActionsByRelationIssue, revalidatedActiveRecoveryAction, mentionedProjects] = await Promise.all([
-      timing.time("relation_recovery", () => relationRecoveryActionMap(recoveryActionsSvc, issue.companyId, relations)),
+    const [revalidatedActiveRecoveryAction, mentionedProjects] = await Promise.all([
       timing.time("revalidate_recovery", () => revalidateActiveSourceRecoveryForRead({
         issue,
         trigger: "read_projection",
@@ -9799,11 +9772,8 @@ export function issueRoutes(
         ? projectsSvc.listByIds(issue.companyId, mentionedProjectIds)
         : Promise.resolve([])),
     ]);
-    const relationsWithRecoveryActions = withRecoveryActionsOnRelationSummaries(
-      relations, recoveryActionsByRelationIssue,
-    );
-    const [visibleRelations, visibleReferenceSummary, visibleProject, mentionedProjectVisibility] = await Promise.all([
-      redactIssueRelationEdges(req, issue.companyId, relationsWithRecoveryActions),
+    const visibleRelations = relations;
+    const [visibleReferenceSummary, visibleProject, mentionedProjectVisibility] = await Promise.all([
       redactIssueReferenceEdges(req, issue.companyId, referenceSummary),
       visibleIssueProject(req, project),
       Promise.all(mentionedProjects.map((mentionedProject) => canActorReadProject(req, mentionedProject))),
