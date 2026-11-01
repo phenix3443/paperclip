@@ -266,33 +266,84 @@ Call contract (one ordinary successor, no disposition repair action):
 | `source` | `issue.rework_handback_continuation_recovery` (a new value of the existing `source` string, not a new mechanism) |
 | `retryOfRunId` | the cancelled park run (`latestRun.id`), kept for lineage |
 | `issueStateGuard` | `{ statuses: ["in_progress"], assigneeAgentId, statusVersion: issue.statusVersion }` |
-| `idempotencyKey` | `issue_rework_handback_continuation:<issueId>:<lastStatusDecisionId>:<latestRun.id>` |
+| `idempotencyKey` | `issue_rework_handback_continuation:<issueId>:<lastStatusDecisionId>:<statusVersion>:<latestRun.id>` |
+| `allowRunCoalescing` | `false` (the successor is its own run, never folded into another turn) |
 
 Branch inside `enqueueStrandedIssueRecovery`: today a cancelled predecessor with
-`retryOfRunId` enters the failure-retry lane (`scheduleRecoveryRetry`, or `null`
-for a `native` predecessor) and never reaches the ordinary enqueue. A park cancel
-is not a failure: the run never started. C3 adds one exclusion to that lane:
-when `source = issue.rework_handback_continuation_recovery`, the predecessor is
-`cancelled`, its `errorCode = issue_continuation_waiting_on_review`, and
-`startedAt` is null, skip the failure lane and go to the ordinary enqueue. A
-predecessor that started, or any other source, keeps today's lane, including the
-`native` early return. `enqueueStrandedIssueRecovery` gains two optional inputs
-(`issueStateGuard`, `idempotencyKey`) that it passes through to the existing
+`retryOfRunId` enters the failure-retry lane and never reaches the ordinary
+enqueue. In order, that lane (`recovery/service.ts:2048-2088`) returns `null` for
+a `native` predecessor, terminalizes a legacy execution that needs
+reconciliation, and otherwise calls `scheduleRecoveryRetry`. A park cancel is not
+a failure: the run never started. C3 adds one exclusion, placed **after** the
+`native` early return and the legacy reconciliation check and **before**
+`scheduleRecoveryRetry`: when `source = issue.rework_handback_continuation_recovery`,
+the predecessor is `cancelled`, its `errorCode = issue_continuation_waiting_on_review`,
+and `startedAt` is null, skip `scheduleRecoveryRetry` and go to the ordinary
+enqueue. A `native` predecessor therefore still returns `null`; a predecessor that
+started, or any other source, keeps today's lane (N7).
+`enqueueStrandedIssueRecovery` gains three optional inputs (`issueStateGuard`,
+`idempotencyKey`, `allowRunCoalescing`) that it passes through to the existing
 `enqueueWakeup` options; today it sets the guard only for
 `issue.productive_terminal_continuation_recovery` and passes no key.
 
-Locking and re-checks: `issueStateGuard` is evaluated by the queue under the
-issue lock. `statusVersion` changes on status and assignee changes, so a
-resubmission or reassignment after the sweep read denies the enqueue. A
-`executionState` change that does not bump `statusVersion` is caught by C1 at
-dispatch. An active execution (N4) is handled by the queue's existing issue
-execution lock: the wake is deferred (`deferred_issue_execution`), not run over
-the lease, and no lock is cleared.
+Locking and re-checks: every issue-scoped admission in `enqueueWakeup` takes the
+issue row lock (`select ... from issues ... for update`, `heartbeat/queue.ts:3026`)
+in the same transaction that later inserts the wake row (`queue.ts:4596-4628`).
+`issueStateGuard` is evaluated under that lock. `statusVersion` changes on status
+and assignee changes, so a resubmission or reassignment after the sweep read
+denies the enqueue. A `executionState` change that does not bump `statusVersion`
+is caught by C1 at dispatch. An active execution (N4) is handled by the queue's
+existing issue execution lock: the wake is deferred (`deferred_issue_execution`),
+not run over the lease, and no lock is cleared.
 
-Deduplication: there is no generic idempotency key on this path today. C3 uses
-the explicit key above in the existing `agent_wakeup_requests.idempotencyKey`
-column. The key changes only with a new review decision or a new park cancel, so
-concurrent or repeated sweeps over the same cancel enqueue at most one successor.
+Deduplication. Storing a key does not deduplicate on this path: the generic
+enqueue inserts a row (`queue.ts:4596-4628`, and the Postgres wake-queue adapter
+inserts one when coalescing), and no partial unique index in
+`agent_wakeup_requests` covers this prefix. C3 does not add an index, table or
+scheduler. It reuses the pattern the queue already applies to
+`execution-reconciliation:` keys (`queue.ts:3578-3617`): an existing-key lookup
+inside the issue-locked transaction. Because all admissions for one issue
+serialize on that row lock, the lookup and the insert are atomic per issue.
+
+For a wake whose key starts with `issue_rework_handback_continuation:`, the queue,
+inside the issue-locked transaction and **before** the state guard:
+
+1. Validates the request shape: `source = automation`, `triggerDetail = system`,
+   `reason = issue_continuation_needed`, `requestedByActorType = system`,
+   `payload.issueId` and `contextSnapshot.issueId` equal the locked issue,
+   `contextSnapshot.retryOfRunId` equals the run id in the key, and
+   `allowRunCoalescing = false`. Otherwise the wake is skipped without a row.
+2. Looks up rows with `ordinaryWakeRequestPredicate()`, the same `companyId`,
+   `agentId` and `idempotencyKey`, any status, oldest first.
+3. If a row exists, it never inserts another:
+   - **bound row** (`runId` set): it loads that run and checks company, agent,
+     `contextSnapshot.issueId`, `retryOfRunId` and `wakeReason`. A match returns
+     `replayed` with that run, whatever the run's status now (queued, running,
+     succeeded or cancelled). A mismatch returns `skipped`.
+   - **deferred row** (`deferred_issue_execution`, no run): returns `deferred`.
+     The existing release path (`resumeQueuedRuns`) promotes that receipt; no
+     second receipt is created.
+   - **terminal row without a run** (for example the `issue_state_guard_mismatch`
+     `skipped` row, or `failed`/`cancelled`): returns `skipped`. The key is spent.
+4. Only with no row does it continue to the state guard and the normal insert.
+   A guard mismatch then writes the existing `skipped` receipt with this key,
+   which spends the key.
+
+Retry semantics. The key contains `statusVersion`, so a key spent by a guard
+denial can only be followed by a new key after a real status or assignee change,
+which a sweep cannot cause. If the issue later satisfies the hand-back predicate
+again for the same decision, the new `statusVersion` gives a new key, and each
+resulting run is still counted by the ledger below. A replay after a lost response
+(first commit succeeded, caller saw an error or timeout) returns the same run and
+writes nothing, so it does not count against the ledger or the transient budget.
+When the sweep receives `skipped` for a key that is spent with no run, it escalates
+through the existing `escalateStrandedAssignedIssue` instead of leaving the issue
+with no live path.
+
+Coalescing. `allowRunCoalescing = false` (the same setting owner-repair
+continuations and case handoffs use) means the wake never merges into another
+queued or running turn. Its receipt is always bound to its own run or to its own
+deferred row, so the receipt proves an independent ordinary successor (section 6).
 
 Bounded attempts: the ledger is the one this sweep already uses for the same
 error code in the accepted-interaction branch:
@@ -333,11 +384,30 @@ authority are unchanged.
 
 Any other referenced action keeps today's behavior. That includes a
 cross-agent action, an action of another cause or issue, and a still-active
-owner repair without a hand-back. A retry with no `recoveryActionId` but a
-`recoveryCause` keeps today's behavior too, unless the same owner-repair keys
+owner repair without a hand-back.
+
+No `recoveryActionId`. A retry whose context has a `recoveryCause` but no
+`recoveryActionId` re-activates recovery through the fallback in 3.3. Provenance
 (`dispositionRepairFingerprint` with `source = issue.deliberate_wait_disposition_repair`)
-show it came from this repair; then the same key list is dropped. This removes the
-`recoveryCause` fallback of 3.3 for this fault only.
+only shows the context came from an owner repair; it does not show the repair is
+no longer valid. Without an action id there is no exact action whose state could
+prove that, so C4 does not try to infer invalidity from other recovery rows.
+The fallback drops the same key list only when **all** of these hold:
+
+- the context has `recoveryCause = deliberate_wait_without_target`,
+  `source = issue.deliberate_wait_disposition_repair` and a
+  `dispositionRepairFingerprint`;
+- the context has no `legacyDispositionEpisode` (a legacy repair keeps its context);
+- the source run's company, issue and agent equal the retry's, and the agent is
+  the issue assignee;
+- the issue row that `scheduleBoundedRetryForRun` already loads
+  (`heartbeat/retries.ts:452-457`, extended to also select `executionState` and
+  `assigneeUserId`) satisfies the native rework hand-back predicate now, which
+  excludes a pending review.
+
+If any of these fails, the retry keeps today's context. C1 re-reads the same
+facts at dispatch, so a hand-back that ends between scheduling and dispatch parks
+the retry as today.
 
 C4 does not resolve the action. A still-active action is left to the existing
 action sweep, which sees the retry as an active execution path and resolves it as
@@ -359,7 +429,9 @@ returned for a scope decision (section 9).
 Per `rules/heartbeat-execution-boundaries.mdc`: the predicate and C1 live in the
 run-dispatch module (`modules/run-dispatch/`), C2 in
 `services/issue-continuation-summary.ts`, C3 in `services/recovery/service.ts`,
-C4 in `services/heartbeat/retries.ts`. `heartbeat.ts` does not grow.
+C4 in `services/heartbeat/retries.ts`, and the C3 key lookup in
+`services/heartbeat/queue.ts` next to the existing `execution-reconciliation:`
+lookup. `heartbeat.ts` does not grow.
 
 ## 5. Synthetic regression
 
@@ -391,6 +463,24 @@ Assertions, red on `870a6179a5ae`, green after the fix:
   unchanged and `scheduleRecoveryRetry` is not called.
 - **R3b (C3 ledger):** with three consecutive park cancels in the ledger, the
   sweep escalates and queues nothing.
+- **R3c (C3 dedup, real queue and DB):** against the embedded DB and the real
+  `enqueueWakeup` and wake-queue adapter (no mocked queue):
+  - two concurrent sweeps (`Promise.all`) over the R3 state leave exactly one
+    `agent_wakeup_requests` row with the C3 key and one `heartbeat_runs` row with
+    that `retryOfRunId`; both calls return that run;
+  - lost response: after the first call commits, a second call with the same
+    inputs returns the same run and adds no row. Repeat after the run has
+    succeeded and after it has been cancelled: still the same run, no new row;
+  - with another queued executor run for the issue, the C3 run is a separate run
+    (`allowRunCoalescing = false`) and its receipt's `runId` is that run;
+  - with an active execution lease, the first call writes one
+    `deferred_issue_execution` row; a second call returns `deferred` and adds
+    nothing; after release the existing promotion binds that same row to one run;
+  - a guard denial writes one `skipped` row; a second call with the same key adds
+    nothing and the sweep escalates; after a real assignee round-trip
+    (`statusVersion` changed) the new key admits one run;
+  - in every case the ledger count, `executionRetryAccounting` and the transient
+    budget are the same as after a single successful call.
 - **R4 (3.4/C4):** a repair run whose action has been resolved is interrupted with
   a settled `SIGTERM` (`server_shutdown_interrupted`), then a
   `transient_failure_retry` is scheduled. The retry context has none of the C4
@@ -407,6 +497,13 @@ Assertions, red on `870a6179a5ae`, green after the fix:
 - **R6 (3.5, pin):** a completed scheduled owner repair with no hand-back and no
   other path delivers one `owner_repair_continuation` wake with its continuation
   key, and the action is resolved `owner_repair_continuation_admitted`. Unchanged.
+- **R4c (C4 fallback positive):** the retry's source context has no
+  `recoveryActionId`, has `recoveryCause = deliberate_wait_without_target`, the
+  repair source and fingerprint, no `legacyDispositionEpisode`, and the issue
+  satisfies the hand-back predicate. The retry context has none of the C4 key
+  list, the prepared wake payload has `recovery = null` and
+  `dispositionRepair = null`, and the rendered prompt has no "Recovery contract"
+  line. Asserting the deleted keys alone does not pass this case.
 - **R7 (3.5 + C4):** an owner repair whose scheduled run is interrupted and whose
   transient retry succeeds produces no `owner_repair_continuation` (unchanged
   admission). After C4 under a hand-back the retry itself is the ordinary turn
@@ -427,11 +524,11 @@ Negative cases (must stay as today):
 - **N2b hand-back plus unrelated active action:** the hand-back predicate holds
   and the retry's `recoveryActionId` names an active action of another cause or
   owner -> C4 keeps all keys and `recovery` stays non-null.
-- **N3 duplicate and stale requests:** two concurrent sweeps over R3 enqueue at
-  most one successor (C3 idempotency key, one `agent_wakeup_requests` row); a
-  sweep after the reviewer resubmits (`statusVersion` changed) is denied by the
-  guard; a stale queued repair for an old fingerprint is still suppressed with
-  `issue_disposition_repair_superseded`.
+- **N3 duplicate and stale requests:** duplicates are covered by R3c (one row,
+  one run, via the issue-locked lookup); a sweep after the reviewer resubmits
+  (`statusVersion` changed) is denied by the guard and no hand-back sweep follows
+  because the predicate no longer holds; a stale queued repair for an old
+  fingerprint is still suppressed with `issue_disposition_repair_superseded`.
 - **N4 active lease:** when another run holds `executionRunId`/`checkoutRunId`,
   the C3 wake is deferred by the existing issue execution lock, not dispatched
   over it, and no lock is cleared.
@@ -439,14 +536,22 @@ Negative cases (must stay as today):
   hand-back (for example review pending) keeps the repair context.
 - **N6 legacy task without execution policy:** a review-wait summary still parks
   `issue_continuation_needed` as before.
+- **N5b fallback without hand-back:** the retry's source context has no
+  `recoveryActionId` but has `recoveryCause`, the repair source and fingerprint,
+  and either (a) `executionState.status = pending` with the reviewer as current
+  participant, or (b) a `legacyDispositionEpisode`, or (c) a task without
+  execution policy. In each case the retry context keeps all keys, the prepared
+  wake payload has a non-null `recovery` (and, for (b), the `dispositionRepair`
+  block), and the prompt still renders the recovery contract.
 - **N7 started predecessor:** a cancelled predecessor with `startedAt` set, or a
   `native` predecessor, with the C3 source still takes today's failure lane.
 
 Test files: extend `server/src/modules/run-dispatch/domain/policy.test.ts` and
 `adapters/postgres.test.ts`, `server/src/services/explicit-native-continuation.test.ts`
 (it already models the park cancel), `server/src/services/heartbeat/retries.test.ts` for C4,
-and a focused recovery test next to `server/src/services/recovery/` for C3 and
-R5 to R7. Run only those vitest files on the host; full build and typecheck run
+a focused recovery test next to `server/src/services/recovery/` for C3 and
+R5 to R7, and a queue test next to `server/src/services/heartbeat/queue.ts` on the
+embedded DB for R3c. Run only those vitest files on the host; full build and typecheck run
 in CI.
 
 ## 6. Ordinary successor evidence
