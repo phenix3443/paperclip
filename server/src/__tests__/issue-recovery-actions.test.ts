@@ -4529,6 +4529,123 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       return response;
     }
 
+    async function seedStrandedPendingReview() {
+      const fixture = await seedPreStartCancelledReview();
+      const secondStageId = randomUUID();
+      const [issue] = await db.select().from(issues).where(eq(issues.id, fixture.issueA));
+      const policy = issue!.executionPolicy as { stages: Array<Record<string, unknown>> };
+      const [company] = await db.select().from(companies).where(eq(companies.id, fixture.companyId));
+      await db.update(issues).set({
+        status: "blocked",
+        responsibleUserId: company!.defaultResponsibleUserId,
+        executionPolicy: {
+          ...policy,
+          stages: [...policy.stages, {
+            id: secondStageId, type: "review", approvalsNeeded: 1,
+            participants: [{ id: randomUUID(), type: "agent", agentId: fixture.managerId }],
+          }],
+        },
+      }).where(eq(issues.id, fixture.issueA));
+      const [blocker] = await db.insert(issues).values({
+        companyId: fixture.companyId, title: "Unfinished recovery dependency", status: "in_progress",
+        assigneeAgentId: fixture.coderId, issueNumber: 2, identifier: `${fixture.prefix}-2`,
+      }).returning();
+      await db.insert(issueRelations).values({
+        companyId: fixture.companyId, issueId: blocker!.id, relatedIssueId: fixture.issueA, type: "blocks",
+      });
+      await db.update(heartbeatRuns).set({
+        error: "Agent lifecycle stop requested", errorCode: null, scheduledRetryReason: "transient_failure",
+        contextSnapshot: {
+          issueId: fixture.issueA, retryReason: "transient_failure",
+          executionRetryAccounting: { failureRetries: 2 },
+          execution: { attempt: 3, maxAttempts: 3 },
+          retryExhaustedReason: "Bounded retry exhausted after 2 scheduled attempts; no further automatic retry will be queued",
+        },
+      }).where(eq(heartbeatRuns.id, fixture.run1));
+      await db.update(issueRecoveryActions).set({
+        kind: "stranded_assigned_issue", cause: "execution_review_participant_recovery",
+        status: "active", outcome: null, resolvedAt: null,
+        evidence: { runId: null, latestRunId: fixture.run1, retryExhausted: true },
+        wakePolicy: { type: "manual", preservesSourceAssignee: true },
+      }).where(eq(issueRecoveryActions.id, fixture.action1.id));
+      return fixture;
+    }
+
+    async function strandedSnapshot() {
+      return {
+        issues: await db.select().from(issues).orderBy(issues.id),
+        actions: await db.select().from(issueRecoveryActions).orderBy(issueRecoveryActions.id),
+        runs: await db.select().from(heartbeatRuns).orderBy(heartbeatRuns.id),
+        blockers: await db.select().from(issueRelations).orderBy(issueRelations.id),
+        decisions: await db.select().from(issueExecutionDecisions).orderBy(issueExecutionDecisions.id),
+        receipts: await db.select().from(executionReconciliationReceipts),
+        wakes: await db.select().from(agentWakeupRequests),
+        activity: await db.select().from(activityLog).orderBy(activityLog.id),
+        comments: await db.select().from(issueComments).orderBy(issueComments.id),
+      };
+    }
+
+    it("refuses status-only stranded pending review restoration repeatedly without any writes", async () => {
+      const fixture = await seedStrandedPendingReview();
+      const before = await strandedSnapshot();
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const response = await request(fixture.app)
+          .post(`/api/issues/${fixture.issueA}/recovery-actions/resolve`)
+          .send({ actionId: fixture.action1.id, outcome: "restored", sourceIssueStatus: "in_review" });
+        expect(response.status).toBe(409);
+        expect(response.body.details?.code).toBe("recovery_review_continuation_unavailable");
+        expect(response.body.error).toBe(
+          "Restoring this review would not dispatch the reviewer and would be reopened by the next recovery pass. Keep the recovery action open; a bound reviewer continuation is required.",
+        );
+        expect(await strandedSnapshot()).toEqual(before);
+      }
+    });
+
+    it("still resolves a stranded pending review as blocked with its unresolved dependency", async () => {
+      const fixture = await seedStrandedPendingReview();
+      const before = await strandedSnapshot();
+      await request(fixture.app)
+        .post(`/api/issues/${fixture.issueA}/recovery-actions/resolve`)
+        .send({ actionId: fixture.action1.id, outcome: "blocked", sourceIssueStatus: "blocked" })
+        .expect(200);
+      const after = await strandedSnapshot();
+      expect(after.actions[0]).toMatchObject({ status: "resolved", outcome: "blocked" });
+      expect(after.issues).toEqual(before.issues);
+      expect(after.blockers).toEqual(before.blockers);
+      expect(after.decisions).toEqual(before.decisions);
+      expect(after.runs).toEqual(before.runs);
+      expect(after.wakes).toEqual(before.wakes);
+      expect(after.receipts).toEqual(before.receipts);
+    });
+
+    it("keeps status-only restoration for other recovery causes unchanged", async () => {
+      const fixture = await seedStrandedPendingReview();
+      await db.update(issueRecoveryActions).set({ cause: "issue_graph_liveness" })
+        .where(eq(issueRecoveryActions.id, fixture.action1.id));
+      await request(fixture.app)
+        .post(`/api/issues/${fixture.issueA}/recovery-actions/resolve`)
+        .send({ actionId: fixture.action1.id, outcome: "restored", sourceIssueStatus: "in_review" })
+        .expect(200);
+      const after = await strandedSnapshot();
+      expect(after.actions[0]).toMatchObject({ status: "resolved", outcome: "restored" });
+      expect(after.issues.find((issue) => issue.id === fixture.issueA)?.status).toBe("in_review");
+    });
+
+    it("keeps non-pending todo hand-back for the reviewer recovery cause unchanged", async () => {
+      const fixture = await seedStrandedPendingReview();
+      await db.delete(issueRelations).where(eq(issueRelations.companyId, fixture.companyId));
+      await db.update(issues).set({ status: "todo", executionPolicy: null, executionState: null })
+        .where(eq(issues.id, fixture.issueA));
+      await request(fixture.app)
+        .post(`/api/issues/${fixture.issueA}/recovery-actions/resolve`)
+        .send({ actionId: fixture.action1.id, outcome: "restored", sourceIssueStatus: "todo" })
+        .expect(200);
+      const after = await strandedSnapshot();
+      expect(after.actions[0]).toMatchObject({ status: "resolved", outcome: "handed_back" });
+      expect(after.issues.find((issue) => issue.id === fixture.issueA)?.status).toBe("todo");
+      expect(after.wakes).toHaveLength(0);
+    });
+
     it("keeps refusing a todo hand-back that would bypass the pending review stage", async () => {
       const fixture = await seedPreStartCancelledReview();
       // Handing back to todo would bypass the pending review, so that gate correctly refuses it.
