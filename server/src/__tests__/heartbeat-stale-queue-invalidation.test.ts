@@ -1845,7 +1845,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(claimedIssue).toEqual({ status: "in_progress", executionRunId: runId });
   });
 
-  it.each(["queued", "queued-policy", "queued-participant", "queued-stage", "queued-decision", "queued-assignee", "queued-responsible", "accounting", "provider", "retry"] as const)("rejects a real admitted generation independently at the %s fence", async phase => {
+  it.each(["queued", "queued-policy", "queued-participant", "queued-stage", "queued-decision", "queued-assignee", "queued-responsible", "accounting", "provider", "retry", "explicit-retry"] as const)("rejects a real admitted generation independently at the %s fence", async phase => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const [author] = await db.insert(agents).values({ companyId, name: "Author", role: "engineer", adapterType: "codex_local" }).returning();
     const policy = normalizeIssueExecutionPolicy({ stages: [{ type: "review", participants: [{ type: "agent", agentId }] }] })!;
@@ -1860,6 +1860,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     beforeClaimCheck = async () => { entered = true; await blocked; };
     const dispatch = vi.fn(async () => "unexpected provider");
     let wakePromise: Promise<unknown> | undefined;
+    let explicitRetryPromise: Promise<unknown> | undefined;
     let restore: (() => void) | undefined;
     try {
       wakePromise = heartbeat.wakeup(agentId, { source: "automation", triggerDetail: "system",
@@ -1882,7 +1883,21 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         await db.update(issues).set(patch).where(eq(issues.id, original.id));
       };
       const adapter = createPostgresRunDispatchAdapter(db);
-      if (phase === "retry") {
+      if (phase === "explicit-retry") {
+        await db.update(heartbeatRuns).set({ status: "failed", errorCode: "fixture_failure", finishedAt: new Date(),
+          resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } }).where(eq(heartbeatRuns.id, admitted.id));
+        await db.update(issues).set({ executionRunId: admitted.id }).where(eq(issues.id, original.id));
+        explicitRetryPromise = heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "manual",
+          reason: "retry_failed_run", failedRunId: admitted.id, payload: { issueId: original.id },
+          requestedByActorType: "user", requestedByActorId: "responsible-user",
+          contextSnapshot: { issueId: original.id, reviewerAssignmentGeneration: "forged-retry" } });
+        expect(await waitForCondition(async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, admitted.id))).length === 1)).toBe(true);
+        const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, admitted.id));
+        expect(retry.contextSnapshot?.reviewerAssignmentGeneration).toBe(admitted.contextSnapshot?.reviewerAssignmentGeneration);
+        await changeSubmission();
+        expect(await adapter.cancelStaleQueuedRun({ companyId, runId: retry.id,
+          expectedStatus: "queued", now: new Date() })).toMatchObject({ outcome: "cancelled", errorCode: "issue_review_participant_changed" });
+      } else if (phase === "retry") {
         await db.update(heartbeatRuns).set({ status: "failed", errorCode: "codex_transient_upstream", finishedAt: new Date(),
           resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } }).where(eq(heartbeatRuns.id, admitted!.id));
         await db.update(issues).set({ executionRunId: admitted!.id }).where(eq(issues.id, original.id));
@@ -1928,7 +1943,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       expect(task.executionState).toMatchObject({ status: "pending" });
       if (["queued", "accounting", "provider", "retry"].includes(phase))
         expect(task.executionState).toMatchObject({ changesRequestedCount: 2 });
-    } finally { restore?.(); release(); beforeClaimCheck = null; await wakePromise; }
+    } finally { restore?.(); release(); beforeClaimCheck = null; await Promise.all([wakePromise, explicitRetryPromise]); }
   });
 
   it("settles a manually admitted review from its linked operator receipt before comment authors", async () => {
@@ -1986,6 +2001,23 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       contextSnapshot: { issueId: original.id } }).returning();
     const legacyMerged = await merge(legacy.id, { issueId: original.id, reviewerAssignmentGeneration: "forged-legacy" });
     expect(legacyMerged.contextSnapshot).not.toHaveProperty("reviewerAssignmentGeneration");
+  });
+
+  it.each([true, false])("preserves persisted generation in the unscoped wake coalescing path: %s", async (withGeneration) => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const generation = "original-admitted-generation";
+    const [target] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "queued",
+      contextSnapshot: { taskKey: "unscoped-review", ...(withGeneration ? { reviewerAssignmentGeneration: generation } : {}) } }).returning();
+    const coalesced = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "manual",
+      contextSnapshot: { taskKey: "unscoped-review", reviewerAssignmentGeneration: "forged", additionalContext: "merged" } });
+    expect(coalesced?.id).toBe(target.id);
+    const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, target.id));
+    expect(saved.contextSnapshot?.additionalContext).toBe("merged");
+    if (withGeneration) expect(saved.contextSnapshot?.reviewerAssignmentGeneration).toBe(generation);
+    else expect(saved.contextSnapshot).not.toHaveProperty("reviewerAssignmentGeneration");
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId)))[0])
+      .toMatchObject({ status: "coalesced", runId: target.id });
+    await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, target.id));
   });
 
   it("claims and runs a pending interaction wake for an addressee who neither owns nor reviews the task", async () => {

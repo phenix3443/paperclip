@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { eq } from "drizzle-orm";
@@ -12,11 +12,16 @@ import {
   createDb,
   heartbeatRuns,
   issueThreadInteractions,
+  issueComments,
+  chatActions, chatConversations, chatDeliveries, chatEndpoints, chatExternalPrincipals,
+  chatIdentityLinks, chatMessageLinks, toolApplications, toolConnections,
   issues,
 } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { issueExecutionGeneration, normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
+import { chatChannelService, type ChatChannelServiceOptions } from "../services/chat-channels.js";
+import { createDurableChatWakeupRequest } from "../services/durable-chat-wakeup.js";
 import { initializeRunIdentity } from "../services/run-identity.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { runningProcesses } from "../adapters/index.ts";
@@ -83,6 +88,7 @@ describeEmbeddedPostgres("pending interaction addressee dispatch during review (
   }, 30_000);
 
   afterEach(async () => {
+    vi.unstubAllEnvs();
     mockAdapterExecute.mockClear();
     runningProcesses.clear();
     await drainHeartbeatRunsToQuiescence(db, heartbeat);
@@ -277,33 +283,162 @@ describeEmbeddedPostgres("pending interaction addressee dispatch during review (
     expect(executeCallsForAgent(f.reviewer.id)).toHaveLength(0);
   });
 
-  it("submits through the current-agent HTTP route and dispatches a generation from the settled task", async () => {
+  it.each(["current", "stale", "missing-generation", "invalid-identity"])(
+    "submits through the current-agent HTTP route and preserves recovery provenance: %s", async (mode) => {
     const f = await currentAgentFixture();
     const policy = normalizeIssueExecutionPolicy({ stages: [{ type: "review", participants: [{ type: "agent", agentId: f.reviewer.id }] }] })!;
     await db.update(issues).set({ status: "in_progress", executionPolicy: policy, executionState: null,
       executionRunId: f.run.id, checkoutRunId: f.run.id }).where(eq(issues.id, f.issue.id));
-    const response = await request(app(f.actor)).patch(`/api/issues/${f.issue.id}`)
-      .send({ status: "done", comment: "Ready for independent review" });
-    expect(response.status, JSON.stringify(response.body)).toBe(200);
-    expect(response.body).toMatchObject({ status: "in_review", executionState: { status: "pending", currentParticipant: { agentId: f.reviewer.id } } });
-    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.run.id));
-    expect(await waitForCondition(async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.reviewer.id))).length === 1)).toBe(true);
-    await heartbeat.resumeQueuedRuns();
-    await drainHeartbeatRunsToQuiescence(db, heartbeat);
-    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.reviewer.id));
-    const [task] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
-    expect(run.contextSnapshot?.reviewerAssignmentGeneration).toBe(issueExecutionGeneration(task));
-    expect(executeCallsForAgent(f.reviewer.id)).toHaveLength(1);
+    let sourceId: string | undefined;
+    let admittedGeneration: unknown;
+    let settledGeneration: string | undefined;
+    const execute = mockAdapterExecute.getMockImplementation()!;
+    mockAdapterExecute.mockImplementation(async (context) => {
+      const { runId, agent } = context as { runId: string; agent: { id: string } };
+      if (agent.id === f.reviewer.id && !sourceId) {
+        sourceId = runId;
+        const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+        const [task] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
+        admittedGeneration = source.contextSnapshot?.reviewerAssignmentGeneration;
+        settledGeneration = issueExecutionGeneration(task);
+        if (mode === "stale") await db.update(issues).set({ executionPolicy: { ...policy, maxReviewRounds: 4 } }).where(eq(issues.id, task.id));
+        if (mode === "missing-generation") {
+          const contextSnapshot = { ...source.contextSnapshot };
+          delete contextSnapshot.reviewerAssignmentGeneration;
+          await db.update(heartbeatRuns).set({ contextSnapshot }).where(eq(heartbeatRuns.id, runId));
+        }
+        if (mode === "invalid-identity") await db.update(heartbeatRuns).set({ activeIdentityContextId: f.run.activeIdentityContextId ?? String(f.actor.identityContextId) })
+          .where(eq(heartbeatRuns.id, runId));
+      }
+      return execute(context);
+    });
+    try {
+      const response = await request(app(f.actor)).patch(`/api/issues/${f.issue.id}`)
+        .send({ status: "done", comment: "Ready for independent review" });
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(response.body).toMatchObject({ status: "in_review", executionState: { status: "pending", currentParticipant: { agentId: f.reviewer.id } } });
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.run.id));
+      expect(await waitForCondition(async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.reviewer.id))).length > 0)).toBe(true);
+      await heartbeat.resumeQueuedRuns();
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      expect(sourceId).toBeTruthy();
+      expect(typeof admittedGeneration).toBe("string");
+      expect(admittedGeneration).toBe(settledGeneration);
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.reviewer.id));
+      const recovery = runs.filter(run => run.contextSnapshot?.source === "issue.execution_review_recovery");
+      if (mode === "missing-generation" || mode === "invalid-identity") {
+        expect(recovery).toHaveLength(0);
+        expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.reviewer.id))).toHaveLength(1);
+      } else {
+        expect(recovery).toHaveLength(1);
+        expect(recovery[0].retryOfRunId).toBe(sourceId);
+        expect(recovery[0].contextSnapshot?.retryOfRunId).toBe(sourceId);
+        expect(recovery[0].contextSnapshot?.reviewerAssignmentGeneration).toBe(admittedGeneration);
+        if (mode === "stale") {
+          expect(recovery[0]).toMatchObject({ status: "cancelled", errorCode: "issue_review_participant_changed" });
+          expect(executeCallsForAgent(f.reviewer.id)).toHaveLength(1);
+        } else expect(executeCallsForAgent(f.reviewer.id)).toHaveLength(2);
+      }
+      expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.companyId, f.companyId))).toHaveLength(0);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.addressee.id))).toHaveLength(0);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.addressee.id))).toHaveLength(0);
+    } finally { mockAdapterExecute.mockImplementation(execute); }
+  });
+
+  it("reauthorizes a durable failed chat request and inherits its admitted generation before stale admission", async () => {
+    const f = await seedReviewFixture();
+    const policy = normalizeIssueExecutionPolicy({ stages: [{ type: "review", participants: [{ type: "agent", agentId: f.reviewer.id }] }] })!;
+    await db.update(issues).set({ assigneeAgentId: f.reviewer.id, executionPolicy: policy,
+      executionState: { ...f.executionState, currentStageId: policy.stages[0].id } }).where(eq(issues.id, f.issue.id));
+    const [application] = await db.insert(toolApplications).values({ companyId: f.companyId, name: "Chat retry", type: "chat" }).returning();
+    const [connection] = await db.insert(toolConnections).values({ companyId: f.companyId, applicationId: application.id,
+      name: "Chat retry", uid: randomUUID(), connectionPurpose: "channel", transport: "chat_sdk", status: "active", credentialSecretRefs: [] }).returning();
+    const [endpoint] = await db.insert(chatEndpoints).values({ companyId: f.companyId, connectionId: connection.id,
+      provider: "telegram", publicId: randomUUID(), assignedAgentId: f.reviewer.id, status: "active", setup: { step: "complete" } }).returning();
+    const [principal] = await db.insert(chatExternalPrincipals).values({ companyId: f.companyId, provider: "telegram",
+      providerAccountId: "fixture", externalId: "12345" }).returning();
+    await db.insert(chatIdentityLinks).values({ companyId: f.companyId, endpointId: endpoint.id,
+      principalId: principal.id, paperclipUserId: f.board.userId, status: "linked" });
+    const [conversation] = await db.insert(chatConversations).values({ companyId: f.companyId, endpointId: endpoint.id,
+      issueId: f.issue.id, externalConversationId: "12345", externalLabel: "Retry request", isDirectMessage: true }).returning();
+    const [delivery] = await db.insert(chatDeliveries).values({ companyId: f.companyId, endpointId: endpoint.id,
+      conversationId: conversation.id, principalId: principal.id, providerEventId: "12345:1", deduplicationKey: randomUUID(),
+      eventKind: "message", state: "processed", normalizedEvent: { message: { id: "12345:1", text: "Review exactly this" },
+        runtimeContext: { generation: 0, credentialFingerprint: createHash("sha256").update("[]").digest("hex") } } }).returning();
+    const acceptedAt = new Date();
+    const [comment] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issue.id,
+      authorUserId: f.board.userId, body: "Review exactly this", createdAt: acceptedAt, updatedAt: acceptedAt }).returning();
+    await db.insert(chatMessageLinks).values({ companyId: f.companyId, endpointId: endpoint.id, conversationId: conversation.id,
+      deliveryId: delivery.id, commentId: comment.id, providerMessageId: "12345:1", direction: "inbound" });
+    const [action] = await db.insert(chatActions).values({ companyId: f.companyId, endpointId: endpoint.id,
+      conversationId: conversation.id, principalId: principal.id, deliveryId: delivery.id, kind: "inbound_wakeup",
+      providerActionId: randomUUID(), status: "processed", payload: { version: 1, issueId: f.issue.id, agentId: f.reviewer.id,
+        commentId: comment.id, sessionGeneration: conversation.sessionGeneration, requestedByActorType: "user", requestedByActorId: f.board.userId } }).returning();
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    let claimHeld = false;
+    const admissionHeartbeat = heartbeatService(db, { runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "false" },
+      beforeChatControlRecoveryCheck: async () => { if (!claimHeld) { claimHeld = true; await held; } } });
+    let originalWake: Promise<unknown> | undefined;
+    const service = chatChannelService(db, { heartbeat: { wakeup: admissionHeartbeat.wakeup },
+      runtime: { shutdown: async () => {} } as unknown as ChatChannelServiceOptions["runtime"] });
+    try {
+      const request = createDurableChatWakeupRequest({ id: action.id, companyId: f.companyId, agentId: f.reviewer.id,
+        issueId: f.issue.id, commentId: comment.id, requestedByActorType: "user", requestedByActorId: f.board.userId,
+        requestedAt: action.createdAt, authorize: async tx => {
+          const [saved] = await tx.select().from(chatActions).where(eq(chatActions.id, action.id));
+          if (saved?.status !== "processed") throw new Error("Original request is no longer accepted");
+        } });
+      originalWake = admissionHeartbeat.wakeup(f.reviewer.id, { source: "automation", triggerDetail: "system", reason: "issue_commented",
+        payload: { issueId: f.issue.id, commentId: comment.id }, requestedByActorType: "user", requestedByActorId: f.board.userId,
+        contextSnapshot: { issueId: f.issue.id, taskKey: f.issue.id, source: "chat:telegram", wakeCommentId: comment.id }, durableChatRequest: request });
+      expect(await waitForCondition(async () => claimHeld)).toBe(true);
+      const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.reviewer.id));
+      expect(typeof source.contextSnapshot?.reviewerAssignmentGeneration).toBe("string");
+      await db.update(heartbeatRuns).set({ status: "failed", errorCode: "adapter_exit_code", finishedAt: new Date() }).where(eq(heartbeatRuns.id, source.id));
+      release();
+      await originalWake;
+      const intent = await db.transaction(tx => service.prepareFailedChatRunRetry(tx, { companyId: f.companyId, issueId: f.issue.id,
+        agentId: f.reviewer.id, failedRunId: source.id, initiatedByUserId: f.board.userId }));
+      await db.update(issues).set({ executionPolicy: { ...policy, maxReviewRounds: 4 } }).where(eq(issues.id, f.issue.id));
+      await service.processFailedChatRunRetry(intent.actionId);
+      const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, intent.actionId));
+      expect(receipt.runId).toBeTruthy();
+      const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, receipt.runId!));
+      expect(retry.retryOfRunId).toBe(source.id);
+      expect(retry.contextSnapshot?.reviewerAssignmentGeneration).toBe(source.contextSnapshot?.reviewerAssignmentGeneration);
+      expect(retry.contextSnapshot?.chatFailedRunRetry).toMatchObject({ version: 1, actionId: intent.actionId, failedRunId: source.id });
+      await admissionHeartbeat.resumeQueuedRuns();
+      const [rejected] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retry.id));
+      expect(rejected).toMatchObject({ status: "cancelled", errorCode: "issue_review_participant_changed" });
+      expect(executeCallsForAgent(f.reviewer.id)).toHaveLength(0);
+      expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.companyId, f.companyId))).toHaveLength(0);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.addressee.id))).toHaveLength(0);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.addressee.id))).toHaveLength(0);
+    } finally { release(); await originalWake; await admissionHeartbeat.drainActiveRunExecutions(); await service.shutdown(); }
   });
 
   it.each([
-    ["unauthenticated", 404], ["missing-run", 401], ["missing-source", 422],
+    ["invisible", 404], ["read-without-mutate", 403], ["unauthenticated", 404], ["missing-run", 401], ["missing-source", 422],
     ["wrong-company", 404], ["wrong-source-company", 422], ["wrong-source-agent", 422],
     ["wrong-source-issue", 422], ["wrong-identity", 422], ["self", 422], ["noninvokable", 422],
     ["other-agent-lock", 409], ["low-trust", 403], ["tool-action", 422], ["secret-proposal", 422],
   ])("rejects %s on the current-agent route without creating a card or wake", async (fault, status) => {
     const f = await currentAgentFixture();
     let body: Record<string, unknown> = f.body;
+    if (fault === "invisible") {
+      vi.stubEnv("PAPERCLIP_ISSUE_PRIVACY_MODE", "enforce");
+      await db.update(issues).set({ visibility: "private", assigneeAgentId: f.reviewer.id }).where(eq(issues.id, f.issue.id));
+      expect((await request(app(f.actor)).get(`/api/issues/${f.issue.id}`)).status).toBe(404);
+    }
+    if (fault === "read-without-mutate") {
+      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issue.id,
+        executionPolicy: { trustPreset: "low_trust_review", authorizationPolicy: { trustBoundary: {
+          mode: "low_trust_review", issueIds: [randomUUID()], allowedAgentIds: [f.assignee.id] } } } } }).where(eq(heartbeatRuns.id, f.run.id));
+      await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issue.id,
+        authorUserId: f.board.userId, body: `Please inspect [Assignee](agent://${f.assignee.id})` });
+      expect((await request(app(f.actor)).get(`/api/issues/${f.issue.id}`)).status).toBe(200);
+    }
     if (fault === "unauthenticated") { f.actor.type = "none"; delete f.actor.agentId; }
     if (fault === "missing-run") delete f.actor.runId;
     if (fault === "missing-source") f.actor.runId = randomUUID();
