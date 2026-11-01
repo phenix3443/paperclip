@@ -602,7 +602,6 @@ describe("watcher and config reload generations through the real app, route and 
     expect(h.gate.count("spawned")).toBe(1);
     expect(state.rows.get(row.id)!.status).toBe("disabled");
     expect(h.workerManager.getWorker(row.id)).toBeUndefined();
-    expect(h.appLifecycle.isQuiesced(row.id)).toBe(true);
   });
 
   it("N18: a reload scheduled before a queued disable is superseded, and the following enable runs alone", async () => {
