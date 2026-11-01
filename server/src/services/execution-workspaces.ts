@@ -4810,7 +4810,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           message: "execution workspace cleanup skipped because it was reopened",
         },
         onSkip: () => ({ skippedReopened: true as const }),
-        write: async () => ({ skippedReopened: false as const, result: await input.destroy() }),
+        write: async ({ tx }) => {
+          const [workspace] = await tx.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, input.workspaceId));
+          if (!workspace) return { skippedReopened: true as const };
+          await assertWorkspaceRetentionAllowsRemoval(tx, workspace);
+          return { skippedReopened: false as const, result: await input.destroy() };
+        },
       });
     },
 

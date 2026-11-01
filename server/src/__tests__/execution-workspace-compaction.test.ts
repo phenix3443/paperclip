@@ -250,6 +250,24 @@ describeEmbeddedPostgres("terminal workspace compaction", () => {
     expect(await fs.readFile(path.join(worktreePath, "README.md"), "utf8")).toContain("uncommitted edit");
   }
 
+  it("refuses manual destruction when retention appears after readiness", async () => {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "retention-manual-")); tempDirs.add(home); vi.stubEnv("PAPERCLIP_HOME", home);
+    const seeded = await seedWorkspace({ populate: false });
+    const svc = service();
+    const readiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
+    expect(readiness?.blockingReasons).toEqual([]);
+    const retained = await retainedFixture(db, { id: seeded.executionWorkspaceId, companyId: seeded.companyId,
+      sourceIssueId: seeded.sourceIssueId, cwd: seeded.worktreePath }, "retained");
+    const archived = await svc.archiveWorkspaceUnderLifecycleLock({ id: seeded.executionWorkspaceId, closedAt: new Date(), patch: { status: "archived" } });
+    expect(archived?.outcome).toBe("archived"); if (archived?.outcome !== "archived") throw new Error("not archived");
+    const destroy = vi.fn(async () => { await fs.rm(seeded.worktreePath, { recursive: true, force: true }); });
+    await expect(svc.fenceClosedWorkspaceDestruction({ workspaceId: seeded.executionWorkspaceId,
+      capturedGeneration: archived.capturedGeneration, destroy })).rejects.toThrow("detached_repository_retention");
+    expect(destroy).not.toHaveBeenCalled();
+    expect(await fs.readFile(path.join(retained.destination, "unique"), "utf8")).toBe("retained unique bytes");
+    expect(await exists(seeded.worktreePath)).toBe(true);
+  }, 30_000);
+
   it.each(receiptCases.flatMap(state => ["cleanup", "compaction"].map(removal => ({ state, removal }))))(
     "refuses $removal with retention history before removal hook ($state)", async ({ state, removal }) => {
       const home = await fs.mkdtemp(path.join(os.tmpdir(), "retention-removal-")); tempDirs.add(home);

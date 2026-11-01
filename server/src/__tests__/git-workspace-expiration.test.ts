@@ -1,3 +1,6 @@
+import { withIsolatedRepositorySourceLock } from "../services/isolated-remote-workspace-source.js";
+import { withExecutionWorkspaceLifecycleLock } from "../services/execution-workspace-lifecycle-lock.js";
+import { resolveDetachedRepositoryRetentionDir } from "../home-paths.js";
 import { receiptCases, retainedFixture } from "./helpers/detached-retention.js";
 import * as retentionInspection from "../services/detached-repository-retention.js";
 import { promises as fs } from "node:fs";
@@ -1111,11 +1114,16 @@ describeEmbeddedPostgres("reconstructable Git expiration", () => {
       const f = await nestedFixture(false, true);
       git(f.nestedSource, "push", "-q", f.nestedRemote, "main:other");
       const original = git(f.nested.cwd, "symbolic-ref", "HEAD");
-      await prepareProjectRepositoryWorkspaces({ ...f.preparation, workspaces: [{ ...f.preparation.workspaces[0]!, repoRef: "other" }] });
-      const detachedRoot = path.join(f.cwd, ".paperclip-runtime", "detached-repositories");
-      const [retained] = await fs.readdir(detachedRoot);
+      const prepare = (workspaces = f.preparation.workspaces) => withIsolatedRepositorySourceLock(db, f.companyId, f.issueId,
+        () => prepareProjectRepositoryWorkspaces({ ...f.preparation, workspaces, retention: {
+          companyId: f.companyId, executionWorkspaceId: f.workspaceId, sourceIssueId: f.issueId, runId: null, generation: 0,
+          withLifecycleLock: work => withExecutionWorkspaceLifecycleLock(db, f.workspaceId, work),
+        } }));
+      await prepare([{ ...f.preparation.workspaces[0]!, repoRef: "other" }]);
+      const detachedRoot = resolveDetachedRepositoryRetentionDir({ companyId: f.companyId, executionWorkspaceId: f.workspaceId });
+      const [retained] = (await fs.readdir(detachedRoot)).filter(name => !name.endsWith(".json"));
       expect(git(path.join(detachedRoot, retained!), "symbolic-ref", "HEAD")).toBe(original);
-      const [back] = await prepareProjectRepositoryWorkspaces(f.preparation);
+      const [back] = await prepare();
       expect(back!.cwd).toBe(f.nested.cwd);
       expect(git(back!.cwd, "symbolic-ref", "HEAD")).toBe(original.replace(/\/main$/, "/r2/main"));
       expect(git(back!.cwd, "rev-parse", "--abbrev-ref", "@{upstream}")).toBe("origin/main");

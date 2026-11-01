@@ -171,4 +171,27 @@ describe("detached repository custody", () => {
     expect(await fs.readFile(path.join(original, "tracked"), "utf8")).toBe("initial");
   });
 
+  it("finishes a pending rollback after repair and unlock already completed", async () => {
+    const base = path.join(root, "base"); await fs.rename(source, base);
+    git(base, "worktree", "add", "-qb", "paperclip/123456789abc/private", source);
+    await preserveDetachedRepositories({ cwd, active: new Set(), retention: scope });
+    const { file, value } = await receipt();
+    await fs.rename(value.destination, source); git(base, "worktree", "repair", source); git(base, "worktree", "unlock", source);
+    value.state = "pending"; value.history = [value.history[0]]; value.rollbackStartedAt = new Date().toISOString();
+    await fs.writeFile(file, JSON.stringify(value));
+    await preserveDetachedRepositories({ cwd, active: new Set(), retention: scope });
+    expect(JSON.parse(await fs.readFile(file, "utf8")).state).toBe("rolled_back");
+    expect(await fs.readFile(path.join(source, "tracked"), "utf8")).toBe("initial");
+  });
+
+  it("leaves corrupt pending custody evidence and both paths unchanged", async () => {
+    await preserveDetachedRepositories({ cwd, active: new Set(), retention: scope });
+    const { file, value } = await receipt(); value.state = "pending"; value.before = {}; value.history = [value.history[0]];
+    const bytes = JSON.stringify(value); await fs.writeFile(file, bytes);
+    expect((await preserveDetachedRepositories({ cwd, active: new Set(), retention: scope })).join(" ")).toContain("Unrecognized custody receipt");
+    expect(await fs.readFile(file, "utf8")).toBe(bytes);
+    expect(await fs.lstat(source).catch(() => null)).toBeNull();
+    expect(await fs.readFile(path.join(value.destination, "tracked"), "utf8")).toBe("initial");
+  });
+
 });

@@ -147,13 +147,15 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
     return { companyId, issueId, workspaceId, agentId, cwd, row, ledger, service, expire, reopen };
   }
 
-  it.each(["running_before", "queued_during", "archive_first", "move_first", "two_preparations"])("serializes detached retention with native consumers (%s)", async scenario => {
+  it.each(["running_before", "issue_column_before", "queued_during", "archive_first", "move_first", "two_preparations"])("serializes detached retention with native consumers (%s)", async scenario => {
     const f = await fixture();
     const source = path.join(f.cwd, ".paperclip-repositories", "removed"); await fs.mkdir(source, { recursive: true });
     await fs.writeFile(path.join(source, "unique"), "keep");
     const runId = randomUUID();
     if (scenario === "running_before") await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.agentId,
       nativeIssueId: f.issueId, status: "running" });
+    if (scenario === "issue_column_before") await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.agentId,
+      issueId: f.issueId, status: "running" });
     if (scenario === "archive_first") await f.service().archiveWorkspaceUnderLifecycleLock({ id: f.workspaceId, closedAt: new Date(), patch: { status: "archived" } });
     let entered!: () => void, release!: () => void;
     const waiting = new Promise<void>(resolve => { entered = resolve; });
@@ -182,7 +184,7 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
     } else await prepare(false);
     const directory = resolveDetachedRepositoryRetentionDir({ companyId: f.companyId, executionWorkspaceId: f.workspaceId });
     const files = (await fs.readdir(directory)).filter(name => name.endsWith(".json"));
-    if (["running_before", "archive_first"].includes(scenario)) { expect(files).toEqual([]); expect(await fs.readFile(path.join(source, "unique"), "utf8")).toBe("keep"); }
+    if (["running_before", "issue_column_before", "archive_first"].includes(scenario)) { expect(files).toEqual([]); expect(await fs.readFile(path.join(source, "unique"), "utf8")).toBe("keep"); }
     else {
       expect(files).toHaveLength(1);
       const receipt = JSON.parse(await fs.readFile(path.join(directory, files[0]!), "utf8"));

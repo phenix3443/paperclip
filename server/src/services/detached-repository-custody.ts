@@ -117,27 +117,33 @@ async function verifyOriginal(receipt: Receipt) {
   if (current.commit !== receipt.before.commit || current.symbolicRef !== receipt.before.symbolicRef) throw new Error("Original HEAD changed");
 }
 async function rollback(file: string, receipt: Receipt, error: unknown) {
+  let state: State = "rolled_back";
+  let failure: unknown = error;
   try {
+    const destination = await stat(receipt.destination);
+    if (!destination?.isDirectory() || destination.isSymbolicLink() || destination.dev !== receipt.dev || destination.ino !== receipt.ino) throw new Error("Rollback destination identity changed");
     if (receipt.base) {
       const lock = lockLine(await registration(receipt.base, receipt.destination));
-      if (lock && lock !== `locked ${receipt.lockReason}`) { await transition(file, receipt, "in_doubt", lock); return; }
+      if (lock && lock !== `locked ${receipt.lockReason}`) { state = "in_doubt"; failure = lock; }
     }
-    if (await stat(receipt.source)) throw new Error("Original path occupied; refusing rollback overwrite");
-    receipt.rollbackStartedAt = new Date().toISOString();
-    await transition(file, receipt, "pending", error);
-    await fs.rename(receipt.destination, receipt.source);
-    await syncDirectory(path.dirname(receipt.source));
-    await syncDirectory(path.dirname(receipt.destination));
-    await verifyOriginal(receipt);
-    await transition(file, receipt, "rolled_back", error);
-  } catch (failure) { await transition(file, receipt, "rollback_failed", failure); }
+    if (state !== "in_doubt") {
+      if (await stat(receipt.source)) throw new Error("Original path occupied; refusing rollback overwrite");
+      receipt.rollbackStartedAt = new Date().toISOString();
+      await transition(file, receipt, "pending", error);
+      await fs.rename(receipt.destination, receipt.source);
+      await syncDirectory(path.dirname(receipt.source));
+      await syncDirectory(path.dirname(receipt.destination));
+      await verifyOriginal(receipt);
+    }
+  } catch (cause) { state = "rollback_failed"; failure = cause; }
+  await transition(file, receipt, state, failure);
 }
 async function finalize(file: string, receipt: Receipt, guard: () => Promise<void>) {
+  let foreign: string | null = null;
+  try { if (receipt.base) foreign = await pin(receipt); }
+  catch (error) { await rollback(file, receipt, error); return; }
+  if (foreign) { await transition(file, receipt, "in_doubt", foreign); return; }
   try {
-    if (receipt.base) {
-      const foreign = await pin(receipt);
-      if (foreign) { await transition(file, receipt, "in_doubt", foreign); return; }
-    }
     const entry = await stat(receipt.destination);
     if (!entry?.isDirectory() || entry.isSymbolicLink() || entry.dev !== receipt.dev || entry.ino !== receipt.ino) throw new Error("Retained checkout identity changed");
     receipt.after = await facts(receipt.destination);
@@ -146,16 +152,40 @@ async function finalize(file: string, receipt: Receipt, guard: () => Promise<voi
   } catch (error) { await rollback(file, receipt, error); return; }
   await transition(file, receipt, "retained");
 }
+const receiptStates: ReadonlySet<unknown> = new Set(["pending", "retained", "rolled_back", "aborted", "in_doubt", "rollback_failed", "conflict", "unknown"]);
+function validFacts(value: unknown): value is Facts {
+  if (!value || typeof value !== "object") return false;
+  const fact = value as Record<string, unknown>;
+  return (fact.symbolicRef === null || typeof fact.symbolicRef === "string")
+    && (fact.commit === null || typeof fact.commit === "string" && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(fact.commit))
+    && typeof fact.statusDigest === "string" && /^[a-f0-9]{64}$/.test(fact.statusDigest);
+}
+function validTime(value: unknown) { return typeof value === "string" && Number.isFinite(Date.parse(value)); }
 function validReceipt(value: Record<string, unknown>, file: string, directory: string, cwd: string, scope: CustodyScope): value is Record<string, unknown> & Receipt {
   if (value.schemaVersion !== 1 || typeof value.id !== "string" || !/^[a-f0-9-]{36}$/.test(value.id)
     || value.companyId !== scope.companyId || value.executionWorkspaceId !== scope.executionWorkspaceId
     || typeof value.entry !== "string" || path.basename(value.entry) !== value.entry || [".", "..", ""].includes(value.entry)
     || value.source !== path.join(cwd, ".paperclip-repositories", value.entry)
     || value.destination !== path.join(directory, value.id) || file !== path.join(directory, `${value.id}.json`)
-    || typeof value.dev !== "number" || typeof value.ino !== "number" || !Array.isArray(value.history)
-    || !value.before || typeof value.before !== "object") return false;
+    || typeof value.dev !== "number" || !Number.isSafeInteger(value.dev) || typeof value.ino !== "number" || !Number.isSafeInteger(value.ino)
+    || !validFacts(value.before) || value.after !== undefined && !validFacts(value.after)
+    || !receiptStates.has(value.state) || !validTime(value.createdAt) || !validTime(value.updatedAt)
+    || value.rollbackStartedAt !== undefined && !validTime(value.rollbackStartedAt)
+    || !Array.isArray(value.history) || value.history.length === 0
+    || !value.history.every(entry => entry && receiptStates.has(entry.state) && validTime(entry.at))
+    || value.history.at(-1).state !== value.state) return false;
   if (value.kind === "linked") return typeof value.base === "string" && path.isAbsolute(value.base) && value.lockReason === `paperclip detached retention ${value.id}`;
   return value.kind === "standalone" && value.base === null && value.lockReason === null;
+}
+async function proveReceiptLinkedAdministration(receipt: Receipt, checkout: string) {
+  const common = (await git(checkout, ["rev-parse", "--path-format=absolute", "--git-common-dir"])).trim();
+  const admin = (await git(checkout, ["rev-parse", "--absolute-git-dir"])).trim();
+  const storage = await fs.lstat(common);
+  if (!storage.isDirectory() || storage.isSymbolicLink() || await fs.realpath(receipt.base!) !== receipt.base
+    || common !== path.join(receipt.base!, ".git") || path.dirname(admin) !== path.join(common, "worktrees")
+    || await fs.realpath(admin) !== admin) throw new Error("Unproven retained worktree administration");
+  const pointer = await readWorktreePointer(admin);
+  if (![path.join(receipt.source, ".git"), path.join(receipt.destination, ".git")].includes(pointer)) throw new Error("Foreign worktree administration");
 }
 async function reconcile(file: string, receipt: Receipt, guard: () => Promise<void>) {
   const source = await stat(receipt.source), destination = await stat(receipt.destination);
@@ -163,25 +193,19 @@ async function reconcile(file: string, receipt: Receipt, guard: () => Promise<vo
   if (source && destination) return transition(file, receipt, "conflict");
   if (ours(destination)) {
     if (receipt.base) {
-      const common = (await git(receipt.destination, ["rev-parse", "--path-format=absolute", "--git-common-dir"])).trim();
-      const admin = (await git(receipt.destination, ["rev-parse", "--absolute-git-dir"])).trim();
-      if (common !== path.join(receipt.base, ".git") || path.dirname(admin) !== path.join(common, "worktrees")) {
-        return transition(file, receipt, "unknown", "Unproven retained worktree administration");
-      }
-      const pointer = await readWorktreePointer(admin);
-      if (![path.join(receipt.source, ".git"), path.join(receipt.destination, ".git")].includes(pointer)) {
-        return transition(file, receipt, "unknown", "Foreign worktree administration");
-      }
+      try { await proveReceiptLinkedAdministration(receipt, receipt.destination); }
+      catch (error) { return transition(file, receipt, "unknown", error); }
     }
     return finalize(file, receipt, guard);
   }
   if (ours(source)) {
     if (receipt.base) {
       try {
+        await proveReceiptLinkedAdministration(receipt, receipt.source);
         const registered = await registration(receipt.base, receipt.source);
         if (registered) {
           await verifyOriginal(receipt);
-          return transition(file, receipt, lockLine(registered) === `locked ${receipt.lockReason}` ? "rolled_back" : "aborted");
+          return transition(file, receipt, receipt.rollbackStartedAt || lockLine(registered) === `locked ${receipt.lockReason}` ? "rolled_back" : "aborted");
         }
         await verifyOriginal(receipt);
         return transition(file, receipt, "rolled_back");
@@ -238,7 +262,9 @@ export async function preserveDetachedRepositories(input: Input): Promise<string
         const linked = await readLinkedNestedCheckout(source);
         const action = async () => {
           if (linked) {
-            if (lockLine(await registration(linked.base, source))) throw new Error("Worktree lock belongs to another owner");
+            const registered = await registration(linked.base, source);
+            if (!registered) throw new Error("Missing source worktree registration");
+            if (lockLine(registered)) throw new Error("Worktree lock belongs to another owner");
           } else if (await stat(path.join(source, ".git"))) {
             const worktrees = (await git(source, ["worktree", "list", "--porcelain"])).split("\n").filter(line => line.startsWith("worktree "));
             if (worktrees.length !== 1 || worktrees[0] !== `worktree ${await fs.realpath(source)}`) throw new Error("Standalone checkout has foreign worktrees");

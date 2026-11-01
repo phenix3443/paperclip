@@ -44,7 +44,9 @@ async function assertRetentionMayMove(tx: Transaction, input: ProjectRepositoryR
         SELECT 1 FROM ${heartbeatRuns} issue_run WHERE issue_run.company_id = ${input.companyId}
           AND issue_run.status IN ('queued', 'running')
           AND (${input.runId}::uuid IS NULL OR issue_run.id <> ${input.runId}::uuid)
-          AND (issue_run.context_snapshot->>'executionWorkspaceId' = ${workspace.id}::text OR coalesce(issue_run.native_issue_id::text,
+          AND (issue_run.issue_id IN (SELECT id FROM issue_tree)
+            OR issue_run.issue_id IN (SELECT id FROM ${issues} WHERE company_id = ${input.companyId} AND execution_workspace_id = ${workspace.id})
+            OR issue_run.context_snapshot->>'executionWorkspaceId' = ${workspace.id}::text OR coalesce(issue_run.native_issue_id::text,
             nullif(issue_run.context_snapshot->>'issueId', ''), nullif(issue_run.context_snapshot->>'taskId', '')) IN (SELECT id::text FROM issue_tree))
       )
       AND NOT EXISTS (SELECT 1 FROM ${workspaceRuntimeServices} service WHERE service.company_id = ${input.companyId}
