@@ -137,7 +137,7 @@ export const createProjectToolSchema = createProjectSchema.extend({
   idempotencyKey: z.string().min(1).max(255),
 });
 
-let projectToolJsonSchema: ReturnType<typeof z.toJSONSchema> | undefined;
+let projectToolJsonSchema: z.core.JSONSchema.BaseSchema | undefined;
 export function createProjectToolJsonSchema() {
   return structuredClone(projectToolJsonSchema ??= z.toJSONSchema(createProjectToolSchema));
 }

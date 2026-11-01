@@ -9,7 +9,7 @@ export const setAgentAvatarSchema = z.object({
 }).strict();
 export type SetAgentAvatarInput = z.infer<typeof setAgentAvatarSchema>;
 
-let avatarJsonSchema: ReturnType<typeof z.toJSONSchema> | undefined;
+let avatarJsonSchema: z.core.JSONSchema.BaseSchema | undefined;
 export function setAgentAvatarJsonSchema() {
   return structuredClone(avatarJsonSchema ??= z.toJSONSchema(setAgentAvatarSchema));
 }

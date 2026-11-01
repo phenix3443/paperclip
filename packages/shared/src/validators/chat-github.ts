@@ -161,7 +161,7 @@ export const githubReviewAssessmentSchema = z
       });
   });
 
-let assessmentJsonSchema: ReturnType<typeof z.toJSONSchema> | undefined;
+let assessmentJsonSchema: z.core.JSONSchema.BaseSchema | undefined;
 export function githubReviewAssessmentJsonSchema() {
   return structuredClone(assessmentJsonSchema ??= z.toJSONSchema(githubReviewAssessmentSchema, {
     target: "draft-7", io: "input",
