@@ -270,6 +270,11 @@ export function prepareGitPayloadSkills(checkoutPath: string): void {
   }
 }
 
+export async function unifyGitPayloadVersions(checkoutPath: string, runCommand: CommandRunner, buildEnv: (extra?: NodeJS.ProcessEnv) => NodeJS.ProcessEnv = gitBuildEnv): Promise<void> {
+  const { version } = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
+  await runCommand(process.execPath, ["scripts/release-package-map.mjs", "set-version", version], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 4 * 1024 * 1024 });
+}
+
 export async function packGitPayload({ checkoutPath, stagingRoot, stagedPayload, runCommand, buildEnv = gitBuildEnv }: GitPayloadPackOptions): Promise<{ version: string; expected: PostgresDriverExpectation }> {
   const expected = readCheckoutPostgresDriver(checkoutPath);
   const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
@@ -344,6 +349,7 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     await runCommand("corepack", ["pnpm", "-r", "--filter", "@paperclipai/server...", "--if-present", "run", "build"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("bash", ["scripts/prepare-server-ui-dist.sh"], { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
     prepareGitPayloadSkills(checkoutPath);
+    await unifyGitPayloadVersions(checkoutPath, runCommand, buildEnv);
     const { version, expected } = await packGitPayload({ checkoutPath, stagingRoot, stagedPayload, runCommand, buildEnv });
     await verifyPayload(stagedPayload, expected);
     await smokePayload(stagedPayload, version, runCommand);
