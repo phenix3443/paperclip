@@ -731,6 +731,8 @@ export function createHeartbeatScheduling(
             sourceRun.status,
           )
         ) {
+          if (isProviderQuotaReviewMonitor) throw new ReviewQuotaMonitorHeld(
+            "The quota recovery source changed; inspect the current task execution.");
           throw conflict(
             "The quota recovery source changed; inspect the current task execution.",
           );
@@ -777,6 +779,8 @@ export function createHeartbeatScheduling(
                 : {}),
             },
           );
+          if (atomicAdmission && scheduled.outcome === "retry_exhausted")
+            throw new ReviewQuotaMonitorHeld("The quota retry budget is exhausted");
           if (scheduled.outcome === "not_scheduled") {
             if (atomicAdmission) throw new ReviewQuotaMonitorHeld(scheduled.reason);
             throw conflict(scheduled.reason);

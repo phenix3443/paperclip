@@ -287,7 +287,7 @@ describeEmbeddedPostgres("pending interaction addressee dispatch during review (
     expect(executeCallsForAgent(f.reviewer.id)).toHaveLength(0);
   });
 
-  it.each(["valid", "scheduled-valid", "source-identity-install", "source-identity-retry", "scheduled-question", "atomic-identity", "atomic-proof", "retry-insert", "retry-commit", "install-write", "install-commit", "duplicate", "manual-exhausted", "scheduled-exhausted"])(
+  it.each(["valid", "scheduled-valid", "source-identity-install", "source-identity-retry", "scheduled-question", "atomic-identity", "atomic-proof", "retry-insert", "retry-commit", "install-write", "install-commit", "duplicate", "manual-exhausted", "scheduled-exhausted", "parallel-install", "submission-before-install", "submission-before-consume", "replacement-before-consume"])(
     "records quota installation proof from a real admitted reviewer before monitor retry (%s)", async mode => {
     const f = await currentAgentFixture();
     const policy = normalizeIssueExecutionPolicy({ stages: [{ type: "review", participants: [{ type: "agent", agentId: f.reviewer.id }] }] })!;
@@ -323,6 +323,69 @@ describeEmbeddedPostgres("pending interaction addressee dispatch during review (
       const transition = applyIssueMonitorPolicyTransition({ issue: before, policy: installedPolicy,
         previousPolicy: normalizeIssueExecutionPolicy(before.executionPolicy), requestedStatus: before.status,
         requestedAssigneePatch: {}, actor: { agentId: null, userId: null }, monitorExplicitlyUpdated: true });
+      if (["submission-before-install", "submission-before-consume", "replacement-before-consume"].includes(mode)) {
+        const installing = mode === "submission-before-install";
+        const raceIssue = installing ? before : (await issueService(db).update(f.issue.id, { ...transition.patch, executionPolicy: installedPolicy }))!;
+        await db.update(issueThreadInteractions).set({ status: "cancelled" }).where(eq(issueThreadInteractions.id, question.id));
+        const replacementAt = new Date(Date.now() + 120_000).toISOString();
+        const racePolicy = normalizeIssueExecutionPolicy(mode === "replacement-before-consume"
+          ? { ...raceIssue.executionPolicy, monitor: { nextCheckAt: replacementAt, notes: "Replacement monitor" } }
+          : { ...raceIssue.executionPolicy, maxReviewRounds: 4 })!;
+        const racePatch = mode === "replacement-before-consume"
+          ? { ...applyIssueMonitorPolicyTransition({ issue: raceIssue, policy: racePolicy,
+              previousPolicy: normalizeIssueExecutionPolicy(raceIssue.executionPolicy), requestedStatus: raceIssue.status,
+              requestedAssigneePatch: {}, actor: { agentId: f.reviewer.id }, monitorExplicitlyUpdated: true }).patch,
+              executionPolicy: racePolicy }
+          : { executionPolicy: racePolicy };
+        let unlock!: () => void;
+        let entered!: () => void;
+        const release = new Promise<void>(resolve => { unlock = resolve; });
+        const locked = new Promise<void>(resolve => { entered = resolve; });
+        const writer = db.transaction(async tx => {
+          if (installing) await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, f.issue.id)).for("no key update");
+          else await tx.select({ id: companies.id }).from(companies).where(eq(companies.id, f.companyId)).for("update");
+          entered();
+          await release;
+          await tx.update(issues).set(racePatch).where(eq(issues.id, f.issue.id));
+        });
+        let operation: Promise<unknown> | undefined;
+        try {
+          await locked;
+          operation = (installing
+            ? issueService(db).update(f.issue.id, { ...transition.patch, executionPolicy: installedPolicy })
+            : heartbeat.triggerIssueMonitor(f.issue.id, { now: new Date(nextCheckAt), actorType: "user", actorId: f.board.userId }))
+            .catch(error => error);
+          let blocked = false;
+          for (let attempt = 0; attempt < 100; attempt++) {
+            const waiting = await db.execute(sql`select pid from pg_stat_activity
+              where datname = current_database() and cardinality(pg_blocking_pids(pid)) > 0`);
+            if (waiting.length > 0) { blocked = true; break; }
+            await new Promise(resolve => setTimeout(resolve, 20));
+          }
+          expect(blocked).toBe(true);
+          unlock();
+          await writer;
+          const result = await operation;
+          if (installing) expect(result).toBeInstanceOf(Error);
+          else if (!(result instanceof Error)) expect(result).toMatchObject({ outcome: "skipped" });
+          const [saved] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
+          expect(saved.executionPolicy).toEqual(racePolicy);
+          expect(saved.executionState).toEqual("executionState" in racePatch ? racePatch.executionState : raceIssue.executionState);
+          expect(saved).toMatchObject({ monitorNextCheckAt: installing ? null
+            : new Date(mode === "replacement-before-consume" ? replacementAt : nextCheckAt), monitorWakeRequestedAt: null, monitorAttemptCount: 0 });
+          expect((await db.select().from(activityLog).where(eq(activityLog.entityId, f.issue.id)))
+            .filter(row => row.action === "issue.review_quota_monitor_installed")).toHaveLength(installing ? 0 : 1);
+          expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, source.id))).toHaveLength(0);
+          expect(executeCallsForAgent(f.reviewer.id)).toHaveLength(1);
+          expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, source.id)))[0].contextSnapshot)
+            .toEqual(source.contextSnapshot);
+        } finally {
+          unlock();
+          await writer;
+          await operation;
+        }
+        return;
+      }
       if (mode === "source-identity-install") {
         const [foreignIdentity] = await db.select().from(runIdentityContexts)
           .where(eq(runIdentityContexts.id, String(f.actor.identityContextId)));
@@ -376,7 +439,16 @@ describeEmbeddedPostgres("pending interaction addressee dispatch during review (
         expect(executeCallsForAgent(f.reviewer.id)).toHaveLength(1);
         return;
       }
-      const installed = await issueService(db).update(f.issue.id, { ...transition.patch, executionPolicy: installedPolicy });
+      const installations = mode === "parallel-install" ? await Promise.all([
+        issueService(db).update(f.issue.id, { ...transition.patch, executionPolicy: installedPolicy }),
+        issueService(db).update(f.issue.id, { ...transition.patch, executionPolicy: installedPolicy }),
+      ]) : [await issueService(db).update(f.issue.id, { ...transition.patch, executionPolicy: installedPolicy })];
+      const installed = installations[0];
+      if (mode === "parallel-install") {
+        expect(installations[1]?.executionPolicy).toEqual(installed?.executionPolicy);
+        expect((await db.select().from(activityLog).where(eq(activityLog.entityId, f.issue.id)))
+          .filter(row => row.action === "issue.review_quota_monitor_installed")).toHaveLength(1);
+      }
       expect(installed).toBeTruthy();
       const proof = (await db.select().from(activityLog).where(eq(activityLog.entityId, f.issue.id)))
         .find(row => row.action === "issue.review_quota_monitor_installed");
@@ -487,14 +559,21 @@ describeEmbeddedPostgres("pending interaction addressee dispatch during review (
         expect(executeCallsForAgent(f.reviewer.id)).toHaveLength(1);
         return;
       }
+      const [otherIssue] = await db.insert(issues).values({ companyId: f.companyId, title: "Other source binding" }).returning();
+      await expect(db.update(heartbeatRuns).set({ issueId: otherIssue.id }).where(eq(heartbeatRuns.id, source.id)))
+        .rejects.toMatchObject({ cause: { message: "run task binding is immutable" } });
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, source.id)))[0].issueId).toBe(source.issueId);
       for (const fault of ["policy", "state", "responsible", "participant", "assignee", "missing-G", "wrong-G",
         "provider-work", "native", "source-agent", "source-issue", "source-status", "proof-version", "proof-actor",
-        "proof-action", "proof-source", "proof-generation", "proof-schedule", "successor"]) {
+        "proof-action", "proof-source", "proof-generation", "proof-schedule", "successor",
+        "proof-owner", "proof-entity", "proof-run", "proof-source-id", "source-error", "missing-recovery", "workspace-restore", "schedule-policy"]) {
         const taskPatch = fault === "policy" ? { executionPolicy: { ...installed!.executionPolicy, maxReviewRounds: 4 } }
           : fault === "state" ? { executionState: { ...installed!.executionState, lastDecisionId: randomUUID() } }
           : fault === "responsible" ? { responsibleUserId: null }
           : fault === "participant" ? { executionState: { ...installed!.executionState, currentParticipant: { type: "agent", agentId: f.addressee.id, userId: null } } }
-          : fault === "assignee" ? { assigneeAgentId: f.addressee.id } : null;
+          : fault === "assignee" ? { assigneeAgentId: f.addressee.id }
+          : fault === "schedule-policy" ? { executionPolicy: { ...installed!.executionPolicy,
+              monitor: { ...normalizeIssueExecutionPolicy(installed!.executionPolicy)!.monitor, nextCheckAt: new Date(0).toISOString() } } } : null;
         if (taskPatch) await db.update(issues).set(taskPatch).where(eq(issues.id, f.issue.id));
         const sourceContext = { ...source.contextSnapshot };
         if (fault === "missing-G") delete sourceContext.reviewerAssignmentGeneration;
@@ -502,6 +581,9 @@ describeEmbeddedPostgres("pending interaction addressee dispatch during review (
         if (fault === "source-issue") sourceContext.issueId = randomUUID();
         await db.update(heartbeatRuns).set({ contextSnapshot: sourceContext,
           ...(fault === "provider-work" ? { resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: true } } } : {}),
+          ...(fault === "missing-recovery" ? { resultJson: {} } : {}),
+          ...(fault === "workspace-restore" ? { resultJson: { ...source.resultJson, workspaceRestoreFailure: "restore_unsafe_archive" } } : {}),
+          ...(fault === "source-error" ? { errorCode: "transient_failure" } : {}),
           ...(fault === "native" ? { runtimeMode: "native" } : {}),
           ...(fault === "source-agent" ? { agentId: f.addressee.id } : {}),
           ...(fault === "source-status" ? { status: "succeeded" } : {}),
@@ -509,9 +591,13 @@ describeEmbeddedPostgres("pending interaction addressee dispatch during review (
         await db.update(activityLog).set({
           ...(fault === "proof-actor" ? { actorType: "agent", actorId: f.reviewer.id } : {}),
           ...(fault === "proof-action" ? { action: "issue.monitor_scheduled" } : {}),
+          ...(fault === "proof-owner" ? { actorId: "wrong-system-owner" } : {}),
+          ...(fault === "proof-entity" ? { entityId: otherIssue.id } : {}),
+          ...(fault === "proof-run" ? { runId: f.run.id } : {}),
           details: { ...proof!.details,
             ...(fault === "proof-version" ? { version: 2 } : {}),
             ...(fault === "proof-source" ? { sourceGeneration: "forged" } : {}),
+            ...(fault === "proof-source-id" ? { sourceRunId: f.run.id } : {}),
             ...(fault === "proof-generation" ? { installedGeneration: "forged" } : {}),
             ...(fault === "proof-schedule" ? { nextCheckAt: new Date(0).toISOString() } : {}),
           },
@@ -528,9 +614,11 @@ describeEmbeddedPostgres("pending interaction addressee dispatch during review (
         } finally {
           if (successor) await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, successor.id));
           await db.update(heartbeatRuns).set({ contextSnapshot: source.contextSnapshot, resultJson: source.resultJson,
-            runtimeMode: source.runtimeMode, agentId: source.agentId, status: source.status }).where(eq(heartbeatRuns.id, source.id));
+            runtimeMode: source.runtimeMode, agentId: source.agentId, status: source.status,
+            errorCode: source.errorCode, issueId: source.issueId }).where(eq(heartbeatRuns.id, source.id));
           await db.update(activityLog).set({ actorType: proof!.actorType, actorId: proof!.actorId,
-            action: proof!.action, details: proof!.details }).where(eq(activityLog.id, proof!.id));
+            action: proof!.action, details: proof!.details, entityId: proof!.entityId,
+            runId: proof!.runId }).where(eq(activityLog.id, proof!.id));
           await db.update(issues).set({ executionPolicy: installed!.executionPolicy, executionState: installed!.executionState,
             responsibleUserId: installed!.responsibleUserId, assigneeAgentId: installed!.assigneeAgentId,
             monitorNextCheckAt: installed!.monitorNextCheckAt, monitorWakeRequestedAt: null }).where(eq(issues.id, f.issue.id));
