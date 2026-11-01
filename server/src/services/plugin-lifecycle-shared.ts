@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import { HttpError } from "../errors.js";
+import { logger } from "../middleware/logger.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 
 export type PluginLifecycleOpKind = "Q" | "A" | "R";
@@ -132,7 +133,13 @@ export interface PluginLifecycleShared {
   readonly emitter: EventEmitter;
   readonly serializer: PluginLifecycleSerializer;
   readonly quiesced: Set<string>;
-  readonly pendingEvents: WeakMap<PluginLifecycleLease, Array<[string, unknown]>>;
+  exclusive<T>(
+    pluginKey: string,
+    kind: PluginLifecycleOpKind,
+    fn: (lease: PluginLifecycleLease) => Promise<T>,
+    queueWaitMs?: number,
+  ): Promise<T>;
+  emitAtRelease(lease: PluginLifecycleLease, event: string, payload: unknown): void;
   bumpEpoch(pluginId: string): number;
   currentEpoch(pluginId: string): number;
   isCurrentGeneration(pluginId: string, epoch: number): boolean;
@@ -149,11 +156,33 @@ export function createPluginLifecycleShared(
   const lastBump = new Map<string, number>();
   const quiesced = new Set<string>();
   let bumps = 0;
+  const serializer = createPluginLifecycleSerializer(defaults);
+  const pendingEvents = new WeakMap<PluginLifecycleLease, Array<[string, unknown]>>();
   return {
     emitter,
-    serializer: createPluginLifecycleSerializer(defaults),
+    serializer,
     quiesced,
-    pendingEvents: new WeakMap(),
+    exclusive(pluginKey, kind, fn, queueWaitMs) {
+      const queue: Array<[string, unknown]> = [];
+      const flush = () => {
+        for (const [event, payload] of queue.splice(0)) {
+          try {
+            emitter.emit(event, payload);
+          } catch (err) {
+            logger.warn({ err, event }, "plugin lifecycle: event listener failed");
+          }
+        }
+      };
+      return serializer.run(pluginKey, kind, (lease) => {
+        pendingEvents.set(lease, queue);
+        return fn(lease);
+      }, { queueWaitMs, onSettled: flush });
+    },
+    emitAtRelease(lease, event, payload) {
+      const queue = pendingEvents.get(lease);
+      if (queue && !lease.released) queue.push([event, payload]);
+      else emitter.emit(event, payload);
+    },
     bumpEpoch(pluginId) {
       const next = (epochs.get(pluginId) ?? 0) + 1;
       epochs.set(pluginId, next);

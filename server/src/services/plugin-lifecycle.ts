@@ -373,8 +373,6 @@ export function pluginLifecycleManager(
     lease: PluginLifecycleLease;
     kind: PluginLifecycleOpKind;
   }
-  type PendingEvent = [LifecycleEventName, PluginLifecycleEvents[LifecycleEventName]];
-  const pendingEvents = shared.pendingEvents as WeakMap<PluginLifecycleLease, PendingEvent[]>;
 
   const log = logger.child({ service: "plugin-lifecycle" });
 
@@ -441,23 +439,7 @@ export function pluginLifecycleManager(
       emitter.emit(event, payload);
       return;
     }
-    const stamped = { ...payload, epoch: shared.currentEpoch(payload.pluginId), kind: op.kind };
-    const queue = pendingEvents.get(op.lease);
-    if (queue && !op.lease.released) {
-      queue.push([event, stamped]);
-      return;
-    }
-    emitter.emit(event, stamped);
-  }
-
-  function flushEvents(queue: PendingEvent[]): void {
-    for (const [event, payload] of queue.splice(0)) {
-      try {
-        emitter.emit(event, payload);
-      } catch (err) {
-        log.warn({ err, event, pluginId: payload.pluginId }, "plugin lifecycle: event listener failed");
-      }
-    }
+    shared.emitAtRelease(op.lease, event, { ...payload, epoch: shared.currentEpoch(payload.pluginId), kind: op.kind });
   }
 
   function exclusive<T>(
@@ -465,16 +447,7 @@ export function pluginLifecycleManager(
     kind: PluginLifecycleOpKind,
     fn: (lease: PluginLifecycleLease) => Promise<T>,
   ): Promise<T> {
-    const queue: PendingEvent[] = [];
-    return shared.serializer.run(
-      pluginKey,
-      kind,
-      (lease) => {
-        pendingEvents.set(lease, queue);
-        return fn(lease);
-      },
-      { queueWaitMs: lifecycleTimings?.queueWaitMs, onSettled: () => flushEvents(queue) },
-    );
+    return shared.exclusive(pluginKey, kind, fn, lifecycleTimings?.queueWaitMs);
   }
 
   async function runOp<T>(
