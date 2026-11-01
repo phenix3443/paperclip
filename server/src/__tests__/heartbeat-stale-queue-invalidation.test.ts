@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  type Db,
   agents,
   authUsers,
   agentWakeupRequests,
@@ -35,6 +36,11 @@ import {
 import { runningProcesses } from "../adapters/index.ts";
 import { recoveryService } from "../services/recovery/service.ts";
 import { withQueuedCommentIdsInWakePayload } from "../services/issue-queued-comment-queue.ts";
+import { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy, issueExecutionGeneration } from "../services/issue-execution-policy.js";
+import { createAdmissionTransactionScope, createWakeAdmissionWriter } from "../modules/wake-queue/adapters/postgres.js";
+import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapters/postgres.js";
+import { reserveRunBudget } from "../services/budget-reservations.js";
+import { issueThreadInteractionService } from "../services/issue-thread-interactions.ts";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -136,6 +142,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
   let db!: ReturnType<typeof createDb>;
   let heartbeat!: ReturnType<typeof heartbeatService>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+  let beforeClaimCheck: (() => Promise<void>) | null = null;
   let beforeContinuationDispatchCheck:
     | ((input: { runId: string; issueId: string }) => Promise<void>)
     | null = null;
@@ -151,6 +158,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     db = createDb(tempDb.connectionString);
     heartbeat = heartbeatService(db, {
       runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "false" },
+      beforeChatControlRecoveryCheck: async () => { await beforeClaimCheck?.(); },
       beforeResolvedInteractionContinuationDispatchCheck: async (input) => {
         await beforeContinuationDispatchCheck?.(input);
       },
@@ -162,6 +170,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
   }, 20_000);
 
   afterEach(async () => {
+    beforeClaimCheck = null;
     beforeContinuationDispatchCheck = null;
     afterContinuationDispatchCheck = null;
     mockAdapterExecute.mockReset();
@@ -1834,5 +1843,270 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(countExecuteCallsForRun(runId)).toBe(1);
     await waitForCondition(async () => claimedIssue !== null);
     expect(claimedIssue).toEqual({ status: "in_progress", executionRunId: runId });
+  });
+
+  it.each(["queued", "queued-policy", "queued-participant", "queued-stage", "queued-decision", "queued-assignee", "queued-responsible", "accounting", "provider", "retry", "explicit-retry", "coalesced"] as const)("rejects a real admitted generation independently at the %s fence", async phase => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const [author] = await db.insert(agents).values({ companyId, name: "Author", role: "engineer", adapterType: "codex_local" }).returning();
+    const policy = normalizeIssueExecutionPolicy({ stages: [{ type: "review", participants: [{ type: "agent", agentId }] }] })!;
+    const [original] = await db.insert(issues).values({ companyId, title: "Version fence",
+      status: "in_progress", assigneeAgentId: author.id, executionPolicy: policy }).returning();
+    const transition = applyIssueExecutionPolicyTransition({ issue: original, policy, requestedStatus: "done",
+      requestedAssigneePatch: {}, actor: { agentId: author.id }, commentBody: "Ready for review" });
+    await db.update(issues).set(transition.patch).where(eq(issues.id, original.id));
+    let release!: () => void;
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    let entered = false;
+    beforeClaimCheck = async () => { entered = true; await blocked; };
+    const dispatch = vi.fn(async () => "unexpected provider");
+    let wakePromise: Promise<unknown> | undefined;
+    let explicitRetryPromise: Promise<unknown> | undefined;
+    let restore: (() => void) | undefined;
+    try {
+      wakePromise = heartbeat.wakeup(agentId, { source: "automation", triggerDetail: "system",
+        reason: "issue_execution_stage_started", payload: { issueId: original.id },
+        requestedByActorType: "agent", requestedByActorId: author.id, contextSnapshot: { issueId: original.id } });
+      expect(await waitForCondition(async () => entered)).toBe(true);
+      const [admitted] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      expect(admitted).toBeTruthy();
+      expect(typeof admitted.contextSnapshot?.reviewerAssignmentGeneration).toBe("string");
+      const changeSubmission = async () => {
+        const [task] = await db.select().from(issues).where(eq(issues.id, original.id));
+        const state = { ...task.executionState };
+        const patch = phase === "queued-policy" ? { executionPolicy: { ...task.executionPolicy, maxReviewRounds: 4 } }
+          : phase === "queued-participant" ? { executionState: { ...state, currentParticipant: { type: "agent", agentId: author.id, userId: null } } }
+          : phase === "queued-stage" ? { executionState: { ...state, currentStageId: randomUUID() } }
+          : phase === "queued-decision" ? { executionState: { ...state, lastDecisionId: randomUUID(), lastDecisionOutcome: "changes_requested" } }
+          : phase === "queued-assignee" ? { assigneeAgentId: author.id }
+          : phase === "queued-responsible" ? { responsibleUserId: "another-user" }
+          : { executionState: { ...state, changesRequestedCount: 2 } };
+        await db.update(issues).set(patch).where(eq(issues.id, original.id));
+      };
+      const adapter = createPostgresRunDispatchAdapter(db);
+      if (phase === "explicit-retry") {
+        await db.update(heartbeatRuns).set({ status: "failed", errorCode: "fixture_failure", finishedAt: new Date(),
+          resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } }).where(eq(heartbeatRuns.id, admitted.id));
+        await db.update(issues).set({ executionRunId: admitted.id }).where(eq(issues.id, original.id));
+        explicitRetryPromise = heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "manual",
+          reason: "retry_failed_run", failedRunId: admitted.id, payload: { issueId: original.id },
+          requestedByActorType: "user", requestedByActorId: "responsible-user",
+          contextSnapshot: { issueId: original.id, reviewerAssignmentGeneration: "forged-retry" } });
+        expect(await waitForCondition(async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, admitted.id))).length === 1)).toBe(true);
+        const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, admitted.id));
+        expect(retry.contextSnapshot?.reviewerAssignmentGeneration).toBe(admitted.contextSnapshot?.reviewerAssignmentGeneration);
+        await changeSubmission();
+        expect(await adapter.cancelStaleQueuedRun({ companyId, runId: retry.id,
+          expectedStatus: "queued", now: new Date() })).toMatchObject({ outcome: "cancelled", errorCode: "issue_review_participant_changed" });
+      } else if (phase === "retry") {
+        await db.update(heartbeatRuns).set({ status: "failed", errorCode: "codex_transient_upstream", finishedAt: new Date(),
+          resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } }).where(eq(heartbeatRuns.id, admitted!.id));
+        await db.update(issues).set({ executionRunId: admitted!.id }).where(eq(issues.id, original.id));
+        const retry = await heartbeat.scheduleBoundedRetry(admitted!.id, { now: new Date(), delayMs: 1_000 });
+        expect(retry.outcome).toBe("scheduled");
+        if (retry.outcome !== "scheduled") throw new Error("Expected ordinary retry");
+        expect(retry.run.contextSnapshot?.reviewerAssignmentGeneration).toBe(admitted!.contextSnapshot!.reviewerAssignmentGeneration);
+        expect(await heartbeat.scheduleBoundedRetry(admitted!.id)).toMatchObject({ outcome: "scheduled", run: { id: retry.run.id }, reusedExisting: true });
+        await changeSubmission();
+        expect(await adapter.promoteOrCancelDueRetry({ companyId, runId: retry.run.id, now: new Date(retry.dueAt.getTime() + 1) }))
+          .toMatchObject({ outcome: "promoted" });
+        expect(await adapter.cancelStaleQueuedRun({ companyId, runId: retry.run.id,
+          expectedStatus: "queued", now: new Date() })).toMatchObject({ outcome: "cancelled", errorCode: "issue_review_participant_changed" });
+      } else if (phase.startsWith("queued") || phase === "coalesced") {
+        if (phase === "coalesced") {
+          const [comment] = await db.insert(issueComments).values({ companyId, issueId: original.id,
+            authorUserId: "responsible-user", body: "Additional review context" }).returning();
+          const merged = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "manual",
+            payload: { commentId: comment.id }, requestedByActorType: "user", requestedByActorId: "responsible-user",
+            contextSnapshot: { taskKey: original.id, wakeCommentId: comment.id,
+              reviewerAssignmentGeneration: "forged-second-writer", additionalContext: "merged" } });
+          expect(merged).toMatchObject({ id: admitted.id, status: "queued", contextSnapshot: {
+            additionalContext: "merged", reviewerAssignmentGeneration: admitted.contextSnapshot?.reviewerAssignmentGeneration } });
+          const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, admitted.id));
+          expect(saved.contextSnapshot?.reviewerAssignmentGeneration).toBe(admitted.contextSnapshot?.reviewerAssignmentGeneration);
+        }
+        await changeSubmission();
+        expect(await adapter.cancelStaleQueuedRun({ companyId, runId: admitted!.id,
+          expectedStatus: "queued", now: new Date() })).toMatchObject({ outcome: "cancelled", errorCode: "issue_review_participant_changed" });
+      } else {
+        await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, admitted!.id));
+        await db.update(issues).set({ executionRunId: admitted!.id }).where(eq(issues.id, original.id));
+        const reservation = await reserveRunBudget(db, companyId, admitted!.id, null);
+        if (phase === "accounting") await changeSubmission();
+        else {
+          const transaction = db.transaction.bind(db);
+          let calls = 0;
+          const spy = vi.spyOn(db, "transaction").mockImplementation(async (callback, config) => {
+            const value = await transaction(callback, config);
+            if (++calls === 1) await changeSubmission();
+            return value;
+          });
+          restore = () => spy.mockRestore();
+        }
+        const result = await adapter.dispatchResolvedInteractionIfCurrent({ companyId, runId: admitted!.id,
+          reservationId: reservation.id, expectedStatus: "running", now: new Date(), enforceContinuationOwnership: false, dispatch });
+        expect(result).toMatchObject({ dispatched: false, cancellation: { outcome: "cancelled", errorCode: "issue_review_participant_changed" } });
+        const [guarded] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, admitted!.id));
+        if (phase === "accounting") expect(guarded.usageJson?.budgetDispatch).toBeUndefined();
+        else expect(guarded.usageJson?.budgetDispatch).toMatchObject({ reservationId: reservation.id });
+      }
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(countExecuteCallsForRun(admitted!.id)).toBe(0);
+      const [task] = await db.select().from(issues).where(eq(issues.id, original.id));
+      expect(task.executionState).toMatchObject({ status: "pending" });
+      if (["queued", "accounting", "provider", "retry"].includes(phase))
+        expect(task.executionState).toMatchObject({ changesRequestedCount: 2 });
+    } finally { restore?.(); release(); beforeClaimCheck = null; await Promise.all([wakePromise, explicitRetryPromise]); }
+  });
+
+  it("settles a manually admitted review from its linked operator receipt before comment authors", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const [author] = await db.insert(agents).values({ companyId, name: "Author", role: "engineer", adapterType: "codex_local" }).returning();
+    const policy = normalizeIssueExecutionPolicy({ stages: [{ type: "review", participants: [{ type: "agent", agentId }] }] })!;
+    const [original] = await db.insert(issues).values({ companyId, title: "Operator review identity",
+      status: "in_progress", assigneeAgentId: author.id, executionPolicy: policy }).returning();
+    const transition = applyIssueExecutionPolicyTransition({ issue: original, policy, requestedStatus: "done",
+      requestedAssigneePatch: {}, actor: { agentId: author.id }, commentBody: "Ready for review" });
+    await db.update(issues).set(transition.patch).where(eq(issues.id, original.id));
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: original.id,
+      authorUserId: "another-comment-author", body: "Additional context" }).returning();
+    const run = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "manual", manualUserWake: true,
+      requestedByActorType: "user", requestedByActorId: "responsible-user", payload: { issueId: original.id },
+      contextSnapshot: { issueId: original.id, wakeCommentId: message.id } });
+    expect(run).toBeTruthy();
+    const [task] = await db.select().from(issues).where(eq(issues.id, original.id));
+    expect(task.responsibleUserId).toBe("responsible-user");
+    expect(run!.contextSnapshot?.reviewerAssignmentGeneration).toBe(issueExecutionGeneration(task));
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    expect(countExecuteCallsForRun(run!.id)).toBe(1);
+  });
+
+  it("stamps a submitted review after settling responsibility and ignores caller generation", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const [author] = await db.insert(agents).values({ companyId, name: "Author", role: "engineer", adapterType: "codex_local" }).returning();
+    const policy = normalizeIssueExecutionPolicy({ stages: [{ type: "review", participants: [{ type: "agent", agentId }] }] })!;
+    const [original] = await db.insert(issues).values({ companyId, title: "Submitted version",
+      status: "in_progress", assigneeAgentId: author.id, executionPolicy: policy }).returning();
+    const transition = applyIssueExecutionPolicyTransition({ issue: original, policy, requestedStatus: "done",
+      requestedAssigneePatch: {}, actor: { agentId: author.id }, commentBody: "Ready for review" });
+    await db.update(issues).set(transition.patch).where(eq(issues.id, original.id));
+    const run = await heartbeat.wakeup(agentId, { source: "automation", triggerDetail: "system",
+      reason: "issue_execution_stage_started", requestedByActorType: "agent", requestedByActorId: author.id,
+      payload: { issueId: original.id, reviewerAssignmentGeneration: "payload-forgery" },
+      contextSnapshot: { issueId: original.id, reviewerAssignmentGeneration: "caller-forgery" } });
+    expect(run).toBeTruthy();
+    const [task] = await db.select().from(issues).where(eq(issues.id, original.id));
+    expect(task.responsibleUserId).toBe("responsible-user");
+    expect(run!.contextSnapshot?.reviewerAssignmentGeneration).toBe(issueExecutionGeneration(task));
+    expect(run!.contextSnapshot?.reviewerAssignmentGeneration).not.toBe("caller-forgery");
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    expect(countExecuteCallsForRun(run!.id)).toBe(1);
+    const merge = (runId: string, context: Record<string, unknown>) => db.transaction(tx => createWakeAdmissionWriter().coalesceIntoActiveExecutionRun(
+      createAdmissionTransactionScope(companyId, tx as unknown as Db), { companyId, agentId, activeExecutionRunId: runId,
+        mergedContextSnapshot: context, source: "automation", triggerDetail: "system", payload: { issueId: original.id },
+        requestedByActorType: "system", requestedByActorId: null, idempotencyKey: null }));
+    for (const input of [{ reviewerAssignmentGeneration: "forged-coalesce" }, {}]) {
+      const merged = await merge(run!.id, { issueId: original.id, ...input, merged: true });
+      expect(merged.contextSnapshot).toMatchObject({ merged: true,
+        reviewerAssignmentGeneration: run!.contextSnapshot!.reviewerAssignmentGeneration });
+    }
+    const [legacy] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "succeeded",
+      contextSnapshot: { issueId: original.id } }).returning();
+    const legacyMerged = await merge(legacy.id, { issueId: original.id, reviewerAssignmentGeneration: "forged-legacy" });
+    expect(legacyMerged.contextSnapshot).not.toHaveProperty("reviewerAssignmentGeneration");
+  });
+
+  it.each([true, false])("preserves persisted generation in the unscoped wake coalescing path: %s", async (withGeneration) => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const generation = "original-admitted-generation";
+    const [target] = await db.insert(heartbeatRuns).values({ companyId, agentId, status: "queued",
+      contextSnapshot: { taskKey: "unscoped-review", ...(withGeneration ? { reviewerAssignmentGeneration: generation } : {}) } }).returning();
+    const coalesced = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "manual",
+      contextSnapshot: { taskKey: "unscoped-review", reviewerAssignmentGeneration: "forged", additionalContext: "merged" } });
+    expect(coalesced?.id).toBe(target.id);
+    const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, target.id));
+    expect(saved.contextSnapshot?.additionalContext).toBe("merged");
+    if (withGeneration) expect(saved.contextSnapshot?.reviewerAssignmentGeneration).toBe(generation);
+    else expect(saved.contextSnapshot).not.toHaveProperty("reviewerAssignmentGeneration");
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId)))[0])
+      .toMatchObject({ status: "coalesced", runId: target.id });
+    await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, target.id));
+  });
+
+  it("claims and runs a pending interaction wake for an addressee who neither owns nor reviews the task", async () => {
+    const { companyId, agentId: addresseeAgentId } = await seedCompanyAndAgent();
+    const [assignee, reviewer] = await db.insert(agents).values([
+      { companyId, name: "AssigneeCoder", role: "engineer", status: "idle", adapterType: "codex_local", adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: false } }, permissions: {} },
+      { companyId, name: "ReviewerAgent", role: "qa", status: "idle", adapterType: "codex_local", adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: false } }, permissions: {} },
+    ]).returning();
+    const [issue] = await db.insert(issues).values({
+      companyId,
+      title: "Question for another agent during review",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: assignee.id,
+      executionState: {
+        status: "pending",
+        currentStageId: randomUUID(),
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: reviewer.id, userId: null },
+        returnAssignee: { type: "agent", agentId: assignee.id, userId: null },
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    }).returning();
+    const interaction = await issueThreadInteractionService(db).create(
+      { id: issue.id, companyId },
+      {
+        kind: "ask_user_questions",
+        addresseeAgentId,
+        payload: {
+          version: 1,
+          questions: [{ id: "scope", prompt: "Which scope?", selectionMode: "single", required: true, options: [{ id: "a", label: "A" }] }],
+        },
+      },
+      { agentId: assignee.id },
+    );
+    expect(interaction).toMatchObject({ status: "pending", addresseeAgentId });
+
+    const run = await heartbeat.wakeup(addresseeAgentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "interaction_pending",
+      payload: {
+        issueId: issue.id,
+        interactionId: interaction.id,
+        interactionKind: interaction.kind,
+        sourceCommentId: null,
+        sourceRunId: null,
+        mutation: "interaction",
+      },
+      idempotencyKey: `interaction-pending:${interaction.id}`,
+      requestedByActorType: "agent",
+      requestedByActorId: assignee.id,
+      contextSnapshot: {
+        issueId: issue.id,
+        taskId: issue.id,
+        interactionId: interaction.id,
+        interactionKind: interaction.kind,
+        sourceCommentId: null,
+        sourceRunId: null,
+        wakeReason: "interaction_pending",
+        source: "issue.interaction.created",
+      },
+    });
+    expect(run).toBeTruthy();
+    await heartbeat.resumeQueuedRuns();
+    expect(await waitForCondition(async () => countExecuteCallsForRun(run!.id) === 1)).toBe(true);
+    await heartbeat.waitForRunExecutionDrain(run!.id);
+
+    const [finished] = await db.select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns).where(eq(heartbeatRuns.id, run!.id));
+    expect(finished).toEqual({ status: "succeeded", errorCode: null });
+    expect(countExecuteCallsForRun(run!.id)).toBe(1);
   });
 });

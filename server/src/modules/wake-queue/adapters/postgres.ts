@@ -21,6 +21,7 @@ import {
   issueThreadInteractions,
   issues,
   nativeRunFinalizations,
+  runIdentityContexts,
 } from "@paperclipai/db";
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
 import { legacyExecutionNeedsReconciliationWithEvidence } from "../../../services/legacy-execution-recovery.js";
@@ -38,6 +39,7 @@ import { issueService } from "../../../services/issues.js";
 import { issueRecoveryActionService } from "../../../services/issue-recovery-actions.js";
 import { readContinuationAttempt } from "../../../services/recovery/run-liveness-continuations.js";
 import { withRecoveryContext } from "../../../services/recovery/status-only-context.js";
+import { boundRunIssueId } from "../../../services/run-task-binding.js";
 import { parseIssueExecutionState } from "../../../services/issue-execution-policy.js";
 import {
   queuedCommentIdsFromWakePayload,
@@ -626,6 +628,20 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
     },
 
     async queueReviewParticipantRecoveryRun({ companyId, issue, finishingRun, recoveryAgent, sessionBefore, now }) {
+      const [source] = finishingRun.id === run.id && companyId === run.companyId
+        ? await tx.select().from(heartbeatRuns).where(and(
+            eq(heartbeatRuns.id, finishingRun.id), eq(heartbeatRuns.companyId, companyId),
+            eq(heartbeatRuns.agentId, recoveryAgent.id))).for("no key update")
+        : [];
+      const [identity] = source?.activeIdentityContextId
+        ? await tx.select().from(runIdentityContexts).where(and(
+            eq(runIdentityContexts.id, source.activeIdentityContextId), eq(runIdentityContexts.companyId, companyId),
+            eq(runIdentityContexts.runId, source.id), eq(runIdentityContexts.status, "accepted")))
+        : [];
+      const generation = source?.contextSnapshot?.reviewerAssignmentGeneration;
+      if (!source || boundRunIssueId(source) !== issue.id || !identity ||
+          identity.responsibleUserId !== source.responsibleUserId || typeof generation !== "string")
+        throw new HttpError(409, "Review recovery source generation or accepted identity is unavailable");
       const executionState = parseIssueExecutionState(issue.executionState);
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
@@ -669,6 +685,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
               wakeReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
               retryReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
               source: "issue.execution_review_recovery",
+              reviewerAssignmentGeneration: generation,
               retryOfRunId: finishingRun.id,
               currentStageId: executionState?.currentStageId ?? null,
               currentStageType: executionState?.currentStageType ?? null,
@@ -976,7 +993,10 @@ export function createWakeAdmissionWriter(): WakeAdmissionWriter {
       const now = new Date();
       const mergedRun = await tx
         .update(heartbeatRuns)
-        .set({ contextSnapshot: input.mergedContextSnapshot, updatedAt: now })
+        .set({ contextSnapshot: sql`(${JSON.stringify(input.mergedContextSnapshot)}::jsonb - 'reviewerAssignmentGeneration') ||
+          case when jsonb_typeof(${heartbeatRuns.contextSnapshot}->'reviewerAssignmentGeneration') = 'string'
+            then jsonb_build_object('reviewerAssignmentGeneration', ${heartbeatRuns.contextSnapshot}->'reviewerAssignmentGeneration')
+            else '{}'::jsonb end`, updatedAt: now })
         .where(
           and(
             eq(heartbeatRuns.id, input.activeExecutionRunId),

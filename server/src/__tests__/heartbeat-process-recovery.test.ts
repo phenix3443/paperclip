@@ -1263,6 +1263,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   }
 
   async function seedInReviewParticipantRunFixture(input?: {
+    admittedReviewSource?: boolean;
     wakeReason?: string;
     retryReason?: string | null;
   }) {
@@ -1279,6 +1280,52 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await seedRecoveryCompany(companyId, issuePrefix);
 
     await db.insert(agents).values(recoveryAgentRow(agentId, companyId, "CodexReviewer", "engineer", "idle"));
+
+    if (input?.admittedReviewSource) {
+      const { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy } =
+        await import("../services/issue-execution-policy.js");
+      const { runIdentityContexts } = await import("@paperclipai/db");
+      const authorId = randomUUID();
+      await db.insert(agents).values(recoveryAgentRow(authorId, companyId, "CodexAuthor", "engineer", "idle"));
+      const policy = normalizeIssueExecutionPolicy({ stages: [{
+        id: stageId, type: "review", participants: [{ type: "agent", agentId }],
+      }] })!;
+      const [original] = await db.insert(issues).values({
+        id: issueId, companyId, title: "Review participant stayed pending",
+        status: "in_progress", priority: "medium", assigneeAgentId: authorId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`, executionPolicy: policy,
+      }).returning();
+      const transition = applyIssueExecutionPolicyTransition({
+        issue: original, policy, requestedStatus: "done", requestedAssigneePatch: {},
+        actor: { agentId: authorId }, commentBody: "Ready for review",
+      });
+      expect(transition.patch).toMatchObject({ status: "in_review",
+        executionState: { status: "pending", currentParticipant: { agentId } } });
+      await db.update(issues).set(transition.patch).where(eq(issues.id, issueId));
+      const [blocker] = await db.insert(heartbeatRuns).values({
+        companyId, agentId, status: "running", contextSnapshot: {},
+      }).returning();
+      try {
+        const heartbeat = heartbeatService(db);
+        const source = await heartbeat.wakeup(agentId, {
+          source: "automation", triggerDetail: "system", reason: wakeReason,
+          payload: { issueId }, contextSnapshot: { issueId, taskId: issueId },
+          requestedByActorType: "agent", requestedByActorId: authorId,
+        });
+        expect(source).toMatchObject({ status: "queued", companyId, agentId });
+        expect(typeof source!.contextSnapshot?.reviewerAssignmentGeneration).toBe("string");
+        const [identity] = await db.select().from(runIdentityContexts)
+          .where(eq(runIdentityContexts.id, source!.activeIdentityContextId!));
+        expect(identity).toMatchObject({ companyId, runId: source!.id, status: "accepted",
+          responsibleUserId: source!.responsibleUserId });
+        return { companyId, agentId, runId: source!.id,
+          wakeupRequestId: source!.wakeupRequestId!, issueId,
+          stageId: policy.stages[0]!.id };
+      } finally {
+        await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, blocker.id));
+      }
+    }
 
     await db.insert(agentWakeupRequests).values({
       id: wakeupRequestId,
@@ -11750,7 +11797,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
   it("retries a pending execution-review participant when another agent has an active issue run", async () => {
     const { companyId, agentId, issueId, runId } =
-      await seedInReviewParticipantRunFixture();
+      await seedInReviewParticipantRunFixture({ admittedReviewSource: true });
     const otherAgentId = randomUUID();
     const otherRunId = randomUUID();
     await db.insert(agents).values(recoveryAgentRow(otherAgentId, companyId, "CodexImplementor", "engineer", "idle"));
@@ -11770,6 +11817,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       updatedAt: new Date("2026-03-19T00:01:00.000Z"),
     });
 
+    const [predecessor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    const { runIdentityContexts } = await import("@paperclipai/db");
+    const [identity] = await db.select().from(runIdentityContexts)
+      .where(eq(runIdentityContexts.id, predecessor.activeIdentityContextId!));
+    expect(identity).toMatchObject({ companyId, runId, status: "accepted",
+      responsibleUserId: predecessor.responsibleUserId });
+    expect(typeof predecessor.contextSnapshot?.reviewerAssignmentGeneration).toBe("string");
+
     const heartbeat = heartbeatService(db);
     await heartbeat.resumeQueuedRuns();
     const reviewRecoveryRun = await waitForValue(async () => {
@@ -11783,11 +11838,18 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       );
     }, 8_000);
 
+    expect(reviewRecoveryRun?.contextSnapshot).toMatchObject({
+      retryOfRunId: runId,
+      reviewerAssignmentGeneration: predecessor.contextSnapshot!.reviewerAssignmentGeneration,
+    });
     expect(reviewRecoveryRun).toMatchObject({
       companyId,
       agentId,
       retryOfRunId: runId,
     });
+    expect(await selectRecoveryRunsByAgent(otherAgentId)).toEqual([
+      expect.objectContaining({ id: otherRunId, status: "running" }),
+    ]);
   });
 
   it("does not immediately recover a generic on-demand run used for an in-review agent API update", async () => {
@@ -11818,7 +11880,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
   it("retries a pending execution-review participant once before blocking with a recovery action", async () => {
     const { companyId, agentId, issueId, runId, stageId } =
-      await seedInReviewParticipantRunFixture();
+      await seedInReviewParticipantRunFixture({ admittedReviewSource: true });
+    const [predecessor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    const { runIdentityContexts } = await import("@paperclipai/db");
+    const [identity] = await db.select().from(runIdentityContexts)
+      .where(eq(runIdentityContexts.id, predecessor.activeIdentityContextId!));
+    expect(identity).toMatchObject({ companyId, runId, status: "accepted",
+      responsibleUserId: predecessor.responsibleUserId });
+    expect(typeof predecessor.contextSnapshot?.reviewerAssignmentGeneration).toBe("string");
+
     const heartbeat = heartbeatService(db);
 
     await heartbeat.resumeQueuedRuns();
@@ -11835,6 +11905,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       );
     }, 8_000);
     expect(reviewRecoveryRun).toBeTruthy();
+    expect(reviewRecoveryRun?.contextSnapshot).toMatchObject({
+      retryOfRunId: runId,
+      reviewerAssignmentGeneration: predecessor.contextSnapshot!.reviewerAssignmentGeneration,
+    });
     expect(reviewRecoveryRun).toMatchObject({
       companyId,
       agentId,
@@ -11919,6 +11993,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       );
     });
     expect(recoveryActivityEvent).toBeTruthy();
+    const recoveryRuns = (await selectRecoveryRunsByAgent(agentId)).filter(
+      (run) => run.contextSnapshot?.retryReason === "execution_review_participant_recovery",
+    );
+    expect(recoveryRuns).toHaveLength(1);
+    expect(recoveryRuns[0].retryOfRunId).toBe(runId);
   });
 
   it("blocks failed execution-review recovery under the reviewer when the source assignee differs", async () => {

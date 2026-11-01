@@ -1,3 +1,6 @@
+import { boundRunIssueId } from "../run-task-binding.js";
+import { issueExecutionGeneration, parseIssueExecutionState } from "../issue-execution-policy.js";
+import { settleNewReviewRunIdentity, settleReviewRunClaimIdentity } from "../run-identity.js";
 import { authorizationService } from "../authorization.js";
 import { assertTaskRetryConversationAllowed, readTaskRetryIntent, retireSupersededTaskRetry } from "../task-retry.js";
 import { insertIssueComment } from "../issue-comment-writes.js";
@@ -1238,14 +1241,17 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       }
       return { ownsIssue, blocked: false };
     }
-    async function bindClaimedIssueExecution(tx: Db, ownsIssue: boolean, claimedRun: typeof heartbeatRuns.$inferSelect | null | undefined) {
-      if (!claimedRun || !issueId || !ownsIssue) return;
+    async function bindClaimedIssueExecution(tx: Db, ownsIssue: boolean, claimedRun: typeof heartbeatRuns.$inferSelect | null | undefined, previousStartedAt: Date | null) {
+      if (!claimedRun) return null;
+      const settled = await settleReviewRunClaimIdentity(tx, claimedRun, previousStartedAt);
+      if (!issueId || !ownsIssue) return settled;
       await tx.update(issues).set({
         executionRunId: claimedRun.id,
         executionAgentNameKey: normalizeAgentNameKey(agent.name),
         executionLockedAt: claimedAt,
         updatedAt: claimedAt,
       }).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)));
+      return settled;
     }
     const nativeReviewContext = readNativeReviewAssignmentContext(context);
     const queuedCommentIds = queuedCommentIdsFromRunContext(context);
@@ -1420,9 +1426,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                     ),
                   )
                   .returning();
-                await bindClaimedIssueExecution(tx as unknown as Db, issueClaim.ownsIssue, claimedRun);
+                const settledRun = await bindClaimedIssueExecution(tx as unknown as Db, issueClaim.ownsIssue, claimedRun, lockedRun.startedAt);
                 return claimedRun
-                  ? { kind: "claimed" as const, run: claimedRun }
+                  ? { kind: "claimed" as const, run: settledRun! }
                   : { kind: "stale" as const, run: null };
               }
               const commentRows = await tx
@@ -1524,9 +1530,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   ),
                 )
                 .returning();
-              await bindClaimedIssueExecution(tx as unknown as Db, issueClaim.ownsIssue, claimedRun);
+              const settledRun = await bindClaimedIssueExecution(tx as unknown as Db, issueClaim.ownsIssue, claimedRun, lockedRun.startedAt);
               return claimedRun
-                ? { kind: "claimed" as const, run: claimedRun }
+                ? { kind: "claimed" as const, run: settledRun! }
                 : { kind: "stale" as const, run: null };
             })
             .catch((error) => {
@@ -1604,8 +1610,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             const claimedRun = await claimTx.update(heartbeatRuns).set(claimValues).where(and(
               eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued"),
             )).returning().then((rows) => rows[0] ?? null);
-            await bindClaimedIssueExecution(claimTx as unknown as Db, issueClaim.ownsIssue, claimedRun);
-            return claimedRun;
+            return bindClaimedIssueExecution(claimTx as unknown as Db, issueClaim.ownsIssue, claimedRun, lockedRun.startedAt);
           });
         });
     if (!claimed) return null;
@@ -2150,6 +2155,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     const contextSnapshot: Record<string, unknown> = {
       ...(opts.contextSnapshot ?? {}),
     };
+    delete contextSnapshot.reviewerAssignmentGeneration;
     const reason = opts.reason ?? null;
     let payload = opts.payload ? { ...opts.payload } : null;
     // Only the board queue route can record interruption authority on an
@@ -2180,6 +2186,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       triggerDetail,
       payload,
     });
+    delete enrichedContextSnapshot.reviewerAssignmentGeneration;
     // Keep each request's own server-derived origin, including coalesced wakes.
     // A run's merged context cannot establish which caller authored one receipt.
     // Overwrite caller-supplied nested context rather than trusting it.
@@ -4395,7 +4402,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             adoptedCommentIds = await undeliveredLegacyUserCommentIds(tx as unknown as Db,
               agent.companyId, issueId, agentId, adoptedCommentIds);
           }
-          const newRun = await tx
+          let newRun = await tx
             .insert(heartbeatRuns)
             .values({
               ...(explicitContinuation || decidedReviewAdmitted ? { id: explicitContinuationRunId } : {}),
@@ -4476,6 +4483,27 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 payload: withQueuedCommentIdsInWakePayload(payload, adoptedCommentIds),
               })
               .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+          }
+
+          const reviewState = parseIssueExecutionState(issue.executionState);
+          if (newRun.retryOfRunId) {
+            const [sourceRun] = await tx.select().from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.id, newRun.retryOfRunId), eq(heartbeatRuns.companyId, issue.companyId),
+              eq(heartbeatRuns.agentId, agentId))).for("no key update");
+            if (!sourceRun || boundRunIssueId(sourceRun) !== issue.id) throw conflict("Review retry source is unavailable");
+            const generation = sourceRun.contextSnapshot?.reviewerAssignmentGeneration;
+            const context = { ...newRun.contextSnapshot };
+            delete context.reviewerAssignmentGeneration;
+            if (typeof generation === "string") context.reviewerAssignmentGeneration = generation;
+            [newRun] = await tx.update(heartbeatRuns).set({ contextSnapshot: context })
+              .where(eq(heartbeatRuns.id, newRun.id)).returning();
+          } else if (issue.status === "in_review" && reviewState?.status === "pending" &&
+              reviewState.currentStageType === "review" && reviewState.currentParticipant?.type === "agent" &&
+              reviewState.currentParticipant.agentId === agentId) {
+            const settledIssue = await settleNewReviewRunIdentity(tx as unknown as Db, newRun, Boolean(failedChatRetry));
+            [newRun] = await tx.update(heartbeatRuns).set({ contextSnapshot: {
+              ...newRun.contextSnapshot, reviewerAssignmentGeneration: issueExecutionGeneration(settledIssue),
+            } }).where(eq(heartbeatRuns.id, newRun.id)).returning();
           }
 
           // executionRunId is NOT stamped here (enqueueWakeup queues the run but
@@ -4598,7 +4626,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const mergedRun = await db
         .update(heartbeatRuns)
         .set({
-          contextSnapshot: mergedContextSnapshot,
+          contextSnapshot: sql`(${JSON.stringify(mergedContextSnapshot)}::jsonb - 'reviewerAssignmentGeneration') ||
+            case when jsonb_typeof(${heartbeatRuns.contextSnapshot}->'reviewerAssignmentGeneration') = 'string'
+              then jsonb_build_object('reviewerAssignmentGeneration', ${heartbeatRuns.contextSnapshot}->'reviewerAssignmentGeneration')
+              else '{}'::jsonb end`,
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, coalescedTargetRun.id))

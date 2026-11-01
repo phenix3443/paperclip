@@ -1,9 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { agentWakeupRequests, agents, companies, createDb, heartbeatRuns, heartbeatRunEvents, issueComments, issueThreadInteractions, issues, secretAccessEvents } from "@paperclipai/db";
+import { type Db, agentWakeupRequests, agents, companies, createDb, heartbeatRuns, heartbeatRunEvents, issueComments, issueThreadInteractions, issues, runIdentityContexts, secretAccessEvents } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { acceptSteeredIdentity, captureRunIdentity, initializeRunIdentity, listRunIdentityContexts, rejectSteeredIdentity, reserveSteeredIdentity } from "../services/run-identity.js";
+import { acceptSteeredIdentity, captureRunIdentity, initializeRunIdentity, listRunIdentityContexts, rejectSteeredIdentity, reserveSteeredIdentity, settleNewReviewRunIdentity, settleReviewRunClaimIdentity, runIdentityInitializationInput } from "../services/run-identity.js";
+
+import { issueExecutionGeneration } from "../services/issue-execution-policy.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("durable execution identity", () => {
@@ -41,6 +43,56 @@ const support = await getEmbeddedPostgresTestSupport();
     await initializeRunIdentity(db, { ...input, responsibleUserId: "B", cause: "restart" });
     expect(await listRunIdentityContexts(db, input.companyId, input.runId)).toHaveLength(4);
   });
+  it("settles absent task responsibility before stamping and returns the claimed identity", async () => {
+    const input = await seed();
+    await db.update(issues).set({ responsibleUserId: null }).where(eq(issues.id, input.issueId));
+    const [queued] = await db.update(heartbeatRuns).set({ status: "queued", responsibleUserId: "owner",
+      contextSnapshot: { issueId: input.issueId, wakeCommentIds: input.messageIds } }).where(eq(heartbeatRuns.id, input.runId)).returning();
+    const task = await db.transaction(tx => settleNewReviewRunIdentity(tx as unknown as Db, queued));
+    expect(task.responsibleUserId).toBe("A");
+    const [stamped] = await db.update(heartbeatRuns).set({ status: "running",
+      contextSnapshot: { ...queued.contextSnapshot, reviewerAssignmentGeneration: issueExecutionGeneration(task) } })
+      .where(eq(heartbeatRuns.id, input.runId)).returning();
+    const claimed = await db.transaction(tx => settleReviewRunClaimIdentity(tx as unknown as Db, stamped, null));
+    expect(claimed.responsibleUserId).toBe("A");
+    expect(claimed.activeIdentityContextId).toBeTruthy();
+    const history = await listRunIdentityContexts(db, input.companyId, input.runId);
+    expect(history.map(row => row.responsibleUserId)).toEqual(["owner", "A", "B", "A"]);
+    expect(await db.transaction(tx => settleReviewRunClaimIdentity(tx as unknown as Db, claimed, new Date()))).toEqual(claimed);
+    expect(await listRunIdentityContexts(db, input.companyId, input.runId)).toHaveLength(4);
+    await db.update(issues).set({ responsibleUserId: "B" }).where(eq(issues.id, input.issueId));
+    await expect(db.transaction(tx => settleReviewRunClaimIdentity(tx as unknown as Db, claimed, null))).rejects.toThrow("submission changed");
+  });
+
+  it.each(["origin", "active-run", "active-status"])("refuses a claimed review with invalid %s identity evidence", async fault => {
+    const input = await seed();
+    await db.update(issues).set({ responsibleUserId: null }).where(eq(issues.id, input.issueId));
+    const [queued] = await db.update(heartbeatRuns).set({ status: "queued", responsibleUserId: "owner" })
+      .where(eq(heartbeatRuns.id, input.runId)).returning();
+    const task = await db.transaction(tx => settleNewReviewRunIdentity(tx as unknown as Db, queued));
+    const [stamped] = await db.update(heartbeatRuns).set({ status: "running",
+      contextSnapshot: { ...queued.contextSnapshot, reviewerAssignmentGeneration: issueExecutionGeneration(task) } })
+      .where(eq(heartbeatRuns.id, input.runId)).returning();
+    if (fault === "origin") await db.update(runIdentityContexts).set({ correlationId: "not-dispatch" }).where(eq(runIdentityContexts.id, stamped.activeIdentityContextId!));
+    if (fault === "active-status") await db.update(runIdentityContexts).set({ status: "pending" }).where(eq(runIdentityContexts.id, stamped.activeIdentityContextId!));
+    if (fault === "active-run") {
+      const other = await seed();
+      const identity = await initializeRunIdentity(db, { ...other, responsibleUserId: "owner", cause: "dispatch" });
+      stamped.activeIdentityContextId = identity.id;
+    }
+    await expect(db.transaction(tx => settleReviewRunClaimIdentity(tx as unknown as Db, stamped, null)))
+      .rejects.toThrow(fault === "origin" ? "origin identity is unavailable" : "review identity is unavailable");
+  });
+
+  it("uses validated failed-chat retry facts to retain messages only on that retry", async () => {
+    const input = await seed();
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.runId));
+    const retry = { ...run, retryOfRunId: randomUUID() };
+    const context = { issueId: input.issueId, wakeCommentIds: input.messageIds };
+    expect(runIdentityInitializationInput(retry, context, null, "owner").messageIds).toEqual([]);
+    expect(runIdentityInitializationInput(retry, context, null, "owner", true).messageIds).toEqual(input.messageIds);
+  });
+
   async function seedInterrupt() {
     const input = await seed();
     const queueId = randomUUID(), wakeupRequestId = randomUUID();
