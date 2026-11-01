@@ -53,6 +53,24 @@ describe("postgres driver payload verifier", () => {
     await expect(verifyPostgresDriverPayload(payload)).resolves.toHaveLength(3);
   });
 
+  it("accepts a file link that resolves inside its own directory, like a versioned shared library", async () => {
+    const lib = path.join(payload, "node_modules", "paperclipai", "lib");
+    fs.mkdirSync(lib);
+    fs.writeFileSync(path.join(lib, "libexample.so.6.1"), "library");
+    fs.symlinkSync("libexample.so.6.1", path.join(lib, "libexample.so.6"));
+    await expect(verifyPostgresDriverPayload(payload)).resolves.toHaveLength(3);
+  });
+
+  it("rejects a directory link even when it stays inside the payload", async () => {
+    fs.symlinkSync("drizzle-orm", path.join(payload, "node_modules", "drizzle-alias"));
+    await expect(verifyPostgresDriverPayload(payload)).rejects.toThrow(/must not contain linked files or packages.*node_modules\/drizzle-alias/);
+  });
+
+  it("rejects a file link to another directory inside the payload outside .bin", async () => {
+    fs.symlinkSync("../../drizzle-orm/postgres-js/driver.js", path.join(payload, "node_modules", "paperclipai", "driver.js"));
+    await expect(verifyPostgresDriverPayload(payload)).rejects.toThrow(/node_modules\/paperclipai\/driver\.js/);
+  });
+
   it("checks every installed drizzle-orm wherever npm placed it", async () => {
     writeDrizzle(path.join(payload, "node_modules", "paperclipai", "node_modules", "drizzle-orm"));
     const resolutions = await verifyPostgresDriverPayload(payload);

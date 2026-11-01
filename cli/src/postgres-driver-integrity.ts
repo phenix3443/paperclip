@@ -76,7 +76,9 @@ function findForbiddenLinks(payloadRoot: string): string[] {
       else if (entry.isSymbolicLink()) {
         const binLink = path.basename(directory) === ".bin" && path.basename(path.dirname(directory)) === "node_modules";
         const target = fs.existsSync(location) ? fs.realpathSync(location) : null;
-        if (!binLink || !target || !inside(payloadRoot, target) || fs.statSync(location).isDirectory()) forbidden.push(location);
+        const allowed = target !== null && fs.statSync(location).isFile()
+          && (path.dirname(target) === fs.realpathSync(directory) || (binLink && inside(payloadRoot, target)));
+        if (!allowed) forbidden.push(location);
       }
     }
   }
