@@ -1761,7 +1761,24 @@ export function enrichWakeContextSnapshot(input: {
   ) {
     contextSnapshot.wakeTriggerDetail = triggerDetail;
   }
+  // A wake for a pending card names the card in its snapshot or payload. Dispatch recognizes the card's addressee
+  // only through `contextSnapshot.interactionId` (`isPendingInteractionAddressee`); a route-built wake carries the id
+  // in the payload alone, and the normalization below clears interaction keys from any wake that is not a resolved
+  // interaction's continuation. So the id is taken before normalization and put back after it for this wake reason;
+  // a pending card is not a continuation, which also needs `interactionStatus`.
+  const pendingCardWake =
+    reason === "interaction_pending" || readNonEmptyString(contextSnapshot["wakeReason"]) === "interaction_pending";
+  const pendingInteractionId = pendingCardWake
+    ? readNonEmptyString(contextSnapshot["interactionId"]) ?? readNonEmptyString(payload?.["interactionId"])
+    : null;
+  const pendingInteractionKind = pendingCardWake
+    ? readNonEmptyString(contextSnapshot["interactionKind"]) ?? readNonEmptyString(payload?.["interactionKind"])
+    : null;
   normalizeInteractionContinuationWakeContext(contextSnapshot, payload);
+  if (pendingInteractionId) {
+    contextSnapshot.interactionId = pendingInteractionId;
+    if (pendingInteractionKind) contextSnapshot.interactionKind = pendingInteractionKind;
+  }
 
   return {
     contextSnapshot,

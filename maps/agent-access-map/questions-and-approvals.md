@@ -554,7 +554,7 @@ Policy: Approval and displayed action-wide trust rule atomic. Only reviewed appr
 
 Evidence: `source-only` — [remember transaction](../../server/src/services/tool-action-review.ts), [rule scope](../../server/src/services/tool-access-policy.ts), [rule administration](../../server/src/routes/tool-access.ts); reviewed at `3bbc2104b65caf9f7763938a01260a5673e12f7a`. No live proof.
 
-Verification: `not-run` — Approve remember then safe changed args obey rule; Off/definition change still blocks/reviews. Failed rule save leaves pending/no execution. Revoke rule then next action follows current policy.
+Verification: `not-run` — Approve remember then safe changed args obey rule; Off/definition change still blocks/reviews. Failed rule save leaves pending/no execution. Revoke rule then next action follows current policy. Revocation and both audit writes share a notifying transaction; [delivery regressions](../../server/src/__tests__/tool-trust-rule-revocation-delivery.test.ts) cover rollback and exact pending-request rechecks through the real coordinator. Trust-rule creation and both audit writes likewise share a notifying transaction; [creation delivery regressions](../../server/src/__tests__/tool-trust-rule-creation-delivery.test.ts) cover rollback, outer-commit publication and exact pending-request rechecks. These service tests do not establish agent authorization or live provider access.
 
 Gaps: Cross-link app-permissions for full trust administration; not company-wide blanket trust.
 

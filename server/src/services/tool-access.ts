@@ -1,5 +1,6 @@
 import { notifyVoiceChange } from "./voice/voice-recovery-notifications.js";
 import { notifyToolConnectionHealth, writeToolConnectionHealthChange } from "./tool-connection-health-notifications.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { connectionHealthSchedule } from "./tool-access/catalog/health-schedule.js";
 import type { ConnectionManagementContext } from "./connection-management.js";
 import { connectionActorUserId } from "./tool-access/actor.js";
@@ -779,6 +780,11 @@ export function toolAccessService(
       ? createVercelConnectClient()
       : options.vercelConnectClient;
   const runtimeSupervisor = createToolRuntimeSupervisor(db, options);
+  const notifyConnectionAccess = (tx: object) => notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
+  const writeConnectionAccess = <T>(write: (tx: Db) => Promise<T>) => db.transaction(async tx => {
+    await notifyConnectionAccess(tx);
+    return write(tx as unknown as Db);
+  });
   const connectionGrantsService = createConnectionGrants(db, { getConnectionRow, assertSecretRefs, vercelConnect });
   const removeConnection = createConnectionRemoval(db, { options, secrets, runtimeSupervisor, vercelConnect, getConnectionRow });
   const credentialStore = createOAuthCredentialStore(db, secrets);
@@ -1227,6 +1233,7 @@ export function toolAccessService(
           .where(and(eq(toolApplications.id, existing.id), eq(toolApplications.companyId, companyId)))
           .for("no key update");
         if (current && current.type !== "mcp_stdio") await notifyToolConnectionHealth(tx, { companyId, applicationId: existing.id });
+        await notifyConnectionAccess(tx);
         return tx.update(toolApplications)
         .set({
           name: definition.applicationName,
@@ -1242,7 +1249,7 @@ export function toolAccessService(
       });
       return { row: updated, created: false };
     }
-    const [created] = await db
+    const [created] = await writeConnectionAccess(tx => tx
       .insert(toolApplications)
       .values({
         companyId,
@@ -1253,7 +1260,7 @@ export function toolAccessService(
         status: "active",
         metadata,
       })
-      .returning();
+      .returning());
     return { row: created, created: true };
   }
 
@@ -1271,6 +1278,7 @@ export function toolAccessService(
     };
     if (existing) {
       const updated = await writeToolConnectionHealthChange(db, existing, async tx => {
+        await notifyConnectionAccess(tx);
         const [updated] = await tx
           .update(toolConnections)
           .set({
@@ -1297,6 +1305,7 @@ export function toolAccessService(
     }
     const connectionId = randomUUID();
     const created = await writeToolConnectionHealthChange(db, { companyId, id: connectionId }, async tx => {
+      await notifyConnectionAccess(tx);
       const [created] = await tx
         .insert(toolConnections)
         .values({
@@ -1340,7 +1349,7 @@ export function toolAccessService(
       safeDefault: true,
     };
     if (existing) {
-      const [updated] = await db
+      const [updated] = await writeConnectionAccess(tx => tx
         .update(toolProfiles)
         .set({
           name: definition.profileName,
@@ -1351,10 +1360,10 @@ export function toolAccessService(
           updatedAt: new Date(),
         })
         .where(eq(toolProfiles.id, existing.id))
-        .returning();
+        .returning());
       return { row: updated, created: false };
     }
-    const [created] = await db
+    const [created] = await writeConnectionAccess(tx => tx
       .insert(toolProfiles)
       .values({
         companyId,
@@ -1365,7 +1374,7 @@ export function toolAccessService(
         defaultAction: "deny",
         metadata,
       })
-      .returning();
+      .returning());
     return { row: created, created: true };
   }
 
@@ -1374,7 +1383,7 @@ export function toolAccessService(
     profileId: string,
     catalog: ToolCatalogEntry[],
   ): Promise<ToolProfileEntry[]> {
-    await db
+    const deleteEntries = (tx: Db) => tx
       .delete(toolProfileEntries)
       .where(
         and(
@@ -1385,8 +1394,7 @@ export function toolAccessService(
     const readEntries = catalog.filter(
       (entry) => entry.riskLevel === "read" && entry.status === "active",
     );
-    if (readEntries.length === 0) return [];
-    const rows = await db
+    const insertEntries = (tx: Db) => tx
       .insert(toolProfileEntries)
       .values(
         readEntries.map((entry) => ({
@@ -1403,6 +1411,10 @@ export function toolAccessService(
         })),
       )
       .returning();
+    const rows = await writeConnectionAccess(async tx => {
+      await deleteEntries(tx);
+      return readEntries.length === 0 ? [] : insertEntries(tx);
+    });
     return rows.map(toProfileEntry);
   }
 
@@ -1418,14 +1430,14 @@ export function toolAccessService(
       safeDefault: true,
     };
     if (existing) {
-      const [updated] = await db
+      const [updated] = await writeConnectionAccess(tx => tx
         .update(toolProfileBindings)
         .set({ priority: 100, metadata, updatedAt: new Date() })
         .where(eq(toolProfileBindings.id, existing.id))
-        .returning();
+        .returning());
       return toProfileBinding(updated);
     }
-    const [created] = await db
+    const [created] = await writeConnectionAccess(tx => tx
       .insert(toolProfileBindings)
       .values({
         companyId,
@@ -1439,7 +1451,7 @@ export function toolAccessService(
         createdByUserId:
           connectionActorUserId(actor),
       })
-      .returning();
+      .returning());
     return toProfileBinding(created);
   }
 
@@ -2410,7 +2422,7 @@ export function toolAccessService(
         `Connected app at ${remoteUrlCredential?.publicUrl ?? input.link}`;
       if (existingApplication) {
         if (existingApplication.status !== "active") {
-          [applicationRow] = await db
+          [applicationRow] = await db.transaction(async (tx) => { await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection); return tx
             .update(toolApplications)
             .set({
               status: "draft",
@@ -2421,7 +2433,7 @@ export function toolAccessService(
               updatedAt: new Date(),
             })
             .where(eq(toolApplications.id, existingApplication.id))
-            .returning();
+            .returning(); });
         } else {
           applicationRow = existingApplication;
         }
@@ -2433,7 +2445,7 @@ export function toolAccessService(
         // the user never asked to resolve.
         for (let attempt = 0; attempt < 10 && !applicationRow; attempt += 1) {
           try {
-            [applicationRow] = await db
+            [applicationRow] = await db.transaction(async (tx) => { await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection); return tx
               .insert(toolApplications)
               .values({
                 companyId,
@@ -2449,7 +2461,7 @@ export function toolAccessService(
                     }
                   : { source: "link" },
               })
-              .returning();
+              .returning(); });
           } catch (error) {
             if (!isUniqueViolation(error, "tool_applications_company_name_uq"))
               throw error;
@@ -2489,7 +2501,7 @@ export function toolAccessService(
         personalIdentityUserId || dedicatedAgentId ? [] : credentialSecretRefs;
       if (revivedConnectionPrevious) {
         forgetMcpHttpSessions(revivedConnectionPrevious.id);
-        [connectionRow] = await writeToolConnectionHealthChange(db, revivedConnectionPrevious, tx => tx
+        [connectionRow] = await writeToolConnectionHealthChange(db, revivedConnectionPrevious, async tx => { await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection); return tx
           .update(toolConnections)
           .set({
             name,
@@ -2511,18 +2523,18 @@ export function toolAccessService(
             updatedAt: new Date(),
           })
           .where(eq(toolConnections.id, revivedConnectionPrevious.id))
-          .returning());
+          .returning(); });
       } else {
         const connectionId = randomUUID();
-        [connectionRow] = await db
+        [connectionRow] = await db.transaction(async (tx) => { await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection); return tx
           .insert(toolConnections)
           .values({
             id: connectionId,
             companyId,
-            applicationId: applicationRow.id,
+            applicationId: applicationRow!.id,
             name,
             uid: connectionUid(
-              applicationRow.applicationKey ?? applicationRow.name,
+              applicationRow!.applicationKey ?? applicationRow!.name,
               name,
               connectionId,
             ),
@@ -2548,7 +2560,7 @@ export function toolAccessService(
             createdByUserId:
               connectionActorUserId(actor),
           })
-          .returning();
+          .returning(); });
       }
       if (revivedConnectionPrevious) {
         emitConnectionUpdated(
@@ -2598,7 +2610,7 @@ export function toolAccessService(
                 "The personal credential changed during setup. Please try again.",
               );
             previousGrant = currentGrant;
-            [changedGrant] = await db
+            [changedGrant] = await db.transaction(async (tx) => { await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection); return tx
               .update(connectionGrants)
               .set({
                 credentialSecretRefs,
@@ -2614,17 +2626,17 @@ export function toolAccessService(
                   sql`${connectionGrants.updatedAt} = ${grantSnapshot!.updatedAtVersion}::timestamptz`,
                 ),
               )
-              .returning();
+              .returning(); });
             if (!changedGrant)
               throw conflict(
                 "The personal credential changed during setup. Please try again.",
               );
           } else {
-            [changedGrant] = await db
+            [changedGrant] = await db.transaction(async (tx) => { await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection); return tx
               .insert(connectionGrants)
               .values({
                 companyId,
-                connectionId: connectionRow.id,
+                connectionId: connectionRow!.id,
                 kind: "user",
                 subjectUserId: personalIdentityUserId,
                 credentialSecretRefs,
@@ -2632,7 +2644,7 @@ export function toolAccessService(
                 isDefault: false,
                 createdByUserId: personalIdentityUserId,
               })
-              .returning();
+              .returning(); });
             if (!changedGrant)
               throw new Error("Failed to create personal connection grant");
           }
@@ -2696,6 +2708,7 @@ export function toolAccessService(
                 "The organization credential changed during setup. Please try again.",
               );
             }
+            await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
             const [updated] = await tx
               .update(connectionGrants)
               .set({
@@ -2825,6 +2838,7 @@ export function toolAccessService(
       if (unauthenticatedPersonalProbe) {
         const personalConnectionId = connectionRow.id;
         const grant = await db.transaction(async (tx) => {
+          await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
           const [createdGrant] = await tx
             .insert(connectionGrants)
             .values({
@@ -2935,6 +2949,7 @@ export function toolAccessService(
             );
             if (connectionMutationIsStillCurrent) {
               await notifyToolConnectionHealth(tx, revivedConnectionPrevious);
+              await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
               await tx
                 .update(toolConnections)
                 .set({
@@ -3153,6 +3168,7 @@ export function toolAccessService(
           .where(and(eq(toolApplications.id, connection.applicationId), eq(toolApplications.companyId, companyId)))
           .for("update");
         await notifyToolConnectionHealth(tx, connection);
+        await notifyConnectionAccess(tx);
         const [row] = await tx.update(toolConnections).set({ config, transportConfig: config, status: "active", enabled: true, ...(input.agentInstructions !== undefined ? { agentInstructions: input.agentInstructions } : {}), updatedAt: new Date() })
           .where(and(eq(toolConnections.id, connection.id), eq(toolConnections.companyId, companyId))).returning();
         await tx.update(toolApplications).set({ status: "active", updatedAt: new Date() }).where(and(eq(toolApplications.id, connection.applicationId), eq(toolApplications.companyId, companyId)));
@@ -3277,6 +3293,7 @@ export function toolAccessService(
       const companyTargets = lockedConnection.status !== "active" || !lockedConnection.enabled || (existingProfile && existingProfile.status !== "active")
         ? [{ targetType: "company", targetId: companyId }] : [];
       await lockToolAssignmentAgents(tx, companyId, [...existingBindings, ...bindingInputs, ...existingInstalls, ...companyTargets]);
+      await notifyConnectionAccess(tx);
       // A renamed connection can leave its old profile name in use. Resolve
       // names against profiles too, including when finalizing an installed draft.
       const otherProfiles = await tx
@@ -3648,6 +3665,7 @@ export function toolAccessService(
       await tx.select({ id: toolConnections.id }).from(toolConnections)
         .where(and(eq(toolConnections.id, connection.id), eq(toolConnections.companyId, companyId)))
         .for("update");
+      await notifyConnectionAccess(tx);
       for (const field of providedFields) {
         const value = input.credentialValues[field.configPath]!.trim();
         if (field.placement === "url" && !remoteUrlCredentialMatchesPublicUrl(String(connection.config.url ?? ""), value)) {
@@ -3956,7 +3974,7 @@ export function toolAccessService(
         .map((entry) => entry.id);
       if (safeReadEntryIds.length > 0) {
         const reviewedAt = new Date();
-        await db
+        await writeConnectionAccess(tx => tx
           .update(toolCatalogEntries)
           .set({
             status: "active",
@@ -3974,7 +3992,7 @@ export function toolAccessService(
               eq(toolCatalogEntries.companyId, companyId),
               inArray(toolCatalogEntries.id, safeReadEntryIds),
             ),
-          );
+          ));
         catalog = catalog.map((entry) =>
           safeReadEntryIds.includes(entry.id)
             ? {
@@ -4113,7 +4131,7 @@ export function toolAccessService(
         "Tool application owner agent",
       );
       await managementContext?.reauthorize();
-      const [row] = await db
+      const [row] = await writeConnectionAccess(tx => tx
         .insert(toolApplications)
         .values({
           companyId,
@@ -4127,7 +4145,7 @@ export function toolAccessService(
           ownerUserId: input.ownerUserId ?? null,
           metadata: input.metadata ?? {},
         })
-        .returning();
+        .returning());
       return toApplication(row);
     },
 
@@ -4181,7 +4199,7 @@ export function toolAccessService(
         }
       }
       await managementContext?.reauthorize();
-      const [row] = await db
+      const [row] = await writeConnectionAccess(tx => tx
         .update(toolApplications)
         .set({
           name: input.name ?? existing.name,
@@ -4194,7 +4212,7 @@ export function toolAccessService(
           updatedAt: new Date(),
         })
         .where(eq(toolApplications.id, applicationId))
-        .returning();
+        .returning());
       return toApplication(row);
     },
 
@@ -4227,10 +4245,10 @@ export function toolAccessService(
       await managementContext?.reauthorize();
       let row: typeof toolApplications.$inferSelect | undefined;
       try {
-        [row] = await db
+        [row] = await writeConnectionAccess(tx => tx
           .delete(toolApplications)
           .where(eq(toolApplications.id, applicationId))
-          .returning();
+          .returning());
       } catch (error) {
         if (isToolConnectionForeignKeyViolation(error)) {
           throw conflict(
@@ -4527,7 +4545,7 @@ export function toolAccessService(
           );
         }
       } else {
-        const [app] = await db
+        const [app] = await writeConnectionAccess(tx => tx
           .insert(toolApplications)
           .values({
             companyId,
@@ -4537,13 +4555,14 @@ export function toolAccessService(
             status: "active",
             metadata: {},
           })
-          .returning();
+          .returning());
         applicationId = app.id;
       }
       await actor?.managementContext?.reauthorize();
       const connectionId = randomUUID();
       const binding = actorBinding(actor);
       const row = await writeToolConnectionHealthChange(db, { companyId, id: connectionId }, async tx => {
+        await notifyConnectionAccess(tx);
         const [row] = await tx
           .insert(toolConnections)
           .values({
@@ -4666,6 +4685,7 @@ export function toolAccessService(
       const [row] = existing.transport === "chat_sdk"
         ? await db.transaction(async tx => {
             await notifyChatEndpointWork(tx, existing.id, existing.companyId);
+            await notifyConnectionAccess(tx);
             const rows = await write(tx as unknown as Db);
             // Credential resolution must never observe the binding rebuild's
             // delete/insert gap after a configuration wake.
@@ -4674,6 +4694,7 @@ export function toolAccessService(
           })
         : await writeToolConnectionHealthChange(db, existing, async tx => {
             if (existing.transport === "voice") await notifyVoiceChange(tx, { kind: "connection", id: existing.id });
+            await notifyConnectionAccess(tx);
             const rows = await write(tx);
             await syncCredentialBindings(rows[0]!, [], tx);
             await createToolRuntimeSlots(tx, runtimeSupervisor).ensureRuntimeSlot(rows[0]!);

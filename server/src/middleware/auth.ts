@@ -31,6 +31,7 @@ import { boardAuthService } from "../services/board-auth.js";
 import { retryIdempotentDatabaseOperation } from "../database-retry.js";
 import { beginIdleTrackedWork } from "../services/task-admission.js";
 import { notifyChatCompanyAuthorityChange } from "../services/chat-run-milestone-notifications.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "../services/delivery-work-notifications.js";
 
 export {
   isTransientDbConnectionError,
@@ -666,6 +667,9 @@ async function resolveCloudTenantActorOnce(
       // guarded upsert that leaves unchanged memberships untouched.
       if (!existing || existing.status !== "active" || existing.membershipRole === "viewer") {
         await notifyChatCompanyAuthorityChange(tx, { companyId });
+      }
+      if (!existing || existing.status !== "active" || existing.membershipRole !== membershipRole) {
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
       }
       return tx
         .insert(companyMemberships)
