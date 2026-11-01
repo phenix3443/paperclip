@@ -1,11 +1,12 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
-import { packGitPayload } from "../cli/src/commands/install.ts";
+import { GIT_PAYLOAD_SKILL_PACKAGES, packGitPayload, prepareGitPayloadSkills } from "../cli/src/commands/install.ts";
 import { readCheckoutPostgresDriver, readPostgresDriverRecord, verifyPostgresDriverPayload } from "../cli/src/postgres-driver-integrity.ts";
 
 const execFileAsync = promisify(execFile);
@@ -37,6 +38,35 @@ function packageCopies(payload, name) {
   return copies;
 }
 
+function fileHashes(root) {
+  const hashes = new Map();
+  const visit = (directory) => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const entryPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) visit(entryPath);
+      else hashes.set(path.relative(root, entryPath), createHash("sha256").update(fs.readFileSync(entryPath)).digest("hex"));
+    }
+  };
+  visit(root);
+  return hashes;
+}
+
+function verifySkills(payload) {
+  const expected = fileHashes(path.join(repoRoot, "skills"));
+  if (expected.size === 0) throw new Error("Checkout skills directory is empty.");
+  for (const packageDir of GIT_PAYLOAD_SKILL_PACKAGES) {
+    const name = JSON.parse(fs.readFileSync(path.join(repoRoot, packageDir, "package.json"), "utf8")).name;
+    const copies = packageCopies(payload, name);
+    if (copies.length !== 1) throw new Error(`Expected exactly one ${name} package; found ${copies.length}.`);
+    const actual = fileHashes(path.join(copies[0], "skills"));
+    for (const [file, hash] of expected) {
+      if (actual.get(file) !== hash) throw new Error(`${name} skills/${file} is missing or differs from the checkout.`);
+    }
+    if (actual.size !== expected.size) throw new Error(`${name} ships ${actual.size} skills files; expected ${expected.size}.`);
+    console.log(`skills ${path.relative(payload, copies[0])}: ${actual.size} files match the checkout`);
+  }
+}
+
 function listCopies(payload) {
   for (const name of ["postgres", "drizzle-orm"]) {
     console.error(`${name} copies:`);
@@ -54,6 +84,7 @@ try {
   await runCommand("bash", ["scripts/build-npm.sh", "--skip-checks", "--skip-typecheck"], { cwd: repoRoot, maxBuffer: 32 * 1024 * 1024 });
   await runCommand("corepack", ["pnpm", "-r", "--filter", "@paperclipai/server...", "--if-present", "run", "build"], { cwd: repoRoot, maxBuffer: 32 * 1024 * 1024 });
   await runCommand("bash", ["scripts/prepare-server-ui-dist.sh"], { cwd: repoRoot, env: { ...process.env, PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }, maxBuffer: 32 * 1024 * 1024 });
+  prepareGitPayloadSkills(repoRoot);
   const { version, expected } = await packGitPayload({ checkoutPath: repoRoot, stagingRoot, stagedPayload, runCommand });
   const checkoutExpected = readCheckoutPostgresDriver(repoRoot);
   if (JSON.stringify(expected) !== JSON.stringify(checkoutExpected)) throw new Error("packGitPayload expectation differs from the checkout driver.");
@@ -73,6 +104,7 @@ try {
     const driver = path.relative(stagedPayload, path.join(copy, "postgres-js", "driver.js"));
     if (!verifiedDrizzle.has(driver)) throw new Error(`drizzle-orm copy ${path.relative(stagedPayload, copy)} was not verified.`);
   }
+  verifySkills(stagedPayload);
   const cliVersion = JSON.parse(fs.readFileSync(path.join(repoRoot, "cli", "package.json"), "utf8")).version;
   const { stdout } = await runCommand(path.join(stagedPayload, "node_modules", ".bin", "paperclipai"), ["--version"], { cwd: workRoot });
   const reported = stdout.trim().split(/\s+/)[0];
