@@ -777,8 +777,10 @@ export function createHeartbeatScheduling(
                 : {}),
             },
           );
-          if (scheduled.outcome === "not_scheduled")
+          if (scheduled.outcome === "not_scheduled") {
+            if (atomicAdmission) throw new ReviewQuotaMonitorHeld(scheduled.reason);
             throw conflict(scheduled.reason);
+          }
         }
       } else {
         let executionDeferredCause: string | null = null;

@@ -2,7 +2,7 @@ import { legacyExecutionNeedsReconciliationWithEvidence } from "../legacy-execut
 import { parseObject } from "../../adapters/utils.js";
 import { isDeepStrictEqual } from "node:util";
 import { and, desc, eq, sql } from "drizzle-orm";
-import { activityLog, heartbeatRuns, issues, type Db } from "@paperclipai/db";
+import { activityLog, heartbeatRuns, issues, runIdentityContexts, type Db } from "@paperclipai/db";
 import { PROVIDER_QUOTA_MONITOR_SERVICE_NAME, isUuidLike } from "@paperclipai/shared";
 import { HttpError } from "../../errors.js";
 import { issueExecutionGeneration, parseIssueExecutionState } from "../issue-execution-policy.js";
@@ -19,6 +19,11 @@ export class ReviewQuotaMonitorHeld extends HttpError {
 }
 
 async function assertQuotaSourceEligibility(tx: Db, source: Run) {
+  const [identity] = source.activeIdentityContextId ? await tx.select().from(runIdentityContexts).where(and(
+    eq(runIdentityContexts.id, source.activeIdentityContextId), eq(runIdentityContexts.companyId, source.companyId),
+    eq(runIdentityContexts.runId, source.id), eq(runIdentityContexts.status, "accepted"))) : [];
+  if (!identity || identity.responsibleUserId !== source.responsibleUserId)
+    throw new ReviewQuotaMonitorHeld("The quota source accepted identity is unavailable");
   const recovery = parseObject(source.resultJson?.executionRecovery);
   if (source.runtimeMode === "native" || !["failed", "timed_out", "interrupted", "cancelled"].includes(source.status) ||
       source.errorCode !== "provider_quota" || recovery.kind !== "bootstrap" || recovery.providerWorkStarted !== false ||
