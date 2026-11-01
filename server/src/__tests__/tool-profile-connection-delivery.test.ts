@@ -145,7 +145,7 @@ describePostgres("tool profile writes notify the connection delivery worker", ()
     await expectRetired(f);
   });
 
-  it.each([["grant", "expired"], ["grant then revoke", "pending"]] as const)("reruns a sweep that read before a %s committed", async (name, status) => {
+  it.each([["grant", "expired"], ["grant then revoke", "pending"]] as const)("runs another sweep after a %s commits while a sweep is held before its read", async (name, status) => {
     const f = await seedPendingAccessRequest(db, "owner");
     const p = await reads();
     let gate: Promise<void> | null = null, entered!: () => void, release!: () => void;
