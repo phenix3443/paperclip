@@ -262,6 +262,30 @@ describe("plugin worker stop finality", () => {
     expect(gate.spawned()).toBe(1);
   });
 
+  it.each(["crash", "exit"] as const)("a manager stop issued from the %s callback of a crash schedules no retry", async (event) => {
+    const gate = await createGate();
+    closeGate = gate.close;
+    manager = createPluginWorkerManager();
+    const workers = manager;
+    const handle = await workers.startWorker("gated.plugin", startOptions(gate.socketPath, ""));
+    let stopping: Promise<void> | null = null;
+    const exited = new Promise<void>((resolve) => {
+      handle.on(event, () => {
+        stopping ??= workers.stopWorker("gated.plugin");
+        resolve();
+      });
+    });
+
+    gate.crash();
+    await exited;
+    await stopping;
+
+    expect(handle.status).toBe("stopped");
+    expect(handle.diagnostics().nextRestartAt).toBeNull();
+    expect(workers.getWorker("gated.plugin")).toBeUndefined();
+    expect(gate.spawned()).toBe(1);
+  });
+
   it("N7e: normal crash recovery still restarts the worker", async () => {
     const { gate, handle } = await startThenCrash("");
     expect(handle.status).toBe("backoff");

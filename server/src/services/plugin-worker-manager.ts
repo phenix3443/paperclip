@@ -3038,6 +3038,7 @@ export function createPluginWorkerHandle(
     signal: NodeJS.Signals | null,
   ): void {
     const wasIntentional = intentionalStop;
+    const token = startToken;
 
     // Clean up readline interfaces
     if (readline) {
@@ -3093,6 +3094,7 @@ export function createPluginWorkerHandle(
       log.info({ code, signal }, "worker process stopped");
       return;
     }
+    if (token !== startToken && status === "stopped") return;
 
     // Unexpected exit — crash recovery
     totalCrashes++;
@@ -3111,10 +3113,11 @@ export function createPluginWorkerHandle(
     );
 
     const willRestart =
-      autoRestart && consecutiveCrashes <= MAX_CONSECUTIVE_CRASHES && isStartAdmitted();
+      autoRestart && consecutiveCrashes <= MAX_CONSECUTIVE_CRASHES && isStartAdmitted() && token === startToken;
 
     setStatus("crashed");
     emitter.emit("crash", { pluginId, code, signal, willRestart });
+    if (token !== startToken) return;
 
     if (willRestart) {
       scheduleRestart();
