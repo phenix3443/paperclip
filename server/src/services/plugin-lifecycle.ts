@@ -569,7 +569,7 @@ export function pluginLifecycleManager(
 
       const teardownError = await tryDeactivatePluginRuntime(pluginId, plugin.pluginKey);
       if (teardownError && removeData) throw teardownError;
-      await pluginLoaderInstance.cleanupInstallArtifacts(plugin);
+      if (!teardownError) await pluginLoaderInstance.cleanupInstallArtifacts(plugin);
 
       // Perform the uninstall via registry (handles soft/hard delete)
       const result = await registry.uninstall(pluginId, removeData);
