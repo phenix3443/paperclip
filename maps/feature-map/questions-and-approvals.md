@@ -202,6 +202,7 @@ unless its actual provider journey was driven.
 - Dismissing a question does not answer it. Dismissing an app review neither
   grants permission nor resumes the agent. Ordinary comments cannot approve it.
 - A resolved request and a successful tool execution are separate facts.
+- A pending agent addressee can be woken during another agent's review. Its card does not authorize an older submitted review version or bypass task, budget, or execution ownership gates.
 - Do not reuse an accepted request to test rejection; use another request.
 - Agent Chat and skill tests have distinct lifecycle/authority rules despite
   sharing UI. A watchdog cannot acquire board authority by resolving a card.

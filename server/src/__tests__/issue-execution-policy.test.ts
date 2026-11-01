@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
+import { applyIssueExecutionPolicyTransition, issueExecutionGeneration, normalizeIssueExecutionPolicy, parseIssueExecutionState, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 import { buildExecutionPolicy } from "../../../ui/src/lib/issue-execution-policy.ts";
 
@@ -2320,5 +2320,25 @@ describe("review round circuit breaker", () => {
       currentParticipant: { type: "user", userId: boardUserId },
       changesRequestedCount: 1,
     });
+  });
+});
+
+describe("issueExecutionGeneration", () => {
+  it("retains the canonical null byte contract", () => {
+    expect(issueExecutionGeneration({ status: "in_review" })).toBe("640ddf9961bb7eabe4648ed9bf38f5bba7c8b14824ad57d22602dc54c79f7bc7");
+  });
+  it("sorts object keys, preserves array order, and binds every authority field", () => {
+    const task = { status: "in_review", assigneeAgentId: qaAgentId, assigneeUserId: null,
+      responsibleUserId: boardUserId, executionPolicy: { stages: [{ a: 1, b: 2 }] },
+      executionState: { decisions: ["first", "second"], count: 1 } };
+    const generation = issueExecutionGeneration(task);
+    expect(issueExecutionGeneration({ ...task, executionPolicy: { stages: [{ b: 2, a: 1 }] } })).toBe(generation);
+    expect(issueExecutionGeneration({ ...task, status: "blocked" })).toBe(generation);
+    for (const change of [
+      { assigneeAgentId: coderAgentId }, { assigneeUserId: ctoUserId }, { responsibleUserId: ctoUserId },
+      { executionPolicy: { stages: [{ a: 2, b: 2 }] } },
+      { executionState: { decisions: ["second", "first"], count: 1 } },
+      { executionState: { decisions: ["first", "second"], count: 2 } },
+    ]) expect(issueExecutionGeneration({ ...task, ...change })).not.toBe(generation);
   });
 });

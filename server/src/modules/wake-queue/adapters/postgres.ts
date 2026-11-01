@@ -976,7 +976,10 @@ export function createWakeAdmissionWriter(): WakeAdmissionWriter {
       const now = new Date();
       const mergedRun = await tx
         .update(heartbeatRuns)
-        .set({ contextSnapshot: input.mergedContextSnapshot, updatedAt: now })
+        .set({ contextSnapshot: sql`(${JSON.stringify(input.mergedContextSnapshot)}::jsonb - 'reviewerAssignmentGeneration') ||
+          case when jsonb_typeof(${heartbeatRuns.contextSnapshot}->'reviewerAssignmentGeneration') = 'string'
+            then jsonb_build_object('reviewerAssignmentGeneration', ${heartbeatRuns.contextSnapshot}->'reviewerAssignmentGeneration')
+            else '{}'::jsonb end`, updatedAt: now })
         .where(
           and(
             eq(heartbeatRuns.id, input.activeExecutionRunId),

@@ -386,7 +386,9 @@ Capability ID: `questions-and-approvals/audience`.
 
 Review: `operation-reviewed`.
 
-Persisted audience and current authority govern every operation, including permitted agent reviewers.
+Persisted audience and current authority govern every operation, including permitted agent reviewers. A pending agent addressee may receive its wake while another agent reviews the task. A review run with a saved string submission generation must still match the current task at queue admission, accounting admission, and provider handoff; the card does not bypass those fences. Legacy missing generations retain the existing task gates. Ordinary retries and coalescing retain their source generation.
+
+The S1 reconstruction is source staging only. Monitor generation transitions require the separately reviewed S2 change before release. Route tests inject an agent actor and use persisted run/identity facts; they do not verify bearer signing or production credentials.
 
 ### `requested-and-effective-policy`
 
