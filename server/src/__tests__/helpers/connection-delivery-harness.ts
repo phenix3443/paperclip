@@ -29,30 +29,36 @@ export async function seedPendingAccessRequest(db: Db, owner: string, companyId:
   return { companyId, agentId, issueId, intent: intent!, connection: connection!, tool: tool! };
 }
 
-export async function startConnectionDelivery(db: Db, options: { canRun?: () => boolean; beforeSweep?: () => Promise<void> } = {}) {
+export async function startConnectionDelivery(db: Db, options: { canRun?: () => boolean; beforeSweep?: () => Promise<void>; afterSweep?: () => Promise<void> } = {}) {
   const startedAt = Date.now();
   const wakeup = vi.fn<() => Promise<null>>().mockResolvedValue(null);
   const service = connectionIntentDeliveryService(db, { wakeup });
   const errors: unknown[] = [];
   let sweeps = 0, running = 0, accountedSweeps = 0;
+  let sweeping = false;
   const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: options.canRun ?? (() => true), onError: error => { errors.push(error); } });
   const worker = coordinator.register(DELIVERY_QUEUES.connection, {
     retryMs: RETRY_MS,
     nextRunAt: () => null,
     hasPending: async () => {
       running += 1;
-      try { return await service.hasPending(); } finally { running -= 1; }
+      try { return await service.hasPending(); } finally { running -= 1; sweeping = false; }
     },
     run: async () => {
       sweeps += 1;
       running += 1;
+      sweeping = true;
       try {
         await options.beforeSweep?.();
-        return await service.sweepPending();
-      } finally { running -= 1; }
+        const result = await service.sweepPending();
+        await options.afterSweep?.();
+        return result;
+      }
+      catch (error) { sweeping = false; throw error; }
+      finally { running -= 1; }
     },
   });
-  const quiet = () => running === 0 && !databaseWorkPending(db, DELIVERY_QUEUES.connection)
+  const quiet = () => running === 0 && !sweeping && !databaseWorkPending(db, DELIVERY_QUEUES.connection)
     && (coordinator.nextWakeAt() ?? Infinity) > Date.now() + RETRY_MS / 2;
   async function settle(minSweeps = 0) {
     const limit = Date.now() + 5_000;
@@ -78,6 +84,7 @@ export async function startConnectionDelivery(db: Db, options: { canRun?: () => 
       await coordinator.stop();
       expect(sweeps).toBe(accountedSweeps);
       expect(running).toBe(0);
+      expect(sweeping).toBe(false);
       expect(errors).toEqual([]);
       expect(Date.now() - startedAt).toBeLessThan(RETRY_MS / 2);
     },
