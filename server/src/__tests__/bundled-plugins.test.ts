@@ -326,6 +326,7 @@ describe("ensureBundledPlugins", () => {
     expect(installPlugin).toHaveBeenCalledWith({ localPath: K8S.localPath });
     expect(deps.lifecycle.load).toHaveBeenCalledWith(
       "id-paperclip.kubernetes-sandbox-provider",
+      { activate: false },
     );
   });
 
@@ -595,7 +596,7 @@ describe("ensureBundledPlugins", () => {
     );
     // Daytona still installed after the kubernetes failure.
     expect(installPlugin).toHaveBeenCalledTimes(2);
-    expect(deps.lifecycle.load).toHaveBeenCalledWith("id-paperclip.daytona-sandbox-provider");
+    expect(deps.lifecycle.load).toHaveBeenCalledWith("id-paperclip.daytona-sandbox-provider", { activate: false });
   });
 
   it("never uninstalls anything: plugins absent from the list are untouched", async () => {

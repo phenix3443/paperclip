@@ -1,6 +1,7 @@
 import { EventEmitter } from "node:events";
 import { HttpError } from "../errors.js";
 import { logger } from "../middleware/logger.js";
+import type { PluginLoader } from "./plugin-loader.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 
 export type PluginLifecycleOpKind = "Q" | "A" | "R";
@@ -145,6 +146,9 @@ export interface PluginLifecycleShared {
   readonly emitter: EventEmitter;
   readonly serializer: PluginLifecycleSerializer;
   readonly quiesced: Set<string>;
+  runtimeLoader: PluginLoader | undefined;
+  registerWithdrawer(withdraw: (pluginId: string) => void): () => void;
+  withdraw(pluginId: string): void;
   exclusive<T>(
     pluginKey: string,
     kind: PluginLifecycleOpKind,
@@ -170,10 +174,25 @@ export function createPluginLifecycleShared(
   let bumps = 0;
   const serializer = createPluginLifecycleSerializer(defaults);
   const pendingEvents = new WeakMap<PluginLifecycleLease, Array<[string, unknown]>>();
+  const withdrawers = new Set<(pluginId: string) => void>();
   return {
     emitter,
     serializer,
     quiesced,
+    runtimeLoader: undefined,
+    registerWithdrawer(withdraw) {
+      withdrawers.add(withdraw);
+      return () => void withdrawers.delete(withdraw);
+    },
+    withdraw(pluginId) {
+      for (const withdraw of withdrawers) {
+        try {
+          withdraw(pluginId);
+        } catch (err) {
+          logger.warn({ err, pluginId }, "plugin lifecycle: watch withdrawer failed");
+        }
+      }
+    },
     exclusive(pluginKey, kind, fn, queueWaitMs) {
       const queue: Array<[string, unknown]> = [];
       const flush = () => {

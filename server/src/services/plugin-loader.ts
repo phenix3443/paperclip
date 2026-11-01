@@ -1999,30 +1999,14 @@ export function pluginLoader(
       // uninstalled, so a retry that failed while still in error status could
       // not re-mark itself as errored.
       const erroredPlugins = (await registry.listByStatus("error")) as PluginRecord[];
-      const retriedPlugins: PluginRecord[] = [];
-      for (const plugin of erroredPlugins) {
-        try {
-          const flipped = (await registry.updateStatus(plugin.id, { status: "ready" })) as PluginRecord | null;
-          if (flipped) retriedPlugins.push(flipped);
-        } catch (err) {
-          log.warn(
-            {
-              pluginId: plugin.id,
-              pluginKey: plugin.pluginKey,
-              err: err instanceof Error ? err.message : String(err),
-            },
-            "plugin-loader: could not queue errored plugin for a boot retry",
-          );
-        }
-      }
-      if (retriedPlugins.length > 0) {
+      if (erroredPlugins.length > 0) {
         log.info(
-          { count: retriedPlugins.length, pluginKeys: retriedPlugins.map((plugin) => plugin.pluginKey) },
+          { count: erroredPlugins.length, pluginKeys: erroredPlugins.map((plugin) => plugin.pluginKey) },
           "plugin-loader: retrying plugins that failed activation on a previous boot",
         );
       }
 
-      const pluginsToLoad = [...readyPlugins, ...retriedPlugins];
+      const pluginsToLoad = [...readyPlugins, ...erroredPlugins];
 
       if (pluginsToLoad.length === 0) {
         log.info("plugin-loader: no ready plugins to load");
@@ -2034,13 +2018,47 @@ export function pluginLoader(
         "plugin-loader: found ready plugins to load",
       );
 
-      // Load plugins in parallel
+      // Each plugin activates under its lifecycle lease, so a disable or
+      // DELETE racing startup waits for this activation and then wins. A
+      // plugin quiesced in this process, or whose row changed since it was
+      // listed, is skipped instead of revived.
+      const { lifecycleManager } = runtimeServices;
+      const loadOne = async (listed: PluginRecord, lease?: PluginLifecycleLease): Promise<PluginLoadResult | null> => {
+        if (lease && lifecycleManager.isQuiesced(listed.id)) return null;
+        let plugin = listed;
+        if (lease) {
+          const current = (await registry.getById(listed.id)) as PluginRecord | null;
+          if (!current || current.status !== listed.status) return null;
+          plugin = current;
+        }
+        if (plugin.status === "error") {
+          try {
+            lease?.assertActive();
+            const flipped = (await registry.updateStatus(plugin.id, { status: "ready" })) as PluginRecord | null;
+            if (!flipped) return null;
+            plugin = flipped;
+          } catch (err) {
+            log.warn(
+              {
+                pluginId: plugin.id,
+                pluginKey: plugin.pluginKey,
+                err: err instanceof Error ? err.message : String(err),
+              },
+              "plugin-loader: could not queue errored plugin for a boot retry",
+            );
+            return null;
+          }
+        }
+        return activatePlugin(plugin, { markErrorOnFailure: true, lease });
+      };
       const results = await Promise.allSettled(
-        pluginsToLoad.map((plugin) => activatePlugin(plugin))
+        pluginsToLoad.map((plugin) => typeof lifecycleManager.exclusive === "function"
+          ? lifecycleManager.exclusive(plugin.pluginKey, "A", (lease) => loadOne(plugin, lease))
+          : loadOne(plugin)),
       );
 
-      const loadResults = results.map((r, i) => {
-        if (r.status === "fulfilled") return r.value;
+      const loadResults = results.flatMap((r, i) => {
+        if (r.status === "fulfilled") return r.value ? [r.value] : [];
         return {
           plugin: pluginsToLoad[i]!,
           success: false,
@@ -2054,7 +2072,7 @@ export function pluginLoader(
 
       log.info(
         {
-          total: pluginsToLoad.length,
+          total: loadResults.length,
           succeeded,
           failed,
         },
@@ -2062,7 +2080,7 @@ export function pluginLoader(
       );
 
       return {
-        total: pluginsToLoad.length,
+        total: loadResults.length,
         succeeded,
         failed,
         results: loadResults,

@@ -1276,12 +1276,10 @@ export async function createApp(
   // installed here from their local paths. This runs BEFORE loadAll() so
   // loadAll() can activate them in the same startup pass.
   //
-  // Workers are started exactly once, by loadAll(): the `lifecycle` manager
-  // above is constructed without a runtime-capable loader
-  // (pluginLifecycleManager(db, { workerManager }) — no `loader` option), so
-  // the lifecycle.load() that ensureBundledPlugins performs per newly
-  // installed bundle only records the `ready` status and does not spawn a
-  // worker (see activateReadyPlugin in services/plugin-lifecycle.ts).
+  // Workers are started exactly once, by loadAll(): the lifecycle.load()
+  // that ensureBundledPlugins performs per newly installed bundle passes
+  // `{ activate: false }`, so it only records the `ready` status even though
+  // the lifecycle reaches the shared runtime loader.
   //
   // Managed instances (`plugins.autoInstall` from PAPERCLIP_MANAGED_CONFIG)
   // drive the key list from the control plane; self-hosted instances keep
@@ -1315,6 +1313,7 @@ export async function createApp(
     .then((result) => {
       if (!result) return;
       for (const loaded of result.results) {
+        if (lifecycle.isQuiesced(loaded.plugin.id)) continue;
         if (devWatcher && loaded.success && loaded.plugin.packagePath) {
           devWatcher.watch(loaded.plugin.id, loaded.plugin.packagePath);
         }

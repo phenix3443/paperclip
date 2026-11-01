@@ -160,6 +160,19 @@ export interface PluginLifecycleOpOptions {
   lease?: PluginLifecycleLease;
 }
 
+export interface PluginLoadOptions extends PluginLifecycleOpOptions {
+  activate?: boolean;
+}
+
+export interface PluginRestartOptions extends PluginLifecycleOpOptions {
+  source?: "watcher" | "config";
+  epoch?: number;
+}
+
+export interface PluginRestartResult {
+  superseded: boolean;
+}
+
 export interface PluginLifecycleManager {
   /**
    * Load a newly installed plugin – transitions `installed` → `ready`.
@@ -168,7 +181,7 @@ export interface PluginLifecycleManager {
    * The caller should have already spawned the worker and performed health
    * checks before calling this.  If the worker fails, call `markError` instead.
    */
-  load(pluginId: string, options?: PluginLifecycleOpOptions): Promise<PluginRecord>;
+  load(pluginId: string, options?: PluginLoadOptions): Promise<PluginRecord>;
 
   /**
    * Enable a plugin that is in `disabled`, `error`, or `upgrade_pending` state.
@@ -250,7 +263,7 @@ export interface PluginLifecycleManager {
    * @param pluginId - The UUID of the plugin to restart
    * @throws if no worker manager is configured or the plugin is not ready
    */
-  restartWorker(pluginId: string, options?: PluginLifecycleOpOptions): Promise<void>;
+  restartWorker(pluginId: string, options?: PluginRestartOptions): Promise<PluginRestartResult>;
 
   exclusive<T>(
     pluginKey: string,
@@ -265,6 +278,10 @@ export interface PluginLifecycleManager {
   changedSince(pluginId: string, mark: number): boolean;
 
   isCurrentGeneration(pluginId: string, epoch: number): boolean;
+
+  isQuiesced(pluginId: string): boolean;
+
+  registerWatchWithdrawer(withdraw: (pluginId: string) => void): () => void;
 
   /**
    * Get the current lifecycle state for a plugin.
@@ -370,6 +387,13 @@ export function pluginLifecycleManager(
   const registry = pluginRegistryService(db);
   const pluginLoaderInstance = loaderArg ?? pluginLoader(db);
   const shared = pluginLifecycleSharedFor(workerManager);
+  const hasRuntime = (candidate: PluginLoader | undefined): candidate is PluginLoader =>
+    typeof candidate?.hasRuntimeServices === "function" && candidate.hasRuntimeServices();
+  if (workerManager && !shared.runtimeLoader && hasRuntime(pluginLoaderInstance)) {
+    shared.runtimeLoader = pluginLoaderInstance;
+  }
+  const runtimeLoader = (): PluginLoader | undefined =>
+    hasRuntime(pluginLoaderInstance) ? pluginLoaderInstance : shared.runtimeLoader;
   const emitter = shared.emitter;
 
   interface LifecycleOp {
@@ -476,6 +500,7 @@ export function pluginLifecycleManager(
     shared.bumpEpoch(pluginId);
     shared.quiesced.add(pluginId);
     workerManager?.revokeStarts?.(pluginId);
+    shared.withdraw(pluginId);
   }
 
   function beginActivation(pluginId: string, op: LifecycleOp): void {
@@ -507,15 +532,11 @@ export function pluginLifecycleManager(
   }
 
   async function activateReadyPlugin(pluginId: string, op: LifecycleOp): Promise<void> {
-    const supportsRuntimeActivation =
-      typeof pluginLoaderInstance.hasRuntimeServices === "function"
-      && typeof pluginLoaderInstance.loadSingle === "function";
-    if (!supportsRuntimeActivation || !pluginLoaderInstance.hasRuntimeServices()) {
-      return;
-    }
+    const loader = runtimeLoader();
+    if (typeof loader?.loadSingle !== "function") return;
 
     op.lease.assertActive();
-    const loadResult = await pluginLoaderInstance.loadSingle(pluginId, { lease: op.lease });
+    const loadResult = await loader.loadSingle(pluginId, { lease: op.lease });
     if (!loadResult.success) {
       throw new PluginActivationError(
         loadResult.error
@@ -530,12 +551,9 @@ export function pluginLifecycleManager(
     op: LifecycleOp,
   ): Promise<void> {
     op.lease.assertCleanup();
-    const supportsRuntimeDeactivation =
-      typeof pluginLoaderInstance.hasRuntimeServices === "function"
-      && typeof pluginLoaderInstance.unloadSingle === "function";
-
-    if (supportsRuntimeDeactivation && pluginLoaderInstance.hasRuntimeServices()) {
-      await pluginLoaderInstance.unloadSingle(pluginId, pluginKey);
+    const loader = runtimeLoader();
+    if (typeof loader?.unloadSingle === "function") {
+      await loader.unloadSingle(pluginId, pluginKey);
       return;
     }
 
@@ -571,13 +589,13 @@ export function pluginLifecycleManager(
      * @param pluginId - The UUID of the plugin to load.
      * @returns The updated plugin record.
      */
-    async load(pluginId: string, options?: PluginLifecycleOpOptions): Promise<PluginRecord> {
+    async load(pluginId: string, options?: PluginLoadOptions): Promise<PluginRecord> {
       return runOp(pluginId, "A", options, async (op) => {
         const plugin = await requirePlugin(pluginId);
         assertTransition(plugin, "ready");
         beginActivation(pluginId, op);
         const result = await transition(pluginId, "ready", null, plugin, op);
-        await activateReadyPlugin(pluginId, op);
+        if (options?.activate !== false) await activateReadyPlugin(pluginId, op);
 
         emitDomain("plugin.loaded", { pluginId, pluginKey: result.pluginKey }, op);
         emitDomain("plugin.enabled", { pluginId, pluginKey: result.pluginKey }, op);
@@ -870,7 +888,7 @@ export function pluginLifecycleManager(
     },
 
     // -- restartWorker ----------------------------------------------------
-    async restartWorker(pluginId: string, options?: PluginLifecycleOpOptions): Promise<void> {
+    async restartWorker(pluginId: string, options?: PluginRestartOptions): Promise<PluginRestartResult> {
       if (!workerManager) {
         throw badRequest(
           "Cannot restart worker: no PluginWorkerManager is configured.",
@@ -878,31 +896,26 @@ export function pluginLifecycleManager(
       }
 
       const manager = workerManager;
+      const scheduledEpoch = options?.epoch ?? shared.currentEpoch(pluginId);
       return runOp(pluginId, "R", options, async (op) => {
         const plugin = await requirePlugin(pluginId);
-        if (plugin.status !== "ready") {
-          throw invalidTransition(
-            `Cannot restart worker for plugin in status '${plugin.status}'. ` +
-              `Plugin must be in 'ready' status.`,
-          );
-        }
-
         const handle = manager.getWorker(pluginId);
-        if (!handle) {
-          throw badRequest(
-            `Cannot restart worker for plugin "${plugin.pluginKey}": no worker is running.`,
+        if (
+          !shared.isCurrentGeneration(pluginId, scheduledEpoch)
+          || plugin.status !== "ready"
+          || !handle
+        ) {
+          log.info(
+            { pluginId, pluginKey: plugin.pluginKey, source: options?.source, status: plugin.status },
+            "plugin lifecycle: reload superseded",
           );
+          return { superseded: true };
         }
 
-        const supportsRuntimeActivation =
-          typeof pluginLoaderInstance.hasRuntimeServices === "function"
-          && typeof pluginLoaderInstance.loadSingle === "function"
-          && typeof pluginLoaderInstance.unloadSingle === "function"
-          && pluginLoaderInstance.hasRuntimeServices();
-
-        if (supportsRuntimeActivation) {
+        const loader = runtimeLoader();
+        if (typeof loader?.loadSingle === "function" && typeof loader.unloadSingle === "function") {
           log.info(
-            { pluginId, pluginKey: plugin.pluginKey },
+            { pluginId, pluginKey: plugin.pluginKey, source: options?.source },
             "plugin lifecycle: reloading plugin (re-reading manifest, re-applying pending migrations, restarting worker)",
           );
 
@@ -924,9 +937,10 @@ export function pluginLifecycleManager(
           // No runtime activation services wired in (e.g. state-only test harness)
           // — fall back to a bare worker subprocess bounce.
           log.info(
-            { pluginId, pluginKey: plugin.pluginKey },
+            { pluginId, pluginKey: plugin.pluginKey, source: options?.source },
             "plugin lifecycle: restarting worker (runtime services unavailable; skipping migration re-apply)",
           );
+          op.lease.assertActive();
           await handle.restart();
           emitDomain("plugin.worker_stopped", { pluginId, pluginKey: plugin.pluginKey }, op);
           emitDomain("plugin.worker_started", { pluginId, pluginKey: plugin.pluginKey }, op);
@@ -936,6 +950,7 @@ export function pluginLifecycleManager(
           { pluginId, pluginKey: plugin.pluginKey },
           "plugin lifecycle: plugin reloaded",
         );
+        return { superseded: false };
       });
     },
 
@@ -955,6 +970,14 @@ export function pluginLifecycleManager(
 
     isCurrentGeneration(pluginId: string, epoch: number): boolean {
       return shared.isCurrentGeneration(pluginId, epoch);
+    },
+
+    isQuiesced(pluginId: string): boolean {
+      return shared.quiesced.has(pluginId);
+    },
+
+    registerWatchWithdrawer(withdraw: (pluginId: string) => void): () => void {
+      return shared.registerWithdrawer(withdraw);
     },
 
     // -- getStatus --------------------------------------------------------

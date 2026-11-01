@@ -2496,7 +2496,8 @@ export function pluginRoutes(
           ) {
             // Worker doesn't handle live config — restart it.
             try {
-              await lifecycle.restartWorker(plugin.id);
+              const epoch = lifecycle.currentEpoch(plugin.id);
+              await lifecycle.restartWorker(plugin.id, { source: "config", epoch });
             } catch {
               // Restart failure is non-fatal for the config save response.
             }

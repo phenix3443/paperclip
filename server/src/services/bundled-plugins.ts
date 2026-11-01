@@ -242,7 +242,7 @@ export interface BundledPluginProvisionerDeps {
     loadManifest(packagePath: string): Promise<PaperclipPluginManifestV1 | null>;
   };
   lifecycle: {
-    load(pluginId: string): Promise<unknown>;
+    load(pluginId: string, options?: { activate?: boolean }): Promise<unknown>;
   };
   logger: {
     info(obj: unknown, msg?: string): void;
@@ -453,14 +453,11 @@ export async function ensureBundledPlugins(
         );
         continue;
       }
-      // Transition installed -> ready. Whether this also starts the worker
-      // depends on the injected lifecycle manager: one built with a
-      // runtime-capable loader activates here; the boot-time manager in
-      // app.ts is not, so at startup this only records `ready` and the
-      // worker is started exactly once by the subsequent loader.loadAll().
+      // Transition installed -> ready without activating: the worker is
+      // started exactly once by the subsequent loader.loadAll().
       const installed = await deps.registry.getByKey(discovered.manifest.id);
       if (installed) {
-        await deps.lifecycle.load(installed.id);
+        await deps.lifecycle.load(installed.id, { activate: false });
         deps.logger.info(
           { pluginId: installed.id, pluginKey: installed.pluginKey },
           "bundled plugin auto-installed and loaded",
