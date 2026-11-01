@@ -243,7 +243,7 @@ export async function installNpmPayload(
   }
 }
 
-function gitBuildEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+export function gitBuildEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const env = { ...process.env, ...extra };
   // Source builds need devDependencies (esbuild, typescript); ambient NODE_ENV=production
   // makes pnpm/npm omit them, so the checkout build must not inherit it.

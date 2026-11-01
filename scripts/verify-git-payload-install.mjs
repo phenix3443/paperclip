@@ -6,7 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
-import { GIT_PAYLOAD_SKILL_PACKAGES, packGitPayload, prepareGitPayloadSkills, unifyGitPayloadVersions } from "../cli/src/commands/install.ts";
+import { GIT_PAYLOAD_SKILL_PACKAGES, gitBuildEnv, packGitPayload, prepareGitPayloadSkills, unifyGitPayloadVersions } from "../cli/src/commands/install.ts";
 import { readCheckoutPostgresDriver, readPostgresDriverRecord, verifyPostgresDriverPayload } from "../cli/src/postgres-driver-integrity.ts";
 
 const execFileAsync = promisify(execFile);
@@ -81,9 +81,9 @@ fs.mkdirSync(stagingRoot);
 fs.mkdirSync(stagedPayload);
 
 try {
-  await runCommand("bash", ["scripts/build-npm.sh", "--skip-checks", "--skip-typecheck"], { cwd: repoRoot, maxBuffer: 32 * 1024 * 1024 });
-  await runCommand("corepack", ["pnpm", "-r", "--filter", "@paperclipai/server...", "--if-present", "run", "build"], { cwd: repoRoot, maxBuffer: 32 * 1024 * 1024 });
-  await runCommand("bash", ["scripts/prepare-server-ui-dist.sh"], { cwd: repoRoot, env: { ...process.env, PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }, maxBuffer: 32 * 1024 * 1024 });
+  await runCommand("bash", ["scripts/build-npm.sh", "--skip-checks", "--skip-typecheck"], { cwd: repoRoot, env: gitBuildEnv(), maxBuffer: 32 * 1024 * 1024 });
+  await runCommand("corepack", ["pnpm", "-r", "--filter", "@paperclipai/server...", "--if-present", "run", "build"], { cwd: repoRoot, env: gitBuildEnv(), maxBuffer: 32 * 1024 * 1024 });
+  await runCommand("bash", ["scripts/prepare-server-ui-dist.sh"], { cwd: repoRoot, env: gitBuildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
   prepareGitPayloadSkills(repoRoot);
   await unifyGitPayloadVersions(repoRoot, runCommand);
   const { version, expected } = await packGitPayload({ checkoutPath: repoRoot, stagingRoot, stagedPayload, runCommand });
