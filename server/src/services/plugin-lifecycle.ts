@@ -662,8 +662,6 @@ export function pluginLifecycleManager(
     const teardownError = await tryDeactivatePluginRuntime(pluginId, pluginKey, op);
     if (teardownError) {
       fence(pluginId, teardownError instanceof Error ? teardownError.message : String(teardownError));
-    } else {
-      shared.fenced.delete(pluginId);
     }
     return teardownError;
   }
@@ -691,7 +689,7 @@ export function pluginLifecycleManager(
         beginActivation(pluginId, op);
         const result = await transition(pluginId, "ready", null, plugin, op);
         if (options?.activate !== false) await activateReadyPlugin(pluginId, op);
-
+        op.lease.assertActive();
         emitDomain("plugin.loaded", { pluginId, pluginKey: result.pluginKey }, op);
         emitDomain("plugin.enabled", { pluginId, pluginKey: result.pluginKey }, op);
         return result;
@@ -723,6 +721,7 @@ export function pluginLifecycleManager(
         beginActivation(pluginId, op);
         const result = await transition(pluginId, "ready", null, plugin, op);
         await activateReadyPlugin(pluginId, op);
+        op.lease.assertActive();
         emitDomain("plugin.enabled", { pluginId, pluginKey: result.pluginKey }, op);
         return result;
       });
@@ -749,12 +748,14 @@ export function pluginLifecycleManager(
         const teardownError = await quiesceRuntime(pluginId, plugin.pluginKey, op);
         if (plugin.status === "disabled") {
           if (teardownError) throw new PluginTeardownError(plugin.pluginKey, teardownError);
+          shared.fenced.delete(pluginId);
           return plugin;
         }
 
         const result = await transition(pluginId, "disabled", reason ?? null, plugin, op);
         emitDomain("plugin.disabled", { pluginId, pluginKey: result.pluginKey, reason }, op);
         if (teardownError) throw new PluginTeardownError(plugin.pluginKey, teardownError);
+        shared.fenced.delete(pluginId);
         return result;
       });
     },
@@ -779,10 +780,12 @@ export function pluginLifecycleManager(
               "plugin lifecycle: hard-deleted already-uninstalled plugin",
             );
             emitDomain("plugin.unloaded", { pluginId, pluginKey: plugin.pluginKey, removeData: true }, op);
+            shared.fenced.delete(pluginId);
             return deleted as PluginRecord | null;
           }
           const teardownError = await quiesceRuntime(pluginId, plugin.pluginKey, op);
           if (teardownError) throw new PluginTeardownError(plugin.pluginKey, teardownError);
+          shared.fenced.delete(pluginId);
           return plugin;
         }
 
@@ -806,7 +809,7 @@ export function pluginLifecycleManager(
         }, op);
         emitDomain("plugin.unloaded", { pluginId, pluginKey: plugin.pluginKey, removeData }, op);
         if (teardownError) throw new PluginTeardownError(plugin.pluginKey, teardownError);
-
+        shared.fenced.delete(pluginId);
         return result as PluginRecord | null;
       });
     },
@@ -930,6 +933,7 @@ export function pluginLifecycleManager(
           manifestJson: newManifest,
         } as PluginRecord, op);
         await activateReadyPlugin(pluginId, op);
+        op.lease.assertActive();
 
         emitDomain("plugin.loaded", { pluginId, pluginKey: result.pluginKey }, op);
         emitDomain("plugin.enabled", { pluginId, pluginKey: result.pluginKey }, op);

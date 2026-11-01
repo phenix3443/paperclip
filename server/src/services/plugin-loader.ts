@@ -1273,7 +1273,7 @@ export function pluginLoader(
         await execFileAsync(
           "npm",
           ["install", spec, "--prefix", targetInstallDir, "--save", "--ignore-scripts"],
-          { timeout: 120_000, signal }, // 2 minute timeout for npm install
+          { timeout: 120_000, signal },
         );
       } catch (err) {
         throw new Error(`npm install failed for ${spec}: ${String(err)}`);

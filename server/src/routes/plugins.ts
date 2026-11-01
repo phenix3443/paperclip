@@ -1297,9 +1297,9 @@ export function pluginRoutes(
         return;
       }
 
-      let targetId: string | undefined;
+      let targetId = (await registry.getByKey(prepared.manifest.id))?.id;
       const existingPlugin = await lifecycle.exclusive(prepared.manifest.id, "A", async (lease) => {
-        targetId = (await registry.getByKey(prepared.manifest!.id))?.id;
+        targetId = (await registry.getByKey(prepared.manifest!.id))?.id ?? targetId;
         if (targetId && lifecycle.isFenced(targetId)) {
           throw new PluginLifecycleFencedError(prepared.manifest!.id, "a previous stop was not proven");
         }
@@ -2353,6 +2353,7 @@ export function pluginRoutes(
    * Errors: 404 if plugin not found, 400 for lifecycle errors
    */
   router.post("/plugins/:pluginId/upgrade", async (req, res) => {
+    const deadlineAt = lifecycle.responseDeadline();
     assertInstanceAdmin(req);
     assertPluginManagementVisible();
     const { pluginId } = req.params;
@@ -2371,7 +2372,7 @@ export function pluginRoutes(
       // 2. Compare capabilities
       // 3. If new capabilities, mark as upgrade_pending
       // 4. Otherwise, transition to ready
-      const result = await lifecycle.upgrade(plugin.id, version);
+      const result = await lifecycle.upgrade(plugin.id, version, { deadlineAt });
       await logPluginMutationActivity(req, "plugin.upgraded", plugin.id, {
         pluginId: plugin.id,
         pluginKey: plugin.pluginKey,
