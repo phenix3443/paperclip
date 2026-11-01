@@ -64,6 +64,68 @@ describe("postgres driver payload verifier", () => {
     await expect(verifyPostgresDriverPayload(payload, EXPECTED)).resolves.toHaveLength(3);
   });
 
+  describe("with files linked inside one package", () => {
+    const nativeLib = () => path.join(payload, "node_modules", "@embedded-postgres", "linux-x64", "native", "lib");
+    beforeEach(() => {
+      writePackage(path.join(payload, "node_modules", "@embedded-postgres", "linux-x64"), "@embedded-postgres/linux-x64");
+      fs.mkdirSync(nativeLib(), { recursive: true });
+      fs.writeFileSync(path.join(nativeLib(), "libecpg.so.6.13"), "elf");
+    });
+
+    it("accepts shared library version links, including link chains, inside a scoped package", async () => {
+      fs.symlinkSync("libecpg.so.6.13", path.join(nativeLib(), "libecpg.so.6"));
+      fs.symlinkSync("libecpg.so.6", path.join(nativeLib(), "libecpg.so"));
+      fs.symlinkSync("lib/libecpg.so", path.join(nativeLib(), "..", "libecpg.so"));
+      await expect(verifyPostgresDriverPayload(payload, EXPECTED)).resolves.toHaveLength(3);
+    });
+
+    it("rejects a link to a file in a sibling package that is still inside the payload", async () => {
+      fs.symlinkSync(path.join(payload, "node_modules", "drizzle-orm", "postgres-js", "driver.js"), path.join(nativeLib(), "driver.js"));
+      await expect(verifyPostgresDriverPayload(payload, EXPECTED)).rejects.toThrow(/must not contain linked files or packages.*native\/lib\/driver\.js/);
+    });
+
+    it("rejects a link to a file in the same scope but another package", async () => {
+      writePackage(path.join(payload, "node_modules", "@embedded-postgres", "linux-arm64"), "@embedded-postgres/linux-arm64");
+      fs.writeFileSync(path.join(payload, "node_modules", "@embedded-postgres", "linux-arm64", "libpq.so.5"), "elf");
+      fs.symlinkSync("../../linux-arm64/libpq.so.5", path.join(nativeLib(), "..", "libpq.so"));
+      await expect(verifyPostgresDriverPayload(payload, EXPECTED)).rejects.toThrow(/must not contain linked files or packages.*linux-x64\/native\/libpq\.so/);
+    });
+
+    it("rejects a link to a file of a nested dependency", async () => {
+      const nested = writePackage(path.join(payload, "node_modules", "@embedded-postgres", "linux-x64", "node_modules", "dep"), "dep");
+      fs.writeFileSync(path.join(nested, "index.js"), "");
+      fs.symlinkSync("../node_modules/dep/index.js", path.join(nativeLib(), "..", "dep.js"));
+      await expect(verifyPostgresDriverPayload(payload, EXPECTED)).rejects.toThrow(/must not contain linked files or packages.*linux-x64\/native\/dep\.js/);
+    });
+
+    it("rejects a file link placed in a nested node_modules even when its target is in the package", async () => {
+      fs.mkdirSync(path.join(payload, "node_modules", "@embedded-postgres", "linux-x64", "node_modules"));
+      fs.symlinkSync("../native/lib/libecpg.so.6.13", path.join(payload, "node_modules", "@embedded-postgres", "linux-x64", "node_modules", "libecpg.so"));
+      await expect(verifyPostgresDriverPayload(payload, EXPECTED)).rejects.toThrow(/must not contain linked files or packages.*linux-x64\/node_modules\/libecpg\.so/);
+    });
+
+    it("rejects a directory link inside the package", async () => {
+      fs.symlinkSync("lib", path.join(nativeLib(), "..", "lib64"));
+      await expect(verifyPostgresDriverPayload(payload, EXPECTED)).rejects.toThrow(/must not contain linked files or packages.*native\/lib64/);
+    });
+
+    it("rejects a broken link inside the package", async () => {
+      fs.symlinkSync("libmissing.so.1", path.join(nativeLib(), "libmissing.so"));
+      await expect(verifyPostgresDriverPayload(payload, EXPECTED)).rejects.toThrow(/must not contain linked files or packages.*native\/lib\/libmissing\.so/);
+    });
+
+    it("rejects looping links inside the package", async () => {
+      fs.symlinkSync("libloop.b", path.join(nativeLib(), "libloop.a"));
+      fs.symlinkSync("libloop.a", path.join(nativeLib(), "libloop.b"));
+      await expect(verifyPostgresDriverPayload(payload, EXPECTED)).rejects.toThrow(/must not contain linked files or packages.*native\/lib\/libloop\./);
+    });
+
+    it("rejects a file link directly in node_modules", async () => {
+      fs.symlinkSync("drizzle-orm/package.json", path.join(payload, "node_modules", "loose.json"));
+      await expect(verifyPostgresDriverPayload(payload, EXPECTED)).rejects.toThrow(/must not contain linked files or packages.*node_modules\/loose\.json/);
+    });
+  });
+
   it("checks every installed drizzle-orm wherever npm placed it", async () => {
     writeDrizzle(path.join(payload, "node_modules", "paperclipai", "node_modules", "drizzle-orm"));
     const resolutions = await verifyPostgresDriverPayload(payload, EXPECTED);
