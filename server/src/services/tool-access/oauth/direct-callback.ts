@@ -1,3 +1,4 @@
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../delivery-work-notifications.js";
 import { notifyIssueReviewState } from "../../issue-review-state-notifications.js";
 import { notifyToolConnectionHealth } from "../../tool-connection-health-notifications.js";
 import { credentialScope } from "./client-settings.js";
@@ -207,6 +208,7 @@ export function createDirectOAuthCallback(db: Db, dependencies: Dependencies) {
         await tx.select({ id: toolConnections.id }).from(toolConnections)
           .where(and(eq(toolConnections.id, connection.id), eq(toolConnections.companyId, connection.companyId)))
           .for("update");
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
         const subjectCredentialSecretRefs =
           existingUserGrant?.credentialSecretRefs ?? [];
         const accessRef = await createOrRotateOAuthSecret(
@@ -533,6 +535,7 @@ export function createDirectOAuthCallback(db: Db, dependencies: Dependencies) {
       await tx.select({ id: toolConnections.id }).from(toolConnections)
         .where(and(eq(toolConnections.id, connection.id), eq(toolConnections.companyId, connection.companyId)))
         .for("update");
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
       const txSecrets = secretService(tx);
       const txSecretContext = { dbClient: tx, secretClient: txSecrets };
 
