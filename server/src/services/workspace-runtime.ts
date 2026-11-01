@@ -4272,6 +4272,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
   recorder?: WorkspaceOperationRecorder | null;
   assertSafeToCleanup?: (() => Promise<void>) | null;
   beforeBranchDelete?: (() => Promise<void>) | null;
+  beforeWorktreeRemoval?: (() => Promise<void>) | null;
   expectedBranchHeadSha?: string | null;
   runCleanupCommands?: boolean;
   forceWorktreeRemoval?: boolean;
@@ -4377,6 +4378,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
       } else {
         try {
           await input.assertSafeToCleanup?.();
+          await input.beforeWorktreeRemoval?.();
           await recordGitOperation(input.recorder, {
             phase: "worktree_cleanup",
             args: [
@@ -4449,6 +4451,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
       warnings.push(`Refusing to remove path "${workspacePath}" because it contains the project workspace.`);
     } else {
       await input.assertSafeToCleanup?.();
+      await input.beforeWorktreeRemoval?.();
       await fs.rm(resolvedWorkspacePath, { recursive: true, force: true });
       if (input.recorder) {
         await input.recorder.recordOperation({

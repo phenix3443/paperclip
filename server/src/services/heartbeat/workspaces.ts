@@ -1,3 +1,4 @@
+import { retainProjectRepositoryEntries, type ProjectRepositoryRetention } from "../project-repository-retention.js";
 import { effectiveProjectWorkspacePolicy } from "../project-workspace-provider.js";
 import { canonicalRepositoryRoot } from "../execution-workspace-source-roots.js";
 import { assertTaskWorkspaceExecutionAccess } from "../task-workspace-access.js";
@@ -7,7 +8,7 @@ import { deriveRepoNameFromRepoUrl, managedProjectCheckoutName, projectRepositor
 import { forbidden } from "../../errors.js";
 import { readGitConnectionFailure } from "../git-connection-failure.js";
 import { materializeManagedProjectWorkspace, ensureManagedRepositoriesIgnored } from "../managed-repository-checkout.js";
-import { addNestedRepositoryWorktree, isVerifiedNestedRepositoryBase, nestedRepositoryBaseCandidates, readLinkedNestedCheckout, repairMovedNestedRepositoryWorktree } from "../nested-repository-worktrees.js";
+import { addNestedRepositoryWorktree, isVerifiedNestedRepositoryBase, nestedRepositoryBaseCandidates, readLinkedNestedCheckout } from "../nested-repository-worktrees.js";
 export { materializeManagedProjectWorkspace } from "../managed-repository-checkout.js";
 import { sql } from "drizzle-orm";
 import { materializeIsolatedTaskDirectory } from "../isolated-task-directory.js";
@@ -505,6 +506,8 @@ export async function prepareProjectRepositoryWorkspaces(input: {
   prepareLocalSource?: (sourceCwd: string, projectWorkspaceId: string) => Promise<() => Promise<void>>;
   restoredContents?: GitWorkspaceContents;
   sharedBase?: { companyId: string; projectId: string };
+  retention?: ProjectRepositoryRetention;
+  onRetentionWarning?: (warning: string) => Promise<void>;
 }): Promise<Array<{ workspaceId: string; cwd: string; repoUrl: string; repoRef: string | null }>> {
   const identity = projectRepositoryIdentity;
   const seen = new Set(input.anchorRepoUrl ? [identity(input.anchorRepoUrl)] : []);
@@ -515,7 +518,18 @@ export async function prepareProjectRepositoryWorkspaces(input: {
   });
   if (input.restoredContents?.checkouts.some(checkout => !selected.some(source => source.id === checkout.source.id))) throw new GitCacheRestorationFailure();
   const root = path.join(input.cwd, PROJECT_REPOSITORIES_DIR);
-  if (selected.length === 0 && !(await fs.lstat(root).catch(() => null))) return [];
+  const retainDetached = async (active: ReadonlySet<string>) => {
+    const warnings = await retainProjectRepositoryEntries({ cwd: input.cwd, active, retention: input.retention });
+    for (const warning of warnings) {
+      logger.warn({ executionWorkspaceId: input.retention?.executionWorkspaceId, warning }, "Detached repository preservation warning");
+      try { await input.onRetentionWarning?.(warning); }
+      catch (error) { logger.warn({ err: error }, "Could not record detached repository warning in the run log"); }
+    }
+  };
+  if (selected.length === 0 && !(await fs.lstat(root).catch(() => null))) {
+    await retainDetached(new Set());
+    return [];
+  }
   await fs.mkdir(root, { recursive: true });
   if (await fs.realpath(root) !== path.join(await fs.realpath(input.cwd), PROJECT_REPOSITORIES_DIR)) {
     throw new Error("Project repositories directory escapes the task workspace");
@@ -560,16 +574,7 @@ export async function prepareProjectRepositoryWorkspaces(input: {
     await beforePublish();
     results.push({ workspaceId: workspace.id, cwd, repoUrl, repoRef: workspace.repoRef });
   }
-  // Retain detached checkout work outside the synchronized repository set.
-  const active = new Set(results.map((repo) => path.basename(repo.cwd)));
-  for (const entry of await fs.readdir(root)) {
-    if (active.has(entry) || entry.startsWith("task-repo-") || entry.includes(".clone-")) continue;
-    const retained = path.join(input.cwd, ".paperclip-runtime", "detached-repositories", randomUUID());
-    const linked = await readLinkedNestedCheckout(path.join(root, entry)).catch(() => null);
-    await fs.mkdir(path.dirname(retained), { recursive: true });
-    await fs.rename(path.join(root, entry), retained);
-    if (linked) await repairMovedNestedRepositoryWorktree(linked.base, retained);
-  }
+  await retainDetached(new Set(results.map(repo => path.basename(repo.cwd))));
   return results;
 }
 

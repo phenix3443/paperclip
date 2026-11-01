@@ -1,3 +1,6 @@
+import { receiptCases, retainedFixture } from "./helpers/detached-retention.js";
+import * as nestedWorktrees from "../services/nested-repository-worktrees.js";
+import * as retentionInspection from "../services/detached-repository-retention.js";
 import { EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -5,8 +8,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { and, eq, sql } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -104,6 +107,7 @@ describeEmbeddedPostgres("terminal workspace compaction", () => {
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
   afterEach(async () => {
+    vi.restoreAllMocks(); vi.unstubAllEnvs();
     await db.delete(workspaceRuntimeServices);
     await db.delete(activityLog);
     await db.update(issues).set({ checkoutRunId: null, executionRunId: null, parentId: null });
@@ -246,6 +250,127 @@ describeEmbeddedPostgres("terminal workspace compaction", () => {
     }
     expect(await fs.readFile(path.join(worktreePath, "README.md"), "utf8")).toContain("uncommitted edit");
   }
+
+  it.each(["refused", "legacy"])("blocks close readiness, manual cleanup and compaction for %s content", async kind => {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "retention-local-")); tempDirs.add(home); vi.stubEnv("PAPERCLIP_HOME", home);
+    const seeded = await seedWorkspace();
+    const parent = path.join(seeded.worktreePath, kind === "refused" ? ".paperclip-repositories" : ".paperclip-runtime/detached-repositories");
+    const retained = path.join(parent, "kept"); await writeFile(path.join(retained, "unique"), "legacy bytes");
+    const beforeMove = vi.fn(async () => {}), svc = service({ beforeWorkspaceCompactionMove: beforeMove });
+    expect((await svc.getCloseReadiness(seeded.executionWorkspaceId))?.blockingReasons.join(" ")).toContain(parent);
+    expect(await svc.sweepTerminalWorkspaces()).toMatchObject({ compacted: 0 }); expect(beforeMove).not.toHaveBeenCalled();
+    await expectRegenerablePresent(seeded.worktreePath, true);
+    const archived = await svc.archiveWorkspaceUnderLifecycleLock({ id: seeded.executionWorkspaceId, closedAt: new Date(), patch: { status: "archived" } });
+    if (archived?.outcome !== "archived") throw new Error("not archived");
+    const destroy = vi.fn(async () => { await fs.rm(seeded.worktreePath, { recursive: true, force: true }); });
+    await expect(svc.fenceClosedWorkspaceDestruction({ workspaceId: seeded.executionWorkspaceId, capturedGeneration: archived.capturedGeneration, destroy }))
+      .rejects.toThrow("detached_repository_retention");
+    expect(destroy).not.toHaveBeenCalled(); expect(await fs.readFile(path.join(retained, "unique"), "utf8")).toBe("legacy bytes");
+  }, 30_000);
+
+  it("keeps a busy active workspace from blocking later terminal work", async () => {
+    const active = await seedWorkspace(), terminal = await seedWorkspace();
+    await db.update(issues).set({ status: "in_progress", completedAt: null }).where(eq(issues.id, active.sourceIssueId));
+    let enter!: () => void, release!: () => void, held = true;
+    const ready = new Promise<void>(resolve => { enter = resolve; });
+    const pause = new Promise<void>(resolve => { release = () => { held = false; resolve(); }; });
+    const owner = db.transaction(async tx => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`execution_workspace_lifecycle:${active.executionWorkspaceId}`}, 0))`);
+      enter(); await pause;
+    });
+    await ready;
+    const deadline = setTimeout(release, 5_000);
+    let inspectedTerminal = false;
+    const svc = service({ beforeWorkspaceCompactionMove: async workspace => {
+      expect(workspace.id).toBe(terminal.executionWorkspaceId); expect(held).toBe(true);
+      inspectedTerminal = true; release();
+    } });
+    try {
+      expect(await svc.sweepTerminalWorkspaces()).toMatchObject({ compacted: 1 });
+      expect(inspectedTerminal).toBe(true);
+      await expectRegenerablePresent(active.worktreePath, true);
+      await expectRegenerablePresent(terminal.worktreePath, false);
+    } finally { clearTimeout(deadline); release(); await owner; }
+  }, 30_000);
+
+  it.each([false, true])("settles retained history without another removal deadline (Git expiration %s)", async gitCacheExpirationEnabled => {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "retention-idle-")); tempDirs.add(home); vi.stubEnv("PAPERCLIP_HOME", home);
+    const seeded = await seedWorkspace();
+    await retainedFixture(db, { id: seeded.executionWorkspaceId, companyId: seeded.companyId,
+      sourceIssueId: seeded.sourceIssueId, cwd: seeded.worktreePath }, "retained");
+    const svc = service({ gitCacheExpirationEnabled });
+    expect(await svc.sweepTerminalWorkspaces()).toMatchObject({ compacted: 0, archived: 0 });
+    expect(await svc.nextTerminalWorkspaceSweepAt()).toBeNull();
+    const selects = vi.spyOn(db, "select");
+    for (let i = 0; i < 3; i++) expect(await svc.nextTerminalWorkspaceSweepAt()).toBeNull();
+    expect(selects).not.toHaveBeenCalled(); selects.mockRestore();
+    await expectRegenerablePresent(seeded.worktreePath, true);
+    const next = await seedWorkspace();
+    svc.terminalWorkspaceWorkSettled(new Set([`workspace:${next.executionWorkspaceId}`]));
+    expect(await svc.sweepTerminalWorkspaces()).toMatchObject({ compacted: 1 });
+    await expectRegenerablePresent(next.worktreePath, false);
+    expect(await svc.nextTerminalWorkspaceSweepAt()).not.toBeNull();
+  }, 30_000);
+
+  it("refuses manual destruction when retention appears after readiness", async () => {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "retention-manual-")); tempDirs.add(home); vi.stubEnv("PAPERCLIP_HOME", home);
+    const seeded = await seedWorkspace({ populate: false });
+    const svc = service();
+    const readiness = await svc.getCloseReadiness(seeded.executionWorkspaceId);
+    expect(readiness?.blockingReasons).toEqual([]);
+    const retained = await retainedFixture(db, { id: seeded.executionWorkspaceId, companyId: seeded.companyId,
+      sourceIssueId: seeded.sourceIssueId, cwd: seeded.worktreePath }, "retained");
+    const archived = await svc.archiveWorkspaceUnderLifecycleLock({ id: seeded.executionWorkspaceId, closedAt: new Date(), patch: { status: "archived" } });
+    expect(archived?.outcome).toBe("archived"); if (archived?.outcome !== "archived") throw new Error("not archived");
+    const destroy = vi.fn(async () => { await fs.rm(seeded.worktreePath, { recursive: true, force: true }); });
+    await expect(svc.fenceClosedWorkspaceDestruction({ workspaceId: seeded.executionWorkspaceId,
+      capturedGeneration: archived.capturedGeneration, destroy })).rejects.toThrow("detached_repository_retention");
+    expect(destroy).not.toHaveBeenCalled();
+    expect(await fs.readFile(path.join(retained.destination, "unique"), "utf8")).toBe("retained unique bytes");
+    expect(await exists(seeded.worktreePath)).toBe(true);
+  }, 30_000);
+
+  it.each(receiptCases.flatMap(state => ["cleanup", "compaction"].map(removal => ({ state, removal }))))(
+    "refuses $removal with retention history before removal hook ($state)", async ({ state, removal }) => {
+      const home = await fs.mkdtemp(path.join(os.tmpdir(), "retention-removal-")); tempDirs.add(home);
+      vi.stubEnv("PAPERCLIP_HOME", home);
+      const seeded = await seedWorkspace({ populate: removal === "compaction" });
+      const retained = await retainedFixture(db, { id: seeded.executionWorkspaceId, companyId: seeded.companyId,
+        sourceIssueId: seeded.sourceIssueId, cwd: seeded.worktreePath }, state);
+      const readiness = await service().getCloseReadiness(seeded.executionWorkspaceId);
+      if (state !== null) expect(readiness?.blockingReasons.join(" ")).toContain(retained.file);
+      const inspect = retentionInspection.inspectDetachedRepositoryRetention;
+      const spy = vi.spyOn(retentionInspection, "inspectDetachedRepositoryRetention").mockImplementation(async (...args) => {
+        await db.transaction(async tx => {
+          const [lock] = await tx.execute(sql`select pg_try_advisory_xact_lock(hashtextextended(${`execution_workspace_lifecycle:${seeded.executionWorkspaceId}`}, 0)) as acquired`);
+          expect(lock?.acquired).toBe(false);
+        });
+        const reasons = await inspect(...args);
+        if (state !== null && reasons.length) {
+          await fs.mkdir(retained.source, { recursive: true }); await fs.writeFile(path.join(retained.source, "late-unique"), "late unique bytes");
+        }
+        return reasons;
+      });
+      const removalHook = vi.fn(async () => {
+        await fs.mkdir(retained.source, { recursive: true }); await fs.writeFile(path.join(retained.source, "hook-write"), "hook bytes");
+      });
+      const releaseRefs = vi.spyOn(nestedWorktrees, "releaseNestedRepositoryWorktrees");
+      const svc = service({ beforeWorktreeRemoval: removalHook, beforeWorkspaceCompactionMove: removalHook });
+      try {
+        await svc.sweepTerminalWorkspaces();
+        if (state === null) expect(removalHook).toHaveBeenCalledTimes(1);
+        else {
+          expect(releaseRefs).not.toHaveBeenCalled();
+          expect(spy).toHaveBeenCalled(); expect(removalHook).not.toHaveBeenCalled();
+          expect(await exists(seeded.worktreePath)).toBe(true);
+          expect(await fs.readFile(path.join(retained.source, "late-unique"), "utf8")).toBe("late unique bytes");
+          expect(await fs.readFile(retained.file, "utf8")).toBe(retained.bytes);
+          if (removal === "compaction") await expectRegenerablePresent(seeded.worktreePath, true);
+        }
+        expect(await fs.readFile(path.join(retained.destination, "unique"), "utf8")).toBe("retained unique bytes");
+      } finally { spy.mockRestore(); }
+    }, 30_000,
+  );
 
   it.each([false, true])("compacts an undelivered workspace and preserves source with Git expiration %s", async gitCacheExpirationEnabled => {
     const seeded = await seedWorkspace({ commitOnBranch: true });

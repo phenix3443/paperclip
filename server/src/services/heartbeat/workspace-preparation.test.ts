@@ -32,6 +32,8 @@ import { isolatedRemoteSourcePath } from "../isolated-remote-workspace-source.js
 import { cleanupExecutionWorkspaceArtifacts } from "../workspace-runtime.js";
 import { buildProjectMentionHref } from "@paperclipai/shared";
 import { trace } from "@opentelemetry/api";
+import * as retentionInspection from "../detached-repository-retention.js";
+import { resolveDetachedRepositoryRetentionDir } from "../../home-paths.js";
 import { effectiveProjectWorkspacePolicy } from "../project-workspace-provider.js";
 import { resolveExecutionWorkspaceMode, buildExecutionWorkspaceAdapterConfig } from "../execution-workspace-policy.js";
 import { createLocalDiskStorageProvider } from "../../storage/local-disk-provider.js";
@@ -714,13 +716,64 @@ describe.skipIf(!support.supported && !externalDatabaseUrl)("heartbeat workspace
     expect(await readFile(join(privateCwd, "confidential.txt"), "utf8")).toContain("OS storage");
   });
 
-  it("cleans up a new local worktree after workspace persistence fails", async () => {
+  it.each(["retained", "unreadable", "legacy", "refused", null] as const)("preserves retention after reconstructed-workspace persistence fails (%s)", async state => {
+    const { input, source, issue } = await fixture(true);
+    await execFile("git", ["-C", source, "remote", "add", "origin", source]);
+    await db.update(projectWorkspaces).set({ repoUrl: source, repoRef: "main" }).where(eq(projectWorkspaces.id, issue.projectWorkspaceId!));
+    const teardownMarker = join(home, `teardown-${issue.id}`);
+    input.policy.projectExecutionWorkspacePolicy = { enabled: true, workspaceStrategy: { type: "git_worktree", teardownCommand: `printf teardown > '${teardownMarker}'` } };
+    const first = await prepareHeartbeatWorkspace(db, input);
+    const workspace = first.persistedExecutionWorkspace!;
+    await execFile("git", ["-C", source, "worktree", "remove", "--force", workspace.cwd!]);
+    await execFile("git", ["-C", source, "branch", "-D", workspace.branchName!]);
+    await reuse(input, workspace);
+    const receiptDir = resolveDetachedRepositoryRetentionDir({ companyId: workspace.companyId, executionWorkspaceId: workspace.id });
+    if (state === "retained" || state === "unreadable") {
+      await mkdir(receiptDir, { recursive: true });
+      await writeFile(join(receiptDir, "history.json"), state === "unreadable" ? "{broken" : JSON.stringify({ schemaVersion: 1, state }));
+    }
+    const inspect = retentionInspection.inspectDetachedRepositoryRetention;
+    const lockedInspection = vi.spyOn(retentionInspection, "inspectDetachedRepositoryRetention").mockImplementation(async (...args) => {
+      await db.transaction(async tx => {
+        const [locks] = await tx.execute(sql`select
+          pg_try_advisory_xact_lock(hashtextextended(${`isolated_repository_source:${workspace.companyId}:${workspace.sourceIssueId}`}, 0)) as source,
+          pg_try_advisory_xact_lock(hashtextextended(${`execution_workspace_lifecycle:${workspace.id}`}, 0)) as lifecycle`);
+        expect(locks).toMatchObject({ source: false, lifecycle: false });
+      });
+      return inspect(...args);
+    });
+    vi.spyOn(input.services.executionWorkspacesSvc, "update").mockImplementationOnce(async () => {
+      await writeFile(join(workspace.cwd!, "late-writer.txt"), "late bytes must survive retention\n");
+      if (state === "legacy" || state === "refused") {
+        const directory = state === "legacy" ? join(workspace.cwd!, ".paperclip-runtime", "detached-repositories", "old")
+          : join(workspace.cwd!, ".paperclip-repositories", "removed");
+        await mkdir(directory, { recursive: true });
+        await writeFile(join(directory, "unique.txt"), "detached bytes\n");
+      }
+      throw new Error("Reconstructed workspace persistence failed");
+    });
+    await expect(prepareHeartbeatWorkspace(db, input)).rejects.toThrow("Reconstructed workspace persistence failed");
+    expect(lockedInspection).toHaveBeenCalled();
+    if (state === null) {
+      await expect(access(workspace.cwd!)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readFile(teardownMarker, "utf8")).toBe("teardown");
+    } else {
+      await expect(access(teardownMarker)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readFile(join(workspace.cwd!, "late-writer.txt"), "utf8")).toBe("late bytes must survive retention\n");
+      expect((await execFile("git", ["-C", workspace.cwd!, "rev-parse", "--is-inside-work-tree"])).stdout.trim()).toBe("true");
+      if (state === "retained" || state === "unreadable") expect(await readFile(join(receiptDir, "history.json"), "utf8"))
+        .toBe(state === "unreadable" ? "{broken" : JSON.stringify({ schemaVersion: 1, state }));
+    }
+    expect((await readIssue(issue.id)).executionWorkspaceId).toBe(workspace.id);
+  });
+
+  it("retains a new local worktree without durable identity after workspace persistence fails", async () => {
     const { input, source, issue } = await fixture(true);
     vi.spyOn(input.services.executionWorkspacesSvc, "create").mockRejectedValueOnce(new Error("Workspace persistence failed"));
     await expect(prepareHeartbeatWorkspace(db, input)).rejects.toThrow("Workspace persistence failed");
     const worktrees = (await execFile("git", ["-C", source, "worktree", "list", "--porcelain"])).stdout;
-    expect(worktrees.match(/^worktree /gm)).toHaveLength(1);
-    await expect(execFile("git", ["-C", source, "rev-parse", "--verify", `refs/heads/test-${issue.identifier}`])).rejects.toBeDefined();
+    expect(worktrees.match(/^worktree /gm)).toHaveLength(2);
+    expect((await execFile("git", ["-C", source, "rev-parse", "--verify", `refs/heads/test-${issue.identifier}`])).stdout.trim()).toMatch(/^[a-f0-9]{40}$/);
     expect((await readIssue(issue.id)).executionWorkspaceId).toBeNull();
   });
 
@@ -1090,14 +1143,16 @@ describe.skipIf(!support.supported && !externalDatabaseUrl)("heartbeat workspace
     expect((await readIssue(issue.id)).executionWorkspaceId).toBeNull();
   });
 
-  it("removes a newly created worktree when persistence fails and preserves the original error", async () => {
+  it("retains an unidentified new worktree when persistence fails and preserves the original error", async () => {
     const { input, source } = await fixture(true);
     const error = new Error("workspace persistence unavailable");
     let createdCwd = "";
-    vi.spyOn(input.services.executionWorkspacesSvc, "create").mockImplementation(async args => { createdCwd = args.cwd!; throw error; });
+    vi.spyOn(input.services.executionWorkspacesSvc, "create").mockImplementation(async args => {
+      createdCwd = args.cwd!; await writeFile(join(createdCwd, "late-unique"), "no durable cleanup identity\n"); throw error;
+    });
     await expect(prepareHeartbeatWorkspace(db, input)).rejects.toBe(error);
     expect(createdCwd).not.toBe("");
-    await expect(access(createdCwd)).rejects.toThrow();
+    expect(await readFile(join(createdCwd, "late-unique"), "utf8")).toBe("no durable cleanup identity\n");
     expect(await readFile(join(source, "README.md"), "utf8")).toBe("source content\n");
     expect(await leases(input.run.id)).toHaveLength(0);
   });

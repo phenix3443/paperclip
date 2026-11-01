@@ -1,3 +1,6 @@
+import { EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY, EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY,
+  readExecutionWorkspaceLifecycleGeneration, metadataHasReopenPendingConsumption } from "./execution-workspace-lifecycle-state.js";
+import { assertWorkspaceRetentionAllowsRemoval, workspaceRetentionBlockingReasons } from "./detached-repository-retention-guard.js";
 import { effectiveProjectWorkspacePolicy } from "./project-workspace-provider.js";
 import { inspectPluginWorkspace, removePluginWorkspace, restorePluginWorkspace, type WorkspaceWorkers } from "./plugin-workspaces.js";
 import { acquireExecutionWorkspaceLifecycleLock, withExecutionWorkspaceLifecycleLock } from "./execution-workspace-lifecycle-lock.js";
@@ -168,14 +171,7 @@ export const STALE_REOPEN_PENDING_CONSUMPTION_GRACE_MS = 5 * 60 * 1000;
 // A reopen that ran in between raises the generation, so the stale cleanup finds
 // a mismatch and does nothing. This fences a queued or in-flight cleanup against
 // a workspace that a reopen already restored.
-export const EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY = "lifecycleGeneration";
-
-export function readExecutionWorkspaceLifecycleGeneration(
-  metadata: Record<string, unknown> | null | undefined,
-): number {
-  const raw = metadata?.[EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY];
-  return typeof raw === "number" && Number.isInteger(raw) && raw >= 0 ? raw : 0;
-}
+export { EXECUTION_WORKSPACE_LIFECYCLE_GENERATION_METADATA_KEY, readExecutionWorkspaceLifecycleGeneration };
 
 // Return a metadata object with the lifecycle generation increased by one. The
 // caller keeps every other metadata key.
@@ -207,7 +203,7 @@ export function isClosedExecutionWorkspaceStatus(status: string | null | undefin
 // that a reopen rebuilt while the caller has not yet consumed it. The reaper
 // clears the flag on a later pass once the source issue leaves the terminal
 // state, so a normal terminal cycle can reap the workspace again.
-export const EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY = "reopenPendingConsumption";
+export { EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY };
 
 // The metadata key that holds the time a reopen set the reopen-pending flag. The
 // terminal reaper reads this timestamp to tell a fresh, in-flight reopen from a
@@ -215,11 +211,7 @@ export const EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY = "reopenPendingCon
 // same write that sets the flag, and every clear removes both keys together.
 export const EXECUTION_WORKSPACE_REOPEN_PENDING_SINCE_METADATA_KEY = "reopenPendingConsumptionSince";
 
-export function metadataHasReopenPendingConsumption(
-  metadata: Record<string, unknown> | null | undefined,
-): boolean {
-  return metadata?.[EXECUTION_WORKSPACE_REOPEN_PENDING_METADATA_KEY] === true;
-}
+export { metadataHasReopenPendingConsumption };
 
 // Read the time a reopen set the reopen-pending flag. Return null when the flag
 // carries no valid timestamp. The terminal reaper uses this to tell a fresh,
@@ -339,6 +331,8 @@ export type ExecutionWorkspaceServiceOptions = {
   workspaceCompactionDelayMs?: number | null;
   // Test hook. Runs after compaction moves directories out of the worktree and
   // before it re-checks the guard under the lifecycle lock.
+  beforeWorktreeRemoval?: (workspace: ExecutionWorkspaceRow) => Promise<void>;
+  beforeWorkspaceCompactionMove?: (workspace: ExecutionWorkspaceRow) => Promise<void>;
   afterWorkspaceCompactionMove?: (workspace: ExecutionWorkspaceRow) => Promise<void>;
   inspectGitCloseReadiness?: (workspace: ExecutionWorkspace) => Promise<{
     git: ExecutionWorkspaceCloseGitReadiness | null;
@@ -2394,6 +2388,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       ) {
         return null;
       }
+      if ((await workspaceRetentionBlockingReasons(tx, workspace)).length) return null;
+      await opts.beforeWorkspaceCompactionMove?.(workspace);
       const moved = await moveWorkspaceDirsToTrash(worktreePath, relativePaths);
       try {
         await opts.afterWorkspaceCompactionMove?.(workspace);
@@ -2455,7 +2451,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         message: "execution workspace cleanup skipped because it was reopened",
       },
       onSkip: () => ({ cleaned: false, warnings: [], skippedReopened: true }),
-      write: () => runTerminalWorkspaceCleanup(workspace, expectedHeadSha),
+      write: async ({ tx }) => {
+        await assertWorkspaceRetentionAllowsRemoval(tx, workspace);
+        return runTerminalWorkspaceCleanup(workspace, expectedHeadSha);
+      },
     });
   }
 
@@ -2517,6 +2516,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           executionWorkspaceId: workspace.id,
         }),
         assertSafeToCleanup: () => assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha),
+        beforeWorktreeRemoval: () => opts.beforeWorktreeRemoval?.(workspace) ?? Promise.resolve(),
         beforeBranchDelete: () => cleanupLock?.releaseBranchRefLock() ?? Promise.resolve(),
         expectedBranchHeadSha: expectedHeadSha,
         // Git index, HEAD, and branch-ref locks prevent a clean HEAD change
@@ -3133,7 +3133,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       } = await inspectWorkspace(executionWorkspace);
       const { deliveryState } = await assessDelivery(workspace, git);
       const warnings = [...gitWarnings];
-      const blockingReasons: string[] = [];
+      const blockingReasons: string[] = await workspaceRetentionBlockingReasons(db, workspace);
       if (!statusInspectionSucceeded) {
         blockingReasons.push("Paperclip could not verify the workspace git status. Retry before destructive cleanup.");
       }
@@ -3482,6 +3482,18 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       for (const candidate of candidates) {
         let workspace = candidate.workspace;
         signal?.throwIfAborted();
+        const retentionHeld = await db.transaction(async tx => {
+          const [lock] = await tx.execute(sql`select pg_try_advisory_xact_lock(hashtextextended(${`execution_workspace_lifecycle:${workspace.id}`}, 0)) as acquired`);
+          if (!lock?.acquired) return false;
+          const [fresh] = await tx.select().from(executionWorkspaces).where(and(
+            eq(executionWorkspaces.id, workspace.id), eq(executionWorkspaces.companyId, workspace.companyId),
+          ));
+          return !fresh || (await workspaceRetentionBlockingReasons(tx, fresh)).length > 0;
+        });
+        if (retentionHeld) {
+          result.skippedUndelivered += 1;
+          continue;
+        }
         // Trash deletion is part of compaction, so a sweep that skips compaction
         // also leaves leftover trash for a later sweep.
         if (options.compact !== false) await purgeCompactionTrashIfDue(workspace);
@@ -4295,7 +4307,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           const repositoryRows = await tx.select().from(projectWorkspaces).where(and(
             eq(projectWorkspaces.companyId, row.companyId), eq(projectWorkspaces.projectId, row.projectId!),
           )).orderBy(asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id));
+          await tx.update(executionWorkspaces).set({ status: "active", closedAt: null }).where(eq(executionWorkspaces.id, row.id));
+          try {
           await prepareProjectRepositoryWorkspaces({ cwd: targetCwd, anchorRepoUrl: row.repoUrl, workspaces: repositoryRows,
+            retention: { companyId: row.companyId, executionWorkspaceId: row.id, sourceIssueId: row.sourceIssueId!, runId: null,
+              generation: readExecutionWorkspaceLifecycleGeneration(row.metadata as Record<string, unknown> | null),
+              withLifecycleLock: work => work(tx) },
             sharedBase: { companyId: row.companyId, projectId: row.projectId! }, resolveGitAuth: gitAuth,
             prepareLocalSource: async sourceCwd => {
               const sourceIdentity = await fs.realpath(sourceCwd);
@@ -4304,6 +4321,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
                 await assertTaskWorkspaceExecutionAccess(tx, input.authorizationActor, issue.companyId, { issueId: issue.id, workspaceId: row.id });
               };
             } });
+          } finally {
+            await tx.update(executionWorkspaces).set({ status: row.status, closedAt: row.closedAt }).where(eq(executionWorkspaces.id, row.id));
+          }
         };
         const recorder = workspaceOperationService(db).createRecorder({
           companyId: row.companyId,
@@ -4793,7 +4813,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           message: "execution workspace cleanup skipped because it was reopened",
         },
         onSkip: () => ({ skippedReopened: true as const }),
-        write: async () => ({ skippedReopened: false as const, result: await input.destroy() }),
+        write: async ({ tx }) => {
+          const [workspace] = await tx.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, input.workspaceId));
+          if (!workspace) return { skippedReopened: true as const };
+          await assertWorkspaceRetentionAllowsRemoval(tx, workspace);
+          return { skippedReopened: false as const, result: await input.destroy() };
+        },
       });
     },
 

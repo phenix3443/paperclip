@@ -1,3 +1,6 @@
+import { metadataHasReopenPendingConsumption, readExecutionWorkspaceLifecycleGeneration } from "../execution-workspace-lifecycle-state.js";
+import { assertWorkspaceRetentionAllowsRemoval } from "../detached-repository-retention-guard.js";
+import { withExecutionWorkspaceLifecycleLock } from "../execution-workspace-lifecycle-lock.js";
 import { reserveFreshPluginTaskWorkspace, stageProviderFreshWorkspace } from "../provider-fresh-workspace.js";
 import { freshWorkspaceSchema, type PluginFreshWorkspace } from "@paperclipai/plugin-sdk";
 import { pluginRegistryService } from "../plugin-registry.js";
@@ -163,10 +166,10 @@ export async function prepareHeartbeatWorkspace(db: Db, input: HeartbeatWorkspac
     ?? input.reuse.existingExecutionWorkspace?.sourceIssueId ?? input.task.issueId;
   if (!sourceIssueId || input.reuse.isDotRun) return prepareHeartbeatWorkspaceLocked(db, input);
   return withIsolatedRepositorySourceLock(db, input.agent.companyId, sourceIssueId,
-    () => prepareHeartbeatWorkspaceLocked(db, input));
+    () => prepareHeartbeatWorkspaceLocked(db, input, sourceIssueId));
 }
 
-async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspacePreparationInput) {
+async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspacePreparationInput, lockedSourceIssueId?: string) {
   const { run, agent, controllerLease, nativeRunnerPreparationSpans } = input;
   const fresh = input.task.freshWorkspace?.mode === "fresh_isolated_workspace";
   const timeWorkspace = createHeartbeatPreparationTiming(run.id);
@@ -964,38 +967,35 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
   } catch (error) {
     if (executionWorkspace.created) {
       try {
-        await cleanupExecutionWorkspaceArtifacts({
-          workspace: {
-            companyId: agent.companyId,
-            id:
-              reusableExistingExecutionWorkspace?.id ??
-              workspaceReuseRequest.requestedExecutionWorkspaceId ??
-              `transient-${run.id}`,
-            cwd: executionWorkspace.cwd,
-            providerType:
-              executionWorkspace.strategy === "git_worktree"
-                ? "git_worktree"
-                : "local_fs",
-            providerRef: executionWorkspace.worktreePath,
-            branchName: executionWorkspace.branchName,
-            repoUrl: executionWorkspace.repoUrl,
-            baseRef: executionWorkspace.repoRef,
-            projectId: resolvedProjectId,
-            projectWorkspaceId: resolvedProjectWorkspaceId,
-            sourceIssueId: issueRef?.id ?? null,
-            metadata: nextExecutionWorkspaceMetadata,
-          },
-          projectWorkspace: {
-            cwd: resolvedWorkspace.cwd,
-            cleanupCommand: null,
-          },
-          cleanupCommand: configSnapshot?.cleanupCommand ?? null,
-          teardownCommand:
-            configSnapshot?.teardownCommand ??
-            projectExecutionWorkspacePolicy?.workspaceStrategy
-              ?.teardownCommand ??
-            null,
-          recorder: workspaceOperationRecorder,
+        const previous = reusableExistingExecutionWorkspace ?? existingExecutionWorkspace;
+        if (!previous || !lockedSourceIssueId) throw new Error("Workspace cleanup identity is unverified");
+        await withExecutionWorkspaceLifecycleLock(db, previous.id, async tx => {
+          const [workspace] = await tx.select().from(executionWorkspacesTable).where(and(
+            eq(executionWorkspacesTable.companyId, agent.companyId), eq(executionWorkspacesTable.id, previous.id),
+          ));
+          if (!workspace || workspace.sourceIssueId !== lockedSourceIssueId || workspace.cwd !== executionWorkspace.cwd
+            || (workspace.providerRef && workspace.providerRef !== executionWorkspace.cwd)
+            || workspace.providerType !== (executionWorkspace.strategy === "git_worktree" ? "git_worktree" : "local_fs")
+            || !["active", "idle", "in_review"].includes(workspace.status) || workspace.closedAt
+            || metadataHasReopenPendingConsumption(workspace.metadata)
+            || readExecutionWorkspaceLifecycleGeneration(workspace.metadata) !== readExecutionWorkspaceLifecycleGeneration(previous.metadata)) {
+            throw new Error("Workspace cleanup identity changed");
+          }
+          await assertWorkspaceRetentionAllowsRemoval(tx, workspace);
+          await cleanupExecutionWorkspaceArtifacts({
+            workspace,
+            projectWorkspace: {
+              cwd: resolvedWorkspace.cwd,
+              cleanupCommand: null,
+            },
+            cleanupCommand: configSnapshot?.cleanupCommand ?? null,
+            teardownCommand:
+              configSnapshot?.teardownCommand ??
+              projectExecutionWorkspacePolicy?.workspaceStrategy
+                ?.teardownCommand ??
+              null,
+            recorder: workspaceOperationRecorder,
+          });
         });
       } catch (cleanupError) {
         logger.warn(
@@ -1065,6 +1065,18 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
       cwd: executionWorkspace.cwd,
       anchorRepoUrl: executionWorkspace.repoUrl,
       workspaces: repositoryRows,
+      onRetentionWarning: async warning => {
+        await appendRunEvent(run, { eventType: "workspace.detached_repository_warning", stream: "system", level: "warn", message: warning,
+          payload: { executionWorkspaceId: persistedExecutionWorkspace?.id ?? null } });
+      },
+      retention: persistedExecutionWorkspace?.sourceIssueId && persistedExecutionWorkspace.sourceIssueId === lockedSourceIssueId ? {
+        companyId: agent.companyId,
+        executionWorkspaceId: persistedExecutionWorkspace.id,
+        sourceIssueId: lockedSourceIssueId,
+        runId: run.id,
+        generation: readExecutionWorkspaceLifecycleGeneration(persistedExecutionWorkspace.metadata),
+        withLifecycleLock: work => withExecutionWorkspaceLifecycleLock(db, persistedExecutionWorkspace!.id, work),
+      } : undefined,
       restoredContents: persistedExecutionWorkspace ? readGitCacheRestoration(persistedExecutionWorkspace)?.contents : undefined,
       sharedBase: { companyId: agent.companyId, projectId: executionWorkspace.projectId! },
       resolveGitAuth: workspaceGitAuthProvider,
