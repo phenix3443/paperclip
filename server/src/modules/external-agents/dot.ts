@@ -568,7 +568,7 @@ function createBroker(db: Db) {
 export function createDotRunnerMcpTools(db: Db, heartbeat?: DotHeartbeat, transfers?: PublicMcpTransfers): PublicMcpToolExtension {
   const broker = dotRunnerBroker(db, { heartbeat });
   const request = { assignmentId: z.uuid(), requestId: z.uuid() };
-  const definitions: Array<{ name: string; description: string; schema: z.ZodType; inputSchema?: Record<string, unknown> }> = [
+  const definitions: Array<{ name: string; description: string; schema: z.ZodType; inputSchema?: ReturnType<typeof z.toJSONSchema> }> = [
     { name: "paperclip_dot_set_avatar", description: "Update only your bound Paperclip agent's avatar, including while idle after pairing. If you can obtain your own avatar, send its PNG/JPEG/WebP bytes as raw base64 (max 512 KiB, static image). Do not send a URL or invent an image. Use imageBase64: null to restore the Paperclip character. Repeating the same image is safe. No active assignment is needed.", schema: setAgentAvatarSchema, inputSchema: setAgentAvatarInputJsonSchema() },
     { name: "paperclip_dot_capabilities", description: "Discover your agent identity, responsible person, configured permissions, enforcement limits, idle entry point, runtime capabilities, and prerequisites. Use this before concluding you cannot act.", schema: z.object({}).strict() },
     { name: "paperclip_dot_request_turn", description: "Start a governed Runner turn for a request from your Dot conversation, even when no task is assigned. Creates one auditable intake task using normal permissions and admission. Retry the exact prompt with the same UUID.", schema: z.object({ prompt: z.string().trim().min(1).max(20_000), requestId: z.uuid(), projectId: z.uuid().optional() }).strict() },

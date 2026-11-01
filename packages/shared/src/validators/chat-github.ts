@@ -161,9 +161,9 @@ export const githubReviewAssessmentSchema = z
       });
   });
 /** Converted with this package's zod; see createProjectToolInputJsonSchema. */
-export function githubReviewAssessmentInputJsonSchema(): Record<string, unknown> {
+export function githubReviewAssessmentInputJsonSchema() {
   return z.toJSONSchema(githubReviewAssessmentSchema, {
     target: "draft-7",
     io: "input",
-  }) as Record<string, unknown>;
+  });
 }

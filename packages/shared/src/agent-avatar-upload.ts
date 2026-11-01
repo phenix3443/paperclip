@@ -9,6 +9,6 @@ export const setAgentAvatarSchema = z.object({
 }).strict();
 export type SetAgentAvatarInput = z.infer<typeof setAgentAvatarSchema>;
 /** Converted with this package's zod; see createProjectToolInputJsonSchema. */
-export function setAgentAvatarInputJsonSchema(): Record<string, unknown> {
-  return z.toJSONSchema(setAgentAvatarSchema) as Record<string, unknown>;
+export function setAgentAvatarInputJsonSchema() {
+  return z.toJSONSchema(setAgentAvatarSchema);
 }
