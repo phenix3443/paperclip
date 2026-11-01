@@ -63,4 +63,33 @@ describe("local plugin autobuild abort", () => {
     await waitFor(() => !alive(grandchild));
     expect(alive(grandchild)).toBe(false);
   });
+
+  it("stops the whole process group once build output exceeds the buffer cap", async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "plugin-autobuild-output-"));
+    dirs.push(dir);
+    const pidFile = path.join(dir, "grandchild.pid");
+    const script = [
+      "const { spawn } = require('node:child_process');",
+      "const fs = require('node:fs');",
+      "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });",
+      `fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));`,
+      "const line = 'x'.repeat(4096) + '\\n';",
+      "setInterval(() => process.stdout.write(line), 1);",
+    ].join("\n");
+
+    const running = runLocalPluginBuildCommand(process.execPath, ["-e", script], {
+      cwd: dir,
+      timeout: 60_000,
+      maxBuffer: 64 * 1024,
+    });
+    const error = await running.then(
+      () => null,
+      (err: unknown) => err as { code?: string; stdout?: string },
+    );
+    expect(error?.code).toBe("ERR_CHILD_PROCESS_STDIO_MAXBUFFER");
+    expect(Buffer.byteLength(error?.stdout ?? "")).toBeLessThanOrEqual(64 * 1024);
+    const grandchild = Number(readFileSync(pidFile, "utf8"));
+    await waitFor(() => !alive(grandchild));
+    expect(alive(grandchild)).toBe(false);
+  });
 });

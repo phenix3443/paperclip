@@ -1669,9 +1669,16 @@ Q is a property of a successful response. No endpoint reports it, and a `ready` 
 | 409 | `plugin_lifecycle_fenced` | A previous stop could not be proven; only `disable` or soft `DELETE` are accepted until one succeeds |
 | 500 | `plugin_quiescence_failed` | Q was attempted but a teardown step failed or the worker did not exit; the row is in its target state, the plugin is fenced; retry the same Q |
 | 500 | `plugin_activation_failed` | A failed; the worker was torn down (or the plugin fenced) and the row is `error` |
-| 504 | `plugin_lifecycle_timeout` | The response deadline passed (`phase` is `queue`, `body` or `prepare`); starts were revoked at once, and the plugin settles to `error`, its Q target state, or fenced |
+| 504 | `plugin_lifecycle_timeout` | The response deadline passed; `phase` tells which part was still running (see below) |
 
-At a timeout the host revokes the plugin's right to start workers in the same step that sends the 504, so neither a crash retry nor a late continuation can bring the worker back. A late `install` package preparation is aborted and its result is discarded without writing a row.
+What a 504 guarantees depends on its `phase`:
+
+- `queue`: the operation was never accepted, because the earlier operation on the plugin still held it. Nothing changed.
+- `prepare`: `install` package preparation was still running. It is aborted and its late result is discarded without writing a row.
+- `body`: the accepted operation was still running. In the same step that sends the 504 the host revokes the plugin's right to start workers, so neither a crash retry nor a late continuation can bring the worker back; the plugin then settles to `error`, its Q target state, or fenced.
+- `response`: the route itself was still waiting outside the operation. Before the operation was accepted (looking up the plugin, checking a local install path, saving config) this means nothing changed: a continuation that resumes after the deadline does not prepare a package, start an operation, notify the worker or restart it. After the operation finished (for example writing the activity log) the operation's result stands, so an `enable` or `install` may have reached A and the row reads `ready`; the response just did not say so in time.
+
+A config save (`POST /api/plugins/:pluginId/config`) is bound by the same deadline. When its 504 has `phase: "response"` the config may already be saved but the worker was not told and was not restarted; it picks up the config on its next start.
 
 **Recovery.** After a lost response, a 5xx or a 504, read the row and issue Q again, then A:
 

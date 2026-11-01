@@ -51,6 +51,8 @@ vi.mock("../services/plugin-registry.js", async () => {
         }
         return clone([...state.rows.values()].find((row) => row.pluginKey === key));
       },
+      upsertConfig: async () => ({}),
+      listConfigs: async () => [],
       listByStatus: async (status: string) => [...state.rows.values()].filter((row) => row.status === status).map(clone),
       updateStatus: async (id: string, patch: { status: string; lastError: string | null }) => {
         const held = state.heldWrite;
@@ -97,6 +99,11 @@ vi.mock("../services/plugin-registry.js", async () => {
   };
 });
 
+vi.mock("../services/secrets.js", () => ({ secretService: () => ({ syncSecretRefsForTarget: async () => undefined }) }));
+vi.mock("../services/plugin-install-guard.js", async (original) => {
+  const actual = await original<typeof import("../services/plugin-install-guard.js")>();
+  return { ...actual, canonicalizeLocalPluginPath: vi.fn(actual.canonicalizeLocalPluginPath) };
+});
 vi.mock("../services/activity-log.js", () => ({ logActivity: vi.fn() }));
 vi.mock("../services/live-events.js", () => ({ publishGlobalLiveEvent: vi.fn() }));
 
@@ -796,6 +803,71 @@ describe("plugin lifecycle response deadlines through the real route wiring", ()
     expect(state.rows.get(row.id)!.status).toBe("ready");
     expect(harness.workerManager.getWorker(row.id)?.status).toBe("running");
     release();
+  });
+
+  it("config: a restart-needing config request held in admission answers 504 at the deadline and never notifies or restarts the worker", async () => {
+    harness = await createHarness({ responseDeadlineMs: 300, companyIds: ["company-1"] });
+    const row = seed("deadline.r", "disabled");
+    expect((await request(harness.app).post(`/api/plugins/${row.pluginKey}/enable`).send({})).status).toBe(200);
+    const pid = harness.workerManager.getWorker(row.id)?.pid;
+    const { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } = await import("@paperclipai/plugin-sdk");
+    const call = vi.spyOn(harness.workerManager, "call").mockRejectedValue(
+      new JsonRpcCallError({ code: PLUGIN_RPC_ERROR_CODES.METHOD_NOT_IMPLEMENTED, message: "unsupported" }),
+    );
+    let release!: () => void;
+    let reached!: () => void;
+    const arrived = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    state.heldKeyRead = {
+      promise: new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+      reached,
+    };
+
+    const pending = request(harness.app).post(`/api/plugins/${row.pluginKey}/config`)
+      .send({ companyId: "company-1", configJson: {} }).then((r) => r);
+    await arrived;
+    const observed = await within(pending, 1_000);
+    expect(observed === "pending" ? "pending" : observed.status).toBe(504);
+    expect((await pending).body).toMatchObject({ code: "plugin_lifecycle_timeout", phase: "response" });
+
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(call).not.toHaveBeenCalled();
+    expect(harness.workerManager.getWorker(row.id)?.status).toBe("running");
+    expect(harness.workerManager.getWorker(row.id)?.pid).toBe(pid);
+  });
+
+  it("admission: a local path canonicalized after the deadline never starts prepare", async () => {
+    harness = await createHarness({ responseDeadlineMs: 300 });
+    const guard = await import("../services/plugin-install-guard.js");
+    let release!: () => void;
+    let reached!: () => void;
+    const arrived = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    vi.mocked(guard.canonicalizeLocalPluginPath).mockImplementationOnce(async () => {
+      reached();
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return { ok: true, canonicalPath: process.cwd() } as never;
+    });
+    const preparing = vi.spyOn(harness.loader, "prepareInstall");
+
+    const pending = request(harness.app).post("/api/plugins/install")
+      .send({ packageName: process.cwd(), isLocalPath: true }).then((r) => r);
+    await arrived;
+    const res = await pending;
+    expect(res.status).toBe(504);
+    expect(res.body).toMatchObject({ code: "plugin_lifecycle_timeout", phase: "response" });
+
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(preparing).not.toHaveBeenCalled();
+    expect(state.calls).toEqual([]);
   });
 
 });

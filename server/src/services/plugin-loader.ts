@@ -56,19 +56,37 @@ import { pluginDatabaseService } from "./plugin-database.js";
 import { resolveBundledCatalogRoot } from "./bundled-plugins.js";
 
 const execFileAsync = promisify(execFile);
+const LOCAL_PLUGIN_BUILD_MAX_BUFFER_BYTES = 1024 * 1024;
 
 export function runLocalPluginBuildCommand(
   file: string,
   args: readonly string[],
-  options: { cwd: string; timeout: number; signal?: AbortSignal },
+  options: { cwd: string; timeout: number; signal?: AbortSignal; maxBuffer?: number },
 ): Promise<{ stdout: string; stderr: string }> {
+  const maxBuffer = options.maxBuffer ?? LOCAL_PLUGIN_BUILD_MAX_BUFFER_BYTES;
   return new Promise((resolve, reject) => {
     const child = spawn(file, [...args], { cwd: options.cwd, detached: true, stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
+    const output = { stdout: "", stderr: "" };
+    const bytes = { stdout: 0, stderr: 0 };
     let killed = false;
-    child.stdout?.on("data", (chunk) => void (stdout += String(chunk)));
-    child.stderr?.on("data", (chunk) => void (stderr += String(chunk)));
+    let overflow: Error | null = null;
+    const collect = (stream: "stdout" | "stderr") => (chunk: Buffer) => {
+      if (overflow) return;
+      const remaining = maxBuffer - bytes[stream];
+      if (chunk.length > remaining) {
+        output[stream] += chunk.subarray(0, remaining).toString();
+        bytes[stream] = maxBuffer;
+        overflow = Object.assign(new Error(`${stream} maxBuffer length exceeded`), {
+          code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+        });
+        stop();
+        return;
+      }
+      output[stream] += chunk.toString();
+      bytes[stream] += chunk.length;
+    };
+    child.stdout?.on("data", collect("stdout"));
+    child.stderr?.on("data", collect("stderr"));
     const killGroup = () => {
       try {
         if (child.pid) process.kill(-child.pid, "SIGKILL");
@@ -87,16 +105,20 @@ export function runLocalPluginBuildCommand(
     child.once("error", (err) => {
       clearTimeout(timer);
       options.signal?.removeEventListener("abort", stop);
-      reject(Object.assign(err, { stdout, stderr, killed }));
+      reject(Object.assign(err, { ...output, killed }));
     });
     child.once("close", (code, signal) => {
       clearTimeout(timer);
       options.signal?.removeEventListener("abort", stop);
-      if (code === 0 && !killed) {
-        resolve({ stdout, stderr });
+      if (overflow) {
+        reject(Object.assign(overflow, { ...output, killed, signal }));
         return;
       }
-      reject(Object.assign(new Error(`Command failed: ${file} ${args.join(" ")}`), { code, signal, killed, stdout, stderr }));
+      if (code === 0 && !killed) {
+        resolve({ ...output });
+        return;
+      }
+      reject(Object.assign(new Error(`Command failed: ${file} ${args.join(" ")}`), { code, signal, killed, ...output }));
     });
   });
 }

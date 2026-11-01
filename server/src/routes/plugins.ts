@@ -181,6 +181,7 @@ const UUID_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 const PLUGIN_API_BODY_LIMIT_BYTES = 1_000_000;
+const CONFIG_CHANGED_RPC_TIMEOUT_MS = 30_000;
 const PLUGIN_SCOPED_API_RESPONSE_HEADER_ALLOWLIST = new Set([
   "cache-control",
   "etag",
@@ -1297,18 +1298,20 @@ export function pluginRoutes(
         ? { localPath: canonicalLocalPath, signal: abort.signal }
         : { packageName: trimmedPackage, version: version?.trim(), signal: abort.signal };
 
+      if (res.headersSent || Date.now() >= deadlineAt) {
+        throw new PluginLifecycleTimeoutError(trimmedPackage, "prepare");
+      }
       let prepareTimer: NodeJS.Timeout | undefined;
+      const prepareDeadline = new Promise<never>((_, reject) => {
+        prepareTimer = setTimeout(() => {
+          abort.abort();
+          reject(new PluginLifecycleTimeoutError(trimmedPackage, "prepare"));
+        }, Math.max(0, deadlineAt - Date.now()));
+      });
+      prepareDeadline.catch(() => undefined);
       const preparing = loader.prepareInstall(installOptions);
       preparing.catch(() => undefined);
-      const prepared = await Promise.race([
-        preparing,
-        new Promise<never>((_, reject) => {
-          prepareTimer = setTimeout(() => {
-            abort.abort();
-            reject(new PluginLifecycleTimeoutError(trimmedPackage, "prepare"));
-          }, Math.max(0, deadlineAt - Date.now()));
-        }),
-      ]).finally(() => clearTimeout(prepareTimer));
+      const prepared = await Promise.race([preparing, prepareDeadline]).finally(() => clearTimeout(prepareTimer));
 
       if (!prepared.manifest) {
         res.status(500).json({ error: "Plugin installed but manifest is missing" });
@@ -2453,7 +2456,7 @@ export function pluginRoutes(
    * - 404 if plugin not found
    */
   router.post("/plugins/:pluginId/config", async (req, res) => {
-    const deadlineAt = lifecycle.responseDeadline();
+    const deadlineAt = armResponseDeadline(res, lifecycle.responseDeadline());
     assertInstanceAdmin(req);
     assertPluginManagementVisible();
     const { pluginId } = req.params;
@@ -2521,6 +2524,10 @@ export function pluginRoutes(
       // If the worker implements onConfigChanged, send the new config via RPC.
       // If it doesn't (METHOD_NOT_IMPLEMENTED), restart the worker so it picks
       // up the new config on re-initialize. If no worker is running, skip.
+      // Past the deadline the response guard answers 504; do not notify or
+      // restart the worker from a late continuation.
+      if (res.headersSent || Date.now() >= deadlineAt) return;
+      const workerNotifyMs = deadlineAt - Date.now();
       if (bridgeDeps?.workerManager.isRunning(plugin.id)) {
         // Refresh the worker's authorized proactive company scopes so the
         // just-configured company can be acted on from proactive loops (e.g.
@@ -2541,13 +2548,16 @@ export function pluginRoutes(
             plugin.id,
             "configChanged",
             { config: body.configJson, companyId },
+            Math.min(CONFIG_CHANGED_RPC_TIMEOUT_MS, workerNotifyMs),
           );
         } catch (rpcErr) {
           if (
             rpcErr instanceof JsonRpcCallError &&
             rpcErr.code === PLUGIN_RPC_ERROR_CODES.METHOD_NOT_IMPLEMENTED
           ) {
-            // Worker doesn't handle live config — restart it.
+            // Worker doesn't handle live config — restart it, unless the
+            // response deadline already passed while the RPC was pending.
+            if (res.headersSent || Date.now() >= deadlineAt) return;
             try {
               const epoch = lifecycle.currentEpoch(plugin.id);
               await lifecycle.restartWorker(plugin.id, { source: "config", epoch, deadlineAt });
