@@ -18,7 +18,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { issueService } from "../services/issues.js";
+import { BLOCKER_ATTENTION_MAX_NODES, issueService } from "../services/issues.js";
 import { buildIssueGraphLivenessIncidentKey } from "../services/recovery/origins.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -1206,7 +1206,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
           status: "blocked",
           assigneeAgentId,
         });
-        // The last chain is deeper than BLOCKER_ATTENTION_MAX_DEPTH, so only its own walk is truncated.
+        // The last chain is deeper than BLOCKER_ATTENTION_MAX_DEPTH; the inbox walk still reaches its leaf.
         const depth = index === chainCount - 1 ? 10 : 1;
         const covered = index % 2 === 1;
         let blockedIssueId = rootId;
@@ -1249,8 +1249,8 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     const smallList = await countQueries(() => svc.list(small.companyId, { attention: "blocked" }));
     const largeList = await countQueries(() => svc.list(large.companyId, { attention: "blocked" }));
 
-    // Five covered chains stay out of the inbox; six stalled chains and the truncated deep chain stay in.
-    expect(largeList.result).toHaveLength(7);
+    // Six covered chains, including the deep one, stay out of the inbox; six stalled chains stay in.
+    expect(largeList.result).toHaveLength(6);
     expect(largeList.count - smallList.count).toBeLessThan(10);
 
     // Filtering by assignee leaves one candidate row, so its attention is computed from its own graph alone.
@@ -1260,5 +1260,158 @@ describeEmbeddedPostgres("issue blocker attention", () => {
         alone.find((row) => row.id === root.id)?.blockedInboxAttention,
       );
     }
+  });
+  async function seedChain(input: {
+    companyId: string;
+    agentId: string;
+    prefix: string;
+    depth: number;
+    leafStatus: string;
+  }) {
+    const rootId = await insertIssue({
+      companyId: input.companyId,
+      identifier: `${input.prefix}-1`,
+      title: "Blocked source",
+      status: "blocked",
+      assigneeAgentId: input.agentId,
+    });
+    let blockedIssueId = rootId;
+    let leafId = rootId;
+    for (let level = 1; level <= input.depth; level += 1) {
+      const isLeaf = level === input.depth;
+      const blockerIssueId = await insertIssue({
+        companyId: input.companyId,
+        identifier: `${input.prefix}-${level + 1}`,
+        title: isLeaf ? "Leaf" : `Link ${level}`,
+        // Links are not blocked themselves, so the root is the only blocked-inbox candidate and
+        // the bounded issue-list walk cannot reach the leaf through another blocked root.
+        status: isLeaf ? input.leafStatus : "todo",
+        assigneeAgentId: input.agentId,
+      });
+      await block({ companyId: input.companyId, blockerIssueId, blockedIssueId });
+      blockedIssueId = blockerIssueId;
+      leafId = blockerIssueId;
+    }
+    return { rootId, leafId };
+  }
+
+  it("does not flag a deep chain whose leaf is running as stalled in the blocked inbox", async () => {
+    const { companyId, agentId } = await createCompany("BDP");
+    const { rootId, leafId } = await seedChain({
+      companyId,
+      agentId,
+      prefix: "BDP",
+      depth: 12,
+      leafStatus: "in_progress",
+    });
+    await activeRun({ companyId, agentId, issueId: leafId });
+
+    expect(await svc.list(companyId, { attention: "blocked" })).toEqual([]);
+
+    // The issue list keeps its bounded walk, so the same chain still reads as truncated there.
+    const root = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === rootId);
+    expect(root?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+    });
+  });
+
+  it("still flags a deep chain whose leaf has no waiting path", async () => {
+    const { companyId, agentId } = await createCompany("BDS");
+    const { rootId } = await seedChain({
+      companyId,
+      agentId,
+      prefix: "BDS",
+      depth: 12,
+      leafStatus: "in_review",
+    });
+
+    // The review leaf and its direct dependent also get their own review-path rows.
+    const root = (await svc.list(companyId, { attention: "blocked" })).find((row) => row.id === rootId);
+    expect(root?.blockedInboxAttention).toMatchObject({ reason: "blocked_chain_stalled" });
+  });
+
+  it("covers an in_review leaf whose only path is a queued run not yet checked out", async () => {
+    const { companyId, agentId } = await createCompany("BQR");
+    const { rootId, leafId } = await seedChain({
+      companyId,
+      agentId,
+      prefix: "BQR",
+      depth: 3,
+      leafStatus: "in_review",
+    });
+    await activeRun({ companyId, agentId, issueId: leafId, status: "queued", current: false });
+
+    expect(await svc.list(companyId, { attention: "blocked" })).toEqual([]);
+    const root = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === rootId);
+    expect(root?.blockerAttention).toMatchObject({ state: "covered", stalledBlockerCount: 0 });
+  });
+
+  it("covers an in_review leaf waiting on a scheduled retry that is still due", async () => {
+    const { companyId, agentId } = await createCompany("BQT");
+    const { rootId, leafId } = await seedChain({
+      companyId,
+      agentId,
+      prefix: "BQT",
+      depth: 2,
+      leafStatus: "in_review",
+    });
+    await activeRun({
+      companyId,
+      agentId,
+      issueId: leafId,
+      status: "scheduled_retry",
+      current: false,
+      scheduledRetryAt: new Date(Date.now() + 10 * 60_000),
+    });
+
+    const root = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === rootId);
+    expect(root?.blockerAttention).toMatchObject({ state: "covered", stalledBlockerCount: 0 });
+  });
+
+  it("keeps an in_review leaf with no run or wake stalled", async () => {
+    const { companyId, agentId } = await createCompany("BQN");
+    const { rootId, leafId } = await seedChain({
+      companyId,
+      agentId,
+      prefix: "BQN",
+      depth: 3,
+      leafStatus: "in_review",
+    });
+    // A finished run for the leaf is not a waiting path.
+    await activeRun({ companyId, agentId, issueId: leafId, status: "succeeded", current: false });
+
+    // The review leaf and its direct dependent also get their own review-path rows.
+    const root = (await svc.list(companyId, { attention: "blocked" })).find((row) => row.id === rootId);
+    expect(root?.blockedInboxAttention).toMatchObject({ reason: "blocked_chain_stalled" });
+  });
+
+  it("still treats a blocked inbox root as truncated when its graph exceeds the node limit", async () => {
+    const { companyId, agentId } = await createCompany("BNL");
+    const rootId = await insertIssue({
+      companyId,
+      identifier: "BNL-1",
+      title: "Blocked source",
+      status: "blocked",
+      assigneeAgentId: agentId,
+    });
+    // Human-owned children are each covered, so only the node limit can put the root in the inbox.
+    await db.insert(issues).values(
+      Array.from({ length: BLOCKER_ATTENTION_MAX_NODES + 1 }, (_, index) => ({
+        id: randomUUID(),
+        companyId,
+        identifier: `BNL-${index + 2}`,
+        title: `Child ${index}`,
+        status: "todo",
+        priority: "medium",
+        parentId: rootId,
+        assigneeUserId: "board-user",
+        originKind: "manual",
+        originFingerprint: "default",
+      })),
+    );
+
+    const rows = await svc.list(companyId, { attention: "blocked" });
+    expect(rows.map((row) => row.id)).toEqual([rootId]);
   });
 });
