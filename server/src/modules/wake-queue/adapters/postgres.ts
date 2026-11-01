@@ -628,8 +628,6 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
     },
 
     async queueReviewParticipantRecoveryRun({ companyId, issue, finishingRun, recoveryAgent, sessionBefore, now }) {
-      // The issue is already locked. Re-read and lock the exact predecessor;
-      // recovery keeps its admitted version even if the issue has since changed.
       const [source] = finishingRun.id === run.id && companyId === run.companyId
         ? await tx.select().from(heartbeatRuns).where(and(
             eq(heartbeatRuns.id, finishingRun.id), eq(heartbeatRuns.companyId, companyId),
