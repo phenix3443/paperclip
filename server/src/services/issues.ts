@@ -4362,7 +4362,16 @@ async function listIssueBlockerAttentionMap(
         sampleStalledBlockerIdentifier: null,
       };
     }
-    if (node.status === "in_review") {
+    const downstream = (edgesByIssueId.get(node.id) ?? []).filter((edge) => {
+      const blocker = nodesById.get(edge.blockerIssueId);
+      return (
+        blocker?.status !== "done" ||
+        pendingFinalizeBlockerIssueIds.has(edge.blockerIssueId)
+      );
+    });
+    // A reviewer waiting on unfinished blockers correctly has no run of its
+    // own, so the review is judged by those blockers, not as a stalled leaf.
+    if (node.status === "in_review" && downstream.length === 0) {
       const hasWaitingPath =
         activeIssueIds.has(node.id) || Boolean(node.assigneeUserId);
       if (hasWaitingPath) {
@@ -4408,13 +4417,6 @@ async function listIssueBlockerAttentionMap(
       };
     }
 
-    const downstream = (edgesByIssueId.get(node.id) ?? []).filter((edge) => {
-      const blocker = nodesById.get(edge.blockerIssueId);
-      return (
-        blocker?.status !== "done" ||
-        pendingFinalizeBlockerIssueIds.has(edge.blockerIssueId)
-      );
-    });
     if (downstream.length > 0) {
       const nextSeen = new Set(seen);
       nextSeen.add(nodeId);

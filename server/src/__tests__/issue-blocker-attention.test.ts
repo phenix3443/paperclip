@@ -461,7 +461,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     });
   });
 
-  it("returns the direct path and link details when an intermediate blocker is selected", async () => {
+  it("returns the direct path and link details when a downstream blocker is selected", async () => {
     const { companyId, agentId } = await createCompany("PBI");
     const rootId = await insertIssue({ companyId, identifier: "PBI-1", title: "Root", status: "blocked" });
     const directId = await insertIssue({
@@ -473,7 +473,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     const intermediateId = await insertIssue({
       companyId,
       identifier: "PBI-3",
-      title: "Stalled intermediate review",
+      title: "Intermediate review waiting on its blocker",
       status: "in_review",
       assigneeAgentId: agentId,
     });
@@ -490,14 +490,15 @@ describeEmbeddedPostgres("issue blocker attention", () => {
 
     const root = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === rootId);
 
+    // The review is waiting on its own unfinished blocker, so the idle leaf is the terminal.
     expect(root?.blockerAttention).toMatchObject({
-      state: "stalled",
+      state: "needs_attention",
       directBlockerIssueId: directId,
-      terminalBlockerIssueId: intermediateId,
+      terminalBlockerIssueId: leafId,
       terminalBlocker: {
-        id: intermediateId,
-        identifier: "PBI-3",
-        title: "Stalled intermediate review",
+        id: leafId,
+        identifier: "PBI-4",
+        title: "Downstream leaf",
       },
     });
   });
@@ -1413,5 +1414,109 @@ describeEmbeddedPostgres("issue blocker attention", () => {
 
     const rows = await svc.list(companyId, { attention: "blocked" });
     expect(rows.map((row) => row.id)).toEqual([rootId]);
+  });
+  async function seedReviewWaitingOnBlockers(prefix: string, leafStatus: string) {
+    const { companyId, agentId } = await createCompany(prefix);
+    const rootId = await insertIssue({
+      companyId,
+      identifier: `${prefix}-1`,
+      title: "Blocked source",
+      status: "blocked",
+      assigneeAgentId: agentId,
+    });
+    const reviewId = await insertIssue({
+      companyId,
+      identifier: `${prefix}-2`,
+      title: "Review waiting on its own blockers",
+      status: "in_review",
+      assigneeAgentId: agentId,
+      executionState: { status: "pending", currentParticipant: { type: "agent", agentId } },
+    });
+    const linkId = await insertIssue({
+      companyId,
+      identifier: `${prefix}-3`,
+      title: "Link",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    const leafId = await insertIssue({
+      companyId,
+      identifier: `${prefix}-4`,
+      title: "Leaf",
+      status: leafStatus,
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: reviewId, blockedIssueId: rootId });
+    await block({ companyId, blockerIssueId: linkId, blockedIssueId: reviewId });
+    await block({ companyId, blockerIssueId: leafId, blockedIssueId: linkId });
+    return { companyId, agentId, rootId, reviewId, leafId };
+  }
+
+  it("covers an in_review blocker whose own unfinished blockers end in a running run", async () => {
+    const { companyId, agentId, rootId, leafId } = await seedReviewWaitingOnBlockers("BRR", "in_progress");
+    await activeRun({ companyId, agentId, issueId: leafId });
+
+    const root = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === rootId);
+    expect(root?.blockerAttention).toMatchObject({ state: "covered", stalledBlockerCount: 0 });
+    const inboxRoot = (await svc.list(companyId, { attention: "blocked" })).find((row) => row.id === rootId);
+    expect(inboxRoot).toBeUndefined();
+  });
+
+  it("covers an in_review blocker whose own unfinished blockers end in a queued run", async () => {
+    const { companyId, agentId, rootId, leafId } = await seedReviewWaitingOnBlockers("BRQ", "in_review");
+    await activeRun({ companyId, agentId, issueId: leafId, status: "queued", current: false });
+
+    const root = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === rootId);
+    expect(root?.blockerAttention).toMatchObject({ state: "covered", stalledBlockerCount: 0 });
+  });
+
+  it("judges an in_review blocker with unfinished blockers by the stalled review at the chain end", async () => {
+    const { companyId, rootId } = await seedReviewWaitingOnBlockers("BRS", "in_review");
+
+    const root = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === rootId);
+    expect(root?.blockerAttention).toMatchObject({
+      state: "stalled",
+      reason: "stalled_review",
+      sampleStalledBlockerIdentifier: "BRS-4",
+    });
+  });
+
+  it("judges an in_review blocker with unfinished blockers by an idle leaf at the chain end", async () => {
+    const { companyId, rootId, leafId } = await seedReviewWaitingOnBlockers("BRT", "todo");
+
+    const root = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === rootId);
+    expect(root?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+      terminalBlockerIssueId: leafId,
+    });
+  });
+
+  it("keeps an in_review blocker with no blockers and no waiting path stalled", async () => {
+    const { companyId, agentId } = await createCompany("BRN");
+    const rootId = await insertIssue({ companyId, identifier: "BRN-1", title: "Blocked source", status: "blocked" });
+    const reviewId = await insertIssue({
+      companyId,
+      identifier: "BRN-2",
+      title: "Review with no path",
+      status: "in_review",
+      assigneeAgentId: agentId,
+    });
+    const doneId = await insertIssue({
+      companyId,
+      identifier: "BRN-3",
+      title: "Finished dependency",
+      status: "done",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: reviewId, blockedIssueId: rootId });
+    await block({ companyId, blockerIssueId: doneId, blockedIssueId: reviewId });
+
+    const root = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === rootId);
+    expect(root?.blockerAttention).toMatchObject({
+      state: "stalled",
+      reason: "stalled_review",
+      sampleStalledBlockerIdentifier: "BRN-2",
+    });
   });
 });
