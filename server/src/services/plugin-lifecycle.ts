@@ -53,7 +53,11 @@ import {
   type PluginLifecycleLease,
   type PluginLifecycleOpKind,
   type PluginLifecycleTimings,
+  type PluginLoadOptions,
+  type PluginRestartOptions,
+  type PluginRestartResult,
 } from "./plugin-lifecycle-shared.js";
+export type { PluginLoadOptions, PluginRestartOptions, PluginRestartResult };
 
 const invalidTransition = (message: string) => badRequest(message, { code: "invalid_transition" });
 
@@ -158,19 +162,6 @@ type LifecycleEventPayload<K extends LifecycleEventName> = PluginLifecycleEvents
 
 export interface PluginLifecycleOpOptions {
   lease?: PluginLifecycleLease;
-}
-
-export interface PluginLoadOptions extends PluginLifecycleOpOptions {
-  activate?: boolean;
-}
-
-export interface PluginRestartOptions extends PluginLifecycleOpOptions {
-  source?: "watcher" | "config";
-  epoch?: number;
-}
-
-export interface PluginRestartResult {
-  superseded: boolean;
 }
 
 export interface PluginLifecycleManager {
@@ -280,7 +271,6 @@ export interface PluginLifecycleManager {
   isCurrentGeneration(pluginId: string, epoch: number): boolean;
 
   isQuiesced(pluginId: string): boolean;
-
   registerWatchWithdrawer(withdraw: (pluginId: string) => void): () => void;
 
   /**
@@ -905,10 +895,7 @@ export function pluginLifecycleManager(
           || plugin.status !== "ready"
           || !handle
         ) {
-          log.info(
-            { pluginId, pluginKey: plugin.pluginKey, source: options?.source, status: plugin.status },
-            "plugin lifecycle: reload superseded",
-          );
+          log.info({ pluginId, source: options?.source, status: plugin.status }, "plugin lifecycle: reload superseded");
           return { superseded: true };
         }
 

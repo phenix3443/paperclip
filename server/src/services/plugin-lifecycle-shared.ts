@@ -36,6 +36,21 @@ export class LeaseKeyMismatchError extends Error {
   }
 }
 
+export interface PluginLoadOptions {
+  lease?: PluginLifecycleLease;
+  activate?: boolean;
+}
+
+export interface PluginRestartOptions {
+  lease?: PluginLifecycleLease;
+  source?: "watcher" | "config";
+  epoch?: number;
+}
+
+export interface PluginRestartResult {
+  superseded: boolean;
+}
+
 export interface PluginLifecycleLease {
   readonly pluginKey: string;
   readonly kind: PluginLifecycleOpKind;

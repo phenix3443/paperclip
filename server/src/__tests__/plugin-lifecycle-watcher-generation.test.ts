@@ -427,7 +427,7 @@ describe("watcher and config reload generations through the real app, route and 
     expect(h.workerManager.getWorker(row.id)).toBeUndefined();
   });
 
-  it("N2b: a DELETE while a config restart is paused between teardown and activation supersedes the reactivation", async () => {
+  it("N2b: a DELETE while a config restart is paused between teardown and activation waits for it, and nothing starts after the uninstall", async () => {
     harness = await createHarness();
     const h = harness;
     const row = seed(h, "gen.n2b", "ready");
@@ -445,12 +445,13 @@ describe("watcher and config reload generations through the real app, route and 
 
     expect(state.rows.get(row.id)!.status).toBe("uninstalled");
     expect(h.workerManager.getWorker(row.id)).toBeUndefined();
-    expect(state.calls.at(-1)).not.toBe(`worker:start:${row.id}`);
+    expect(state.calls.lastIndexOf(`worker:start:${row.id}`)).toBeLessThan(state.calls.indexOf("row:uninstalled"));
   });
 
-  it("N3: a route disable withdraws the app watcher, so a later file change and a stale path lookup do nothing", async () => {
+  it("N3: a route disable withdraws the app watcher under its lease, so a later file change and a stale path lookup do nothing", async () => {
     harness = await createHarness();
     const h = harness;
+    h.setHold("shutdown");
     const row = seed(h, "gen.n3", "disabled");
     h.setHoldLookups(true);
     await h.appLifecycle.enable(row.id);
@@ -459,13 +460,16 @@ describe("watcher and config reload generations through the real app, route and 
     const fake = h.watcherFor(row.packagePath!)!;
     const watchesBefore = state.watchers.length;
 
-    expect((await request(h.app).post(`/api/plugins/${row.pluginKey}/disable`).send({})).status).toBe(200);
+    const disable = request(h.app).post(`/api/plugins/${row.pluginKey}/disable`).send({}).then((r) => r);
+    await h.gate.next("shutdown-received");
+    expect(fake.closed).toBe(true);
     fake.emit(path.join(row.packagePath!, "dist", "worker.js"));
+    h.gate.release("shutdown");
+    expect((await disable).status).toBe(200);
     await delay(DEBOUNCE_SETTLE_MS);
     for (const resolve of h.heldLookups.splice(0)) resolve();
     await delay(10);
 
-    expect(fake.closed).toBe(true);
     expect(h.restarts).not.toHaveBeenCalled();
     expect(state.watchers.length).toBe(watchesBefore);
     expect(h.workerManager.getWorker(row.id)).toBeUndefined();
@@ -524,7 +528,7 @@ describe("watcher and config reload generations through the real app, route and 
     const data = await request(h.app).post(`/api/plugins/${row.pluginKey}/data/marker`).send({});
     expect(data.status).toBe(200);
     expect(data.body.data).toEqual({ marker: "B" });
-    expect(state.rows.get(row.id)!.id).toBe(row.id);
+    expect(state.rows.get(row.id)).toMatchObject({ id: row.id, version: "1.0.0", packagePath: row.packagePath, status: "ready" });
   });
 
   it("N11: a disable that arrives while a config restart holds the plugin drains it, then quiesces", async () => {

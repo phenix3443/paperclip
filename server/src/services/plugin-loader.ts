@@ -2018,10 +2018,6 @@ export function pluginLoader(
         "plugin-loader: found ready plugins to load",
       );
 
-      // Each plugin activates under its lifecycle lease, so a disable or
-      // DELETE racing startup waits for this activation and then wins. A
-      // plugin quiesced in this process, or whose row changed since it was
-      // listed, is skipped instead of revived.
       const { lifecycleManager } = runtimeServices;
       const loadOne = async (listed: PluginRecord, lease?: PluginLifecycleLease): Promise<PluginLoadResult | null> => {
         if (lease && lifecycleManager.isQuiesced(listed.id)) return null;
