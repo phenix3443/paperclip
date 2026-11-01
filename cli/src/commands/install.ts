@@ -251,6 +251,47 @@ function gitBuildEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return env;
 }
 
+export type GitPayloadPackOptions = {
+  checkoutPath: string;
+  stagingRoot: string;
+  stagedPayload: string;
+  runCommand: CommandRunner;
+  buildEnv?: (extra?: NodeJS.ProcessEnv) => NodeJS.ProcessEnv;
+};
+
+export async function packGitPayload({ checkoutPath, stagingRoot, stagedPayload, runCommand, buildEnv = gitBuildEnv }: GitPayloadPackOptions): Promise<{ version: string; expected: PostgresDriverExpectation }> {
+  const expected = readCheckoutPostgresDriver(checkoutPath);
+  const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
+  const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
+  for (const [index, workspacePackage] of workspacePackages.entries()) {
+    const packageDir = path.join(checkoutPath, workspacePackage.dir);
+    const packageJson = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")) as { bundleDependencies?: string[]; bundledDependencies?: string[] };
+    const bundledDependencies = packageJson.bundleDependencies ?? packageJson.bundledDependencies ?? [];
+    if (bundledDependencies.length > 0) {
+      const stagedPackage = path.join(stagingRoot, `workspace-package-${index}`);
+      await runCommand(process.execPath, [path.join(checkoutPath, "scripts", "prepare-bundled-package.mjs"), packageDir, stagedPackage], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+      await runCommand("npm", ["pack", stagedPackage, "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
+    } else {
+      await runCommand("corepack", ["pnpm", "--dir", workspacePackage.dir, "pack", "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
+    }
+  }
+  await runCommand("npm", ["pack", "--pack-destination", stagingRoot], { cwd: path.join(checkoutPath, "cli"), env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
+  const patchedPostgres = fs.realpathSync(path.join(checkoutPath, "packages", "db", "node_modules", "postgres"));
+  await runCommand("npm", ["pack", patchedPostgres, "--pack-destination", stagingRoot, "--ignore-scripts"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
+  const tarballs = fs.readdirSync(stagingRoot).filter((entry) => entry.endsWith(".tgz"));
+  const cliTarball = tarballs.find((entry) => entry === `paperclipai-${metadata.version}.tgz`);
+  const postgresTarballName = `postgres-${expected.version}.tgz`;
+  const postgresTarball = tarballs.find((entry) => entry === postgresTarballName);
+  const workspaceTarballs = tarballs.filter((entry) => entry !== cliTarball && entry !== postgresTarball);
+  if (!postgresTarball) throw new Error(`Git install packaging did not produce ${postgresTarballName}.`);
+  if (!cliTarball || workspaceTarballs.length !== workspacePackages.length) {
+    throw new Error(`Git install packaging produced ${workspaceTarballs.length} workspace tarballs; expected ${workspacePackages.length}.`);
+  }
+  await runCommand("npm", ["install", "--prefix", stagedPayload, path.join(stagingRoot, cliTarball), path.join(stagingRoot, postgresTarball), ...workspaceTarballs.map((entry) => path.join(stagingRoot, entry)), "--no-audit", "--no-fund"], { cwd: stagingRoot, maxBuffer: 32 * 1024 * 1024 });
+  writePostgresDriverRecord(stagedPayload, expected);
+  return { version: metadata.version, expected };
+}
+
 export type PayloadVerifier = (payloadPath: string, expected: PostgresDriverExpectation) => Promise<unknown>;
 
 export async function installGitPayload(repo: string, sha: string, runCommand: CommandRunner, paths = resolveInstallStorePaths(), verifyPayload: PayloadVerifier = verifyPostgresDriverPayload): Promise<{ payloadPath: string; reused: boolean; version: string }> {
@@ -290,39 +331,11 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     await runCommand("corepack", ["pnpm", "install", "--frozen-lockfile"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("bash", ["scripts/build-npm.sh", "--skip-checks", "--skip-typecheck"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("corepack", ["pnpm", "-r", "--filter", "@paperclipai/server...", "--if-present", "run", "build"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
-    const expected = readCheckoutPostgresDriver(checkoutPath);
-    const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
-    const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
-    for (const [index, workspacePackage] of workspacePackages.entries()) {
-      const packageDir = path.join(checkoutPath, workspacePackage.dir);
-      const packageJson = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")) as { bundleDependencies?: string[]; bundledDependencies?: string[] };
-      const bundledDependencies = packageJson.bundleDependencies ?? packageJson.bundledDependencies ?? [];
-      if (bundledDependencies.length > 0) {
-        const stagedPackage = path.join(stagingRoot, `workspace-package-${index}`);
-        await runCommand(process.execPath, [path.join(checkoutPath, "scripts", "prepare-bundled-package.mjs"), packageDir, stagedPackage], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
-        await runCommand("npm", ["pack", stagedPackage, "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
-      } else {
-        await runCommand("corepack", ["pnpm", "--dir", workspacePackage.dir, "pack", "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
-      }
-    }
-    await runCommand("npm", ["pack", "--pack-destination", stagingRoot], { cwd: path.join(checkoutPath, "cli"), env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
-    const patchedPostgres = fs.realpathSync(path.join(checkoutPath, "packages", "db", "node_modules", "postgres"));
-    await runCommand("npm", ["pack", patchedPostgres, "--pack-destination", stagingRoot, "--ignore-scripts"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
-    const tarballs = fs.readdirSync(stagingRoot).filter((entry) => entry.endsWith(".tgz"));
-    const cliTarball = tarballs.find((entry) => entry === `paperclipai-${metadata.version}.tgz`);
-    const postgresTarballName = `postgres-${expected.version}.tgz`;
-    const postgresTarball = tarballs.find((entry) => entry === postgresTarballName);
-    const workspaceTarballs = tarballs.filter((entry) => entry !== cliTarball && entry !== postgresTarball);
-    if (!postgresTarball) throw new Error(`Git install packaging did not produce ${postgresTarballName}.`);
-    if (!cliTarball || workspaceTarballs.length !== workspacePackages.length) {
-      throw new Error(`Git install packaging produced ${workspaceTarballs.length} workspace tarballs; expected ${workspacePackages.length}.`);
-    }
-    await runCommand("npm", ["install", "--prefix", stagedPayload, path.join(stagingRoot, cliTarball), path.join(stagingRoot, postgresTarball), ...workspaceTarballs.map((entry) => path.join(stagingRoot, entry)), "--no-audit", "--no-fund"], { cwd: stagingRoot, maxBuffer: 32 * 1024 * 1024 });
-    writePostgresDriverRecord(stagedPayload, expected);
+    const { version, expected } = await packGitPayload({ checkoutPath, stagingRoot, stagedPayload, runCommand, buildEnv });
     await verifyPayload(stagedPayload, expected);
-    await smokePayload(stagedPayload, metadata.version, runCommand);
+    await smokePayload(stagedPayload, version, runCommand);
     fs.renameSync(stagedPayload, payloadPath);
-    return { payloadPath, reused: false, version: metadata.version };
+    return { payloadPath, reused: false, version };
   } finally { fs.rmSync(stagingRoot, { recursive: true, force: true }); }
 }
 
