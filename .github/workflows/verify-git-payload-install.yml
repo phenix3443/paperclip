@@ -1,0 +1,44 @@
+name: Verify git payload install
+
+on:
+  push:
+    branches: ['verify/git-payload-install-*']
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Install dependencies
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+      - name: Check the PR-1 commit is an ancestor of the verified head
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          pr1="${BRANCH#verify/git-payload-install-}"
+          echo "checkout HEAD $(git rev-parse HEAD)"
+          echo "github.sha ${GITHUB_SHA}"
+          echo "PR-1 ${pr1}"
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          test "${#pr1}" = 40
+          git merge-base --is-ancestor "${pr1}" HEAD
+      - name: Run the cli install tests
+        run: pnpm exec vitest run cli/src/__tests__/install-command.test.ts cli/src/__tests__/postgres-driver-integrity.test.ts cli/src/__tests__/update-command.test.ts
+      - name: Install the git payload into an empty directory
+        env:
+          NODE_ENV: production
+        run: cli/node_modules/.bin/tsx scripts/verify-git-payload-install.mjs
