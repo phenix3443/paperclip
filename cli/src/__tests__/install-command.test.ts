@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   type CommandRunner,
   installCommand,
+  GIT_PAYLOAD_SKILL_PACKAGES,
   installGitPayload,
   resolveGitHubRef,
   resolveGitInstallRequest,
@@ -163,6 +164,8 @@ describe("managed install commands", () => {
         fs.mkdirSync(path.dirname(path.join(checkout, REPO_PATCH)), { recursive: true });
         fs.copyFileSync(path.join(REPO_ROOT, REPO_PATCH), path.join(checkout, REPO_PATCH));
         fs.cpSync(PATCHED_POSTGRES_SOURCE, path.join(checkout, "packages", "db", "node_modules", "postgres"), { recursive: true, dereference: true });
+        fs.mkdirSync(path.join(checkout, "skills", "paperclip"), { recursive: true });
+        fs.writeFileSync(path.join(checkout, "skills", "paperclip", "SKILL.md"), "skill");
         return { stdout: "", stderr: "" };
       }
       if (file === "corepack") {
@@ -236,7 +239,19 @@ describe("managed install commands", () => {
   it("builds git checkouts with NODE_ENV cleared so ambient production mode keeps devDependencies", async () => {
     process.env.NODE_ENV = "production";
     const sha = "d".repeat(40);
-    const runCommand = createGitCheckoutRunCommand(sha);
+    const baseRunCommand = createGitCheckoutRunCommand(sha);
+    let skillsAtFirstPack: boolean[] | undefined;
+    const runCommand = vi.fn(async (file: string, args: string[], options?: Parameters<CommandRunner>[2]) => {
+      const packing = (file === "corepack" && args.includes("pack")) || (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs"));
+      if (packing && !skillsAtFirstPack && options?.cwd) {
+        const checkout = options.cwd;
+        skillsAtFirstPack = GIT_PAYLOAD_SKILL_PACKAGES.map((packageDir) => {
+          const skillFile = path.join(checkout, packageDir, "skills", "paperclip", "SKILL.md");
+          return fs.existsSync(skillFile) && fs.readFileSync(skillFile, "utf8") === "skill";
+        });
+      }
+      return baseRunCommand(file, args, options);
+    });
     await expect(installGitPayload("paperclipai/paperclip", sha, runCommand, resolveInstallStorePaths())).resolves.toMatchObject({ version: "0.3.1", reused: false });
     const buildCalls = runCommand.mock.calls.filter(([file, args]) =>
       file === "bash" ||
@@ -251,6 +266,7 @@ describe("managed install commands", () => {
       expect(env, `${call[0]} ${call[1].join(" ")} must run with an explicit env`).toBeDefined();
       expect(env, `${call[0]} ${call[1].join(" ")} must not inherit NODE_ENV`).not.toHaveProperty("NODE_ENV");
     }
+    expect(skillsAtFirstPack).toEqual([true, true, true]);
     const uiPackCall = buildCalls.find(([file, , options]) => file === "corepack" && options?.env?.PAPERCLIP_RELEASE_REUSE_UI_DIST === "1");
     expect(uiPackCall).toBeDefined();
   });
