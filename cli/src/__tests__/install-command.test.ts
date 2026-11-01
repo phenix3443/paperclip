@@ -14,6 +14,7 @@ import {
   resolveNpmInstallRequest,
   resolvePublishedVersion,
   runCommandWithDiagnostics,
+  unifyGitPayloadVersions,
 } from "../commands/install.js";
 import { uninstallCommand } from "../commands/uninstall.js";
 import { resolvePaperclipInstanceId } from "../config/home.js";
@@ -245,14 +246,16 @@ describe("managed install commands", () => {
     const sha = "d".repeat(40);
     const baseRunCommand = createGitCheckoutRunCommand(sha);
     let skillsAtFirstPack: boolean[] | undefined;
+    let skillsAtVersion: boolean[] | undefined;
+    const skillsReady = (checkout: string) => GIT_PAYLOAD_SKILL_PACKAGES.map((packageDir) => {
+      const skillFile = path.join(checkout, packageDir, "skills", "paperclip", "SKILL.md");
+      return fs.existsSync(skillFile) && fs.readFileSync(skillFile, "utf8") === "skill";
+    });
     const runCommand = vi.fn(async (file: string, args: string[], options?: Parameters<CommandRunner>[2]) => {
+      if (file === process.execPath && args[0] === "scripts/release-package-map.mjs" && options?.cwd) skillsAtVersion = skillsReady(options.cwd);
       const packing = (file === "corepack" && args.includes("pack")) || (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs"));
       if (packing && !skillsAtFirstPack && options?.cwd) {
-        const checkout = options.cwd;
-        skillsAtFirstPack = GIT_PAYLOAD_SKILL_PACKAGES.map((packageDir) => {
-          const skillFile = path.join(checkout, packageDir, "skills", "paperclip", "SKILL.md");
-          return fs.existsSync(skillFile) && fs.readFileSync(skillFile, "utf8") === "skill";
-        });
+        skillsAtFirstPack = skillsReady(options.cwd);
       }
       return baseRunCommand(file, args, options);
     });
@@ -261,8 +264,15 @@ describe("managed install commands", () => {
       file === "bash" ||
       file === "corepack" ||
       (file === "npm" && args[0] === "pack") ||
-      (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs")));
-    expect(buildCalls).toHaveLength(11);
+      (file === process.execPath && (args[0]?.endsWith("prepare-bundled-package.mjs") || args[0] === "scripts/release-package-map.mjs")));
+    expect(buildCalls).toHaveLength(12);
+    const versionIndex = buildCalls.findIndex(([file, args]) => file === process.execPath && args[0] === "scripts/release-package-map.mjs");
+    const uiDistIndex = buildCalls.findIndex(([file, args]) => file === "bash" && args[0] === "scripts/prepare-server-ui-dist.sh");
+    const firstPackIndex = buildCalls.findIndex(([file, args]) => (file === "corepack" && args.includes("pack")) || (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs")));
+    expect(buildCalls[versionIndex]?.[1]).toEqual(["scripts/release-package-map.mjs", "set-version", "0.3.1"]);
+    expect(uiDistIndex).toBeLessThan(versionIndex);
+    expect(versionIndex).toBeLessThan(firstPackIndex);
+    expect(skillsAtVersion).toEqual([true, true, true]);
     const uiDistCall = buildCalls.find(([file, args]) => file === "bash" && args[0] === "scripts/prepare-server-ui-dist.sh");
     expect(uiDistCall?.[2]?.env?.PAPERCLIP_RELEASE_REUSE_UI_DIST).toBe("1");
     for (const call of buildCalls) {
@@ -273,6 +283,26 @@ describe("managed install commands", () => {
     expect(skillsAtFirstPack).toEqual([true, true, true]);
     const uiPackCall = buildCalls.find(([file, , options]) => file === "corepack" && options?.env?.PAPERCLIP_RELEASE_REUSE_UI_DIST === "1");
     expect(uiPackCall).toBeDefined();
+  });
+
+  it("unifies workspace versions from the selected checkout's CLI version", async () => {
+    process.env.NODE_ENV = "production";
+    const checkout = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-unify-versions-"));
+    try {
+      fs.mkdirSync(path.join(checkout, "cli"), { recursive: true });
+      fs.writeFileSync(path.join(checkout, "cli", "package.json"), JSON.stringify({ version: "9.8.7" }));
+      const runCommand = vi.fn(async () => ({ stdout: "", stderr: "" }));
+      await unifyGitPayloadVersions(checkout, runCommand);
+      expect(runCommand).toHaveBeenCalledOnce();
+      const [file, args, options] = runCommand.mock.calls[0] as unknown as Parameters<CommandRunner>;
+      expect(file).toBe(process.execPath);
+      expect(args).toEqual(["scripts/release-package-map.mjs", "set-version", "9.8.7"]);
+      expect(options?.cwd).toBe(checkout);
+      expect(options?.env).toBeDefined();
+      expect(options?.env).not.toHaveProperty("NODE_ENV");
+    } finally {
+      fs.rmSync(checkout, { recursive: true, force: true });
+    }
   });
 
   it("rejects a git payload whose installed postgres driver lost the patch before activation", async () => {
