@@ -1845,7 +1845,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(claimedIssue).toEqual({ status: "in_progress", executionRunId: runId });
   });
 
-  it.each(["queued", "queued-policy", "queued-participant", "queued-stage", "queued-decision", "queued-assignee", "queued-responsible", "accounting", "provider", "retry", "explicit-retry"] as const)("rejects a real admitted generation independently at the %s fence", async phase => {
+  it.each(["queued", "queued-policy", "queued-participant", "queued-stage", "queued-decision", "queued-assignee", "queued-responsible", "accounting", "provider", "retry", "explicit-retry", "coalesced"] as const)("rejects a real admitted generation independently at the %s fence", async phase => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const [author] = await db.insert(agents).values({ companyId, name: "Author", role: "engineer", adapterType: "codex_local" }).returning();
     const policy = normalizeIssueExecutionPolicy({ stages: [{ type: "review", participants: [{ type: "agent", agentId }] }] })!;
@@ -1911,7 +1911,19 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
           .toMatchObject({ outcome: "promoted" });
         expect(await adapter.cancelStaleQueuedRun({ companyId, runId: retry.run.id,
           expectedStatus: "queued", now: new Date() })).toMatchObject({ outcome: "cancelled", errorCode: "issue_review_participant_changed" });
-      } else if (phase.startsWith("queued")) {
+      } else if (phase.startsWith("queued") || phase === "coalesced") {
+        if (phase === "coalesced") {
+          const [comment] = await db.insert(issueComments).values({ companyId, issueId: original.id,
+            authorUserId: "responsible-user", body: "Additional review context" }).returning();
+          const merged = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "manual",
+            payload: { commentId: comment.id }, requestedByActorType: "user", requestedByActorId: "responsible-user",
+            contextSnapshot: { taskKey: original.id, wakeCommentId: comment.id,
+              reviewerAssignmentGeneration: "forged-second-writer", additionalContext: "merged" } });
+          expect(merged).toMatchObject({ id: admitted.id, status: "queued", contextSnapshot: {
+            additionalContext: "merged", reviewerAssignmentGeneration: admitted.contextSnapshot?.reviewerAssignmentGeneration } });
+          const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, admitted.id));
+          expect(saved.contextSnapshot?.reviewerAssignmentGeneration).toBe(admitted.contextSnapshot?.reviewerAssignmentGeneration);
+        }
         await changeSubmission();
         expect(await adapter.cancelStaleQueuedRun({ companyId, runId: admitted!.id,
           expectedStatus: "queued", now: new Date() })).toMatchObject({ outcome: "cancelled", errorCode: "issue_review_participant_changed" });
