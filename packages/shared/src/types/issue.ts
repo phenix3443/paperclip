@@ -78,8 +78,8 @@ export interface IssueAccessGrant {
 
 /**
  * Existence-only projection used when a readable issue references an issue the
- * current principal cannot read. Edge projections may return this exact shape
- * in place of an IssueRelationIssueSummary; direct reads and list/search rows
+ * current principal cannot read. Reference projections may return this shape;
+ * blocker relations omit unreadable entries. Direct reads and list/search rows
  * never return locked stubs.
  */
 export interface IssueLockedStub {

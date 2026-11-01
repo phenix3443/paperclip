@@ -2,7 +2,7 @@ import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notificatio
 import { skillAccessService } from "./skill-access.js";
 import { credentialAccessConnectionNameSql } from "./credential-access-visibility.js";
 import { executionProjectionsForRuns } from "./execution-projection.js";
-import { and, asc, desc, eq, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -41,6 +41,39 @@ const MAX_ACTIVITY_LIMIT = 500;
 export function normalizeActivityLimit(limit: number | undefined) {
   if (!Number.isFinite(limit)) return DEFAULT_ACTIVITY_LIMIT;
   return Math.max(1, Math.min(MAX_ACTIVITY_LIMIT, Math.floor(limit ?? DEFAULT_ACTIVITY_LIMIT)));
+}
+
+function readableBlockerActivityDetails(readCondition: SQL<boolean> | undefined) {
+  const original = sql`${activityLog.details}`;
+  const readable = (id: SQL) => sql`exists (
+    select 1 from ${issues} where ${issues.id}::text = ${id}
+      and ${issues.companyId} = ${activityLog.companyId}
+      and (${readCondition ?? sql<boolean>`false`})
+  )`;
+  const arrayPatch = (source: SQL, key: string, summary = false) => {
+    const valueId = summary ? sql`blocker.value->>'id'` : sql`blocker.value#>>'{}'`;
+    return sql`case when ${source} ? ${key} then jsonb_build_object(${key}::text,
+      coalesce((select jsonb_agg(blocker.value order by blocker.ordinality)
+        from jsonb_array_elements(case when jsonb_typeof(${source}->${key}) = 'array'
+          then ${source}->${key} else '[]'::jsonb end) with ordinality as blocker(value, ordinality)
+        where ${readable(valueId)}), '[]'::jsonb)) else '{}'::jsonb end`;
+  };
+  const patches: SQL[] = [];
+  for (const key of ["blockedByIssueIds", "addedBlockedByIssueIds", "removedBlockedByIssueIds", "blockerIssueIds"])
+    patches.push(arrayPatch(original, key));
+  for (const key of ["blockedByIssues", "addedBlockedByIssues", "removedBlockedByIssues"])
+    patches.push(arrayPatch(original, key, true));
+  const changes = sql`${original}#>'{changes,blockedByIssueIds}'`;
+  patches.push(sql`case when jsonb_typeof(${changes}) = 'object' then
+    jsonb_build_object('changes', (${original}->'changes') || jsonb_build_object('blockedByIssueIds',
+      ${changes} || ${arrayPatch(changes, "from")} || ${arrayPatch(changes, "to")})) else '{}'::jsonb end`);
+  const previous = sql`${original}->'_previous'`;
+  patches.push(sql`case when jsonb_typeof(${previous}) = 'object' then
+    jsonb_build_object('_previous', ${previous} || ${arrayPatch(previous, "blockedByIssueIds")}) else '{}'::jsonb end`);
+  patches.push(sql`case when ${original} ? 'resolvedBlockerIssueId' then
+    jsonb_build_object('resolvedBlockerIssueId', case when ${readable(sql`${original}->>'resolvedBlockerIssueId'`)}
+      then ${original}->'resolvedBlockerIssueId' else 'null'::jsonb end) else '{}'::jsonb end`);
+  return sql<Record<string, unknown> | null>`${original} || ${sql.join(patches, sql` || `)}`;
 }
 
 export function activityService(db: Db) {
@@ -357,8 +390,25 @@ export function activityService(db: Db) {
       });
   }
 
-  return {
-    list: async (filters: ActivityFilters) => {
+  const issueActivityRows = (issueId: string, limit?: number, publicRead?: { readCondition: SQL<boolean> | undefined }) => {
+      const query = db
+        .select({
+          ...getTableColumns(activityLog),
+          ...(publicRead ? { details: readableBlockerActivityDetails(publicRead.readCondition) } : {}),
+        })
+        .from(activityLog)
+        .where(
+          or(
+            and(eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issueId)),
+            and(or(eq(activityLog.action, "project.created"), eq(activityLog.action, "company.skill_created")), sql`${activityLog.details}->>'sourceIssueId' = ${issueId}`,
+              sql`${activityLog.companyId} = (select company_id from issues where id = ${issueId})`),
+          ),
+        )
+        .orderBy(desc(activityLog.createdAt), desc(activityLog.id));
+      return limit === undefined ? query : query.limit(limit);
+    };
+
+  const listActivity = async (filters: ActivityFilters, publicRead?: { readCondition: SQL<boolean> | undefined }) => {
       const conditions = [eq(activityLog.companyId, filters.companyId), await skillAccessService(db).activityCondition(filters.companyId),
         filters.caseReadCondition ?? sql<boolean>`${activityLog.entityType} <> 'case'`];
       const limit = normalizeActivityLimit(filters.limit);
@@ -374,7 +424,10 @@ export function activityService(db: Db) {
       }
 
       return db
-        .select({ activityLog })
+        .select({ activityLog: {
+          ...getTableColumns(activityLog),
+          ...(publicRead ? { details: readableBlockerActivityDetails(publicRead.readCondition) } : {}),
+        } })
         .from(activityLog)
         .leftJoin(
           issues,
@@ -395,7 +448,11 @@ export function activityService(db: Db) {
         .orderBy(desc(activityLog.createdAt))
         .limit(limit)
         .then((rows) => rows.map((r) => r.activityLog));
-    },
+    };
+
+  return {
+    list: (filters: ActivityFilters) => listActivity(filters),
+    listReadable: (filters: ActivityFilters) => listActivity(filters, { readCondition: filters.readCondition }),
 
     inputFactsForIssue: async (companyId: string, issueId: string, commentIds: string[]) => {
       if (!commentIds.length) return [];
@@ -413,20 +470,9 @@ export function activityService(db: Db) {
         .orderBy(commentId, activityLog.action, asc(activityLog.createdAt), asc(activityLog.id));
     },
 
-    forIssue: (issueId: string, limit?: number) => {
-      const query = db
-        .select()
-        .from(activityLog)
-        .where(
-          or(
-            and(eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issueId)),
-            and(or(eq(activityLog.action, "project.created"), eq(activityLog.action, "company.skill_created")), sql`${activityLog.details}->>'sourceIssueId' = ${issueId}`,
-              sql`${activityLog.companyId} = (select company_id from issues where id = ${issueId})`),
-          ),
-        )
-        .orderBy(desc(activityLog.createdAt), desc(activityLog.id));
-      return limit === undefined ? query : query.limit(limit);
-    },
+    forIssue: (issueId: string, limit?: number) => issueActivityRows(issueId, limit),
+    forIssueReadable: (issueId: string, readCondition: SQL<boolean> | undefined, limit?: number) =>
+      issueActivityRows(issueId, limit, { readCondition }),
 
     runsForIssue: async (companyId: string, issueId: string, viewerUserId: string | null = null, limit?: number, selectedRunIds?: string[]) => {
       if (selectedRunIds && !selectedRunIds.length) return [];

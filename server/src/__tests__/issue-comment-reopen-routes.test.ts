@@ -29,6 +29,21 @@ const mockIssueService = vi.hoisted(() => ({
   getRelationSummaries: vi.fn(),
 }));
 
+function readableMockIssueService() {
+  return {
+    ...mockIssueService,
+    updateReadable: async (id: string, patch: Record<string, unknown>, _read: unknown, ...args: unknown[]) => {
+      const previousRelations = await mockIssueService.getRelationSummaries(id);
+      const receipt = await mockIssueService.update(id, patch, ...args);
+      return { ...receipt, previousRelations, publicReceipt: receipt };
+    },
+    getReadableRelationSummaries: async (id: string, options: { enrich?: (relations: unknown) => Promise<unknown> }) => {
+      const relations = await mockIssueService.getRelationSummaries(id);
+      return options.enrich ? options.enrich(relations) : relations;
+    },
+  };
+}
+
 const mockAccessService = vi.hoisted(() => ({
   canUser: vi.fn(),
   decide: vi.fn(),
@@ -165,7 +180,7 @@ vi.mock("../services/instance-settings.js", () => ({
 }));
 
 vi.mock("../services/issues.js", () => ({
-  issueService: () => mockIssueService,
+  issueService: readableMockIssueService,
 }));
 
 vi.mock("../services/routines.js", () => ({
@@ -211,7 +226,7 @@ vi.mock("../services/index.js", () => ({
     syncDocument: async () => undefined,
     syncIssue: async () => undefined,
   }),
-  issueService: () => mockIssueService,
+  issueService: readableMockIssueService,
   issueThreadInteractionService: () => mockIssueThreadInteractionService,
   issueTreeControlService: () => mockIssueTreeControlService,
   logActivity: mockLogActivity,

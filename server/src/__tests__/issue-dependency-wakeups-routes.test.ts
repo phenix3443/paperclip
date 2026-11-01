@@ -98,7 +98,20 @@ vi.mock("../services/index.js", () => ({
     expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
     expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
   }),
-  issueService: () => mockIssueService,
+  issueService: () => ({
+    ...mockIssueService,
+    updateReadable: async (id: string, patch: Record<string, unknown>, _read: unknown, ...args: unknown[]) => {
+      const previousRelations = await mockIssueService.getRelationSummaries(id);
+      const updated = await mockIssueService.update(id, patch, ...args);
+      const receipt = { ...updated, blockedByIssueIds: patch.blockedByIssueIds,
+        changes: { blockedByIssueIds: { from: [], to: patch.blockedByIssueIds } } };
+      return { ...receipt, previousRelations, publicReceipt: receipt };
+    },
+    getReadableRelationSummaries: async (id: string, options: { enrich?: (relations: unknown) => Promise<unknown> }) => {
+      const relations = await mockIssueService.getRelationSummaries(id);
+      return options.enrich ? options.enrich(relations) : relations;
+    },
+  }),
   logActivity: vi.fn(async () => undefined),
   projectService: () => ({
     getById: vi.fn(),

@@ -5519,39 +5519,6 @@ export function issueRoutes(
     };
   }
 
-  async function redactIssueRelationEdges(
-    req: Request,
-    companyId: string,
-    relations: { blockedBy: IssueRelationIssueSummary[]; blocks: IssueRelationIssueSummary[] },
-  ): Promise<{ blockedBy: IssueEdgeReference[]; blocks: IssueEdgeReference[] }> {
-    const all = [...relations.blockedBy, ...relations.blocks];
-    const edgeIds = new Set<string>();
-    const pending = [...all];
-    while (pending.length > 0) {
-      const issue = pending.pop()!;
-      if (edgeIds.has(issue.id)) continue;
-      edgeIds.add(issue.id);
-      pending.push(...(issue.terminalBlockers ?? []));
-    }
-    const readableIds = await readableIssueEdgeIds(req, companyId, [...edgeIds]);
-    const redact = (issue: IssueRelationIssueSummary, ancestors = new Set<string>()): IssueEdgeReference => {
-      if (!readableIds.has(issue.id)) return lockedIssueStub(issue);
-      const { terminalBlockers, ...visibleFields } = issue;
-      if (ancestors.has(issue.id)) return visibleFields as IssueRelationIssueSummary;
-      const nextAncestors = new Set(ancestors).add(issue.id);
-      return {
-        ...visibleFields,
-        ...(terminalBlockers
-          ? { terminalBlockers: terminalBlockers.map((child) => redact(child, nextAncestors)) as IssueRelationIssueSummary[] }
-          : {}),
-      };
-    };
-    return {
-      blockedBy: relations.blockedBy.map((issue) => redact(issue)),
-      blocks: relations.blocks.map((issue) => redact(issue)),
-    };
-  }
-
   async function redactIssueReferenceEdges<T extends {
     outbound: Array<{ issue: IssueRelationIssueSummary }>;
     inbound: Array<{ issue: IssueRelationIssueSummary }>;
@@ -14487,9 +14454,6 @@ export function issueRoutes(
         );
       const titleOrDescriptionChanged =
         req.body.title !== undefined || req.body.description !== undefined;
-      const existingRelations = Array.isArray(req.body.blockedByIssueIds)
-        ? await svc.getRelationSummaries(existing.id)
-        : null;
       const {
         comment: commentBody,
         commentClientRequestId,
@@ -14997,26 +14961,14 @@ export function issueRoutes(
       }
       const enteringBlocked =
         existing.status !== "blocked" && updateFields.status === "blocked";
+      let requireUnresolvedBlocker = false;
       if (enteringBlocked) {
         const requestedBlockerIds = Array.isArray(req.body.blockedByIssueIds)
           ? [...new Set(req.body.blockedByIssueIds as string[])]
           : null;
         const hasUnresolvedBlocker = requestedBlockerIds
-          ? requestedBlockerIds.length > 0 &&
-            (await db
-              .select({ id: issueRows.id })
-              .from(issueRows)
-              .where(
-                and(
-                  eq(issueRows.companyId, existing.companyId),
-                  inArray(issueRows.id, requestedBlockerIds),
-                  notInArray(issueRows.status, ["done", "cancelled"]),
-                ),
-              )
-              .limit(1)
-              .then((rows) => rows.length > 0))
-          : (await svc.getDependencyReadiness(existing.id))
-              .unresolvedBlockerCount > 0;
+          ? false
+          : (await svc.getDependencyReadiness(existing.id)).unresolvedBlockerCount > 0;
         const [pendingInteraction, pendingApproval] = await Promise.all([
           db
             .select({ id: issueThreadInteractions.id })
@@ -15051,11 +15003,8 @@ export function issueRoutes(
           !pendingApproval &&
           !descriptor
         ) {
-          res.status(422).json({
-            error:
-              "Entering blocked requires unresolved blockers, a pending interaction/approval, or unblockDescriptor",
-          });
-          return;
+          if (requestedBlockerIds) requireUnresolvedBlocker = true;
+          else throw unprocessable("Entering blocked requires unresolved blockers, a pending interaction/approval, or unblockDescriptor");
         }
       }
       if (
@@ -15282,7 +15231,10 @@ export function issueRoutes(
         updateFields.status === "done";
       const shouldCollectTerminalIssueActions =
         updateFields.status === "done" || updateFields.status === "cancelled";
-      const updateIssue = (tx?: Parameters<typeof svc.update>[2]) => {
+      const publicRead = Array.isArray(issueUpdateData.blockedByIssueIds)
+        ? { readCondition: await metadataReadCondition(req), requireUnresolvedBlocker }
+        : null;
+      const updateRawIssue = (tx?: Parameters<typeof svc.update>[2]) => {
         if (tx) {
           if (shouldCollectCompletionPublication) {
             return svc.update(
@@ -15307,6 +15259,11 @@ export function issueRoutes(
           ? svc.update(id, issueUpdateData, db, postCommitActivityPublications)
           : svc.update(id, issueUpdateData);
       };
+      const updateIssue = (tx?: Parameters<typeof svc.update>[2]) => publicRead
+        ? svc.updateReadable(id, issueUpdateData, publicRead, tx ?? db,
+            shouldCollectCompletionPublication ? postCommitActivityPublications : undefined,
+            tx && shouldCollectTerminalIssueActions ? postCommitIssueActions : undefined)
+        : updateRawIssue(tx);
       const assertLockedReviewPolicyAllowsMutation = async (
         tx: Parameters<typeof svc.update>[2],
       ) => {
@@ -15367,6 +15324,7 @@ export function issueRoutes(
             entityId: updated.id,
             details: {
               ...updateFields,
+              ...(updated.blockedByIssueIds !== undefined ? { blockedByIssueIds: updated.blockedByIssueIds } : {}),
               identifier: updated.identifier,
               authorizationReason: issueMutationAuthorizationReason,
               ...decisionDetails,
@@ -15640,25 +15598,31 @@ export function issueRoutes(
               updateReferenceSummaryAfter,
             )
           : null;
+      const publicIssue = publicRead ? issue.publicReceipt : issue;
+      if (!publicIssue) throw new Error("Public issue update requires a projected receipt");
       let issueResponse: typeof issue & {
         blockedBy?: unknown;
         blocks?: unknown;
         activeRecoveryAction?: unknown;
       relatedWork?: unknown;
         referencedIssueIdentifiers?: string[];
-      } = issue;
+      } = publicIssue;
       let updatedRelations: Awaited<
         ReturnType<typeof svc.getRelationSummaries>
       > | null = null;
       if (issue && Array.isArray(req.body.blockedByIssueIds)) {
-        updatedRelations = await svc.getRelationSummaries(issue.id);
-      const visibleUpdatedRelations = await redactIssueRelationEdges(req, issue.companyId, updatedRelations);
+        const visibleUpdatedRelations = await svc.getReadableRelationSummaries(issue.id, {
+          readCondition: publicRead?.readCondition,
+          enrich: async (relations) => {
+            updatedRelations = relations;
+            return relations;
+          },
+        });
         issueResponse = {
-          ...issue,
-          blockedByIssueIds:
-          issue.blockedByIssueIds ?? [...new Set(req.body.blockedByIssueIds as string[])].sort(),
-        blockedBy: visibleUpdatedRelations.blockedBy,
-        blocks: visibleUpdatedRelations.blocks,
+          ...issueResponse,
+          blockedByIssueIds: issue.publicReceipt?.blockedByIssueIds ?? [],
+          blockedBy: visibleUpdatedRelations.blockedBy,
+          blocks: visibleUpdatedRelations.blocks,
         };
       }
       await routinesSvc.syncRunStatusForIssue(issue.id);
@@ -15729,7 +15693,7 @@ export function issueRoutes(
           assigneeChanged:
             existing.assigneeAgentId !== issue.assigneeAgentId ||
             existing.assigneeUserId !== issue.assigneeUserId,
-          blockersChanged: Array.isArray(req.body.blockedByIssueIds),
+          blockersChanged: issue.changes?.blockedByIssueIds !== undefined,
           executionPolicyChanged: req.body.executionPolicy !== undefined,
           monitorChanged,
           resumeRequested: resumeRequested === true,
@@ -15756,6 +15720,7 @@ export function issueRoutes(
           entityId: issue.id,
           details: {
             ...updateFields,
+            ...(issue.blockedByIssueIds !== undefined ? { blockedByIssueIds: issue.blockedByIssueIds } : {}),
             identifier: issue.identifier,
             authorizationReason: issueMutationAuthorizationReason,
             changes: issueChanges,
@@ -15841,11 +15806,9 @@ export function issueRoutes(
 
       if (Array.isArray(req.body.blockedByIssueIds)) {
         const previousBlockedByIds = new Set(
-          (existingRelations?.blockedBy ?? []).map((relation) => relation.id),
+          (issue.previousRelations?.blockedBy ?? []).map(row => row.id),
         );
-        const nextBlockedByIds = new Set(
-          req.body.blockedByIssueIds as string[],
-        );
+        const nextBlockedByIds = new Set(issue.blockedByIssueIds ?? []);
         const addedBlockedByIssueIds = [...nextBlockedByIds].filter(
           (candidate) => !previousBlockedByIds.has(candidate),
         );
@@ -15853,7 +15816,7 @@ export function issueRoutes(
           (candidate) => !nextBlockedByIds.has(candidate),
         );
         const nextBlockedByRelations = updatedRelations?.blockedBy ?? [];
-        const previousBlockedByRelations = existingRelations?.blockedBy ?? [];
+        const previousBlockedByRelations = issue.previousRelations?.blockedBy ?? [];
         if (
           addedBlockedByIssueIds.length > 0 ||
           removedBlockedByIssueIds.length > 0
@@ -15870,7 +15833,7 @@ export function issueRoutes(
             entityId: issue.id,
             details: {
               identifier: issue.identifier,
-              blockedByIssueIds: req.body.blockedByIssueIds,
+              blockedByIssueIds: issue.blockedByIssueIds ?? [],
               addedBlockedByIssueIds,
               removedBlockedByIssueIds,
               blockedByIssues: nextBlockedByRelations.map(
@@ -16546,7 +16509,7 @@ export function issueRoutes(
           nextStatus: issue.status,
           previousAssigneeAgentId: existing.assigneeAgentId ?? null,
           nextAssigneeAgentId: issue.assigneeAgentId ?? null,
-          blockerSetEdited: Array.isArray(req.body.blockedByIssueIds),
+          blockerSetEdited: issue.changes?.blockedByIssueIds !== undefined,
           actorType: actor.actorType,
           actorAgentId: actor.agentId ?? null,
         });

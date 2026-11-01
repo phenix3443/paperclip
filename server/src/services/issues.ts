@@ -2083,6 +2083,11 @@ type IssueRelationSummaryMap = {
   blocks: IssueRelationIssueSummary[];
 };
 
+type PublicIssueUpdateRead = {
+  readCondition: SQL<boolean> | undefined;
+  requireUnresolvedBlocker?: boolean;
+};
+
 type ReadableIssueRelationOptions = {
   readCondition: SQL<boolean> | undefined;
   enrich?: (relations: IssueRelationSummaryMap) => Promise<IssueRelationSummaryMap>;
@@ -11504,7 +11509,7 @@ export function issueService(db: Db) {
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
       postCommitActions?: IssuePostCommitAction[],
-      options: { bindRuntimeSharedWorkspace?: boolean; publicRead?: { readCondition: SQL<boolean> | undefined } } = {},
+      options: { bindRuntimeSharedWorkspace?: boolean; publicRead?: PublicIssueUpdateRead } = {},
     ) => {
       const ownedActivityPublications: ActivityPublication[] = [];
       const activityPublications =
@@ -11935,6 +11940,10 @@ export function issueService(db: Db) {
             { ...readProof, existingIds: new Set(currentIds) }, blockedByIssueIds);
           knownBlockers = new Map((previousRelationSummaries.get(id)?.blockedBy ?? []).map(row => [row.id, row]));
           for (const [id, row] of requestedRows) knownBlockers.set(id, row);
+        }
+        if (options.publicRead?.requireUnresolvedBlocker &&
+          ![...knownBlockers?.values() ?? []].some(row => row.status !== "done" && row.status !== "cancelled")) {
+          throw unprocessable("Entering blocked requires unresolved blockers, a pending interaction/approval, or unblockDescriptor");
         }
         if (readProof) await validateProgress(tx, readProof.readableIds, knownBlockers);
 
@@ -12415,12 +12424,30 @@ export function issueService(db: Db) {
           });
           activityPublications.push(publication);
         }
-        return {
+        const receipt = {
           ...enriched,
           ...(nextBlockedByIssueIds !== undefined
             ? { blockedByIssueIds: nextBlockedByIssueIds }
             : {}),
           changes,
+        };
+        const publicChanges = { ...changes };
+        if (readProof && changes.blockedByIssueIds) {
+          const change = changes.blockedByIssueIds;
+          publicChanges.blockedByIssueIds = {
+            from: (change.from as string[]).filter(id => readProof.readableIds.has(id)),
+            to: (change.to as string[]).filter(id => readProof.readableIds.has(id)),
+          };
+        }
+        return {
+          ...receipt,
+          ...(readProof ? { previousRelations: previousRelationSummaries.get(id), publicReceipt: {
+            ...receipt,
+            ...(nextBlockedByIssueIds !== undefined ? {
+              blockedByIssueIds: nextBlockedByIssueIds.filter(id => readProof.readableIds.has(id)),
+            } : {}),
+            changes: publicChanges,
+          } } : {}),
         };
       };
 
@@ -14598,7 +14625,7 @@ export function issueService(db: Db) {
     updateReadable: (
       id: string,
       data: Parameters<typeof service.update>[1],
-      publicRead: { readCondition: SQL<boolean> | undefined },
+      publicRead: PublicIssueUpdateRead,
       dbOrTx?: any,
       postCommitActivityPublications?: ActivityPublication[],
       postCommitActions?: IssuePostCommitAction[],

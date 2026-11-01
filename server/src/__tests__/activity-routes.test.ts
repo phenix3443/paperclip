@@ -3,8 +3,8 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockActivityService = vi.hoisted(() => ({
-  list: vi.fn(),
-  forIssue: vi.fn(),
+  listReadable: vi.fn(),
+  forIssueReadable: vi.fn(),
   inputFactsForIssue: vi.fn(),
   runsForIssue: vi.fn(),
   issuesForRun: vi.fn(),
@@ -142,14 +142,14 @@ describe("activity routes", () => {
       id: "issue-1", companyId: "company-1", projectId: null, parentId: null,
       assigneeAgentId: "agent-1", assigneeUserId: null, status: "done",
     });
-    mockActivityService.forIssue.mockResolvedValue([{ action: "issue.recovery_action_resolved", actorType: "system" }]);
+    mockActivityService.forIssueReadable.mockResolvedValue([{ action: "issue.recovery_action_resolved", actorType: "system" }]);
     const app = await createApp({ type: "agent", companyId: "company-1", agentId: "agent-1" });
     const res = await requestApp(app, baseUrl => request(baseUrl).get("/api/issues/TEST-1/activity"));
     expect(res.status).toBe(200);
     expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
       action: "issue:read", resource: expect.objectContaining({ companyId: "company-1", issueId: "issue-1" }),
     }));
-    expect(mockActivityService.forIssue).toHaveBeenCalledWith("issue-1");
+    expect(mockActivityService.forIssueReadable).toHaveBeenCalledWith("issue-1", expect.anything(), undefined);
     expect(res.body).toEqual([{ action: "issue.recovery_action_resolved", actorType: "system" }]);
   });
 
@@ -177,7 +177,7 @@ describe("activity routes", () => {
     const app = await createApp({ type: "agent", companyId: "company-1", agentId: "agent-1" });
     const res = await requestApp(app, baseUrl => request(baseUrl).get("/api/issues/issue-1/activity"));
     expect(res.status).toBe(kind === "company" ? 404 : 403);
-    expect(mockActivityService.forIssue).not.toHaveBeenCalled();
+    expect(mockActivityService.forIssueReadable).not.toHaveBeenCalled();
     const inputs = await requestApp(app, baseUrl => request(baseUrl).get("/api/issues/issue-1/activity?view=comment-inputs"));
     expect(inputs.status).toBe(kind === "company" ? 404 : 403);
     expect(mockActivityService.inputFactsForIssue).not.toHaveBeenCalled();
@@ -274,13 +274,13 @@ describe("activity routes", () => {
   });
 
   it("limits company activity lists by default", async () => {
-    mockActivityService.list.mockResolvedValue([]);
+    mockActivityService.listReadable.mockResolvedValue([]);
 
     const app = await createApp();
     const res = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/companies/company-1/activity"));
 
     expect(res.status).toBe(200);
-    expect(mockActivityService.list).toHaveBeenCalledWith({
+    expect(mockActivityService.listReadable).toHaveBeenCalledWith({
       companyId: "company-1",
       agentId: undefined,
       entityType: undefined,
@@ -292,7 +292,7 @@ describe("activity routes", () => {
   });
 
   it("caps requested company activity list limits", async () => {
-    mockActivityService.list.mockResolvedValue([]);
+    mockActivityService.listReadable.mockResolvedValue([]);
 
     const app = await createApp();
     const res = await requestApp(app, (baseUrl) =>
@@ -300,7 +300,7 @@ describe("activity routes", () => {
     );
 
     expect(res.status).toBe(200);
-    expect(mockActivityService.list).toHaveBeenCalledWith({
+    expect(mockActivityService.listReadable).toHaveBeenCalledWith({
       companyId: "company-1",
       agentId: undefined,
       entityType: "issue",

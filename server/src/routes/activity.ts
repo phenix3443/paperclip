@@ -240,7 +240,7 @@ export function activityRoutes(db: Db) {
       readCondition: await issueReadSqlCondition(db, req.actor),
       caseReadCondition: await caseActivityReadSqlCondition(db, req.actor),
     };
-    const result = await svc.list(filters);
+    const result = await svc.listReadable(filters);
     res.json(result);
   });
 
@@ -363,7 +363,9 @@ export function activityRoutes(db: Db) {
       res.json(await svc.inputFactsForIssue(issue.companyId, issue.id, parsed.data));
       return;
     }
-    const result = await (req.query.view === "recent" ? svc.forIssue(issue.id, 50) : svc.forIssue(issue.id));
+    const readCondition = await issueReadSqlCondition(db, req.actor.isInstanceAdmin === false
+      ? { ...req.actor, ignoreInstanceAdmin: true } : req.actor);
+    const result = await svc.forIssueReadable(issue.id, readCondition, req.query.view === "recent" ? 50 : undefined);
     res.json(result);
   });
 

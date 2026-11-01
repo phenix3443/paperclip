@@ -49,6 +49,7 @@ function agentActor(companyId: string, agentId: string): Express.Request["actor"
 async function createApp(db: Db, actor: Express.Request["actor"]) {
   const { issueRoutes } = await import("../routes/issues.js");
   const { projectRoutes } = await import("../routes/projects.js");
+  const { activityRoutes } = await import("../routes/activity.js");
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -57,6 +58,7 @@ async function createApp(db: Db, actor: Express.Request["actor"]) {
   });
   app.use("/api", issueRoutes(db, {} as any));
   app.use("/api", projectRoutes(db));
+  app.use("/api", activityRoutes(db));
   app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     res.status(err.status ?? 500).json({ error: err.message ?? "Internal server error" });
   });
@@ -213,6 +215,102 @@ describeEmbeddedPostgres("issue access grant and locked edge routes", { concurre
       openIssue,
     };
   }
+
+  it("replaces only readable blockers and does not expose the retained hidden edge in PATCH receipts", async () => {
+    const fixture = await seedFixture();
+    await db.insert(issueRelations).values({
+      companyId: fixture.companyId,
+      issueId: fixture.privateIssueId,
+      relatedIssueId: fixture.openIssue.id,
+      type: "blocks",
+    });
+    const app = await createApp(db, boardActor(fixture.companyId, fixture.memberId));
+    const response = await request(app).patch(`/api/issues/${fixture.openIssue.id}`)
+      .send({ blockedByIssueIds: [], title: "Public replacement" });
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    const { issueService } = await import("../services/issues.js");
+    expect((await issueService(db).getRelationSummaries(fixture.openIssue.id)).blockedBy.map(row => row.id))
+      .toEqual([fixture.privateIssueId]);
+    expect(response.body.blockedByIssueIds).toEqual([]);
+    expect(response.body.blockedBy).toEqual([]);
+    expect(response.body.changes).toMatchObject({ title: { from: "Open issue", to: "Public replacement" } });
+    for (const secret of [fixture.privateIssueId, "PRV-1", "Secret launch task"]) {
+      expect(JSON.stringify(response.body)).not.toContain(secret);
+    }
+  }, 20_000);
+
+  it("uses retained hidden blockers when validating entry into blocked", async () => {
+    const fixture = await seedFixture();
+    await db.insert(issueRelations).values({
+      companyId: fixture.companyId,
+      issueId: fixture.privateIssueId,
+      relatedIssueId: fixture.openIssue.id,
+      type: "blocks",
+    });
+    const app = await createApp(db, boardActor(fixture.companyId, fixture.memberId));
+    const response = await request(app).patch(`/api/issues/${fixture.openIssue.id}`)
+      .send({ status: "blocked", blockedByIssueIds: [] });
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(response.body.status).toBe("blocked");
+    expect(response.body.blockedByIssueIds).toEqual([]);
+    expect(JSON.stringify(response.body)).not.toContain(fixture.privateIssueId);
+  }, 20_000);
+
+  it("projects blocker audit references for the current reader while preserving internal facts", async () => {
+    const fixture = await seedFixture();
+    await db.insert(issueRelations).values({
+      companyId: fixture.companyId, issueId: fixture.privateIssueId,
+      relatedIssueId: fixture.openIssue.id, type: "blocks",
+    });
+    const [readableBlocker] = await db.insert(issues).values({
+      companyId: fixture.companyId, title: "Readable dependency", status: "todo", identifier: "PRV-3",
+    }).returning();
+    await db.insert(issueRelations).values({
+      companyId: fixture.companyId, issueId: readableBlocker!.id,
+      relatedIssueId: fixture.openIssue.id, type: "blocks",
+    });
+    const app = await createApp(db, boardActor(fixture.companyId, fixture.memberId));
+    await request(app).patch(`/api/issues/${fixture.openIssue.id}`)
+      .send({ blockedByIssueIds: [] }).expect(200);
+    const { activityService } = await import("../services/activity.js");
+    const facts = await activityService(db).forIssue(fixture.openIssue.id);
+    expect(facts.find(row => row.action === "issue.updated")?.details)
+      .toMatchObject({ blockedByIssueIds: [fixture.privateIssueId] });
+    expect(facts.find(row => row.action === "issue.blockers_updated")?.details)
+      .toMatchObject({ blockedByIssueIds: [fixture.privateIssueId], removedBlockedByIssueIds: [readableBlocker!.id] });
+    for (const path of [
+      `/api/issues/${fixture.openIssue.id}/activity`,
+      `/api/companies/${fixture.companyId}/activity?entityId=${fixture.openIssue.id}`,
+    ]) {
+      const response = await request(app).get(path).expect(200);
+      expect(response.body.some((row: { action: string }) => row.action === "issue.updated")).toBe(true);
+      expect(JSON.stringify(response.body)).not.toContain(fixture.privateIssueId);
+      expect(JSON.stringify(response.body)).toContain(readableBlocker!.id);
+    }
+    await db.insert(issueAccessGrants).values({
+      issueId: fixture.privateIssueId, subjectType: "user", subjectId: fixture.memberId, source: "explicit",
+    });
+    const granted = await request(app).get(`/api/issues/${fixture.openIssue.id}/activity`).expect(200);
+    expect(granted.body.find((row: { action: string }) => row.action === "issue.updated").details.blockedByIssueIds)
+      .toEqual([fixture.privateIssueId]);
+  }, 20_000);
+
+  it("rolls back other fields when retained hidden blockers prevent starting work", async () => {
+    const fixture = await seedFixture();
+    await db.insert(issueRelations).values({ companyId: fixture.companyId,
+      issueId: fixture.privateIssueId, relatedIssueId: fixture.openIssue.id, type: "blocks" });
+    const app = await createApp(db, boardActor(fixture.companyId, fixture.memberId));
+    const rejected = await request(app).patch(`/api/issues/${fixture.openIssue.id}`)
+      .send({ status: "in_progress", assigneeUserId: fixture.memberId,
+        blockedByIssueIds: [], title: "Must roll back" });
+    expect(rejected.status, JSON.stringify(rejected.body)).toBe(422);
+    expect(JSON.stringify(rejected.body)).not.toContain(fixture.privateIssueId);
+    const { issueService } = await import("../services/issues.js");
+    const svc = issueService(db);
+    expect(await svc.getById(fixture.openIssue.id)).toMatchObject({ title: "Open issue", status: "todo", assigneeUserId: null });
+    expect((await svc.getRelationSummaries(fixture.openIssue.id)).blockedBy.map(row => row.id))
+      .toEqual([fixture.privateIssueId]);
+  }, 20_000);
 
   it("requires explicit owner/admin break-glass and records both audit evidence and an owner-visible notice", async () => {
     const fixture = await seedFixture();

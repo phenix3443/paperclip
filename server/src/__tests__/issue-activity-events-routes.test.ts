@@ -1,7 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { getTableName } from "drizzle-orm";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { buildIssueChanges } from "../services/issue-change-receipt.ts";
 import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.ts";
 
@@ -54,6 +54,21 @@ const mockRunnerGoalService = vi.hoisted(() => ({
   act: vi.fn(),
 }));
 
+function readableMockIssueService() {
+  return ({
+      ...mockIssueService,
+      updateReadable: async (id: string, patch: Record<string, unknown>, _read: unknown, ...args: unknown[]) => {
+        const previousRelations = await mockIssueService.getRelationSummaries(id);
+        const receipt = await mockIssueService.update(id, patch, ...args);
+        return receipt ? { ...receipt, previousRelations, publicReceipt: receipt } : receipt;
+      },
+      getReadableRelationSummaries: async (id: string, options: { enrich?: (relations: unknown) => Promise<unknown> }) => {
+        const relations = await mockIssueService.getRelationSummaries(id);
+        return options.enrich ? options.enrich(relations) : relations;
+      },
+    });
+}
+
 function registerModuleMocks() {
   vi.doMock("../services/access.js", () => ({
     accessService: () => mockAccessService,
@@ -76,7 +91,7 @@ function registerModuleMocks() {
   }));
 
   vi.doMock("../services/issues.js", () => ({
-    issueService: () => mockIssueService,
+    issueService: readableMockIssueService,
   }));
 
   vi.doMock("../services/routines.js", () => ({
@@ -131,7 +146,7 @@ function registerModuleMocks() {
       expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
       expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
     }),
-    issueService: () => mockIssueService,
+    issueService: readableMockIssueService,
     logActivity: mockLogActivity,
     projectService: () => ({}),
     routineService: () => mockRoutineService,
@@ -210,6 +225,11 @@ function issueUpdateWithReceipt(issue: ReturnType<typeof makeIssue>, patch: Reco
     changes: buildIssueChanges(issue, updated),
   };
 }
+
+beforeAll(async () => {
+  registerModuleMocks();
+  await import("../routes/issues.js");
+}, 120_000);
 
 describe("issue activity event routes", () => {
   beforeEach(() => {
@@ -311,7 +331,7 @@ describe("issue activity event routes", () => {
     const setResponse = await request(await createApp())
       .patch(`/api/issues/${issue.id}`)
       .send({ blockedByIssueIds: [blockerId] });
-    expect(setResponse.status).toBe(200);
+    expect(setResponse.status, JSON.stringify(setResponse.body)).toBe(200);
     expect(setResponse.body).toMatchObject({
       blockedByIssueIds: [blockerId],
       blockedBy: [{ id: blockerId }],

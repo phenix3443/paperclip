@@ -194,11 +194,11 @@ Gaps: Detailed delegation and governed review handoffs remain [task coordination
 
 ### `set-dependencies`
 
-API: `present` — PATCH /api/issues/{id} blockedByIssueIds replaces whole set.
+API: `present` — PATCH /api/issues/{id} blockedByIssueIds replaces the readable blocker set; internal raw updates still replace the whole set.
 
 Agent access: `partial` — native set_dependencies CURRENT task/standard mode/key+array; REST/call_api arbitrary permitted target; CLI update lacks blocker-set flag.
 
-Policy: Task mutation and valid same-company, nonself/noncycle dependencies. Preserve existing blockers explicitly when replacing. Native Muse additionally checks blocker read. Eligible continuation retains pause/budget/responsible-user/finalization authority.
+Policy: Task mutation and valid same-company, nonself/noncycle dependencies. Public replacement retains current unreadable blockers under the task lock; empty arrays clear only readable blockers. Relation responses omit unreadable edges, and reading a task does not grant dependency mutation authority. Native Muse additionally checks blocker read. Eligible continuation retains pause/budget/responsible-user/finalization authority.
 
 Evidence: `source-only` — reviewed at `3bbc2104b65caf9f7763938a01260a5673e12f7a`; [issues.ts](../../server/src/routes/issues.ts), [issues.ts](../../server/src/services/issues.ts), [paperclip-runner-tool-authority.ts](../../server/src/services/native-runtime/paperclip-runner-tool-authority.ts), [issue-dependency-wakeups-routes.test.ts](../../server/src/__tests__/issue-dependency-wakeups-routes.test.ts), [issue-dependency-restore-wake-policy.test.ts](../../server/src/__tests__/issue-dependency-restore-wake-policy.test.ts). No live execution claimed.
 
@@ -268,7 +268,7 @@ Evidence: `source-only` — reviewed at `3bbc2104b65caf9f7763938a01260a5673e12f7
 
 Verification: `not-run` — Read multipage history and exact comment, reload same content; reject inaccessible task, foreign/mismatched comment and inspect trust redaction. Request native limit 200 and confirm at most 100 comments.
 
-The same authorized activity route supports `view=comment-inputs&commentIds=<comma-separated UUIDs>` for original comment/steering facts. Each request accepts at most 100 comment IDs and returns at most two facts per comment, scoped to the accessible issue and company. This preserves delivered-input state when its receipt is older than the recent activity window.
+The same authorized activity route supports `view=comment-inputs&commentIds=<comma-separated UUIDs>` for original comment/steering facts. Each request accepts at most 100 comment IDs and returns at most two facts per comment, scoped to the accessible issue and company. This preserves delivered-input state when its receipt is older than the recent activity window. Ordinary issue/company activity reads project blocker references against the current reader; stored facts and internal activity reads remain complete.
 
 Gaps: Native bounded history is not an arbitrary-task/paginated API substitute. The new UI preview route has no dedicated native tool or CLI command. Existing full comment reads remain available.
 
