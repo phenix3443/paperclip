@@ -1,3 +1,4 @@
+import { readExecutionWorkspaceLifecycleGeneration, metadataHasReopenPendingConsumption } from "./execution-workspace-lifecycle-state.js";
 import { executionWorkspaces, heartbeatRuns, issues, workspaceRuntimeServices, type Db } from "@paperclipai/db";
 import { and, eq, sql } from "drizzle-orm";
 import { preserveDetachedRepositories } from "./detached-repository-custody.js";
@@ -18,12 +19,11 @@ async function assertRetentionMayMove(tx: Transaction, input: ProjectRepositoryR
     eq(executionWorkspaces.companyId, input.companyId), eq(executionWorkspaces.id, input.executionWorkspaceId),
   ));
   const metadata = workspace?.metadata as Record<string, unknown> | null;
-  const rawGeneration = metadata?.lifecycleGeneration;
-  const generation = typeof rawGeneration === "number" && Number.isInteger(rawGeneration) && rawGeneration >= 0 ? rawGeneration : 0;
+  const generation = readExecutionWorkspaceLifecycleGeneration(metadata);
   if (!workspace || workspace.sourceIssueId !== input.sourceIssueId || workspace.cwd !== cwd
     || (workspace.providerRef && workspace.providerRef !== cwd)
     || !["active", "idle", "in_review"].includes(workspace.status) || workspace.closedAt
-    || metadata?.reopenPendingConsumption === true || generation !== input.generation) throw new Error("Workspace retention lifecycle changed");
+    || metadataHasReopenPendingConsumption(metadata) || generation !== input.generation) throw new Error("Workspace retention lifecycle changed");
   const rows = await tx.execute<{ allowed: boolean }>(sql`
     WITH RECURSIVE issue_tree(id) AS (
       SELECT root.id FROM ${issues} root WHERE root.company_id = ${input.companyId} AND root.id = ${workspace.sourceIssueId}

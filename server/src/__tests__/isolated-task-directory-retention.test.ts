@@ -80,6 +80,15 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
     await db.$client.end({ timeout: 1 }); await database.cleanup(); await fs.rm(root, { recursive: true, force: true });
   });
 
+  it.each(["refused", "legacy"])("refuses expiration of %s content before removal", async kind => {
+    const f = await fixture();
+    const directory = path.join(f.cwd, kind === "refused" ? ".paperclip-repositories" : ".paperclip-runtime/detached-repositories");
+    await fs.mkdir(path.join(directory, "kept"), { recursive: true }); await fs.writeFile(path.join(directory, "kept", "unique"), "legacy bytes");
+    const beforeDelete = vi.fn(async () => {});
+    expect(await f.expire({ beforeDelete })).toMatchObject({ expired: false, skipReason: "detached_repository_retention" });
+    expect(beforeDelete).not.toHaveBeenCalled(); expect(await fs.readFile(path.join(directory, "kept", "unique"), "utf8")).toBe("legacy bytes");
+  });
+
   it.each(receiptCases)("refuses retention history before removal hook (%s)", async state => {
     const f = await fixture();
     const retained = await retainedFixture(db, { id: f.workspaceId, companyId: f.companyId, sourceIssueId: f.issueId, cwd: f.cwd }, state);
@@ -147,7 +156,7 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
     return { companyId, issueId, workspaceId, agentId, cwd, row, ledger, service, expire, reopen };
   }
 
-  it.each(["running_before", "issue_column_before", "queued_during", "archive_first", "move_first", "two_preparations"])("serializes detached retention with native consumers (%s)", async scenario => {
+  it.each(["running_before", "issue_column_before", "queued_during", "archive_first", "generation_before", "reopen_pending", "live_service", "move_first", "two_preparations"])("serializes detached retention with native consumers (%s)", async scenario => {
     const f = await fixture();
     const source = path.join(f.cwd, ".paperclip-repositories", "removed"); await fs.mkdir(source, { recursive: true });
     await fs.writeFile(path.join(source, "unique"), "keep");
@@ -157,6 +166,11 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
     if (scenario === "issue_column_before") await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.agentId,
       issueId: f.issueId, status: "running" });
     if (scenario === "archive_first") await f.service().archiveWorkspaceUnderLifecycleLock({ id: f.workspaceId, closedAt: new Date(), patch: { status: "archived" } });
+    if (scenario === "generation_before" || scenario === "reopen_pending") await db.update(executionWorkspaces).set({ metadata: {
+      ...(await f.row()).metadata, ...(scenario === "generation_before" ? { lifecycleGeneration: 1 } : { reopenPendingConsumption: true }) } })
+      .where(eq(executionWorkspaces.id, f.workspaceId));
+    if (scenario === "live_service") await db.insert(workspaceRuntimeServices).values({ id: randomUUID(), companyId: f.companyId,
+      scopeType: "execution_workspace", serviceName: "web", status: "running", lifecycle: "shared", provider: "local_process", executionWorkspaceId: f.workspaceId, cwd: f.cwd });
     let entered!: () => void, release!: () => void;
     const waiting = new Promise<void>(resolve => { entered = resolve; });
     const barrier = new Promise<void>(resolve => { release = resolve; });
@@ -178,13 +192,19 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
         pg_try_advisory_xact_lock(hashtextextended(${`isolated_repository_source:${f.companyId}:${f.issueId}`}, 0)) AS source_locked,
         pg_try_advisory_xact_lock(hashtextextended(${`execution_workspace_lifecycle:${f.workspaceId}`}, 0)) AS lifecycle_locked`); });
       expect(locks[0]).toEqual({ source_locked: false, lifecycle_locked: false });
-      const second = scenario === "two_preparations" ? prepare(false) : f.service().archiveWorkspaceUnderLifecycleLock({ id: f.workspaceId,
-        closedAt: new Date(), patch: { status: "archived" } });
+      const second = scenario === "two_preparations" ? prepare(false) : (async () => {
+        const archived = await f.service().archiveWorkspaceUnderLifecycleLock({ id: f.workspaceId, closedAt: new Date(), patch: { status: "archived" } });
+        if (archived?.outcome !== "archived") throw new Error("not archived");
+        const destroy = vi.fn(async () => { await fs.rm(f.cwd, { recursive: true, force: true }); });
+        await expect(f.service().fenceClosedWorkspaceDestruction({ workspaceId: f.workspaceId, capturedGeneration: archived.capturedGeneration, destroy }))
+          .rejects.toThrow("detached_repository_retention");
+        expect(destroy).not.toHaveBeenCalled();
+      })();
       release(); await first; await second;
     } else await prepare(false);
     const directory = resolveDetachedRepositoryRetentionDir({ companyId: f.companyId, executionWorkspaceId: f.workspaceId });
     const files = (await fs.readdir(directory)).filter(name => name.endsWith(".json"));
-    if (["running_before", "issue_column_before", "archive_first"].includes(scenario)) { expect(files).toEqual([]); expect(await fs.readFile(path.join(source, "unique"), "utf8")).toBe("keep"); }
+    if (["running_before", "issue_column_before", "archive_first", "generation_before", "reopen_pending", "live_service"].includes(scenario)) { expect(files).toEqual([]); expect(await fs.readFile(path.join(source, "unique"), "utf8")).toBe("keep"); }
     else {
       expect(files).toHaveLength(1);
       const receipt = JSON.parse(await fs.readFile(path.join(directory, files[0]!), "utf8"));

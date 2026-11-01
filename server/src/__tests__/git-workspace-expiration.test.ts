@@ -1,3 +1,5 @@
+import * as projectPreparation from "../services/heartbeat/workspaces.js";
+import * as lifecycleLocks from "../services/execution-workspace-lifecycle-lock.js";
 import { withIsolatedRepositorySourceLock } from "../services/isolated-remote-workspace-source.js";
 import { withExecutionWorkspaceLifecycleLock } from "../services/execution-workspace-lifecycle-lock.js";
 import { resolveDetachedRepositoryRetentionDir } from "../home-paths.js";
@@ -58,6 +60,15 @@ describeEmbeddedPostgres("reconstructable Git expiration", () => {
     if (previousHome === undefined) delete process.env.PAPERCLIP_HOME; else process.env.PAPERCLIP_HOME = previousHome;
     if (previousInstance === undefined) delete process.env.PAPERCLIP_INSTANCE_ID; else process.env.PAPERCLIP_INSTANCE_ID = previousInstance;
     await db.$client.end({ timeout: 1 }); await database?.cleanup(); await fs.rm(root, { recursive: true, force: true });
+  });
+
+  it.each(["refused", "legacy"])("refuses expiration of %s content before removal", async kind => {
+    const f = await fixture();
+    const directory = path.join(f.cwd, kind === "refused" ? ".paperclip-repositories" : ".paperclip-runtime/detached-repositories");
+    await fs.mkdir(path.join(directory, "kept"), { recursive: true }); await fs.writeFile(path.join(directory, "kept", "unique"), "legacy bytes");
+    const beforeDelete = vi.fn(async () => {});
+    expect(await f.expire({ beforeDelete })).toMatchObject({ expired: false, skipReason: "detached_repository_retention" });
+    expect(beforeDelete).not.toHaveBeenCalled(); expect(await fs.readFile(path.join(directory, "kept", "unique"), "utf8")).toBe("legacy bytes");
   });
 
   it.each(receiptCases)("refuses retention history before removal hook (%s)", async state => {
@@ -220,6 +231,64 @@ describeEmbeddedPostgres("reconstructable Git expiration", () => {
       sharedBase: resolveManagedProjectWorkspaceDir({ companyId: f.companyId, projectId: f.projectId!, repoName: "nested" }) };
   }
 
+  it("returns active preparations when a detached entry cannot cross devices", async () => {
+    const f = await nestedFixture();
+    const removed = path.join(f.cwd, ".paperclip-repositories", "removed"); git(f.cwd, "clone", "-q", f.nestedRemote, removed);
+    await fs.writeFile(path.join(removed, "private"), "keep");
+    const rename = fs.rename.bind(fs), warning = vi.fn(async () => {});
+    vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      if (String(from) === removed) throw Object.assign(new Error("EXDEV"), { code: "EXDEV" });
+      return rename(from, to);
+    });
+    expect(await withIsolatedRepositorySourceLock(db, f.companyId, f.issueId, () => prepareProjectRepositoryWorkspaces({ ...f.preparation,
+      onRetentionWarning: warning, retention: { companyId: f.companyId, executionWorkspaceId: f.workspaceId, sourceIssueId: f.issueId,
+        runId: null, generation: 0, withLifecycleLock: work => withExecutionWorkspaceLifecycleLock(db, f.workspaceId, work) } })))
+      .toEqual([f.nested]);
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining("EXDEV"));
+    expect(await fs.readFile(path.join(removed, "private"), "utf8")).toBe("keep");
+    const directory = resolveDetachedRepositoryRetentionDir({ companyId: f.companyId, executionWorkspaceId: f.workspaceId });
+    const [name] = (await fs.readdir(directory)).filter(name => name.endsWith(".json"));
+    const receipt = JSON.parse(await fs.readFile(path.join(directory, name!), "utf8")); expect(receipt.state).toBe("aborted");
+    expect(await exists(receipt.destination)).toBe(false);
+  });
+
+  it("keeps preparation successful when warning recording fails", async () => {
+    const f = await nestedFixture();
+    const removed = path.join(f.cwd, ".paperclip-repositories", "removed");
+    await fs.mkdir(removed); await fs.writeFile(path.join(removed, "private"), "keep");
+    expect(await prepareProjectRepositoryWorkspaces({ ...f.preparation, onRetentionWarning: async () => { throw new Error("run log unavailable"); } }))
+      .toEqual([f.nested]);
+    expect(await fs.readFile(path.join(removed, "private"), "utf8")).toBe("keep");
+  });
+
+  it("keeps active repository bytes, excludes and local settings unchanged during retention", async () => {
+    const f = await nestedFixture();
+    const removed = path.join(f.cwd, ".paperclip-repositories", "removed"); git(f.cwd, "clone", "-q", f.nestedRemote, removed);
+    await fs.writeFile(path.join(removed, "private"), "removed bytes");
+    async function inventory(directory: string): Promise<Record<string, string>> {
+      const found: Record<string, string> = {};
+      async function walk(relative: string) {
+        const target = path.join(directory, relative), stat = await fs.lstat(target);
+        if (stat.isSymbolicLink()) found[relative] = `link:${await fs.readlink(target)}`;
+        else if (stat.isDirectory()) for (const child of (await fs.readdir(target)).sort()) await walk(path.join(relative, child));
+        else found[relative] = `${stat.mode}:${(await fs.readFile(target)).toString("base64")}`;
+      }
+      await walk(""); return found;
+    }
+    const active = await inventory(f.nested.cwd);
+    const exclude = path.resolve(f.cwd, git(f.cwd, "rev-parse", "--git-path", "info/exclude"));
+    const excluded = await fs.readFile(exclude), local = await fs.readFile(f.settingsPath);
+    const prepared = await withIsolatedRepositorySourceLock(db, f.companyId, f.issueId, () => prepareProjectRepositoryWorkspaces({ ...f.preparation,
+      retention: { companyId: f.companyId, executionWorkspaceId: f.workspaceId, sourceIssueId: f.issueId, runId: null, generation: 0,
+        withLifecycleLock: work => withExecutionWorkspaceLifecycleLock(db, f.workspaceId, work) } }));
+    expect(prepared).toEqual([f.nested]); expect(await inventory(f.nested.cwd)).toEqual(active);
+    expect(await fs.readFile(exclude)).toEqual(excluded); expect(await fs.readFile(f.settingsPath)).toEqual(local);
+    const directory = resolveDetachedRepositoryRetentionDir({ companyId: f.companyId, executionWorkspaceId: f.workspaceId });
+    const [file] = (await fs.readdir(directory)).filter(name => name.endsWith(".json"));
+    const receipt = JSON.parse(await fs.readFile(path.join(directory, file!), "utf8")); expect(receipt.state).toBe("retained");
+    expect(await fs.readFile(path.join(receipt.destination, "private"), "utf8")).toBe("removed bytes");
+  });
+
   it("expires a nested workspace and its unused private base with the generated ignore entry", async () => {
     const f = await nestedFixture(false);
     await f.advance();
@@ -273,6 +342,46 @@ describeEmbeddedPostgres("reconstructable Git expiration", () => {
       expect(await fs.readFile(f.nestedSettingsPath)).toEqual(f.settings);
       vi.unstubAllEnvs();
     });
+
+    it("retains removed content during reopen in the existing source/lifecycle transaction", async () => {
+      vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", "31".repeat(32));
+      const f = await nestedFixture(false);
+      await unpushedNestedWork(f.nested.cwd);
+      expect(await f.expire({ expireBase: false, restorePoint: restorePoint() })).toMatchObject({ expired: true, restorePoint: true });
+      const [stored] = await ledger(f.workspaceId); await markGitRestorePointExpired(db, stored!);
+      await fs.rm(f.nested.cwd, { recursive: true, force: true });
+      const originalPrepare = projectPreparation.prepareProjectRepositoryWorkspaces;
+      const pids: number[] = [];
+      const nestedLockSession = vi.spyOn(lifecycleLocks, "withExecutionWorkspaceLifecycleLock");
+      const preparation = vi.spyOn(projectPreparation, "prepareProjectRepositoryWorkspaces").mockImplementation(async input => {
+        if (!input.retention) return originalPrepare(input);
+        const source = path.join(input.cwd, ".paperclip-repositories", "removed-on-reopen");
+        await fs.mkdir(source, { recursive: true }); await fs.writeFile(path.join(source, "private"), "reopen bytes");
+        const retention = input.retention;
+        return originalPrepare({ ...input, retention: { ...retention, withLifecycleLock: work => retention.withLifecycleLock(async tx => {
+          const pid = await tx.execute<{ pid: number }>(sql`SELECT pg_backend_pid() AS pid`); pids.push(pid[0]!.pid);
+          const [inside] = await tx.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, f.workspaceId));
+          expect(inside?.status).toBe("active"); expect((await f.row()).status).toBe("archived");
+          await db.transaction(async other => {
+            const locks = await other.execute<{ source_locked: boolean; lifecycle_locked: boolean }>(sql`SELECT
+              pg_try_advisory_xact_lock(hashtextextended(${`isolated_repository_source:${f.companyId}:${f.issueId}`}, 0)) AS source_locked,
+              pg_try_advisory_xact_lock(hashtextextended(${`execution_workspace_lifecycle:${f.workspaceId}`}, 0)) AS lifecycle_locked`);
+            expect(locks[0]).toEqual({ source_locked: false, lifecycle_locked: false });
+          });
+          return work(tx);
+        }) } });
+      });
+      try {
+        expect(await f.reopen()).toMatchObject({ ok: true, reopened: true });
+        expect(preparation).toHaveBeenCalledTimes(1); expect(pids.length).toBeGreaterThan(0); expect(new Set(pids).size).toBe(1);
+        expect(nestedLockSession).not.toHaveBeenCalled();
+        const directory = resolveDetachedRepositoryRetentionDir({ companyId: f.companyId, executionWorkspaceId: f.workspaceId });
+        const files = (await fs.readdir(directory)).filter(name => name.endsWith(".json")); expect(files).toHaveLength(1);
+        const receipt = JSON.parse(await fs.readFile(path.join(directory, files[0]!), "utf8"));
+        expect(receipt.state).toBe("retained"); expect(await fs.readFile(path.join(receipt.destination, "private"), "utf8")).toBe("reopen bytes");
+        expect((await executionWorkspaceService(db).getCloseReadiness(f.workspaceId))?.blockingReasons.join(" ")).toContain(files[0]);
+      } finally { preparation.mockRestore(); nestedLockSession.mockRestore(); vi.unstubAllEnvs(); }
+    }, 30_000);
 
     it("reopens with a fresh workspace and a warning when a nested checkout's restore point expired", async () => {
       vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", "31".repeat(32));

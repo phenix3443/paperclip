@@ -226,6 +226,7 @@ export async function preserveDetachedRepositories(input: Input): Promise<string
   if (!scope) { for (const entry of entries) warn(path.join(root, entry), "Missing native retention identity"); return warnings; }
   let directory: string;
   try {
+    if (entries.length === 0 && !await stat(resolveDetachedRepositoryRetentionDir(scope))) return warnings;
     const rootStat = await stat(root);
     if (rootStat && (!rootStat.isDirectory() || rootStat.isSymbolicLink()
       || await fs.realpath(root) !== path.join(await fs.realpath(input.cwd), ".paperclip-repositories"))) throw new Error("Unsafe repository root");

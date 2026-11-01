@@ -250,6 +250,23 @@ describeEmbeddedPostgres("terminal workspace compaction", () => {
     expect(await fs.readFile(path.join(worktreePath, "README.md"), "utf8")).toContain("uncommitted edit");
   }
 
+  it.each(["refused", "legacy"])("blocks close readiness, manual cleanup and compaction for %s content", async kind => {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "retention-local-")); tempDirs.add(home); vi.stubEnv("PAPERCLIP_HOME", home);
+    const seeded = await seedWorkspace();
+    const parent = path.join(seeded.worktreePath, kind === "refused" ? ".paperclip-repositories" : ".paperclip-runtime/detached-repositories");
+    const retained = path.join(parent, "kept"); await writeFile(path.join(retained, "unique"), "legacy bytes");
+    const beforeMove = vi.fn(async () => {}), svc = service({ beforeWorkspaceCompactionMove: beforeMove });
+    expect((await svc.getCloseReadiness(seeded.executionWorkspaceId))?.blockingReasons.join(" ")).toContain(parent);
+    expect(await svc.sweepTerminalWorkspaces()).toMatchObject({ compacted: 0 }); expect(beforeMove).not.toHaveBeenCalled();
+    await expectRegenerablePresent(seeded.worktreePath, true);
+    const archived = await svc.archiveWorkspaceUnderLifecycleLock({ id: seeded.executionWorkspaceId, closedAt: new Date(), patch: { status: "archived" } });
+    if (archived?.outcome !== "archived") throw new Error("not archived");
+    const destroy = vi.fn(async () => { await fs.rm(seeded.worktreePath, { recursive: true, force: true }); });
+    await expect(svc.fenceClosedWorkspaceDestruction({ workspaceId: seeded.executionWorkspaceId, capturedGeneration: archived.capturedGeneration, destroy }))
+      .rejects.toThrow("detached_repository_retention");
+    expect(destroy).not.toHaveBeenCalled(); expect(await fs.readFile(path.join(retained, "unique"), "utf8")).toBe("legacy bytes");
+  }, 30_000);
+
   it("refuses manual destruction when retention appears after readiness", async () => {
     const home = await fs.mkdtemp(path.join(os.tmpdir(), "retention-manual-")); tempDirs.add(home); vi.stubEnv("PAPERCLIP_HOME", home);
     const seeded = await seedWorkspace({ populate: false });

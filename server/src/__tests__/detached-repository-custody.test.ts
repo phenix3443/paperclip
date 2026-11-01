@@ -1,11 +1,28 @@
 import fs from "node:fs/promises";
+import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
 import { createInterface } from "node:readline";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { inspectDetachedRepositoryRetention } from "../services/detached-repository-retention.js";
 import { preserveDetachedRepositories, type CustodyScope } from "../services/detached-repository-custody.js";
 import { resolveDetachedRepositoryRetentionDir, resolvePaperclipInstanceRoot } from "../home-paths.js";
+
+const gitFault = vi.hoisted(() => ({ before: (_args: readonly string[]) => {} }));
+vi.mock("node:child_process", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  function execFile(command: string, args: readonly string[], options: import("node:child_process").ExecFileOptions,
+    callback: (error: Error | null, stdout: string, stderr: string) => void) {
+    try { if (command === "git") gitFault.before(args); }
+    catch (error) { callback(error instanceof Error ? error : new Error(String(error)), "", ""); return; }
+    return actual.execFile(command, [...args], { ...options, encoding: "utf8" }, callback);
+  }
+  Object.defineProperty(execFile, Symbol.for("nodejs.util.promisify.custom"), { value: (command: string, args: readonly string[], options: import("node:child_process").ExecFileOptions) =>
+    new Promise((resolve, reject) => execFile(command, args, options, (error, stdout, stderr) => error ? reject(error) : resolve({ stdout, stderr }))) });
+  return { ...actual, execFile };
+});
 
 function git(cwd: string, ...args: string[]) { return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim(); }
 describe("detached repository custody", () => {
@@ -21,7 +38,7 @@ describe("detached repository custody", () => {
     await fs.writeFile(path.join(source, "tracked"), "initial"); git(source, "add", "."); git(source, "commit", "-qm", "initial");
     scope = { companyId: "company", executionWorkspaceId: "workspace", withLifecycleLock: async work => work(async () => {}) };
   });
-  afterEach(async () => { vi.restoreAllMocks(); vi.unstubAllEnvs(); await fs.rm(root, { recursive: true, force: true }); });
+  afterEach(async () => { gitFault.before = () => {}; vi.restoreAllMocks(); vi.unstubAllEnvs(); await fs.rm(root, { recursive: true, force: true }); });
   async function receipt() {
     const directory = resolveDetachedRepositoryRetentionDir(scope);
     const names = (await fs.readdir(directory)).filter(name => name.endsWith(".json"));
@@ -104,6 +121,8 @@ describe("detached repository custody", () => {
     expect(git(base, "worktree", "list", "--porcelain")).toContain(`locked ${lock === "foreign_lock" ? "another owner" : value.lockReason}`);
   });
   it("preserves external cwd/fd writes during rename and later path writes", async () => {
+    git(cwd, "init", "-q");
+    await fs.appendFile(path.resolve(cwd, git(cwd, "rev-parse", "--git-path", "info/exclude")), "\n/.paperclip-repositories/\n");
     const child = spawn(process.execPath, ["--input-type=commonjs", "-e", String.raw`
       const fs = require("node:fs");
       const source = process.argv[1];
@@ -129,6 +148,8 @@ describe("detached repository custody", () => {
       expect(await fs.readFile(path.join(value.destination, "tracked"), "utf8")).toBe("initial-fd");
       expect(await fs.readFile(path.join(value.destination, "cwd-write"), "utf8")).toBe("cwd bytes");
       expect(await fs.readFile(path.join(source, "late-unique"), "utf8")).toBe("late bytes");
+      expect(git(cwd, "status", "--porcelain=v1", "--untracked-files=all")).toBe("");
+      expect((await inspectDetachedRepositoryRetention({ ...scope, id: scope.executionWorkspaceId, cwd })).join(" ")).toContain("retention history (retained)");
     } finally { child.stdin.end(); child.kill(); lines.close(); }
   });
 
@@ -192,6 +213,142 @@ describe("detached repository custody", () => {
     expect(await fs.readFile(file, "utf8")).toBe(bytes);
     expect(await fs.lstat(source).catch(() => null)).toBeNull();
     expect(await fs.readFile(path.join(value.destination, "tracked"), "utf8")).toBe("initial");
+  });
+
+  it.each(["repair", "lock", "reverse_rename", "original_repair"])("preserves linked checkout through an injected %s failure", async failure => {
+    const base = path.join(root, "base"); await fs.rename(source, base);
+    git(base, "worktree", "add", "-qb", "paperclip/123456789abc/private", source);
+    await fs.writeFile(path.join(source, "tracked"), "private work");
+    const inode = (await fs.stat(source)).ino, head = git(source, "rev-parse", "HEAD");
+    let failures = 0;
+    gitFault.before = args => {
+      if (!args.includes("worktree")) return;
+      if (failure === "original_repair" && args.includes("repair")) throw new Error("injected repair failure");
+      if (failures === 0 && args.includes(failure === "repair" ? "repair" : "lock")) { failures++; throw new Error("injected Git failure"); }
+    };
+    if (failure === "reverse_rename") {
+      const rename = fs.rename.bind(fs);
+      vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+        if (String(to) === source) throw new Error("injected reverse rename failure");
+        return rename(from, to);
+      });
+    }
+    expect((await preserveDetachedRepositories({ cwd, active: new Set(), retention: scope })).length).toBeGreaterThan(0);
+    gitFault.before = () => {};
+    const { value } = await receipt();
+    const rolledBack = failure === "repair" || failure === "lock";
+    expect(value.state).toBe(rolledBack ? "rolled_back" : "rollback_failed");
+    const location = failure === "reverse_rename" ? value.destination : source;
+    expect((await fs.stat(location)).ino).toBe(inode);
+    expect(git(location, "rev-parse", "HEAD")).toBe(head);
+    expect(await fs.readFile(path.join(location, "tracked"), "utf8")).toBe("private work");
+    if (rolledBack) expect(git(base, "worktree", "list", "--porcelain")).not.toContain("locked");
+  });
+
+  it.each(["before_rename", "after_rename", "after_lock", "during_rollback"])("recovers a real process crash %s", async crash => {
+    const base = path.join(root, "base"); await fs.rename(source, base);
+    git(base, "worktree", "add", "-qb", "paperclip/123456789abc/private", source);
+    await fs.writeFile(path.join(source, "tracked"), "private work");
+    const inode = (await fs.stat(source)).ino;
+    const script = `
+      import fs from "node:fs/promises";
+import { existsSync } from "node:fs";
+      const source = ${JSON.stringify(source)}, crash = ${JSON.stringify(crash)};
+      const rename = fs.rename.bind(fs), open = fs.open.bind(fs);
+      fs.rename = async (from, to) => {
+        if (crash === "before_rename" && from === source) process.kill(process.pid, "SIGKILL");
+        await rename(from, to);
+        if (crash === "after_rename" && from === source || crash === "during_rollback" && to === source) process.kill(process.pid, "SIGKILL");
+      };
+      fs.open = async (...args) => {
+        if (crash === "after_lock" && String(args[0]).endsWith(".tmp")) process.kill(process.pid, "SIGKILL");
+        return open(...args);
+      };
+      const { preserveDetachedRepositories } = await import(${JSON.stringify(new URL("../services/detached-repository-custody.ts", import.meta.url).href)});
+      let checks = 0;
+      await preserveDetachedRepositories({ cwd: ${JSON.stringify(cwd)}, active: new Set(), retention: {
+        companyId: "company", executionWorkspaceId: "workspace", withLifecycleLock: async work => work(async () => {
+          if (crash === "during_rollback" && ++checks === 3) throw new Error("queued run");
+        }) } });
+      process.exitCode = 2;
+    `;
+    const child = spawnSync(process.execPath, ["--import", createRequire(import.meta.url).resolve("tsx"), "--input-type=module", "-e", script], {
+      timeout: 20_000, encoding: "utf8", env: process.env,
+    });
+    expect(child.signal, child.stderr).toBe("SIGKILL");
+    const pending = await receipt(); expect(pending.value.state).toBe("pending");
+    const history = pending.value.history;
+    expect(await preserveDetachedRepositories({ cwd, active: new Set(), retention: scope })).toEqual([]);
+    const { value } = await receipt();
+    expect(value.state).toBe(crash === "before_rename" ? "aborted" : crash === "during_rollback" ? "rolled_back" : "retained");
+    expect(value.history.slice(0, history.length)).toEqual(history);
+    const location = ["before_rename", "during_rollback"].includes(crash) ? source : value.destination;
+    expect((await fs.stat(location)).ino).toBe(inode);
+    expect(await fs.readFile(path.join(location, "tracked"), "utf8")).toBe("private work");
+    if (value.state === "retained") expect(git(base, "worktree", "list", "--porcelain")).toContain(`locked ${value.lockReason}`);
+  }, 30_000);
+
+  it.each(["checkout", "receipt"])("refuses an occupied retention %s path", async collision => {
+    const directory = resolveDetachedRepositoryRetentionDir(scope);
+    const lstat = fs.lstat.bind(fs);
+    let occupied: string | null = null;
+    vi.spyOn(fs, "lstat").mockImplementation(async (...args) => {
+      const target = String(args[0]);
+      const name = path.basename(target);
+      if (!occupied && path.dirname(target) === directory && /^[a-f0-9-]{36}(?:\.json)?$/.test(name)
+        && name.endsWith(".json") === (collision === "receipt")) {
+        occupied = target;
+        if (collision === "checkout") { await fs.mkdir(target); await fs.writeFile(path.join(target, "foreign"), "foreign bytes"); }
+        else await fs.writeFile(target, "foreign receipt");
+      }
+      return lstat(...args);
+    });
+    expect((await preserveDetachedRepositories({ cwd, active: new Set(), retention: scope })).join(" ")).toContain("collision");
+    expect(await fs.readFile(path.join(source, "tracked"), "utf8")).toBe("initial");
+    expect(occupied).not.toBeNull();
+    expect(await fs.readFile(collision === "checkout" ? path.join(occupied!, "foreign") : occupied!, "utf8"))
+      .toBe(collision === "checkout" ? "foreign bytes" : "foreign receipt");
+  });
+
+  it.each(["retained", "rolled_back", "in_doubt"])("keeps a published %s state when directory fsync fails", async state => {
+    const base = path.join(root, "base"); await fs.rename(source, base);
+    git(base, "worktree", "add", "-qb", "paperclip/123456789abc/private", source);
+    if (state === "rolled_back") {
+      let checks = 0; scope.withLifecycleLock = async work => work(async () => { if (++checks === 3) throw new Error("queued run"); });
+    }
+    let foreign = false;
+    if (state === "in_doubt") gitFault.before = args => {
+      if (!foreign && args.includes("list") && !existsSync(source)) {
+        const entry = git(base, "worktree", "list", "--porcelain").split("\n").find(line => line.startsWith("worktree ") && line !== `worktree ${base}`)!;
+        foreign = true; git(base, "worktree", "lock", "--reason", "foreign", entry.slice(9));
+      }
+    };
+    const directory = resolveDetachedRepositoryRetentionDir(scope), open = fs.open.bind(fs);
+    let injected = false;
+    vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      const handle = await open(...args);
+      if (String(args[0]) !== directory) return handle;
+      return new Proxy(handle, { get(target, key) {
+        if (key === "sync") return async () => {
+          const names = (await fs.readdir(directory)).filter(name => name.endsWith(".json"));
+          const current = names.length ? JSON.parse(await fs.readFile(path.join(directory, names[0]!), "utf8")) : null;
+          if (!injected && current?.state === state) { injected = true; throw new Error("injected directory fsync failure"); }
+          return target.sync();
+        };
+        const value = Reflect.get(target, key, target); return typeof value === "function" ? value.bind(target) : value;
+      } });
+    });
+    expect((await preserveDetachedRepositories({ cwd, active: new Set(), retention: scope })).join(" ")).toContain("injected directory fsync failure");
+    expect(injected).toBe(true); gitFault.before = () => {};
+    const { file, value } = await receipt(); expect(value.state).toBe(state); const bytes = await fs.readFile(file, "utf8");
+    expect(await fs.readFile(path.join(state === "rolled_back" ? source : value.destination, "tracked"), "utf8")).toBe("initial");
+    await preserveDetachedRepositories({ cwd, active: new Set(["removed"]), retention: scope });
+    expect(await fs.readFile(file, "utf8")).toBe(bytes);
+  });
+
+  it("does not allocate custody storage when every repository is active", async () => {
+    expect(await preserveDetachedRepositories({ cwd, active: new Set(["removed"]), retention: scope })).toEqual([]);
+    expect(await fs.lstat(resolveDetachedRepositoryRetentionDir(scope)).catch(() => null)).toBeNull();
   });
 
 });

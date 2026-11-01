@@ -1,3 +1,4 @@
+import { readExecutionWorkspaceLifecycleGeneration } from "../execution-workspace-lifecycle-state.js";
 import { withExecutionWorkspaceLifecycleLock } from "../execution-workspace-lifecycle-lock.js";
 import { reserveFreshPluginTaskWorkspace, stageProviderFreshWorkspace } from "../provider-fresh-workspace.js";
 import { freshWorkspaceSchema, type PluginFreshWorkspace } from "@paperclipai/plugin-sdk";
@@ -1075,8 +1076,7 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
         executionWorkspaceId: persistedExecutionWorkspace.id,
         sourceIssueId: lockedSourceIssueId,
         runId: run.id,
-        generation: typeof persistedExecutionWorkspace.metadata?.lifecycleGeneration === "number"
-          ? persistedExecutionWorkspace.metadata.lifecycleGeneration : 0,
+        generation: readExecutionWorkspaceLifecycleGeneration(persistedExecutionWorkspace.metadata),
         withLifecycleLock: work => withExecutionWorkspaceLifecycleLock(db, persistedExecutionWorkspace!.id, work),
       } : undefined,
       restoredContents: persistedExecutionWorkspace ? readGitCacheRestoration(persistedExecutionWorkspace)?.contents : undefined,

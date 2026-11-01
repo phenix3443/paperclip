@@ -518,7 +518,18 @@ export async function prepareProjectRepositoryWorkspaces(input: {
   });
   if (input.restoredContents?.checkouts.some(checkout => !selected.some(source => source.id === checkout.source.id))) throw new GitCacheRestorationFailure();
   const root = path.join(input.cwd, PROJECT_REPOSITORIES_DIR);
-  if (selected.length === 0 && !input.retention && !(await fs.lstat(root).catch(() => null))) return [];
+  const retainDetached = async (active: ReadonlySet<string>) => {
+    const warnings = await retainProjectRepositoryEntries({ cwd: input.cwd, active, retention: input.retention });
+    for (const warning of warnings) {
+      logger.warn({ executionWorkspaceId: input.retention?.executionWorkspaceId, warning }, "Detached repository preservation warning");
+      try { await input.onRetentionWarning?.(warning); }
+      catch (error) { logger.warn({ err: error }, "Could not record detached repository warning in the run log"); }
+    }
+  };
+  if (selected.length === 0 && !(await fs.lstat(root).catch(() => null))) {
+    await retainDetached(new Set());
+    return [];
+  }
   await fs.mkdir(root, { recursive: true });
   if (await fs.realpath(root) !== path.join(await fs.realpath(input.cwd), PROJECT_REPOSITORIES_DIR)) {
     throw new Error("Project repositories directory escapes the task workspace");
@@ -563,13 +574,7 @@ export async function prepareProjectRepositoryWorkspaces(input: {
     await beforePublish();
     results.push({ workspaceId: workspace.id, cwd, repoUrl, repoRef: workspace.repoRef });
   }
-  const warnings = await retainProjectRepositoryEntries({
-    cwd: input.cwd, active: new Set(results.map(repo => path.basename(repo.cwd))), retention: input.retention,
-  });
-  for (const warning of warnings) {
-    logger.warn({ executionWorkspaceId: input.retention?.executionWorkspaceId, warning }, "Detached repository preservation warning");
-    await input.onRetentionWarning?.(warning);
-  }
+  await retainDetached(new Set(results.map(repo => path.basename(repo.cwd))));
   return results;
 }
 
