@@ -7,6 +7,8 @@ import {
   authUsers,
   agentWakeupRequests,
   agentRuntimeState,
+  budgetPolicies,
+  budgetIncidents,
   companies,
   companyMemberships,
   costEvents,
@@ -1959,7 +1961,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     } finally { restore?.(); release(); beforeClaimCheck = null; await Promise.all([wakePromise, explicitRetryPromise]); }
   });
 
-  it.each(["manual", "scheduled", "scheduled-paused"] as const)("rejects an older queued wake and admits the consumed ordinary monitor generation (%s)", async mode => {
+  it.each(["manual", "scheduled", "manual-paused", "scheduled-paused", "manual-budget", "scheduled-budget"] as const)("rejects an older queued wake and admits the consumed ordinary monitor generation (%s)", async mode => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const [author] = await db.insert(agents).values({ companyId, name: "Author", role: "engineer", adapterType: "codex_local" }).returning();
     const policy = normalizeIssueExecutionPolicy({ stages: [{ type: "review", participants: [{ type: "agent", agentId }] }] })!;
@@ -2001,19 +2003,47 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
           status: "pending", continuationPolicy: "wake_assignee", payload: { version: 1, prompt: "Keep review pending" }, createdByAgentId: agentId });
         return execute();
       });
-      if (mode === "scheduled-paused") {
-        await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+      if (mode.endsWith("-paused") || mode.endsWith("-budget")) {
+        if (mode.endsWith("-paused")) {
+          await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+        } else {
+          await db.insert(budgetPolicies).values({ companyId, scopeType: "agent", scopeId: agentId,
+            windowKind: "lifetime", amount: 1, hardStopEnabled: true });
+          await db.insert(costEvents).values({ companyId, agentId, provider: "test", model: "test-model",
+            costCents: 1, occurredAt: new Date(), billingType: "metered_api", costStatus: "reported" });
+        }
         try {
-          expect(await heartbeat.tickTimers(new Date())).toMatchObject({ enqueued: 0 });
+          if (mode.startsWith("manual")) {
+            await expect(heartbeat.triggerIssueMonitor(original.id, { now: new Date(), actorType: "user",
+              actorId: "responsible-user" })).rejects.toMatchObject({ status: 409,
+                message: expect.stringMatching(mode.endsWith("-budget") ? /budget hard-stop/ : /not invokable/i) });
+          } else {
+            expect(await heartbeat.tickTimers(new Date())).toMatchObject({ enqueued: 0 });
+          }
+          if (mode.endsWith("-budget")) {
+            const [incident] = await db.select().from(budgetIncidents).where(eq(budgetIncidents.companyId, companyId));
+            expect(incident).toMatchObject({ scopeType: "agent", scopeId: agentId, thresholdType: "hard", amountLimit: 1 });
+            const [policy] = await db.select().from(budgetPolicies).where(eq(budgetPolicies.companyId, companyId));
+            expect(policy).toMatchObject({ amount: 1, hardStopEnabled: true });
+            const [cost] = await db.select().from(costEvents).where(eq(costEvents.companyId, companyId));
+            expect(cost.costCents).toBe(1);
+          }
           const [held] = await db.select().from(issues).where(eq(issues.id, original.id));
           expect(held).toMatchObject({ monitorNextCheckAt: installed!.monitorNextCheckAt, monitorWakeRequestedAt: null, monitorAttemptCount: 0 });
           expect(held.executionPolicy).toEqual(installed!.executionPolicy);
           expect(held.executionState).toEqual(installed!.executionState);
+          expect(held.responsibleUserId).toBe(installed!.responsibleUserId);
+          expect(held.assigneeAgentId).toBe(installed!.assigneeAgentId);
+          expect(held.assigneeUserId).toBe(installed!.assigneeUserId);
+          expect(held.status).toBe(installed!.status);
+          const allRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+          expect(allRuns.map(run => run.id)).toEqual([older.id]);
+          expect(allRuns[0]).toMatchObject({ status: "cancelled", errorCode: "issue_review_participant_changed" });
           expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
             .filter(run => run.contextSnapshot?.source === "issue.monitor")).toHaveLength(0);
           expect(mockAdapterExecute).not.toHaveBeenCalled();
         } finally {
-          await db.update(agents).set({ status: "idle" }).where(eq(agents.id, agentId));
+          if (mode.endsWith("-paused")) await db.update(agents).set({ status: "idle" }).where(eq(agents.id, agentId));
         }
         return;
       }

@@ -871,7 +871,7 @@ export function createHeartbeatScheduling(
 
       return { outcome: "triggered" as const };
     } catch (err) {
-      if (!(err instanceof ReviewQuotaMonitorHeld) && err instanceof HttpError && err.status >= 400 && err.status < 500) {
+      if (!atomicAdmission && !(err instanceof ReviewQuotaMonitorHeld) && err instanceof HttpError && err.status >= 400 && err.status < 500) {
         if (input.clearOnClientError) {
           await db
             .update(issues)
