@@ -257,6 +257,10 @@ export interface PluginLifecycleManager {
 
   currentEpoch(pluginId: string): number;
 
+  generationMark(): number;
+
+  changedSince(pluginId: string, mark: number): boolean;
+
   isCurrentGeneration(pluginId: string, epoch: number): boolean;
 
   /**
@@ -370,7 +374,7 @@ export function pluginLifecycleManager(
     kind: PluginLifecycleOpKind;
   }
   type PendingEvent = [LifecycleEventName, PluginLifecycleEvents[LifecycleEventName]];
-  const pendingEvents = new WeakMap<PluginLifecycleLease, PendingEvent[]>();
+  const pendingEvents = shared.pendingEvents as WeakMap<PluginLifecycleLease, PendingEvent[]>;
 
   const log = logger.child({ service: "plugin-lifecycle" });
 
@@ -642,12 +646,11 @@ export function pluginLifecycleManager(
       return runOp(pluginId, "Q", options, async (op) => {
         const plugin = await requirePlugin(pluginId);
 
-        // Only allow disabling from ready state; disabling a disabled plugin
-        // re-establishes quiescence without another row write.
+        // Only allow disabling from ready state
         if (plugin.status !== "ready" && plugin.status !== "disabled") {
           throw badRequest(
             `Cannot disable plugin in status '${plugin.status}'. ` +
-              `Plugin must be in 'ready' status to be disabled.`,
+              `Plugin must be in 'ready' or 'disabled' status to be disabled.`,
           );
         }
 
@@ -962,6 +965,14 @@ export function pluginLifecycleManager(
 
     currentEpoch(pluginId: string): number {
       return shared.currentEpoch(pluginId);
+    },
+
+    generationMark(): number {
+      return shared.generationMark();
+    },
+
+    changedSince(pluginId: string, mark: number): boolean {
+      return shared.changedSince(pluginId, mark);
     },
 
     isCurrentGeneration(pluginId: string, epoch: number): boolean {

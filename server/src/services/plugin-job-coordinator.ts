@@ -1,15 +1,10 @@
 /**
  * PluginJobCoordinator — bridges the plugin lifecycle manager with the
- * job scheduler and job store.
+ * job store.
  *
- * This service listens to lifecycle events and performs the corresponding
- * scheduler and job store operations:
- *
- * - **plugin.loaded** → sync job declarations from manifest, then register
- *   the plugin with the scheduler (computes `nextRunAt` for active jobs).
- *
- * - **plugin.disabled / plugin.unloaded** → unregister the plugin from the
- *   scheduler (cancels in-flight runs, clears tracking state).
+ * Job sync and scheduler registration happen in the plugin loader while the
+ * lifecycle operation holds the plugin. This service only reacts to
+ * **plugin.unloaded** with `removeData` by purging job definitions and runs.
  *
  * ## Why a separate coordinator?
  *
@@ -27,7 +22,6 @@
 import type { PluginLifecycleManager } from "./plugin-lifecycle.js";
 import type { PluginJobScheduler } from "./plugin-job-scheduler.js";
 import type { PluginJobStore } from "./plugin-job-store.js";
-import { pluginRegistryService } from "./plugin-registry.js";
 import type { Db } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 
@@ -56,8 +50,7 @@ export interface PluginJobCoordinator {
   /**
    * Start listening to lifecycle events.
    *
-   * This wires up the `plugin.loaded`, `plugin.disabled`, and
-   * `plugin.unloaded` event handlers.
+   * This wires up the `plugin.unloaded` event handler.
    */
   start(): void;
 
@@ -95,9 +88,8 @@ export interface PluginJobCoordinator {
 export function createPluginJobCoordinator(
   options: PluginJobCoordinatorOptions,
 ): PluginJobCoordinator {
-  const { db, lifecycle, scheduler, jobStore } = options;
+  const { lifecycle, jobStore } = options;
   const log = logger.child({ service: "plugin-job-coordinator" });
-  const registry = pluginRegistryService(db);
 
   // -----------------------------------------------------------------------
   // Event handlers

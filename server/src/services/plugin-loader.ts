@@ -2368,6 +2368,7 @@ export function pluginLoader(
         workerOptions.execArgv = ["--import", DEV_TSX_LOADER_PATH];
       }
 
+      options.lease?.assertActive();
       await workerManager.startWorker(pluginId, workerOptions);
       registered.worker = true;
 
@@ -2430,6 +2431,7 @@ export function pluginLoader(
       // 6. Sync job declarations and register with scheduler
       // ------------------------------------------------------------------
       const jobDeclarations = manifest.jobs ?? [];
+      options.lease?.assertActive();
       await jobStore.syncJobDeclarations(pluginId, jobDeclarations);
       await jobScheduler.registerPlugin(pluginId);
       if (jobDeclarations.length > 0) {
@@ -2489,6 +2491,7 @@ export function pluginLoader(
       // ------------------------------------------------------------------
       const toolDeclarations = manifest.tools ?? [];
       if (toolDeclarations.length > 0) {
+        options.lease?.assertActive();
         toolDispatcher.registerPluginTools(pluginKey, manifest, pluginId);
         registered.tools = toolDeclarations.length;
 

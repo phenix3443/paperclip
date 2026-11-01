@@ -198,8 +198,8 @@ export interface PluginToolDispatcher {
  *
  * The dispatcher:
  * 1. Creates and owns a `PluginToolRegistry` backed by the given worker manager.
- * 2. Listens for lifecycle events (plugin.enabled, plugin.disabled, plugin.unloaded)
- *    to automatically register and unregister tools.
+ * 2. Listens for lifecycle events (plugin.disabled, plugin.unloaded)
+ *    to automatically unregister tools.
  * 3. On `initialize()`, loads tools from all currently-ready plugins via the DB.
  *
  * @param options - Configuration options
@@ -287,14 +287,12 @@ export function createPluginToolDispatcher(
       // Step 1: Load tools from all currently-ready plugins
       if (db) {
         const pluginRegistry = pluginRegistryService(db);
+        const mark = lifecycleManager?.generationMark();
         const readyPlugins = await pluginRegistry.listByStatus("ready") as PluginRecord[];
 
         let totalTools = 0;
         for (const plugin of readyPlugins) {
-          if (
-            lifecycleManager
-            && !lifecycleManager.isCurrentGeneration(plugin.id, lifecycleManager.currentEpoch(plugin.id))
-          ) continue;
+          if (mark !== undefined && lifecycleManager?.changedSince(plugin.id, mark)) continue;
           const manifest = plugin.manifestJson;
           if (manifest?.tools && manifest.tools.length > 0) {
             registry.registerPlugin(plugin.pluginKey, manifest, plugin.id);

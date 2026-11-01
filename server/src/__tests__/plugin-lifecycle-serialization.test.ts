@@ -233,6 +233,7 @@ async function createHarness(options: { hold?: string; queueWaitMs?: number; fai
       return { manifest: manifest(installOptions.packageName), packageName: installOptions.packageName, version: "1.0.0" };
     },
     async persistInstall(discovered: { manifest: PaperclipPluginManifestV1; packageName: string }) {
+      state.calls.push(`persist:${discovered.manifest.id}`);
       const { pluginRegistryService } = await import("../services/plugin-registry.js");
       await pluginRegistryService({} as never).install({ packageName: discovered.packageName } as never, discovered.manifest);
       return discovered;
@@ -402,6 +403,9 @@ describe("plugin lifecycle serialization through the real route wiring", () => {
     const loser = first.status === 409 ? first : second;
     expect(loser.body.code).toBe("already_installed");
     expect(harness.gate.count("spawned")).toBe(1);
+    const persists = state.calls.flatMap((call, index) => (call === "persist:serial.e" ? [index] : []));
+    expect(persists).toHaveLength(2);
+    expect(persists[1]).toBeGreaterThan(state.calls.indexOf("worker:running:id-serial.e"));
   });
 
   it("N14: a client that drops its DELETE does not stop the server, and a repeated soft DELETE is a 200", async () => {
@@ -484,6 +488,8 @@ describe("plugin lifecycle serialization through the real route wiring", () => {
   it("N20a: an activation failure inside a route enable marks the plugin error without a deadlock", async () => {
     harness = await createHarness({ failActivation: true });
     const row = seed("serial.l", "disabled");
+    const statuses: string[] = [];
+    harness.appLifecycle.on("plugin.status_changed", ({ newStatus }) => void statuses.push(newStatus));
 
     const res = await within(request(harness.app).post(`/api/plugins/${row.pluginKey}/enable`).send({}).then((r) => r), 5_000);
 
@@ -491,5 +497,6 @@ describe("plugin lifecycle serialization through the real route wiring", () => {
     expect(res !== "pending" && res.status).toBeGreaterThanOrEqual(400);
     expect(state.rows.get(row.id)!.status).toBe("error");
     expect(harness.workerManager.getWorker(row.id)).toBeUndefined();
+    expect(statuses.at(-1)).toBe("error");
   });
 });

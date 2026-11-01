@@ -131,12 +131,13 @@ export function createPluginLifecycleSerializer(
 export interface PluginLifecycleShared {
   readonly emitter: EventEmitter;
   readonly serializer: PluginLifecycleSerializer;
-  readonly epochs: Map<string, number>;
   readonly quiesced: Set<string>;
-  runtimeLoader: unknown;
+  readonly pendingEvents: WeakMap<PluginLifecycleLease, Array<[string, unknown]>>;
   bumpEpoch(pluginId: string): number;
   currentEpoch(pluginId: string): number;
   isCurrentGeneration(pluginId: string, epoch: number): boolean;
+  generationMark(): number;
+  changedSince(pluginId: string, mark: number): boolean;
 }
 
 export function createPluginLifecycleShared(
@@ -145,17 +146,25 @@ export function createPluginLifecycleShared(
   const emitter = new EventEmitter();
   emitter.setMaxListeners(100);
   const epochs = new Map<string, number>();
+  const lastBump = new Map<string, number>();
   const quiesced = new Set<string>();
+  let bumps = 0;
   return {
     emitter,
     serializer: createPluginLifecycleSerializer(defaults),
-    epochs,
     quiesced,
-    runtimeLoader: undefined,
+    pendingEvents: new WeakMap(),
     bumpEpoch(pluginId) {
       const next = (epochs.get(pluginId) ?? 0) + 1;
       epochs.set(pluginId, next);
+      lastBump.set(pluginId, ++bumps);
       return next;
+    },
+    generationMark() {
+      return bumps;
+    },
+    changedSince(pluginId, mark) {
+      return (lastBump.get(pluginId) ?? 0) > mark || quiesced.has(pluginId);
     },
     currentEpoch(pluginId) {
       return epochs.get(pluginId) ?? 0;
