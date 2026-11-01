@@ -1,3 +1,4 @@
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../delivery-work-notifications.js";
 import { notifyIssueReviewState } from "../../issue-review-state-notifications.js";
 import { notifyToolConnectionHealth } from "../../tool-connection-health-notifications.js";
 import { managedConnectorProfile } from "./client-settings.js";
@@ -214,6 +215,7 @@ export function createCloudOAuthCallback(db: Db, dependencies: Dependencies) {
           );
         }
       }
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
       const [consumedState] = await tx
         .delete(toolOauthStates)
         .where(
