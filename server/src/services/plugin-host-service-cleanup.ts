@@ -9,6 +9,8 @@ export interface PluginWorkerRuntimeEvent {
 }
 
 export interface PluginHostServiceCleanupController {
+  register(pluginId: string, dispose: () => void): void;
+  disposePlugin(pluginId: string): void;
   handleWorkerEvent(event: PluginWorkerRuntimeEvent): void;
   disposeAll(): void;
   teardown(): void;
@@ -45,6 +47,15 @@ export function createPluginHostServiceCleanup(
   lifecycle.on("plugin.unloaded", handlePluginUnloaded);
 
   return {
+    register(pluginId, dispose) {
+      runDispose(pluginId, true);
+      disposers.set(pluginId, dispose);
+    },
+
+    disposePlugin(pluginId) {
+      runDispose(pluginId, true);
+    },
+
     handleWorkerEvent(event) {
       if (event.type === "plugin.worker.crashed") {
         runDispose(event.pluginId);

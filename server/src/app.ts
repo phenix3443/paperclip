@@ -944,13 +944,14 @@ export async function createApp(
             manifest,
           },
         );
-        hostServicesDisposers.set(pluginId, () => services.dispose());
+        hostServiceCleanup.register(pluginId, () => services.dispose());
         return createHostClientHandlers({
           pluginId,
           capabilities: manifest.capabilities,
           services,
         });
       },
+      disposeHostServices: (pluginId) => hostServiceCleanup.disposePlugin(pluginId),
     },
   );
   runtimePluginLoader = loader;

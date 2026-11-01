@@ -384,6 +384,8 @@ export interface PluginRuntimeServices {
    * scoped to its capabilities and plugin ID.
    */
   buildHostHandlers: (pluginId: string, manifest: PaperclipPluginManifestV1) => WorkerToHostHandlers;
+  /** Disposes the host services created by `buildHostHandlers` for a plugin. */
+  disposeHostServices?: (pluginId: string) => void;
   /**
    * Host instance information passed to the worker during initialization.
    * Includes the instance ID and host version.
@@ -2191,6 +2193,7 @@ export function pluginLoader(
       eventBus,
       jobScheduler,
       toolDispatcher,
+      disposeHostServices,
     } = runtimeServices;
 
     const failures: unknown[] = [];
@@ -2208,6 +2211,7 @@ export function pluginLoader(
     await attempt(async () => {
       if (workerManager.getWorker(pluginId)) await workerManager.stopWorker(pluginId);
     });
+    await attempt(() => disposeHostServices?.(pluginId));
 
     if (failures.length > 0) {
       log.warn(
