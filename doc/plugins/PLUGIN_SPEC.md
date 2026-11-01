@@ -1648,6 +1648,42 @@ The host's plugin process manager must support:
 
 Each worker process is independent. There is no shared process pool or batch restart mechanism.
 
+#### 25.4.7 Lifecycle Completion Contract
+
+Lifecycle writes on one plugin run one at a time, in arrival order, whether they come from a route, the dev watcher, a config restart or startup. Different plugins never wait on each other.
+
+**Quiescence (Q).** A successful `POST /api/plugins/:pluginId/disable` or soft `DELETE /api/plugins/:pluginId` answers only after every earlier accepted operation on the plugin finished, the row is `disabled` (or `uninstalled`), the dev watcher stopped watching it, and no worker handle, start or crash retry for it remains. Q lasts until the next accepted `enable` or `install`. Watcher reloads, config restarts, crash retries and startup retries do not end it. `disable` on a `disabled` plugin and soft `DELETE` on an `uninstalled` plugin are idempotent and re-establish Q.
+
+**Activation (A).** A successful `POST /api/plugins/:pluginId/enable` or `POST /api/plugins/install` answers only after the target package's worker initialized and its jobs and tools are registered, with the row `ready`.
+
+Q is a property of a successful response. No endpoint reports it, and a `ready` or `disabled` row alone does not prove Q or A.
+
+**Bounds.** Every lifecycle write is answered within 60 seconds of arrival. Waiting for an earlier operation on the same plugin is limited to 15 seconds. These bounds limit the response, not the work: after a timeout the server keeps the plugin busy until the interrupted operation and its cleanup finish, and other writes on that plugin get `plugin_lifecycle_busy` meanwhile.
+
+| Response | Code | Meaning |
+| --- | --- | --- |
+| 200 | | Q or A holds as described above |
+| 400 | `invalid_transition` | The row state does not allow the operation; nothing changed |
+| 409 | `already_installed` | Install for a plugin that has a row other than soft `uninstalled` |
+| 409 | `plugin_lifecycle_busy` | An earlier operation still holds the plugin; nothing changed, retry later |
+| 409 | `plugin_lifecycle_fenced` | A previous stop could not be proven; only `disable` or soft `DELETE` are accepted until one succeeds |
+| 500 | `plugin_quiescence_failed` | Q was attempted but a teardown step failed or the worker did not exit; the row is in its target state, the plugin is fenced; retry the same Q |
+| 500 | `plugin_activation_failed` | A failed; the worker was torn down (or the plugin fenced) and the row is `error` |
+| 504 | `plugin_lifecycle_timeout` | The response deadline passed (`phase` is `queue`, `body` or `prepare`); starts were revoked at once, and the plugin settles to `error`, its Q target state, or fenced |
+
+At a timeout the host revokes the plugin's right to start workers in the same step that sends the 504, so neither a crash retry nor a late continuation can bring the worker back. A late `install` package preparation is aborted and its result is discarded without writing a row.
+
+**Recovery.** After a lost response, a 5xx or a 504, read the row and issue Q again, then A:
+
+| Row | Q | Then A, same package | Then A, new package |
+| --- | --- | --- | --- |
+| `ready` | `disable` (or soft `DELETE`) | `enable` | soft `DELETE`, then `install` |
+| `disabled` | `disable` again | `enable` | soft `DELETE`, then `install` |
+| `error`, `upgrade_pending`, `installed` | soft `DELETE` | `install` | `install` |
+| `uninstalled` (soft) | soft `DELETE` again | `install` | `install` |
+
+Soft `DELETE` followed by `install` reuses the row, its id, plugin data and company config.
+
 ## 26. Plugin Observability
 
 ### 26.1 Logging
