@@ -2461,6 +2461,7 @@ export function pluginLoader(
       const jobDeclarations = manifest.jobs ?? [];
       options.lease?.assertActive();
       await jobStore.syncJobDeclarations(pluginId, jobDeclarations);
+      options.lease?.assertActive();
       await jobScheduler.registerPlugin(pluginId);
       if (jobDeclarations.length > 0) {
         registered.jobs = jobDeclarations.length;
@@ -2485,6 +2486,7 @@ export function pluginLoader(
       // any previous subscriptions for this plugin are preserved if the
       // worker is restarting.
       // ------------------------------------------------------------------
+      options.lease?.assertActive();
       const _scopedBus = eventBus.forPlugin(pluginKey);
       registered.eventSubscriptions = eventBus.subscriptionCount(pluginKey);
 
