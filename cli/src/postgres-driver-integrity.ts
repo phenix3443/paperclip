@@ -47,29 +47,36 @@ function assertPatchedDriver(packageRoot: string, label: string): void {
   }
 }
 
-type PackageInventory = { name: string; directory: string }[];
+const INVENTORIED_PACKAGES = ["postgres", "drizzle-orm"] as const;
 
-function inventoryPackages(nodeModules: string, inventory: PackageInventory = [], depth = 0): PackageInventory {
-  if (depth > 32 || !fs.existsSync(nodeModules)) return inventory;
-  for (const entry of fs.readdirSync(nodeModules, { withFileTypes: true })) {
-    if (entry.name.startsWith(".") || !entry.isDirectory()) continue;
-    const directory = path.join(nodeModules, entry.name);
-    const packages = entry.name.startsWith("@")
-      ? fs.readdirSync(directory, { withFileTypes: true }).filter((child) => child.isDirectory()).map((child) => path.join(directory, child.name))
-      : [directory];
-    for (const packageDirectory of packages) {
-      inventory.push({ name: path.relative(nodeModules, packageDirectory), directory: packageDirectory });
-      inventoryPackages(path.join(packageDirectory, "node_modules"), inventory, depth + 1);
-    }
-  }
-  return inventory;
+type PayloadScan = { links: string[]; packages: Record<(typeof INVENTORIED_PACKAGES)[number], string[]> };
+
+function packageNameAt(directory: string): string | null {
+  const parent = path.basename(path.dirname(directory));
+  if (parent === "node_modules") return path.basename(directory);
+  if (parent.startsWith("@") && path.basename(path.dirname(path.dirname(directory))) === "node_modules") return `${parent}/${path.basename(directory)}`;
+  return null;
 }
 
-function findForbiddenLinks(payloadRoot: string): string[] {
-  const forbidden: string[] = [];
+function declaredPackageName(directory: string): string | null {
+  const manifest = path.join(directory, "package.json");
+  if (!fs.lstatSync(manifest, { throwIfNoEntry: false })?.isFile()) return null;
+  try {
+    const name = (JSON.parse(fs.readFileSync(manifest, "utf8")) as { name?: unknown }).name;
+    return typeof name === "string" ? name : null;
+  } catch {
+    return null;
+  }
+}
+
+function scanPayload(payloadRoot: string): PayloadScan {
+  const scan: PayloadScan = { links: [], packages: { postgres: [], "drizzle-orm": [] } };
   const pending = [payloadRoot];
   while (pending.length > 0) {
     const directory = pending.pop()!;
+    for (const name of INVENTORIED_PACKAGES) {
+      if (directory !== payloadRoot && (packageNameAt(directory) === name || declaredPackageName(directory) === name)) scan.packages[name].push(directory);
+    }
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
       const location = path.join(directory, entry.name);
       if (entry.isDirectory()) pending.push(location);
@@ -78,25 +85,21 @@ function findForbiddenLinks(payloadRoot: string): string[] {
         const target = fs.existsSync(location) ? fs.realpathSync(location) : null;
         const allowed = target !== null && fs.statSync(location).isFile()
           && (path.dirname(target) === fs.realpathSync(directory) || (binLink && inside(payloadRoot, target)));
-        if (!allowed) forbidden.push(location);
+        if (!allowed) scan.links.push(location);
       }
     }
   }
-  return forbidden;
+  return scan;
 }
-
-const copiesOf = (inventory: PackageInventory, name: string) =>
-  inventory.filter((entry) => entry.name === name).map((entry) => entry.directory);
 
 export async function verifyPostgresDriverPayload(payloadPath: string): Promise<PostgresDriverResolution[]> {
   const payloadRoot = fs.realpathSync(payloadPath);
   const nodeModules = path.join(payloadRoot, "node_modules");
-  const links = findForbiddenLinks(payloadRoot);
-  if (links.length > 0) {
-    throw new Error(`Payload must not contain linked files or packages; found ${links.slice(0, 10).map((link) => path.relative(payloadRoot, link)).join(", ")}.`);
+  const scan = scanPayload(payloadRoot);
+  if (scan.links.length > 0) {
+    throw new Error(`Payload must not contain linked files or packages; found ${scan.links.slice(0, 10).map((link) => path.relative(payloadRoot, link)).join(", ")}.`);
   }
-  const inventory = inventoryPackages(nodeModules);
-  const copies = copiesOf(inventory, "postgres");
+  const copies = scan.packages.postgres;
   if (copies.length === 0) throw new Error(`Payload ${payloadPath} contains no postgres driver.`);
   const rootCopy = path.join(nodeModules, "postgres");
   const extra = copies.filter((copy) => copy !== rootCopy);
@@ -108,7 +111,7 @@ export async function verifyPostgresDriverPayload(payloadPath: string): Promise<
   for (const caller of callers) {
     if (!fs.existsSync(path.join(caller.directory, "package.json"))) throw new Error(`Payload is missing postgres caller ${caller.caller}.`);
   }
-  const drizzleDrivers = copiesOf(inventory, "drizzle-orm")
+  const drizzleDrivers = scan.packages["drizzle-orm"]
     .map((copy) => path.join(copy, "postgres-js"))
     .filter((directory) => fs.existsSync(path.join(directory, "driver.js")));
   if (drizzleDrivers.length === 0) throw new Error(`Payload ${payloadPath} contains no drizzle-orm postgres-js driver.`);

@@ -1,7 +1,9 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { PATCHED_POSTGRES_DRIVER, verifyPostgresDriverPayload } from "../postgres-driver-integrity.js";
 
@@ -166,6 +168,34 @@ describe("postgres driver payload verifier", () => {
       fs.symlinkSync(path.join(outside, "db"), path.join(payload, "node_modules", "@paperclipai", "db"));
       await expect(verifyPostgresDriverPayload(payload)).rejects.toThrow(/must not contain linked files or packages.*@paperclipai\/db/);
     });
+  });
+
+  it("rejects an unpatched copy that the db entry loads through a drizzle-orm in an internal node_modules", async () => {
+    const db = path.join(payload, "node_modules", "@paperclipai", "db");
+    const internal = path.join(db, "dist", "node_modules");
+    writeDrizzle(path.join(internal, "drizzle-orm"));
+    fs.writeFileSync(path.join(internal, "drizzle-orm", "postgres-js", "driver.js"), "export const resolved = import.meta.resolve(\"postgres\");\n");
+    fs.writeFileSync(path.join(internal, "drizzle-orm", "package.json"), JSON.stringify({ name: "drizzle-orm", version: "0.45.2", type: "module", exports: { "./postgres-js/driver.js": "./postgres-js/driver.js" } }));
+    copyDriver(path.join(internal, "postgres"));
+    fs.writeFileSync(path.join(internal, "postgres", "src", "index.js"), "export default null;\n");
+    fs.writeFileSync(path.join(db, "package.json"), JSON.stringify({ name: "@paperclipai/db", version: "0.3.1", type: "module", exports: { ".": "./dist/index.js" } }));
+    fs.writeFileSync(path.join(db, "dist", "index.js"), "export { resolved } from \"drizzle-orm/postgres-js/driver.js\";\n");
+    const entry = JSON.stringify(pathToFileURL(path.join(db, "dist", "index.js")).href);
+    const resolved = execFileSync(process.execPath, ["--input-type=module", "-e", `const { resolved } = await import(${entry}); process.stdout.write(resolved);`], { encoding: "utf8" });
+    expect(fs.realpathSync(new URL(resolved))).toBe(fs.realpathSync(path.join(internal, "postgres", "src", "index.js")));
+    await expect(verifyPostgresDriverPayload(payload)).rejects.toThrow(/exactly one postgres driver.*@paperclipai\/db\/dist\/node_modules\/postgres/);
+  });
+
+  it("rejects a vendored postgres copy outside any node_modules", async () => {
+    copyDriver(path.join(payload, "node_modules", "@paperclipai", "db", "vendor", "pg"));
+    await expect(verifyPostgresDriverPayload(payload)).rejects.toThrow(/exactly one postgres driver.*@paperclipai\/db\/vendor\/pg/);
+  });
+
+  it("checks a drizzle-orm installed in a package's internal node_modules", async () => {
+    writeDrizzle(path.join(payload, "node_modules", "@paperclipai", "db", "dist", "node_modules", "drizzle-orm"));
+    const resolutions = await verifyPostgresDriverPayload(payload);
+    expect(resolutions.map((entry) => entry.caller)).toContain(path.join("node_modules", "@paperclipai", "db", "dist", "node_modules", "drizzle-orm", "postgres-js", "driver.js"));
+    expect(new Set(resolutions.map((entry) => entry.packageRoot)).size).toBe(1);
   });
 
   it("rejects a payload without any postgres driver", async () => {

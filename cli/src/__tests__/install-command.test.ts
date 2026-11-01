@@ -307,6 +307,28 @@ describe("managed install commands", () => {
     expect(fs.readlinkSync(paths.currentPath)).toBe(currentBefore);
   });
 
+  it("refuses a cached git payload whose db carries an unpatched driver in an internal node_modules", async () => {
+    const goodSha = "6".repeat(40);
+    const internalSha = "7".repeat(40);
+    await installCommand({ ref: goodSha, repo: "phenix3443/paperclip", yes: true }, { runCommand: createGitCheckoutRunCommand(goodSha) });
+    const paths = resolveInstallStorePaths();
+    const before = readInstallManifest(paths);
+    const currentBefore = fs.readlinkSync(paths.currentPath);
+    const cached = payloadPathFor(paths, "git", internalSha.slice(0, 12));
+    writePatchedPayload(cached);
+    const internal = path.join(cached, "node_modules", "@paperclipai", "db", "dist", "node_modules");
+    fs.mkdirSync(internal, { recursive: true });
+    fs.cpSync(path.join(cached, "node_modules", "drizzle-orm"), path.join(internal, "drizzle-orm"), { recursive: true });
+    fs.cpSync(PATCHED_POSTGRES_SOURCE, path.join(internal, "postgres"), { recursive: true, dereference: true });
+    fs.writeFileSync(path.join(internal, "postgres", "src", "index.js"), "export default null;\n");
+    const runCommand = createGitCheckoutRunCommand(internalSha);
+    await expect(installCommand({ ref: internalSha, repo: "phenix3443/paperclip", yes: true }, { runCommand })).rejects.toThrow(/exactly one postgres driver/);
+    expect(runCommand.mock.calls.filter(([command, args]) => command === process.execPath && args.at(-1) === "--version")).toHaveLength(0);
+    expect(runCommand.mock.calls.filter(([command, args]) => command === "curl" && args.includes("--output"))).toHaveLength(0);
+    expect(readInstallManifest(paths)).toEqual(before);
+    expect(fs.readlinkSync(paths.currentPath)).toBe(currentBefore);
+  });
+
   it("exports nothing without a packages directory", async () => {
     const sha = "f".repeat(40);
     await installGitPayload("phenix3443/paperclip", sha, createGitCheckoutRunCommand(sha), resolveInstallStorePaths());
