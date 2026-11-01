@@ -8,8 +8,7 @@ export const setAgentAvatarSchema = z.object({
     .nullable(),
 }).strict();
 export type SetAgentAvatarInput = z.infer<typeof setAgentAvatarSchema>;
-
-let avatarJsonSchema: z.core.JSONSchema.BaseSchema | undefined;
-export function setAgentAvatarJsonSchema() {
-  return structuredClone(avatarJsonSchema ??= z.toJSONSchema(setAgentAvatarSchema));
+/** Converted with this package's zod; see createProjectToolInputJsonSchema. */
+export function setAgentAvatarInputJsonSchema() {
+  return z.toJSONSchema(setAgentAvatarSchema);
 }

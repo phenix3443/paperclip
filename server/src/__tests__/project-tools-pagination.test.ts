@@ -1,12 +1,29 @@
+import express from "express";
+import request from "supertest";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { callProjectTool, projectToolDefinitions } from "../services/project-tools.js";
+import { projectToolRoutes } from "../routes/project-tools.js";
+import { logger } from "../middleware/logger.js";
+
+const failCreateProjectSchema = vi.hoisted(() => ({ enabled: false }));
+vi.mock("@paperclipai/shared", async importOriginal => {
+  const actual = await importOriginal<typeof import("@paperclipai/shared")>();
+  return { ...actual, createProjectToolInputJsonSchema: () => {
+    if (failCreateProjectSchema.enabled) throw new Error("schema conversion failed");
+    return actual.createProjectToolInputJsonSchema();
+  } };
+});
+vi.mock("../services/project-tool-context.js", () => ({
+  projectToolContext: vi.fn(async () => ({ run: { companyId: "company", agentId: "agent" }, issue: { id: "issue", workMode: "standard", conversationAgentId: null } })),
+}));
+vi.mock("../routes/authz.js", () => ({ assertCompanyAccess: vi.fn() }));
 
 const input = {
   name: "list_projects", arguments: {}, apiUrl: "http://paperclip.test", token: "test-token",
   companyId: "company", issueId: "issue", agentId: "agent", conversation: false,
 };
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); failCreateProjectSchema.enabled = false; });
 
 describe("project discovery result bounds", () => {
   it("requests bounded summaries and normalizes continuation cursors", async () => {
@@ -57,5 +74,38 @@ describe("project creation receipt recovery", () => {
     vi.stubGlobal("fetch", fetch);
     await expect(callProjectTool({ ...input, receiptOnly: true })).rejects.toThrow(/receipt/i);
     expect(fetch).not.toHaveBeenCalled();
+  });
+});
+
+describe("project tool definitions", () => {
+  it("lists create_project in standard mode with the required idempotency key", () => {
+    const createProject = projectToolDefinitions("standard", true).find(t => t.name === "create_project");
+    expect(createProject?.inputSchema).toMatchObject({
+      type: "object",
+      properties: { idempotencyKey: { type: "string", minLength: 1, maxLength: 255 }, name: expect.any(Object) },
+      required: expect.arrayContaining(["idempotencyKey"]),
+    });
+  });
+
+  it("skips only the tool whose definition fails and reports its name", () => {
+    failCreateProjectSchema.enabled = true;
+    expect(() => projectToolDefinitions("standard", true)).toThrow("schema conversion failed");
+    const onToolError = vi.fn();
+    const names = projectToolDefinitions("standard", true, onToolError).map(t => t.name);
+    expect(names).not.toContain("create_project");
+    expect(names).toEqual(expect.arrayContaining(["list_projects", "list_project_repositories", "create_task", "set_task_title"]));
+    expect(onToolError).toHaveBeenCalledExactlyOnceWith("create_project", expect.any(Error));
+  });
+
+  it("answers tools/list with the remaining tools and a warning when one definition fails", async () => {
+    failCreateProjectSchema.enabled = true;
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+    const app = express().use(express.json()).use((req, _res, next) => { req.actor = { type: "agent" } as never; next(); }).use(projectToolRoutes({} as never));
+    const response = await request(app).post("/mcp/project-tools").send({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+    expect(response.status).toBe(200);
+    const names = response.body.result.tools.map((t: { name: string }) => t.name);
+    expect(names).not.toContain("create_project");
+    expect(names).toContain("list_projects");
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({ tool: "create_project" }), expect.any(String));
   });
 });

@@ -1,5 +1,17 @@
 # Project tool schema ownership
 
+## Approved baseline update
+
+The original implementation path below preceded the Board merge of #349 at
+`92c857406775fd9bf44036715308cfbc228b79b4`. That approved source now supplies
+the defining-package converters and public input schema names. The forward
+change retains those names, returns an independent copy of the cached project
+schema, and logs degraded discovery without the raw exception. The replacement
+draft #351 carries these corrections and the verification coverage. Earlier
+implementation commits remain in its history; they are not separate deliverables.
+
+## Initial plan
+
 Implement the contract in [#350](https://github.com/phenix3443/paperclip/issues/350)
 from base `64ea2bdfb34b897dae3b7288ad99452d5543055d`
 (tree `9bef6328a0f21a11acc374dfa50cd4a3b2c699d2`). This base is the merged

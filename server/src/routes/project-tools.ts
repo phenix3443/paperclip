@@ -16,9 +16,8 @@ export function projectToolRoutes(db: Db) {
     const send = (result: unknown) => res.json({ jsonrpc: "2.0", id, result });
     if (method === "initialize") return send({ protocolVersion: "2025-03-26", capabilities: { tools: { listChanged: false } }, serverInfo: { name: "paperclip-project-tools", version: "1" } });
     if (method === "notifications/initialized") return res.status(202).end();
-    const definitions = projectToolDefinitions(context.issue.workMode, true, name => {
-      logger.warn({ tool: name, workMode: context.issue.workMode }, "Project tool discovery is degraded: definition unavailable");
-    });
+    const definitions = projectToolDefinitions(context.issue.workMode, true, tool =>
+      logger.warn({ tool, workMode: context.issue.workMode }, "Project tool discovery is degraded: definition unavailable"));
     if (method === "tools/list") return send({ tools: definitions });
     if (method !== "tools/call") return res.json({ jsonrpc: "2.0", id, error: { code: -32601, message: "Method not found" } });
     try {

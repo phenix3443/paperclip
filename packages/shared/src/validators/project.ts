@@ -133,13 +133,17 @@ export const createProjectSchema = z.object({
 
 export type CreateProject = z.infer<typeof createProjectSchema>;
 
-export const createProjectToolSchema = createProjectSchema.extend({
+export const createProjectToolInputSchema = createProjectSchema.extend({
   idempotencyKey: z.string().min(1).max(255),
 });
 
-let projectToolJsonSchema: z.core.JSONSchema.BaseSchema | undefined;
-export function createProjectToolJsonSchema() {
-  return structuredClone(projectToolJsonSchema ??= z.toJSONSchema(createProjectToolSchema));
+const buildCreateProjectToolInputJsonSchema = () => z.toJSONSchema(createProjectToolInputSchema);
+let createProjectToolInputJson: ReturnType<typeof buildCreateProjectToolInputJsonSchema> | undefined;
+// Callers must not run their own zod's toJSONSchema on shared schemas: a deployed
+// install can resolve a different zod copy for the server, and zod 4.6 record
+// processors crash under a 4.4 conversion context (ctx.deferred is undefined).
+export function createProjectToolInputJsonSchema() {
+  return structuredClone(createProjectToolInputJson ??= buildCreateProjectToolInputJsonSchema());
 }
 
 export const updateProjectSchema = objectWithoutDefaults(

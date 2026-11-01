@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  createProjectToolSchema, createProjectToolJsonSchema,
-  githubReviewAssessmentSchema, githubReviewAssessmentJsonSchema,
-  setAgentAvatarSchema, setAgentAvatarJsonSchema,
+  createProjectToolInputSchema, createProjectToolInputJsonSchema,
+  githubReviewAssessmentSchema, githubReviewAssessmentInputJsonSchema,
+  setAgentAvatarSchema, setAgentAvatarInputJsonSchema,
 } from "@paperclipai/shared";
 import { projectToolDefinitions } from "../services/project-tools.js";
 import { callProjectTool } from "../services/project-tools.js";
@@ -29,24 +29,24 @@ afterEach(() => { faults.clear(); vi.restoreAllMocks(); vi.unstubAllGlobals(); v
 
 describe("project tool input contract", () => {
   it("publishes the same required idempotency bounds that execution validates", () => {
-    const schema = createProjectToolJsonSchema();
+    const schema = createProjectToolInputJsonSchema();
     expect(schema.required).toContain("idempotencyKey");
     expect(schema.properties?.idempotencyKey).toMatchObject({ type: "string", minLength: 1, maxLength: 255 });
     for (const idempotencyKey of [undefined, "", "a".repeat(256)]) {
-      expect(createProjectToolSchema.safeParse({ name: "Project", idempotencyKey }).success).toBe(false);
+      expect(createProjectToolInputSchema.safeParse({ name: "Project", idempotencyKey }).success).toBe(false);
     }
     for (const idempotencyKey of ["a", "a".repeat(255)]) {
-      expect(createProjectToolSchema.safeParse({ name: "Project", idempotencyKey }).success).toBe(true);
+      expect(createProjectToolInputSchema.safeParse({ name: "Project", idempotencyKey }).success).toBe(true);
     }
   });
 
   it("protects the cached schema from consumer mutations", () => {
-    createProjectToolJsonSchema().required?.splice(0);
-    expect(createProjectToolJsonSchema().required).toContain("idempotencyKey");
+    createProjectToolInputJsonSchema().required?.splice(0);
+    expect(createProjectToolInputJsonSchema().required).toContain("idempotencyKey");
   });
 
   it("preserves nested assessment bounds and input validation", () => {
-    const schema = githubReviewAssessmentJsonSchema();
+    const schema = githubReviewAssessmentInputJsonSchema();
     expect(schema.$schema).toBe("http://json-schema.org/draft-07/schema#");
     expect(schema.properties?.summary).toMatchObject({ maxLength: 24000 });
     expect(schema.properties?.findings).toMatchObject({ type: "array", maxItems: 300 });
@@ -56,11 +56,11 @@ describe("project tool input contract", () => {
     expect(githubReviewAssessmentSchema.safeParse({ ...input, coverage: { ...input.coverage, reviewedPaths: [] } }).success).toBe(false);
     expect(githubReviewAssessmentSchema.safeParse({ ...input, extra: true }).success).toBe(false);
     schema.required?.splice(0);
-    expect(githubReviewAssessmentJsonSchema().required).toContain("coverage");
+    expect(githubReviewAssessmentInputJsonSchema().required).toContain("coverage");
   });
 
   it("preserves nullable, bounded, strict avatar inputs", () => {
-    const schema = setAgentAvatarJsonSchema();
+    const schema = setAgentAvatarInputJsonSchema();
     expect(schema).toMatchObject({ additionalProperties: false, required: ["imageBase64"] });
     expect(setAgentAvatarSchema.safeParse({ imageBase64: null }).success).toBe(true);
     expect(setAgentAvatarSchema.safeParse({ imageBase64: "YQ==" }).success).toBe(true);

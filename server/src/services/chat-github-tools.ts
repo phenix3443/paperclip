@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { githubReviewAssessmentJsonSchema } from "@paperclipai/shared";
+import { githubReviewAssessmentInputJsonSchema } from "@paperclipai/shared";
 import { and, eq, isNull, sql } from "drizzle-orm";
 import {
   chatDeliveries,
@@ -104,7 +104,7 @@ export const GITHUB_BOT_TOOLS = [
     risk: "write",
     // Share the input contract with server validation so discovery includes every
     // length/array bound; hidden limits caused real agents to abandon publication.
-    schema: githubReviewAssessmentJsonSchema(),
+    schema: githubReviewAssessmentInputJsonSchema(),
   },
   {
     name: "formal_review",

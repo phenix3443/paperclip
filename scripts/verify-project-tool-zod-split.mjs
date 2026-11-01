@@ -52,7 +52,7 @@ try {
   for (const name of ["validators/project.js", "validators/chat-github.js", "agent-avatar-upload.js"]) copyModule(name);
   const sourceIndex = readFileSync(join(repository, "packages/shared/src/index.ts"), "utf8");
   const validatorsIndex = readFileSync(join(repository, "packages/shared/src/validators/index.ts"), "utf8");
-  for (const name of ["createProjectToolSchema", "createProjectToolJsonSchema"]) {
+  for (const name of ["createProjectToolInputSchema", "createProjectToolInputJsonSchema"]) {
     assert.match(sourceIndex, new RegExp(`\\b${name}\\b`));
     assert.match(validatorsIndex, new RegExp(`\\b${name}\\b`));
   }
@@ -74,22 +74,22 @@ try {
   assert.equal(createRequire(join(controlPath, "package.json"))("zod/package.json").version, "4.4.3");
   assert(old.z.toJSONSchema(control.createProjectSchema).properties.name);
   assert.throws(() => old.z.toJSONSchema(project.createProjectSchema.extend({ idempotencyKey: old.z.string().min(1).max(255) })), /push|deferred/);
-  const schema = project.createProjectToolJsonSchema();
+  const schema = project.createProjectToolInputJsonSchema();
   assert(schema.required.includes("idempotencyKey"));
   assert.equal(schema.properties.idempotencyKey.minLength, 1);
   assert.equal(schema.properties.idempotencyKey.maxLength, 255);
   assert(schema.properties.executionWorkspacePolicy);
-  assert(project.createProjectToolSchema.safeParse({ name: "Project", idempotencyKey: "key", executionWorkspacePolicy: { enabled: true, branchPolicy: { nested: { enabled: true } } } }).success);
+  assert(project.createProjectToolInputSchema.safeParse({ name: "Project", idempotencyKey: "key", executionWorkspacePolicy: { enabled: true, branchPolicy: { nested: { enabled: true } } } }).success);
   for (const idempotencyKey of [undefined, "", "x".repeat(256)]) {
-    assert.equal(project.createProjectToolSchema.safeParse({ name: "Project", idempotencyKey }).success, false);
+    assert.equal(project.createProjectToolInputSchema.safeParse({ name: "Project", idempotencyKey }).success, false);
   }
-  assert.equal(project.createProjectToolSchema.safeParse({ name: "", idempotencyKey: "key" }).success, false);
+  assert.equal(project.createProjectToolInputSchema.safeParse({ name: "", idempotencyKey: "key" }).success, false);
   schema.required.length = 0;
-  assert(project.createProjectToolJsonSchema().required.includes("idempotencyKey"));
-  assert.equal(github.githubReviewAssessmentJsonSchema().properties.findings.maxItems, 300);
-  assert.equal(github.githubReviewAssessmentJsonSchema().$schema, "http://json-schema.org/draft-07/schema#");
+  assert(project.createProjectToolInputJsonSchema().required.includes("idempotencyKey"));
+  assert.equal(github.githubReviewAssessmentInputJsonSchema().properties.findings.maxItems, 300);
+  assert.equal(github.githubReviewAssessmentInputJsonSchema().$schema, "http://json-schema.org/draft-07/schema#");
   assert.equal(github.githubReviewAssessmentSchema.safeParse({ reviewedCommit: "invalid" }).success, false);
-  assert.equal(avatar.setAgentAvatarJsonSchema().additionalProperties, false);
+  assert.equal(avatar.setAgentAvatarInputJsonSchema().additionalProperties, false);
   assert(avatar.setAgentAvatarSchema.safeParse({ imageBase64: null }).success);
   assert.equal(avatar.setAgentAvatarSchema.safeParse({ imageBase64: "invalid" }).success, false);
   console.log(JSON.stringify({ status: "PASS", serverZod: "4.4.3", sharedZod: "4.6.7", copiedModules: [...copied],
