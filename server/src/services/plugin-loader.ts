@@ -28,7 +28,7 @@ import { finishServiceShutdown } from "../shutdown.js";
  */
 import { existsSync } from "node:fs";
 import { readdir, readFile, rm, stat } from "node:fs/promises";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -56,6 +56,50 @@ import { pluginDatabaseService } from "./plugin-database.js";
 import { resolveBundledCatalogRoot } from "./bundled-plugins.js";
 
 const execFileAsync = promisify(execFile);
+
+export function runLocalPluginBuildCommand(
+  file: string,
+  args: readonly string[],
+  options: { cwd: string; timeout: number; signal?: AbortSignal },
+): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(file, [...args], { cwd: options.cwd, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    let killed = false;
+    child.stdout?.on("data", (chunk) => void (stdout += String(chunk)));
+    child.stderr?.on("data", (chunk) => void (stderr += String(chunk)));
+    const killGroup = () => {
+      try {
+        if (child.pid) process.kill(-child.pid, "SIGKILL");
+      } catch {
+        child.kill("SIGKILL");
+      }
+    };
+    const stop = () => {
+      killed = true;
+      killGroup();
+    };
+    const timer = setTimeout(stop, options.timeout);
+    if (options.signal?.aborted) stop();
+    else options.signal?.addEventListener("abort", stop, { once: true });
+    child.once("exit", () => killGroup());
+    child.once("error", (err) => {
+      clearTimeout(timer);
+      options.signal?.removeEventListener("abort", stop);
+      reject(Object.assign(err, { stdout, stderr, killed }));
+    });
+    child.once("close", (code, signal) => {
+      clearTimeout(timer);
+      options.signal?.removeEventListener("abort", stop);
+      if (code === 0 && !killed) {
+        resolve({ stdout, stderr });
+        return;
+      }
+      reject(Object.assign(new Error(`Command failed: ${file} ${args.join(" ")}`), { code, signal, killed, stdout, stderr }));
+    });
+  });
+}
 const STARTUP_CONFIG_RPC_TIMEOUT_MS = 30_000;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = path.resolve(__dirname, "../../..");
@@ -919,7 +963,7 @@ export async function ensureLocalPluginBuilt(
   const manualBuildCommand = buildLocalPluginRecoveryCommand(packageRoot, pkgJson, { repoRoot: options.repoRoot });
   if (typeof packageName !== "string" || packageName.trim().length === 0 || !manualBuildCommand) return;
 
-  const runExecFileAsync = options.execFileAsyncImpl ?? execFileAsync;
+  const runExecFileAsync = options.execFileAsyncImpl ?? runLocalPluginBuildCommand;
   const buildCommands = buildLocalPluginBuildCommands(packageRoot, pkgJson, {
     repoRoot: options.repoRoot,
     needsBuild: missingEntrypoints.length > 0,
