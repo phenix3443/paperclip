@@ -1519,4 +1519,87 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       sampleStalledBlockerIdentifier: "BRN-2",
     });
   });
+  it("reports a cycle through a parent waiting on its child as a dependency cycle", async () => {
+    const { companyId, agentId } = await createCompany("BCY");
+    const mk = (n: number, status: string, parentId: string | null = null) =>
+      insertIssue({ companyId, identifier: `BCY-${n}`, title: `Issue ${n}`, status, assigneeAgentId: agentId, parentId });
+    const parentId = await mk(2984, "blocked");
+    const coveredChildId = await mk(3004, "blocked", parentId);
+    const cycleChildId = await mk(3006, "blocked", parentId);
+    const middleId = await mk(2967, "blocked");
+    const leafId = await mk(4224, "in_progress");
+    await block({ companyId, blockerIssueId: coveredChildId, blockedIssueId: parentId });
+    await block({ companyId, blockerIssueId: leafId, blockedIssueId: coveredChildId });
+    await block({ companyId, blockerIssueId: middleId, blockedIssueId: cycleChildId });
+    await block({ companyId, blockerIssueId: parentId, blockedIssueId: middleId });
+    await activeRun({ companyId, agentId, issueId: leafId });
+
+    const rows = await svc.list(companyId, { attention: "blocked" });
+
+    expect(rows.map((row) => row.identifier).sort()).toEqual(["BCY-2967", "BCY-2984", "BCY-3006"]);
+    for (const row of rows) {
+      expect(row.blockedInboxAttention).toMatchObject({
+        state: "needs_attention",
+        reason: "blocked_by_dependency_cycle",
+        owner: { type: "agent", agentId },
+        action: { label: "Break dependency cycle" },
+      });
+    }
+    expect(rows.find((row) => row.id === parentId)?.blockedInboxAttention).toMatchObject({
+      leafIssue: { id: parentId, identifier: "BCY-2984" },
+      sampleIssueIdentifier: "BCY-2984",
+      action: {
+        detail:
+          "BCY-2984 → BCY-3006 → BCY-2967 → BCY-2984. Links: BCY-2984 → BCY-3006 parent-waits-child; " +
+          "BCY-3006 → BCY-2967 blocked-by; BCY-2967 → BCY-2984 blocked-by. Remove one link to break the cycle.",
+      },
+    });
+    // The covered child is not on the cycle, so it stays out of the inbox.
+    expect(rows.some((row) => row.id === coveredChildId)).toBe(false);
+  });
+
+  it("reports a cycle made only of blocks links and names its first agent owner", async () => {
+    const { companyId, agentId } = await createCompany("BCB");
+    const otherAgentId = randomUUID();
+    await db.insert(agents).values({ id: otherAgentId, companyId, name: "BCB Other", role: "engineer", status: "idle" });
+    const rootId = await insertIssue({ companyId, identifier: "BCB-1", title: "Root", status: "todo", assigneeAgentId: agentId });
+    const firstId = await insertIssue({ companyId, identifier: "BCB-2", title: "First", status: "blocked", assigneeAgentId: otherAgentId });
+    const secondId = await insertIssue({ companyId, identifier: "BCB-3", title: "Second", status: "blocked", assigneeAgentId: agentId });
+    await block({ companyId, blockerIssueId: firstId, blockedIssueId: rootId });
+    await block({ companyId, blockerIssueId: secondId, blockedIssueId: firstId });
+    await block({ companyId, blockerIssueId: firstId, blockedIssueId: secondId });
+
+    const rows = await svc.list(companyId, { attention: "blocked" });
+
+    expect(rows.find((row) => row.id === firstId)?.blockedInboxAttention).toMatchObject({
+      reason: "blocked_by_dependency_cycle",
+      owner: { type: "agent", agentId: otherAgentId },
+      action: {
+        label: "Break dependency cycle",
+        detail:
+          "BCB-2 → BCB-3 → BCB-2. Links: BCB-2 → BCB-3 blocked-by; BCB-3 → BCB-2 blocked-by. " +
+          "Remove one link to break the cycle.",
+      },
+    });
+    expect(rows.find((row) => row.id === secondId)?.blockedInboxAttention).toMatchObject({
+      reason: "blocked_by_dependency_cycle",
+      owner: { type: "agent", agentId },
+    });
+  });
+
+  it("does not report a cycle for a diamond that reaches one blocker twice", async () => {
+    const { companyId, agentId } = await createCompany("BCD");
+    const rootId = await insertIssue({ companyId, identifier: "BCD-1", title: "Root", status: "blocked", assigneeAgentId: agentId });
+    const leftId = await insertIssue({ companyId, identifier: "BCD-2", title: "Left", status: "todo", assigneeAgentId: agentId });
+    const rightId = await insertIssue({ companyId, identifier: "BCD-3", title: "Right", status: "todo", assigneeAgentId: agentId });
+    const leafId = await insertIssue({ companyId, identifier: "BCD-4", title: "Stalled review", status: "in_review", assigneeAgentId: agentId });
+    await block({ companyId, blockerIssueId: leftId, blockedIssueId: rootId });
+    await block({ companyId, blockerIssueId: rightId, blockedIssueId: rootId });
+    await block({ companyId, blockerIssueId: leafId, blockedIssueId: leftId });
+    await block({ companyId, blockerIssueId: leafId, blockedIssueId: rightId });
+
+    const root = (await svc.list(companyId, { attention: "blocked" })).find((row) => row.id === rootId);
+
+    expect(root?.blockedInboxAttention).toMatchObject({ reason: "blocked_chain_stalled" });
+  });
 });

@@ -400,13 +400,18 @@ function BlockedInboxRow({
   const desktopTrailing = (
     <span className="flex shrink-0 items-center gap-3 text-xs">
       <span
-        className="hidden w-(--sz-10_5rem) shrink-0 justify-start sm:inline-flex"
+        className="relative z-10 hidden w-(--sz-10_5rem) shrink-0 justify-start sm:inline-flex"
         data-testid="blocked-row-reason-column"
       >
         <BlockedReasonChip
           reason={row.attention.reason}
           severity={row.attention.severity}
           className="max-w-full"
+          title={
+            row.attention.action.detail
+              ? `${row.attention.action.label}: ${row.attention.action.detail}`
+              : row.attention.action.label
+          }
         />
       </span>
       {renderIssueColumns ? (

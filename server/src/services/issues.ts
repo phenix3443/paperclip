@@ -3438,6 +3438,10 @@ type IssueBlockerAttentionInputNode = Pick<
 type IssueBlockerAttentionEdge = {
   issueId: string;
   blockerIssueId: string;
+  kind: "blocks" | "child";
+};
+type IssueBlockerDependencyCycle = {
+  links: IssueBlockerAttentionEdge[];
 };
 type IssueBlockerAttentionQueryRow = IssueBlockerAttentionNode & {
   issueId: string | null;
@@ -3832,7 +3836,11 @@ async function listIssueBlockerAttentionMap(
   dbOrTx: any,
   companyId: string,
   issueRows: IssueBlockerAttentionInputNode[],
-  options: { truncatePerRoot?: boolean } = {},
+  options: {
+    truncatePerRoot?: boolean;
+    /** Filled with the first dependency cycle met while classifying each root that needs attention. */
+    cycleByRootId?: Map<string, IssueBlockerDependencyCycle>;
+  } = {},
 ): Promise<Map<string, IssueBlockerAttention>> {
   const roots = issueRows.filter(
     (row) => row.companyId === companyId && row.status === "blocked",
@@ -3946,6 +3954,7 @@ async function listIssueBlockerAttentionMap(
           .map((row) => ({
             issueId: row.issueId,
             blockerIssueId: row.blockerIssueId,
+            kind: "blocks" as const,
           })),
         ...childRows
           .filter(
@@ -3955,6 +3964,7 @@ async function listIssueBlockerAttentionMap(
           .map((row) => ({
             issueId: row.issueId,
             blockerIssueId: row.blockerIssueId,
+            kind: "child" as const,
           })),
       ]);
 
@@ -4298,6 +4308,26 @@ async function listIssueBlockerAttentionMap(
   // the caller's path. Cleared per root because `truncated` is per root.
   const classifyPathCache = new Map<string, PathClassification>();
   let classifyPathCycleHits = 0;
+  const rootCycle: { current: IssueBlockerDependencyCycle | null } = {
+    current: null,
+  };
+  // `seen` keeps insertion order, so it is the walked path from the root.
+  const recordCycle = (nodeId: string, seen: Set<string>) => {
+    if (rootCycle.current) return;
+    const path = [...seen];
+    const start = path.indexOf(nodeId);
+    if (start < 0) return;
+    const cycleNodes = [...path.slice(start), nodeId];
+    const links: IssueBlockerAttentionEdge[] = [];
+    for (let index = 0; index < cycleNodes.length - 1; index += 1) {
+      const edge = (edgesByIssueId.get(cycleNodes[index]!) ?? []).find(
+        (candidate) => candidate.blockerIssueId === cycleNodes[index + 1],
+      );
+      if (!edge) return;
+      links.push(edge);
+    }
+    rootCycle.current = { links };
+  };
   const classifyPath = (
     nodeId: string,
     seen: Set<string>,
@@ -4317,7 +4347,10 @@ async function listIssueBlockerAttentionMap(
   ): PathClassification => {
     const sample = blockerSampleIdentifier(nodesById.get(nodeId));
     if (truncated || seen.has(nodeId)) {
-      if (seen.has(nodeId)) classifyPathCycleHits += 1;
+      if (seen.has(nodeId)) {
+        classifyPathCycleHits += 1;
+        recordCycle(nodeId, seen);
+      }
       return {
         covered: false,
         stalled: false,
@@ -4526,6 +4559,7 @@ async function listIssueBlockerAttentionMap(
       ? isRootTruncated(root.id)
       : graphTruncated;
     classifyPathCache.clear();
+    rootCycle.current = null;
     const topLevelEdges = (edgesByIssueId.get(root.id) ?? []).filter((edge) => {
       const blocker = nodesById.get(edge.blockerIssueId);
       return (
@@ -4606,6 +4640,9 @@ async function listIssueBlockerAttentionMap(
       )
         ? "active_child"
         : "active_dependency";
+    }
+    if (rootCycle.current && state !== "covered") {
+      options.cycleByRootId?.set(root.id, rootCycle.current);
     }
 
     attentionMap.set(
@@ -6223,11 +6260,12 @@ async function listIssueBlockedInboxAttentionMap(
       row.issueId ? [row.issueId] : [],
     ),
   );
+  const blockerCycleByIssueId = new Map<string, IssueBlockerDependencyCycle>();
   const blockerAttentionByIssueId = await listIssueBlockerAttentionMap(
     dbOrTx,
     companyId,
     issueRows.filter((row) => row.status === "blocked" && !row.hiddenAt),
-    { truncatePerRoot: true },
+    { truncatePerRoot: true, cycleByRootId: blockerCycleByIssueId },
   );
 
   for (const row of issueRows) {
@@ -6477,6 +6515,55 @@ async function listIssueBlockedInboxAttentionMap(
     }
 
     const blockerState = blockerAttentionByIssueId.get(row.id);
+    const blockerCycle = blockerCycleByIssueId.get(row.id);
+    if (row.status === "blocked" && blockerCycle) {
+      const cycleIssues = blockerCycle.links.map((link) => link.issueId);
+      // Hidden issues are named generically and never chosen as owner.
+      const visibleCycleIssue = (issueId: string) => {
+        const issue = issuesById.get(issueId);
+        return issue && (issue.id === row.id || issue.visibility === "open")
+          ? issue
+          : undefined;
+      };
+      const cycleLabel = (issueId: string) => {
+        const issue = visibleCycleIssue(issueId);
+        return issue ? (issue.identifier ?? issue.id) : "a private issue";
+      };
+      const ownerIssue = cycleIssues
+        .map(visibleCycleIssue)
+        .find((issue) => issue?.assigneeAgentId);
+      const firstIssueId = cycleIssues[0]!;
+      const linkDetails = blockerCycle.links.map((link) =>
+        link.kind === "child"
+          ? `${cycleLabel(link.issueId)} → ${cycleLabel(link.blockerIssueId)} parent-waits-child`
+          : `${cycleLabel(link.issueId)} → ${cycleLabel(link.blockerIssueId)} blocked-by`,
+      );
+      result.set(
+        row.id,
+        attentionBase({
+          state: "needs_attention",
+          reason: "blocked_by_dependency_cycle",
+          severity: "high",
+          stoppedSinceAt: row.updatedAt,
+          owner: ownerIssue?.assigneeAgentId
+            ? {
+                type: "agent",
+                agentId: ownerIssue.assigneeAgentId,
+                userId: null,
+                label: null,
+              }
+            : { type: "unknown", agentId: null, userId: null, label: null },
+          action: {
+            label: "Break dependency cycle",
+            detail: `${[...cycleIssues, firstIssueId].map(cycleLabel).join(" → ")}. Links: ${linkDetails.join("; ")}. Remove one link to break the cycle.`,
+          },
+          sourceIssue: source,
+          leafIssue: issueRef(visibleCycleIssue(firstIssueId)),
+          sampleIssueIdentifier: visibleCycleIssue(firstIssueId)?.identifier ?? null,
+        }),
+      );
+      continue;
+    }
     if (
       row.status === "blocked" &&
       (blockerState?.state === "needs_attention" ||
