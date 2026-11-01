@@ -3482,10 +3482,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       for (const candidate of candidates) {
         let workspace = candidate.workspace;
         signal?.throwIfAborted();
-        // Retention is a permanent refusal, not a retry obligation. Settle it
-        // under the existing lifecycle lock, then reconsider on a native change.
-        // Destructive consumers still check again if this assessment allowed work.
-        const retentionHeld = await withExecutionWorkspaceLifecycleLock(db, workspace.id, async tx => {
+        const retentionHeld = await db.transaction(async tx => {
+          const [lock] = await tx.execute(sql`select pg_try_advisory_xact_lock(hashtextextended(${`execution_workspace_lifecycle:${workspace.id}`}, 0)) as acquired`);
+          if (!lock?.acquired) return false;
           const [fresh] = await tx.select().from(executionWorkspaces).where(and(
             eq(executionWorkspaces.id, workspace.id), eq(executionWorkspaces.companyId, workspace.companyId),
           ));

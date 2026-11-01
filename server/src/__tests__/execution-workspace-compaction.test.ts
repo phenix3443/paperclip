@@ -268,6 +268,31 @@ describeEmbeddedPostgres("terminal workspace compaction", () => {
     expect(destroy).not.toHaveBeenCalled(); expect(await fs.readFile(path.join(retained, "unique"), "utf8")).toBe("legacy bytes");
   }, 30_000);
 
+  it("keeps a busy active workspace from blocking later terminal work", async () => {
+    const active = await seedWorkspace(), terminal = await seedWorkspace();
+    await db.update(issues).set({ status: "in_progress", completedAt: null }).where(eq(issues.id, active.sourceIssueId));
+    let enter!: () => void, release!: () => void, held = true;
+    const ready = new Promise<void>(resolve => { enter = resolve; });
+    const pause = new Promise<void>(resolve => { release = () => { held = false; resolve(); }; });
+    const owner = db.transaction(async tx => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`execution_workspace_lifecycle:${active.executionWorkspaceId}`}, 0))`);
+      enter(); await pause;
+    });
+    await ready;
+    const deadline = setTimeout(release, 5_000);
+    let inspectedTerminal = false;
+    const svc = service({ beforeWorkspaceCompactionMove: async workspace => {
+      expect(workspace.id).toBe(terminal.executionWorkspaceId); expect(held).toBe(true);
+      inspectedTerminal = true; release();
+    } });
+    try {
+      expect(await svc.sweepTerminalWorkspaces()).toMatchObject({ compacted: 1 });
+      expect(inspectedTerminal).toBe(true);
+      await expectRegenerablePresent(active.worktreePath, true);
+      await expectRegenerablePresent(terminal.worktreePath, false);
+    } finally { clearTimeout(deadline); release(); await owner; }
+  }, 30_000);
+
   it.each([false, true])("settles retained history without another removal deadline (Git expiration %s)", async gitCacheExpirationEnabled => {
     const home = await fs.mkdtemp(path.join(os.tmpdir(), "retention-idle-")); tempDirs.add(home); vi.stubEnv("PAPERCLIP_HOME", home);
     const seeded = await seedWorkspace();
@@ -276,12 +301,10 @@ describeEmbeddedPostgres("terminal workspace compaction", () => {
     const svc = service({ gitCacheExpirationEnabled });
     expect(await svc.sweepTerminalWorkspaces()).toMatchObject({ compacted: 0, archived: 0 });
     expect(await svc.nextTerminalWorkspaceSweepAt()).toBeNull();
-    // Passive scheduler queries must stay in memory once this cycle settles.
     const selects = vi.spyOn(db, "select");
     for (let i = 0; i < 3; i++) expect(await svc.nextTerminalWorkspaceSweepAt()).toBeNull();
     expect(selects).not.toHaveBeenCalled(); selects.mockRestore();
     await expectRegenerablePresent(seeded.worktreePath, true);
-    // A new native producer still causes the next sweep to do useful work.
     const next = await seedWorkspace();
     svc.terminalWorkspaceWorkSettled(new Set([`workspace:${next.executionWorkspaceId}`]));
     expect(await svc.sweepTerminalWorkspaces()).toMatchObject({ compacted: 1 });

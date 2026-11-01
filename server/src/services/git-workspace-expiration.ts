@@ -1,4 +1,3 @@
-import { assertWorkspaceRetentionAllowsRemoval } from "./detached-repository-retention-guard.js";
 import { captureGitWorkspaceContents, assertGitWorkspaceContentsUnchanged, readManagedCheckoutContents } from "./git-workspace-contents.js";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -118,7 +117,6 @@ export async function expireReconstructableGitWorkspace(db: Db, snapshot: Worksp
   try {
     return await withIsolatedRepositorySourceLock(db, snapshot.companyId, snapshot.sourceIssueId, () =>
       withDedicatedDbConnection(db, connection => connection.transaction(async tx => {
-        await assertWorkspaceRetentionAllowsRemoval(tx, snapshot);
         const inspection = await inspectLockedGitExpirationCandidate(tx, snapshot, { now: options.now, signal: options.signal,
           auth: expirationGitAuth(db, snapshot), idleCutoff: options.idleCutoff, restorePoint: options.restorePoint,
           onRestorePointFallback: () => { result.restorePoint = true; } });

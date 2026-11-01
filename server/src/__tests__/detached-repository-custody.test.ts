@@ -221,6 +221,23 @@ describe("detached repository custody", () => {
     expect(await fs.readFile(path.join(source, "tracked"), "utf8")).toBe("initial");
   });
 
+  it.each([false, true])("verifies standalone HEAD after an interrupted rollback (changed: %s)", async changed => {
+    await preserveDetachedRepositories({ cwd, active: new Set(), retention: scope });
+    const { file, value } = await receipt();
+    await fs.rename(value.destination, source);
+    value.state = "pending"; value.history = value.history.slice(0, 1); value.rollbackStartedAt = new Date().toISOString();
+    await fs.writeFile(file, JSON.stringify(value));
+    if (changed) {
+      await fs.writeFile(path.join(source, "tracked"), "new external commit");
+      git(source, "add", "."); git(source, "commit", "-qm", "external writer");
+    }
+    const head = git(source, "rev-parse", "HEAD"), inode = (await fs.stat(source)).ino;
+    const warnings = await preserveDetachedRepositories({ cwd, active: new Set(["removed"]), retention: scope });
+    expect((await receipt()).value.state).toBe(changed ? "rollback_failed" : "rolled_back");
+    expect(warnings.length).toBe(changed ? 1 : 0);
+    expect(git(source, "rev-parse", "HEAD")).toBe(head); expect((await fs.stat(source)).ino).toBe(inode);
+  });
+
   it("leaves corrupt pending custody evidence and both paths unchanged", async () => {
     await preserveDetachedRepositories({ cwd, active: new Set(), retention: scope });
     const { file, value } = await receipt(); value.state = "pending"; value.before = {}; value.history = [value.history[0]];

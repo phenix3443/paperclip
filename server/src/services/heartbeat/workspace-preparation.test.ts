@@ -743,7 +743,6 @@ describe.skipIf(!support.supported && !externalDatabaseUrl)("heartbeat workspace
       return inspect(...args);
     });
     vi.spyOn(input.services.executionWorkspacesSvc, "update").mockImplementationOnce(async () => {
-      // A path writer can arrive after reconstruction but before the record update fails.
       await writeFile(join(workspace.cwd!, "late-writer.txt"), "late bytes must survive retention\n");
       if (state === "legacy" || state === "refused") {
         const directory = state === "legacy" ? join(workspace.cwd!, ".paperclip-runtime", "detached-repositories", "old")

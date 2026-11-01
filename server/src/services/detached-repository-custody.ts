@@ -212,7 +212,12 @@ async function reconcile(file: string, receipt: Receipt, guard: () => Promise<vo
         return transition(file, receipt, "rolled_back");
       } catch (error) { return transition(file, receipt, "rollback_failed", error); }
     }
-    return transition(file, receipt, receipt.rollbackStartedAt ? "rolled_back" : "aborted");
+    if (receipt.rollbackStartedAt) {
+      try { await verifyOriginal(receipt); }
+      catch (error) { return transition(file, receipt, "rollback_failed", error); }
+      return transition(file, receipt, "rolled_back");
+    }
+    return transition(file, receipt, "aborted");
   }
   return transition(file, receipt, "unknown");
 }

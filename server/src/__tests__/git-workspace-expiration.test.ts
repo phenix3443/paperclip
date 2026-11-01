@@ -76,6 +76,12 @@ describeEmbeddedPostgres("reconstructable Git expiration", () => {
     const retained = await retainedFixture(db, { id: f.workspaceId, companyId: f.companyId, sourceIssueId: f.issueId, cwd: f.cwd }, state);
     const inspect = retentionInspection.inspectDetachedRepositoryRetention;
     const spy = vi.spyOn(retentionInspection, "inspectDetachedRepositoryRetention").mockImplementation(async (...args) => {
+      await db.transaction(async tx => {
+        const [locks] = await tx.execute(sql`select
+          pg_try_advisory_xact_lock(hashtextextended(${`isolated_repository_source:${f.companyId}:${f.issueId}`}, 0)) as source,
+          pg_try_advisory_xact_lock(hashtextextended(${`execution_workspace_lifecycle:${f.workspaceId}`}, 0)) as lifecycle`);
+        expect(locks).toMatchObject({ source: false, lifecycle: false });
+      });
       const reasons = await inspect(...args);
       if (state !== null && reasons.length) {
         await fs.mkdir(retained.source, { recursive: true });

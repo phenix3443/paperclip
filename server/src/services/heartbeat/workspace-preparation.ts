@@ -968,8 +968,6 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
     if (executionWorkspace.created) {
       try {
         const previous = reusableExistingExecutionWorkspace ?? existingExecutionWorkspace;
-        // Failed persistence cannot confer ownership on a transient ID. Keep the
-        // realized directory when no native identity can be verified.
         if (!previous || !lockedSourceIssueId) throw new Error("Workspace cleanup identity is unverified");
         await withExecutionWorkspaceLifecycleLock(db, previous.id, async tx => {
           const [workspace] = await tx.select().from(executionWorkspacesTable).where(and(
