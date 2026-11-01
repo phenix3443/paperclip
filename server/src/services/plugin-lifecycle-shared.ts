@@ -74,7 +74,12 @@ export function createPluginLifecycleSerializer(
   const tails = new Map<string, Promise<void>>();
 
   return {
-    run(pluginKey, kind, fn, options) {
+    run<T>(
+      pluginKey: string,
+      kind: PluginLifecycleOpKind,
+      fn: (lease: PluginLifecycleLease) => Promise<T>,
+      options?: { queueWaitMs?: number; onSettled?: () => void },
+    ): Promise<T> {
       const queueWaitMs =
         options?.queueWaitMs ?? defaults.queueWaitMs ?? DEFAULT_PLUGIN_LIFECYCLE_QUEUE_WAIT_MS;
       const previous = tails.get(pluginKey) ?? Promise.resolve();
