@@ -6,15 +6,9 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
-export const PATCHED_POSTGRES_DRIVER = {
-  version: "3.4.9",
-  files: {
-    "src/connection.js": "b57261592f135d127b8e7267c78981eb2c5f4751259641b782ba621b89d939d1",
-    "src/index.js": "07dee80154d83ca9163a4a8790ef0281602ffca682e2387b3487bf20395d2adf",
-    "cjs/src/connection.js": "c3e6807f967203cd35eeb7632f01b419d7ed2405f657f9f5654729c3422bd98a",
-    "cjs/src/index.js": "b28d16e69f28dc5d5ba9a944329f191d896f7ab80ac49300445da7ba8c594d22",
-  },
-} as const;
+export type PostgresDriverExpectation = { version: string; files: Record<string, string> };
+
+export const POSTGRES_DRIVER_RECORD = ".paperclip-postgres-driver.json";
 
 export const POSTGRES_DRIVER_CALLERS = ["paperclipai", "@paperclipai/db"] as const;
 
@@ -35,15 +29,101 @@ function sha256(file: string): string {
   return createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 }
 
-function assertPatchedDriver(packageRoot: string, label: string): void {
-  const manifest = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8")) as { name?: string; version?: string };
-  if (manifest.name !== "postgres" || manifest.version !== PATCHED_POSTGRES_DRIVER.version) {
-    throw new Error(`${label} is ${manifest.name ?? "unknown"}@${manifest.version ?? "unknown"}; expected patched postgres@${PATCHED_POSTGRES_DRIVER.version}.`);
+function readJson(file: string, label: string): unknown {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (error) {
+    throw new Error(`Cannot read ${label} ${file}: ${error instanceof Error ? error.message : String(error)}`);
   }
-  for (const [file, expected] of Object.entries(PATCHED_POSTGRES_DRIVER.files)) {
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+function isPackageRelativePath(file: string): boolean {
+  return file !== "" && !file.includes("\\") && !path.posix.isAbsolute(file) && path.posix.normalize(file) === file && !file.split("/").includes("..");
+}
+
+function postgresPatchEntries(checkoutPath: string): [string, string][] {
+  const manifest = readJson(path.join(checkoutPath, "package.json"), "checkout package.json");
+  if (!isRecord(manifest)) throw new Error(`Checkout package.json in ${checkoutPath} is not an object.`);
+  const patched = isRecord(manifest.pnpm) && isRecord(manifest.pnpm.patchedDependencies) ? manifest.pnpm.patchedDependencies : {};
+  const entries = Object.entries(patched)
+    .filter(([key]) => key.startsWith("postgres@"))
+    .map(([key, value]): [string, string] => [key, typeof value === "string" ? value : ""]);
+  const workspaceFile = path.join(checkoutPath, "pnpm-workspace.yaml");
+  if (fs.existsSync(workspaceFile)) {
+    let section = "";
+    for (const line of fs.readFileSync(workspaceFile, "utf8").split(/\r?\n/)) {
+      if (/^[^\s#]/.test(line)) section = line.split(":")[0].trim();
+      if (section !== "patchedDependencies") continue;
+      const match = /^\s*["']?(postgres@[^"':\s]+)["']?\s*:\s*["']?([^"'\s#]*)["']?\s*(?:#.*)?$/.exec(line);
+      if (match) entries.push([match[1], match[2]]);
+    }
+  }
+  return entries;
+}
+
+export function readCheckoutPostgresDriver(checkoutPath: string): PostgresDriverExpectation {
+  const linkedDriver = path.join(checkoutPath, "packages", "db", "node_modules", "postgres");
+  if (!fs.existsSync(linkedDriver)) throw new Error(`Checkout ${checkoutPath} has no installed postgres driver at packages/db/node_modules/postgres.`);
+  const driverRoot = fs.realpathSync(linkedDriver);
+  const driverManifest = readJson(path.join(driverRoot, "package.json"), "checkout postgres driver package.json");
+  const version = isRecord(driverManifest) ? driverManifest.version : undefined;
+  if (typeof version !== "string" || version === "") throw new Error(`Checkout postgres driver ${driverRoot} has no version.`);
+  const entries = postgresPatchEntries(checkoutPath);
+  if (entries.length === 0) return { version, files: {} };
+  const entry = entries.find(([key]) => key === `postgres@${version}`);
+  if (!entry) {
+    throw new Error(`Checkout patches ${entries.map(([key]) => key).join(", ")} do not match the installed postgres@${version}.`);
+  }
+  const patchFile = path.resolve(checkoutPath, entry[1]);
+  if (entry[1] === "" || !fs.existsSync(patchFile)) throw new Error(`Checkout patch for ${entry[0]} is missing: ${entry[1] || "no path"}.`);
+  const patchedFiles = [...fs.readFileSync(patchFile, "utf8").matchAll(/^diff --git a\/(\S+) b\/(\S+)$/gm)].map((match) => match[2]);
+  if (patchedFiles.length === 0) throw new Error(`Checkout patch ${entry[1]} lists no patched files.`);
+  const files: Record<string, string> = {};
+  for (const file of patchedFiles) {
+    const location = path.join(driverRoot, file);
+    if (!isPackageRelativePath(file) || !fs.existsSync(location)) throw new Error(`Checkout postgres driver is missing patched file ${file}.`);
+    files[file] = sha256(location);
+  }
+  return { version, files };
+}
+
+export function writePostgresDriverRecord(payloadPath: string, expected: PostgresDriverExpectation): void {
+  fs.writeFileSync(path.join(payloadPath, POSTGRES_DRIVER_RECORD), `${JSON.stringify({ version: expected.version, files: expected.files }, null, 2)}\n`);
+}
+
+export function readPostgresDriverRecord(payloadPath: string): PostgresDriverExpectation {
+  const recordPath = path.join(payloadPath, POSTGRES_DRIVER_RECORD);
+  if (!fs.existsSync(recordPath)) throw new Error(`Payload ${payloadPath} has no ${POSTGRES_DRIVER_RECORD}; it predates patched driver packaging and must be rebuilt.`);
+  const record = readJson(recordPath, "postgres driver record");
+  if (!isRecord(record) || Object.keys(record).sort().join(",") !== "files,version") {
+    throw new Error(`Postgres driver record ${recordPath} must contain exactly version and files.`);
+  }
+  const { version, files } = record;
+  if (typeof version !== "string" || version === "") throw new Error(`Postgres driver record ${recordPath} has no version.`);
+  const installed = readJson(path.join(payloadPath, "node_modules", "postgres", "package.json"), "payload postgres driver package.json");
+  if (!isRecord(installed) || installed.version !== version) {
+    throw new Error(`Postgres driver record ${recordPath} names postgres@${version}, but the payload root driver differs.`);
+  }
+  if (!isRecord(files)) throw new Error(`Postgres driver record ${recordPath} files must be an object.`);
+  for (const [file, hash] of Object.entries(files)) {
+    if (!isPackageRelativePath(file)) throw new Error(`Postgres driver record ${recordPath} has unsafe file path ${file}.`);
+    if (typeof hash !== "string" || !/^[0-9a-f]{64}$/.test(hash)) throw new Error(`Postgres driver record ${recordPath} has an invalid hash for ${file}.`);
+  }
+  return { version, files: files as Record<string, string> };
+}
+
+function assertPatchedDriver(packageRoot: string, label: string, expected: PostgresDriverExpectation): void {
+  const manifest = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8")) as { name?: string; version?: string };
+  if (manifest.name !== "postgres" || manifest.version !== expected.version) {
+    throw new Error(`${label} is ${manifest.name ?? "unknown"}@${manifest.version ?? "unknown"}; expected patched postgres@${expected.version}.`);
+  }
+  for (const [file, hash] of Object.entries(expected.files)) {
     const location = path.join(packageRoot, file);
     const actual = fs.existsSync(location) ? sha256(location) : "missing";
-    if (actual !== expected) throw new Error(`${label} ${file} is ${actual}; expected patched ${expected}.`);
+    if (actual !== hash) throw new Error(`${label} ${file} is ${actual}; expected patched ${hash}.`);
   }
 }
 
@@ -86,7 +166,7 @@ function findForbiddenLinks(payloadRoot: string): string[] {
 const copiesOf = (inventory: PackageInventory, name: string) =>
   inventory.filter((entry) => entry.name === name).map((entry) => entry.directory);
 
-export async function verifyPostgresDriverPayload(payloadPath: string): Promise<PostgresDriverResolution[]> {
+export async function verifyPostgresDriverPayload(payloadPath: string, expected: PostgresDriverExpectation): Promise<PostgresDriverResolution[]> {
   const payloadRoot = fs.realpathSync(payloadPath);
   const nodeModules = path.join(payloadRoot, "node_modules");
   const links = findForbiddenLinks(payloadRoot);
@@ -101,7 +181,7 @@ export async function verifyPostgresDriverPayload(payloadPath: string): Promise<
   if (extra.length > 0 || !copies.includes(rootCopy)) {
     throw new Error(`Payload must contain exactly one postgres driver at node_modules/postgres; found ${copies.map((copy) => path.relative(payloadRoot, copy)).join(", ")}.`);
   }
-  assertPatchedDriver(rootCopy, "Payload driver node_modules/postgres");
+  assertPatchedDriver(rootCopy, "Payload driver node_modules/postgres", expected);
   const callers: { caller: string; directory: string }[] = POSTGRES_DRIVER_CALLERS.map((caller) => ({ caller, directory: path.join(nodeModules, caller) }));
   for (const caller of callers) {
     if (!fs.existsSync(path.join(caller.directory, "package.json"))) throw new Error(`Payload is missing postgres caller ${caller.caller}.`);

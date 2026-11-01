@@ -27,6 +27,7 @@ import {
   writeInstallManifestAtomic,
 } from "../install-store.js";
 import { resolveCliVersion } from "../version.js";
+import { POSTGRES_DRIVER_RECORD, readCheckoutPostgresDriver, readPostgresDriverRecord, writePostgresDriverRecord } from "../postgres-driver-integrity.js";
 import { systemdServiceName } from "../services/service-manager.js";
 
 const ORIGINAL_ENV = { ...process.env };
@@ -34,8 +35,13 @@ const PATCHED_POSTGRES_SOURCE = path.resolve(
   path.dirname(createRequire(path.resolve(__dirname, "../../../packages/db/package.json")).resolve("postgres")),
   "../..",
 );
+const REPO_ROOT = path.resolve(__dirname, "../../..");
+const EXPECTED_DRIVER = readCheckoutPostgresDriver(REPO_ROOT);
+const REPO_PATCH = (JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8")) as { pnpm: { patchedDependencies: Record<string, string> } })
+  .pnpm.patchedDependencies[`postgres@${EXPECTED_DRIVER.version}`];
+const POSTGRES_TARBALL = `postgres-${EXPECTED_DRIVER.version}.tgz`;
 
-function writePatchedPayload(prefix: string): void {
+function writePatchedPayload(prefix: string, { record = true } = {}): void {
   const nodeModules = path.join(prefix, "node_modules");
   const packageRoot = path.join(nodeModules, "paperclipai");
   fs.mkdirSync(path.join(packageRoot, "dist"), { recursive: true });
@@ -49,6 +55,7 @@ function writePatchedPayload(prefix: string): void {
   fs.writeFileSync(path.join(drizzleRoot, "package.json"), JSON.stringify({ name: "drizzle-orm", version: "0.45.2" }));
   fs.writeFileSync(path.join(drizzleRoot, "postgres-js", "driver.js"), "import pgClient from \"postgres\";\n");
   fs.cpSync(PATCHED_POSTGRES_SOURCE, path.join(nodeModules, "postgres"), { recursive: true, dereference: true });
+  if (record) writePostgresDriverRecord(prefix, EXPECTED_DRIVER);
 }
 
 describe("managed install commands", () => {
@@ -152,7 +159,10 @@ describe("managed install commands", () => {
           fs.mkdirSync(path.join(checkout, workspacePackage.dir), { recursive: true });
           fs.writeFileSync(path.join(checkout, workspacePackage.dir, "package.json"), JSON.stringify(workspacePackage.packageJson));
         }
-        fs.mkdirSync(path.join(checkout, "packages", "db", "node_modules", "postgres"), { recursive: true });
+        fs.writeFileSync(path.join(checkout, "package.json"), JSON.stringify({ pnpm: { patchedDependencies: { [`postgres@${EXPECTED_DRIVER.version}`]: REPO_PATCH } } }));
+        fs.mkdirSync(path.dirname(path.join(checkout, REPO_PATCH)), { recursive: true });
+        fs.copyFileSync(path.join(REPO_ROOT, REPO_PATCH), path.join(checkout, REPO_PATCH));
+        fs.cpSync(PATCHED_POSTGRES_SOURCE, path.join(checkout, "packages", "db", "node_modules", "postgres"), { recursive: true, dereference: true });
         return { stdout: "", stderr: "" };
       }
       if (file === "corepack") {
@@ -166,11 +176,11 @@ describe("managed install commands", () => {
       }
       if (file === "bash") return { stdout: "", stderr: "" };
       if (file === "npm" && args[0] === "pack") {
-        const tarball = args[1]?.endsWith(path.join("node_modules", "postgres")) ? "postgres-3.4.9.tgz" : `${args[1]?.includes("workspace-package-") ? "paperclipai-db" : "paperclipai"}-0.3.1.tgz`;
+        const tarball = args[1]?.endsWith(path.join("node_modules", "postgres")) ? POSTGRES_TARBALL : `${args[1]?.includes("workspace-package-") ? "paperclipai-db" : "paperclipai"}-0.3.1.tgz`;
         fs.writeFileSync(path.join(args[args.indexOf("--pack-destination") + 1], tarball), "package");
         return { stdout: "", stderr: "" };
       }
-      if (file === "npm" && args[0] === "install") { writePatchedPayload(args[args.indexOf("--prefix") + 1]); return { stdout: "", stderr: "" }; }
+      if (file === "npm" && args[0] === "install") { writePatchedPayload(args[args.indexOf("--prefix") + 1], { record: false }); return { stdout: "", stderr: "" }; }
       if (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs")) {
         fs.mkdirSync(args[2], { recursive: true });
         fs.writeFileSync(path.join(args[2], "package.json"), JSON.stringify({ name: "@paperclipai/db", version: "0.3.1" }));
@@ -197,7 +207,30 @@ describe("managed install commands", () => {
     expect(postgresPack).toBeDefined();
     const installCall = runCommand.mock.calls.find(([command, args]) => command === "npm" && args[0] === "install");
     expect(installCall?.[1].filter((arg) => arg.endsWith(".tgz"))).toHaveLength(5);
-    expect(installCall?.[1].some((arg) => path.basename(arg) === "postgres-3.4.9.tgz")).toBe(true);
+    expect(installCall?.[1].some((arg) => path.basename(arg) === POSTGRES_TARBALL)).toBe(true);
+  });
+
+  it("records the checkout-derived driver expectation in a newly built git payload", async () => {
+    const sha = "6".repeat(40);
+    const { payloadPath } = await installGitPayload("paperclipai/paperclip", sha, createGitCheckoutRunCommand(sha), resolveInstallStorePaths());
+    expect(readPostgresDriverRecord(payloadPath)).toEqual(EXPECTED_DRIVER);
+  });
+
+  it("refuses a cached git payload without a driver record and keeps the current selection", async () => {
+    const goodSha = "7".repeat(40);
+    const unrecordedSha = "8".repeat(40);
+    await installCommand({ ref: goodSha, repo: "paperclipai/paperclip", yes: true }, { runCommand: createGitCheckoutRunCommand(goodSha) });
+    const paths = resolveInstallStorePaths();
+    const before = readInstallManifest(paths);
+    const currentBefore = fs.readlinkSync(paths.currentPath);
+    const cached = payloadPathFor(paths, "git", unrecordedSha.slice(0, 12));
+    writePatchedPayload(cached, { record: false });
+    const runCommand = createGitCheckoutRunCommand(unrecordedSha);
+    await expect(installCommand({ ref: unrecordedSha, repo: "paperclipai/paperclip", yes: true }, { runCommand })).rejects.toThrow(`has no ${POSTGRES_DRIVER_RECORD}`);
+    expect(runCommand.mock.calls.filter(([command, args]) => command === process.execPath && args.at(-1) === "--version")).toHaveLength(0);
+    expect(runCommand.mock.calls.filter(([command, args]) => command === "curl" && args.includes("--output"))).toHaveLength(0);
+    expect(readInstallManifest(paths)).toEqual(before);
+    expect(fs.readlinkSync(paths.currentPath)).toBe(currentBefore);
   });
 
   it("builds git checkouts with NODE_ENV cleared so ambient production mode keeps devDependencies", async () => {

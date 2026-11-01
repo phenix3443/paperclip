@@ -7,14 +7,15 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { PATCHED_POSTGRES_DRIVER } from "../cli/src/postgres-driver-integrity.ts";
+import { readCheckoutPostgresDriver } from "../cli/src/postgres-driver-integrity.ts";
 
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const rootPackage = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"));
 const patchedDependencies = rootPackage.pnpm.patchedDependencies;
 const postgresSpecifier = Object.keys(patchedDependencies).find(specifier => specifier.startsWith("postgres@"));
 const postgresVersion = postgresSpecifier.slice("postgres@".length);
-const driverFiles = ["src/connection.js", "src/index.js", "cjs/src/connection.js", "cjs/src/index.js"];
+const checkoutDriver = readCheckoutPostgresDriver(repoRoot);
+const driverFiles = Object.keys(checkoutDriver.files);
 const hashes = directory => Object.fromEntries(driverFiles.map(file => [file,
   createHash("sha256").update(readFileSync(join(directory, file))).digest("hex")]));
 
@@ -46,9 +47,10 @@ test("the packed workspace driver carries the repository-patched postgres files"
   execFileSync("patch", ["-p1", "--forward", "-d", referencePackage],
     { input: readFileSync(join(repoRoot, patchedDependencies[postgresSpecifier])), stdio: ["pipe", "pipe", "inherit"] });
   const patchedHashes = hashes(referencePackage);
+  assert.ok(driverFiles.length > 0);
   for (const file of driverFiles) assert.notEqual(patchedHashes[file], registryHashes[file], `${file} must be patched`);
-  assert.equal(PATCHED_POSTGRES_DRIVER.version, postgresVersion);
-  assert.deepEqual(PATCHED_POSTGRES_DRIVER.files, patchedHashes);
+  assert.equal(checkoutDriver.version, postgresVersion);
+  assert.deepEqual(checkoutDriver.files, patchedHashes);
 
   const workspaceDriver = realpathSync(join(repoRoot, "packages/db/node_modules/postgres"));
   const packed = join(root, "packed");

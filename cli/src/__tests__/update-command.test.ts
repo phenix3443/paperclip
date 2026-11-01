@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { writeManagedShim, flipCurrentAtomic, initializeInstallStore, payloadPathFor, readInstallManifest, resolveInstallStorePaths, writeInstallManifestAtomic, type InstallManifest, type InstallRecord } from "../install-store.js";
 import type { CommandRunner } from "../commands/install.js";
+import { readCheckoutPostgresDriver, writePostgresDriverRecord } from "../postgres-driver-integrity.js";
 import { compareVersions, detectInstallMode, resolveUpdateRequest, rollbackManagedInstall, updateCommand } from "../commands/update.js";
 
 let root: string;
@@ -26,6 +27,7 @@ function addPatchedPostgres(payloadPath: string): void {
   fs.writeFileSync(path.join(drizzleRoot, "package.json"), JSON.stringify({ name: "drizzle-orm", version: "0.45.2" }));
   fs.writeFileSync(path.join(drizzleRoot, "postgres-js", "driver.js"), "import pgClient from \"postgres\";\n");
   fs.cpSync(PATCHED_POSTGRES_SOURCE, path.join(nodeModules, "postgres"), { recursive: true, dereference: true });
+  writePostgresDriverRecord(payloadPath, readCheckoutPostgresDriver(path.resolve(__dirname, "../../..")));
 }
 
 function record(payloadPath: string, version: string, channel: "latest" | "canary" | "pinned" = "latest"): InstallRecord {

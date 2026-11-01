@@ -21,9 +21,13 @@ import {
   type InstallChannel,
   type InstallRecord,
 } from "../install-store.js";
-import { PATCHED_POSTGRES_DRIVER, verifyPostgresDriverPayload } from "../postgres-driver-integrity.js";
-
-const PATCHED_POSTGRES_TARBALL = `postgres-${PATCHED_POSTGRES_DRIVER.version}.tgz`;
+import {
+  readCheckoutPostgresDriver,
+  readPostgresDriverRecord,
+  verifyPostgresDriverPayload,
+  writePostgresDriverRecord,
+  type PostgresDriverExpectation,
+} from "../postgres-driver-integrity.js";
 
 const execFileAsync = promisify(execFile);
 export const PUBLIC_NPM_REGISTRY = "https://registry.npmjs.org";
@@ -247,14 +251,14 @@ function gitBuildEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return env;
 }
 
-export type PayloadVerifier = (payloadPath: string) => Promise<unknown>;
+export type PayloadVerifier = (payloadPath: string, expected: PostgresDriverExpectation) => Promise<unknown>;
 
 export async function installGitPayload(repo: string, sha: string, runCommand: CommandRunner, paths = resolveInstallStorePaths(), verifyPayload: PayloadVerifier = verifyPostgresDriverPayload): Promise<{ payloadPath: string; reused: boolean; version: string }> {
   const identifier = sha.slice(0, 12);
   const payloadPath = payloadPathFor(paths, "git", identifier);
   if (fs.existsSync(payloadPath)) {
     const metadata = JSON.parse(fs.readFileSync(path.join(payloadPath, "node_modules", "paperclipai", "package.json"), "utf8")) as { version: string };
-    await verifyPayload(payloadPath);
+    await verifyPayload(payloadPath, readPostgresDriverRecord(payloadPath));
     await smokePayload(payloadPath, metadata.version, runCommand);
     return { payloadPath, reused: true, version: metadata.version };
   }
@@ -286,6 +290,7 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     await runCommand("corepack", ["pnpm", "install", "--frozen-lockfile"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("bash", ["scripts/build-npm.sh", "--skip-checks", "--skip-typecheck"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("corepack", ["pnpm", "-r", "--filter", "@paperclipai/server...", "--if-present", "run", "build"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+    const expected = readCheckoutPostgresDriver(checkoutPath);
     const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
     const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
     for (const [index, workspacePackage] of workspacePackages.entries()) {
@@ -305,14 +310,16 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     await runCommand("npm", ["pack", patchedPostgres, "--pack-destination", stagingRoot, "--ignore-scripts"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
     const tarballs = fs.readdirSync(stagingRoot).filter((entry) => entry.endsWith(".tgz"));
     const cliTarball = tarballs.find((entry) => entry === `paperclipai-${metadata.version}.tgz`);
-    const postgresTarball = tarballs.find((entry) => entry === PATCHED_POSTGRES_TARBALL);
+    const postgresTarballName = `postgres-${expected.version}.tgz`;
+    const postgresTarball = tarballs.find((entry) => entry === postgresTarballName);
     const workspaceTarballs = tarballs.filter((entry) => entry !== cliTarball && entry !== postgresTarball);
-    if (!postgresTarball) throw new Error(`Git install packaging did not produce ${PATCHED_POSTGRES_TARBALL}.`);
+    if (!postgresTarball) throw new Error(`Git install packaging did not produce ${postgresTarballName}.`);
     if (!cliTarball || workspaceTarballs.length !== workspacePackages.length) {
       throw new Error(`Git install packaging produced ${workspaceTarballs.length} workspace tarballs; expected ${workspacePackages.length}.`);
     }
     await runCommand("npm", ["install", "--prefix", stagedPayload, path.join(stagingRoot, cliTarball), path.join(stagingRoot, postgresTarball), ...workspaceTarballs.map((entry) => path.join(stagingRoot, entry)), "--no-audit", "--no-fund"], { cwd: stagingRoot, maxBuffer: 32 * 1024 * 1024 });
-    await verifyPayload(stagedPayload);
+    writePostgresDriverRecord(stagedPayload, expected);
+    await verifyPayload(stagedPayload, expected);
     await smokePayload(stagedPayload, metadata.version, runCommand);
     fs.renameSync(stagedPayload, payloadPath);
     return { payloadPath, reused: false, version: metadata.version };
