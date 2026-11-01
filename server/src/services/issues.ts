@@ -3444,6 +3444,7 @@ type IssueBlockerDependencyCycle = {
   links: IssueBlockerAttentionEdge[];
 };
 type IssueBlockerAttentionQueryRow = IssueBlockerAttentionNode & {
+  readable?: boolean | null;
   issueId: string | null;
   blockerIssueId: string;
 };
@@ -3840,6 +3841,7 @@ async function listIssueBlockerAttentionMap(
     truncatePerRoot?: boolean;
     /** Filled with the first dependency cycle met while classifying each root that needs attention. */
     cycleByRootId?: Map<string, IssueBlockerDependencyCycle>;
+    publicRead?: { readCondition: SQL<boolean> | undefined };
   } = {},
 ): Promise<Map<string, IssueBlockerAttention>> {
   const roots = issueRows.filter(
@@ -3853,6 +3855,10 @@ async function listIssueBlockerAttentionMap(
   }
   if (roots.length === 0) return attentionMap;
 
+  const readableIds = new Set<string>();
+  const proofColumns = options.publicRead
+    ? { readable: sql<boolean>`${options.publicRead.readCondition ?? sql<boolean>`false`}` }
+    : {};
   const nodesById = new Map<string, IssueBlockerAttentionNode>();
   const edgesByIssueId = new Map<string, IssueBlockerAttentionEdge[]>();
   for (const root of roots) nodesById.set(root.id, { ...root });
@@ -3888,6 +3894,7 @@ async function listIssueBlockerAttentionMap(
         IssueBlockerAttentionQueryRow[]
       > = dbOrTx
         .select({
+          ...proofColumns,
           issueId: issueRelations.relatedIssueId,
           blockerIssueId: issues.id,
           id: issues.id,
@@ -3912,6 +3919,7 @@ async function listIssueBlockerAttentionMap(
         );
       const childRowsPromise: Promise<IssueBlockerAttentionQueryRow[]> = dbOrTx
         .select({
+          ...proofColumns,
           issueId: issues.parentId,
           blockerIssueId: issues.id,
           id: issues.id,
@@ -3939,6 +3947,10 @@ async function listIssueBlockerAttentionMap(
         explicitBlockerRowsPromise,
         childRowsPromise,
       ]);
+
+      for (const node of [...explicitBlockerRows, ...childRows]) {
+        if (node.companyId === companyId && node.readable === true) readableIds.add(node.id);
+      }
 
       const unresolvedExplicitBlockerRows = explicitBlockerRows.filter(
         (row) =>
@@ -4685,7 +4697,32 @@ async function listIssueBlockerAttentionMap(
     );
   }
 
-  return attentionMap;
+  if (!options.publicRead) return attentionMap;
+  const nodesBySample = new Map<string, IssueBlockerAttentionNode | null>();
+  for (const node of nodesById.values()) {
+    for (const sample of new Set([node.id, node.identifier])) {
+      if (sample) nodesBySample.set(sample, nodesBySample.has(sample) ? null : node);
+    }
+  }
+  const safeSample = (sample: string | null) => {
+    const node = sample ? nodesBySample.get(sample) : null;
+    return node && readableIds.has(node.id) ? sample : null;
+  };
+  const publicAttention = new Map<string, IssueBlockerAttention>();
+  for (const [issueId, raw] of attentionMap) {
+    const terminalReadable = Boolean(raw.terminalBlockerIssueId && readableIds.has(raw.terminalBlockerIssueId));
+    publicAttention.set(issueId, {
+      ...raw,
+      sampleBlockerIdentifier: safeSample(raw.sampleBlockerIdentifier),
+      sampleStalledBlockerIdentifier: safeSample(raw.sampleStalledBlockerIdentifier),
+      directBlockerIssueId: raw.directBlockerIssueId && readableIds.has(raw.directBlockerIssueId)
+        ? raw.directBlockerIssueId : null,
+      terminalBlockerIssueId: terminalReadable ? raw.terminalBlockerIssueId : null,
+      terminalBlocker: terminalReadable ? raw.terminalBlocker : null,
+      pendingFinalizeBlockerIssueIds: raw.pendingFinalizeBlockerIssueIds.filter((id) => readableIds.has(id)),
+    });
+  }
+  return publicAttention;
 }
 
 type IssueReviewAttentionInput = Pick<IssueRow, "id" | "companyId" | "status">;
@@ -5367,10 +5404,11 @@ async function lastActivityStatsForIssues(
   return [...byIssueId.values()];
 }
 
-async function blockedByMapForIssues(
+async function readableBlockedByMapForIssues(
   dbOrTx: any,
   companyId: string,
   issueIds: string[],
+  readCondition: SQL<boolean> | undefined,
 ): Promise<Map<string, IssueRelationIssueSummary[]>> {
   const map = new Map<string, IssueRelationIssueSummary[]>();
   const uniqueIssueIds = [...new Set(issueIds)];
@@ -5386,6 +5424,7 @@ async function blockedByMapForIssues(
   )) {
     const rows = await dbOrTx
       .select({
+        readable: sql<boolean>`${readCondition ?? sql<boolean>`false`}`,
         currentIssueId: issueRelations.relatedIssueId,
         relatedId: issues.id,
         identifier: issues.identifier,
@@ -5400,12 +5439,14 @@ async function blockedByMapForIssues(
       .where(
         and(
           eq(issueRelations.companyId, companyId),
+          eq(issues.companyId, companyId),
           eq(issueRelations.type, "blocks"),
           inArray(issueRelations.relatedIssueId, issueIdChunk),
         ),
       );
 
     for (const row of rows) {
+      if (row.readable !== true) continue;
       const blockedBy = map.get(row.currentIssueId);
       if (!blockedBy) continue;
       blockedBy.push({
@@ -6897,8 +6938,8 @@ async function listBlockedInboxIssues(
       ? userReadStatsForIssues(dbOrTx, companyId, contextUserId, issueIds)
       : Promise.resolve([]),
     lastActivityStatsForIssues(dbOrTx, companyId, issueIds),
-    blockedByMapForIssues(dbOrTx, companyId, issueIds),
-    listIssueBlockerAttentionMap(dbOrTx, companyId, withRuns),
+    readableBlockedByMapForIssues(dbOrTx, companyId, issueIds, filters?.readCondition),
+    listIssueBlockerAttentionMap(dbOrTx, companyId, withRuns, { publicRead: { readCondition: filters?.readCondition } }),
     listIssueReviewAttentionMap(dbOrTx, companyId, withRuns),
     listIssueBlockedInboxAttentionMap(dbOrTx, companyId, withRuns, filters?.readCondition),
     includeLiveDescendantSummary
@@ -8757,7 +8798,7 @@ export function issueService(db: Db) {
           ? inboxArchiveRowsForIssues(db, companyId, contextUserId, issueIds)
           : Promise.resolve([]),
         includeBlockedBy
-          ? blockedByMapForIssues(db, companyId, issueIds)
+          ? readableBlockedByMapForIssues(db, companyId, issueIds, filters?.readCondition)
           : Promise.resolve(new Map<string, IssueRelationIssueSummary[]>()),
         includeLiveDescendantSummary
           ? liveDescendantCountMapForIssues(db, companyId, issueIds)
@@ -8777,7 +8818,7 @@ export function issueService(db: Db) {
         reviewAttentionByIssueId,
         blockedInboxAttentionByIssueId,
       ] = await Promise.all([
-        filters?.listProjection === "index" ? Promise.resolve(new Map<string, IssueBlockerAttention>()) : listIssueBlockerAttentionMap(db, companyId, withRuns),
+        filters?.listProjection === "index" ? Promise.resolve(new Map<string, IssueBlockerAttention>()) : listIssueBlockerAttentionMap(db, companyId, withRuns, { publicRead: { readCondition: filters?.readCondition } }),
         filters?.listProjection === "index" ? Promise.resolve(new Map<string, IssueReviewAttention>()) : listIssueReviewAttentionMap(db, companyId, withRuns),
         includeBlockedInboxAttention
           ? listIssueBlockedInboxAttentionMap(db, companyId, withRuns, filters?.readCondition)
