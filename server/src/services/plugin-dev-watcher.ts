@@ -249,7 +249,8 @@ export function createPluginDevWatcher(
               "plugin-dev-watcher: file change detected, restarting worker",
             );
 
-            lifecycle.restartWorker(pluginId).catch((err) => {
+            const epoch = lifecycle.currentEpoch(pluginId);
+            lifecycle.restartWorker(pluginId, { source: "watcher", epoch }).catch((err) => {
               log.warn(
                 {
                   pluginId,
@@ -319,6 +320,7 @@ export function createPluginDevWatcher(
   }
 
   function close(): void {
+    withdrawRegistration();
     pendingRegistrations.clear();
     lifecycle.off("plugin.loaded", handlePluginLoaded);
     lifecycle.off("plugin.enabled", handlePluginEnabled);
@@ -330,7 +332,7 @@ export function createPluginDevWatcher(
     }
   }
 
-  async function watchLocalPluginById(pluginId: string): Promise<void> {
+  async function watchLocalPluginById(pluginId: string, epoch?: number): Promise<void> {
     if (!resolvePluginPackagePath) {
       log.debug(
         { pluginId },
@@ -344,6 +346,7 @@ export function createPluginDevWatcher(
     try {
       const packagePath = await resolvePluginPackagePath(pluginId);
       if (pendingRegistrations.get(pluginId) !== generation) return;
+      if (epoch !== undefined && !lifecycle.isCurrentGeneration(pluginId, epoch)) return;
       if (!packagePath) {
         unwatchPlugin(pluginId);
         log.debug(
@@ -369,12 +372,12 @@ export function createPluginDevWatcher(
     }
   }
 
-  function handlePluginLoaded(payload: { pluginId: string }): void {
-    void watchLocalPluginById(payload.pluginId);
+  function handlePluginLoaded(payload: { pluginId: string; epoch?: number }): void {
+    void watchLocalPluginById(payload.pluginId, payload.epoch);
   }
 
-  function handlePluginEnabled(payload: { pluginId: string }): void {
-    void watchLocalPluginById(payload.pluginId);
+  function handlePluginEnabled(payload: { pluginId: string; epoch?: number }): void {
+    void watchLocalPluginById(payload.pluginId, payload.epoch);
   }
 
   function handlePluginDisabled(payload: { pluginId: string }): void {
@@ -389,6 +392,7 @@ export function createPluginDevWatcher(
   lifecycle.on("plugin.enabled", handlePluginEnabled);
   lifecycle.on("plugin.disabled", handlePluginDisabled);
   lifecycle.on("plugin.unloaded", handlePluginUnloaded);
+  const withdrawRegistration = lifecycle.registerWatchWithdrawer(unwatchPlugin);
 
   return {
     watch: watchPlugin,

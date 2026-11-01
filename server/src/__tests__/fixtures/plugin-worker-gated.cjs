@@ -18,6 +18,26 @@ readline.createInterface({ input: control }).on("line", (line) => {
   for (const reply of held[release].splice(0)) reply();
 });
 
+let hostCalls = 0;
+const hostPending = new Map();
+function callHost(method, params) {
+  const id = `host-${++hostCalls}`;
+  return new Promise((resolve, reject) => {
+    hostPending.set(id, { resolve, reject });
+    send({ jsonrpc: "2.0", id, method, params });
+  });
+}
+
+function getData(message) {
+  const { key, params = {} } = message.params || {};
+  const reply = (result) => send({ jsonrpc: "2.0", id: message.id, result });
+  const fail = (error) => send({ jsonrpc: "2.0", id: message.id, error: { code: -32603, message: String(error && error.message) } });
+  const stateParams = { scopeKind: "instance", stateKey: "kept" };
+  if (key === "state-write") callHost("state.set", { ...stateParams, value: params.value }).then(() => reply({ written: true }), fail);
+  else if (key === "state-read") callHost("state.get", stateParams).then((value) => reply({ value }), fail);
+  else reply({ marker: process.env.BUNDLE_MARKER || null });
+}
+
 function gate(name, reply) {
   report(`${name}-received`);
   if (!holds.has(name) || released.has(name)) reply();
@@ -27,7 +47,12 @@ function gate(name, reply) {
 readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line", (line) => {
   if (!line.trim()) return;
   const message = JSON.parse(line);
-  if (message.method === "initialize") {
+  if (!message.method && hostPending.has(message.id)) {
+    const pending = hostPending.get(message.id);
+    hostPending.delete(message.id);
+    if (message.error) pending.reject(new Error(message.error.message));
+    else pending.resolve(message.result);
+  } else if (message.method === "initialize") {
     gate("initialize", () => {
       report("initialize-replied");
       send({ jsonrpc: "2.0", id: message.id, result: { ok: true, supportedMethods: ["getData"] } });
@@ -39,6 +64,8 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line
       process.exit(0);
     });
   } else if (message.method === "getData") {
-    send({ jsonrpc: "2.0", id: message.id, result: { marker: process.env.BUNDLE_MARKER || null } });
+    getData(message);
+  } else if (message.id !== undefined && message.method) {
+    send({ jsonrpc: "2.0", id: message.id, error: { code: -32004, message: `${message.method} not implemented` } });
   }
 });

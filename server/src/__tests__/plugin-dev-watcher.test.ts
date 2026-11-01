@@ -57,7 +57,10 @@ function writePluginPackage(pluginDir: string): void {
 function createLifecycle() {
   const emitter = new EventEmitter();
   return Object.assign(emitter, {
-    restartWorker: vi.fn().mockResolvedValue(undefined),
+    restartWorker: vi.fn().mockResolvedValue({ superseded: false }),
+    currentEpoch: vi.fn(() => 0),
+    isCurrentGeneration: vi.fn(() => true),
+    registerWatchWithdrawer: vi.fn(() => () => undefined),
   });
 }
 
@@ -216,7 +219,7 @@ describe("createPluginDevWatcher", () => {
     handlers.all?.("change", path.join(pluginDir, "dist", "worker.js"));
     await vi.advanceTimersByTimeAsync(500);
 
-    expect(lifecycle.restartWorker).toHaveBeenCalledWith("plugin-1");
+    expect(lifecycle.restartWorker).toHaveBeenCalledWith("plugin-1", { source: "watcher", epoch: 0 });
 
     devWatcher.close();
   });
@@ -256,7 +259,7 @@ describe("createPluginDevWatcher", () => {
     second.handlers.all?.("change", path.join(secondDir, "dist", "worker.js"));
     await vi.advanceTimersByTimeAsync(500);
     expect(lifecycle.restartWorker).toHaveBeenCalledTimes(1);
-    expect(lifecycle.restartWorker).toHaveBeenCalledWith("plugin-1");
+    expect(lifecycle.restartWorker).toHaveBeenCalledWith("plugin-1", { source: "watcher", epoch: 0 });
     devWatcher.close();
     expect(second.fakeWatcher.close).toHaveBeenCalledTimes(1);
   });
@@ -424,7 +427,7 @@ describe("createPluginDevWatcher", () => {
     replacement.handlers.all?.("change", path.join(replacementDir, "dist", "worker.js"));
     await vi.advanceTimersByTimeAsync(500);
     expect(lifecycle.restartWorker).toHaveBeenCalledTimes(1);
-    expect(lifecycle.restartWorker).toHaveBeenCalledWith("plugin-1");
+    expect(lifecycle.restartWorker).toHaveBeenCalledWith("plugin-1", { source: "watcher", epoch: 0 });
     devWatcher.close();
   });
 });
