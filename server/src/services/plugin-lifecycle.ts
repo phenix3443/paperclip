@@ -46,6 +46,7 @@ import { pluginRegistryService } from "./plugin-registry.js";
 import { pluginLoader, type PluginLoader } from "./plugin-loader.js";
 import type { PluginWorkerManager, WorkerStartOptions } from "./plugin-worker-manager.js";
 import { badRequest, notFound } from "../errors.js";
+import { PluginTeardownError } from "./plugin-teardown-error.js";
 import { logger } from "../middleware/logger.js";
 
 // ---------------------------------------------------------------------------
@@ -532,7 +533,7 @@ export function pluginLifecycleManager(
         pluginKey: result.pluginKey,
         reason,
       });
-      if (teardownError) throw teardownError;
+      if (teardownError) throw new PluginTeardownError(plugin.pluginKey, teardownError);
       return result;
     },
 
@@ -546,6 +547,7 @@ export function pluginLifecycleManager(
       // If already uninstalled and removeData, hard-delete
       if (plugin.status === "uninstalled") {
         if (removeData) {
+          await deactivatePluginRuntime(pluginId, plugin.pluginKey);
           await pluginLoaderInstance.cleanupInstallArtifacts(plugin);
           const deleted = await registry.uninstall(pluginId, true);
           log.info(
@@ -567,7 +569,7 @@ export function pluginLifecycleManager(
 
       const teardownError = await tryDeactivatePluginRuntime(pluginId, plugin.pluginKey);
       if (teardownError && removeData) throw teardownError;
-      await pluginLoaderInstance.cleanupInstallArtifacts(plugin);
+      if (!teardownError) await pluginLoaderInstance.cleanupInstallArtifacts(plugin);
 
       // Perform the uninstall via registry (handles soft/hard delete)
       const result = await registry.uninstall(pluginId, removeData);
@@ -589,7 +591,7 @@ export function pluginLifecycleManager(
         pluginKey: plugin.pluginKey,
         removeData,
       });
-      if (teardownError) throw teardownError;
+      if (teardownError) throw new PluginTeardownError(plugin.pluginKey, teardownError);
 
       return result as PluginRecord | null;
     },

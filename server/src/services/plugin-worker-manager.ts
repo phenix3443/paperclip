@@ -3038,6 +3038,7 @@ export function createPluginWorkerHandle(
     signal: NodeJS.Signals | null,
   ): void {
     const wasIntentional = intentionalStop;
+    const token = startToken;
 
     // Clean up readline interfaces
     if (readline) {
@@ -3093,6 +3094,7 @@ export function createPluginWorkerHandle(
       log.info({ code, signal }, "worker process stopped");
       return;
     }
+    if (token !== startToken && status === "stopped") return;
 
     // Unexpected exit — crash recovery
     totalCrashes++;
@@ -3111,13 +3113,14 @@ export function createPluginWorkerHandle(
     );
 
     const willRestart =
-      autoRestart && consecutiveCrashes <= MAX_CONSECUTIVE_CRASHES && isStartAdmitted();
+      autoRestart && consecutiveCrashes <= MAX_CONSECUTIVE_CRASHES && isStartAdmitted() && token === startToken;
 
     setStatus("crashed");
-    emitter.emit("crash", { pluginId, code, signal, willRestart });
+    emitter.emit("crash", { pluginId, code, signal, willRestart: willRestart && token === startToken });
+    if (token !== startToken) return;
 
     if (willRestart) {
-      scheduleRestart();
+      scheduleRestart(token);
     } else {
       log.error(
         { consecutiveCrashes, maxCrashes: MAX_CONSECUTIVE_CRASHES },
@@ -3157,18 +3160,21 @@ export function createPluginWorkerHandle(
     return Math.min(Math.round(delay + jitter), MAX_BACKOFF_MS);
   }
 
-  function scheduleRestart(): void {
+  function scheduleRestart(token: number): void {
     const delay = computeBackoffMs();
     nextRestartAt = Date.now() + delay;
 
     setStatus("backoff");
+    if (token !== startToken) {
+      nextRestartAt = null;
+      return;
+    }
 
     log.info(
       { delayMs: delay, consecutiveCrashes },
       "scheduling restart with backoff",
     );
 
-    const token = startToken;
     backoffTimer = setTimeout(async () => {
       backoffTimer = null;
       nextRestartAt = null;
@@ -3176,7 +3182,7 @@ export function createPluginWorkerHandle(
       // A temporary idle hold must not consume the crash-recovery attempt.
       // Keep the bounded backoff until admission reopens.
       if (readTaskDrain(new Date())?.ownerId) {
-        scheduleRestart();
+        scheduleRestart(token);
         return;
       }
       try {

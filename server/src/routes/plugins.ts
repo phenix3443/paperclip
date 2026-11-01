@@ -50,6 +50,7 @@ import {
 } from "@paperclipai/shared";
 import { pluginRegistryService } from "../services/plugin-registry.js";
 import { pluginLifecycleManager } from "../services/plugin-lifecycle.js";
+import { PluginTeardownError } from "../services/plugin-teardown-error.js";
 import {
   getPluginUiContributionMetadata,
   listMissingDeclaredPluginEntrypoints,
@@ -2053,16 +2054,20 @@ export function pluginRoutes(
       return;
     }
 
+    const activityDetails = { pluginId: plugin.id, pluginKey: plugin.pluginKey, purge };
     try {
       const result = await lifecycle.unload(plugin.id, purge);
-      await logPluginMutationActivity(req, "plugin.uninstalled", plugin.id, {
-        pluginId: plugin.id,
-        pluginKey: plugin.pluginKey,
-        purge,
-      });
+      await logPluginMutationActivity(req, "plugin.uninstalled", plugin.id, activityDetails);
       publishGlobalLiveEvent({ type: "plugin.ui.updated", payload: { pluginId: plugin.id, action: "uninstalled" } });
       res.json(result);
     } catch (err) {
+      if (err instanceof PluginTeardownError) {
+        await logPluginMutationActivity(req, "plugin.uninstalled", plugin.id, {
+          ...activityDetails,
+          teardownError: err.message,
+        });
+        publishGlobalLiveEvent({ type: "plugin.ui.updated", payload: { pluginId: plugin.id, action: "uninstalled" } });
+      }
       const message = err instanceof Error ? err.message : String(err);
       res.status(400).json({ error: message });
     }
@@ -2130,16 +2135,20 @@ export function pluginRoutes(
       return;
     }
 
+    const activityDetails = { pluginId: plugin.id, pluginKey: plugin.pluginKey, reason: reason ?? null };
     try {
       const result = await lifecycle.disable(plugin.id, reason);
-      await logPluginMutationActivity(req, "plugin.disabled", plugin.id, {
-        pluginId: plugin.id,
-        pluginKey: plugin.pluginKey,
-        reason: reason ?? null,
-      });
+      await logPluginMutationActivity(req, "plugin.disabled", plugin.id, activityDetails);
       publishGlobalLiveEvent({ type: "plugin.ui.updated", payload: { pluginId: plugin.id, action: "disabled" } });
       res.json(result);
     } catch (err) {
+      if (err instanceof PluginTeardownError) {
+        await logPluginMutationActivity(req, "plugin.disabled", plugin.id, {
+          ...activityDetails,
+          teardownError: err.message,
+        });
+        publishGlobalLiveEvent({ type: "plugin.ui.updated", payload: { pluginId: plugin.id, action: "disabled" } });
+      }
       const message = err instanceof Error ? err.message : String(err);
       res.status(400).json({ error: message });
     }
