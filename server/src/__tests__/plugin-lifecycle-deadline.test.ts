@@ -25,6 +25,8 @@ const state = vi.hoisted(() => ({
   holdReads: false,
   calls: [] as string[],
   prepareHold: null as null | Promise<void>,
+  afterStart: null as null | { promise: Promise<void>; reached: () => void },
+  failWrite: null as null | string,
   prepareSignal: null as null | AbortSignal,
   heldWrite: null as null | { status: string; promise: Promise<void>; reached: () => void },
 }));
@@ -48,6 +50,7 @@ vi.mock("../services/plugin-registry.js", async () => {
           held.reached();
           await held.promise;
         }
+        if (state.failWrite === patch.status) throw new Error(`row write to ${patch.status} failed`);
         const row = state.rows.get(id);
         if (!row) return null;
         Object.assign(row, patch);
@@ -149,6 +152,9 @@ async function createGate() {
         notify();
       });
     },
+    crash() {
+      for (const socket of sockets) if (!socket.destroyed) socket.write(`${JSON.stringify({ crash: true })}\n`);
+    },
     release(name: string) {
       for (const socket of sockets) if (!socket.destroyed) socket.write(`${JSON.stringify({ release: name })}\n`);
     },
@@ -204,7 +210,7 @@ async function createHarness(options: { hold?: string; queueWaitMs?: number; res
   let failActivation = options.failActivation ?? false;
   const loader = {
     hasRuntimeServices: () => true,
-    async loadSingle(id: string, loadOptions?: { lease?: unknown }) {
+    async loadSingle(id: string, loadOptions?: { lease?: { assertActive(): void } }) {
       const row = state.rows.get(id)!;
       if (row.status === "installed") {
         await appLifecycle.load(id, { lease: loadOptions?.lease } as never);
@@ -222,8 +228,16 @@ async function createHarness(options: { hold?: string; queueWaitMs?: number; res
           env: env(hold),
         } as never);
         state.calls.push(`worker:running:${id}`);
+        const afterStart = state.afterStart;
+        if (afterStart) {
+          state.afterStart = null;
+          afterStart.reached();
+          await afterStart.promise;
+        }
+        loadOptions?.lease?.assertActive();
         await jobStore.syncJobDeclarations(id);
         await scheduler.registerPlugin(id);
+        loadOptions?.lease?.assertActive();
         toolDispatcher.registerPluginTools(row.pluginKey, row.manifestJson, id);
         state.calls.push(`tools:register:${row.pluginKey}`);
         return { plugin: { ...row }, success: true, registered: {} };
@@ -329,7 +343,28 @@ beforeEach(() => {
   state.heldWrite = null;
   state.prepareHold = null;
   state.prepareSignal = null;
+  state.afterStart = null;
+  state.failWrite = null;
+  vi.useRealTimers();
+  vi.restoreAllMocks();
 });
+
+function holdAfterStart() {
+  let release!: () => void;
+  let reached!: () => void;
+  const promise = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const arrived = new Promise<void>((resolve) => {
+    reached = resolve;
+  });
+  state.afterStart = { promise, reached };
+  return { release, arrived };
+}
+
+function nextHandleEvent(harness: Harness, id: string, name: "crash" | "ready" | "exit") {
+  return new Promise<void>((resolve) => harness.workerManager.getWorker(id)!.on(name as never, () => resolve()));
+}
 
 function holdStatusWrite(status: string) {
   let release!: () => void;
@@ -555,6 +590,128 @@ describe("plugin lifecycle response deadlines through the real route wiring", ()
     const retried = await request(harness.app).post(`/api/plugins/${row.pluginKey}/disable`).send({});
     expect(retried.status).toBe(200);
     expect(harness.appLifecycle.isFenced(row.id)).toBe(false);
+  });
+
+
+  it("N17a: a post-initialize step held past the deadline answers 504, registers nothing after release, and settles to error", async () => {
+    harness = await createHarness({ responseDeadlineMs: 300 });
+    const row = seed("deadline.k", "disabled");
+    const held = holdAfterStart();
+
+    const enable = request(harness.app).post(`/api/plugins/${row.pluginKey}/enable`).send({}).then((r) => r);
+    await held.arrived;
+    const res = await enable;
+    expect(res.status).toBe(504);
+    expect(res.body.code).toBe("plugin_lifecycle_timeout");
+
+    const callsBefore = state.calls.length;
+    const del = request(harness.app).delete(`/api/plugins/${row.pluginKey}`).then((r) => r);
+    expect(await within(del, 200)).toBe("pending");
+    held.release();
+    expect((await del).status).toBe(200);
+    const after = state.calls.slice(callsBefore);
+    expect(after.filter((call) => /^(jobs:sync|scheduler:register|tools:register)/.test(call))).toEqual([]);
+    expect(after).toContain("row:error");
+    expect(harness.workerManager.getWorker(row.id)).toBeUndefined();
+
+    const install = await request(harness.app).post("/api/plugins/install").send({ packageName: row.pluginKey });
+    expect(install.status).toBe(200);
+    expect(state.rows.get(row.id)!.id).toBe(row.id);
+    expect(harness.workerManager.getWorker(row.id)?.status).toBe("running");
+  });
+
+  it("N17c: when expiry cleanup cannot stop the worker or write error, the plugin is fenced until a later disable succeeds", async () => {
+    harness = await createHarness({ responseDeadlineMs: 300 });
+    const row = seed("deadline.l", "disabled");
+    const held = holdAfterStart();
+    const stop = vi.spyOn(harness.workerManager, "stopWorker").mockRejectedValue(new PluginWorkerStopError(row.id, undefined));
+    state.failWrite = "error";
+
+    const enable = request(harness.app).post(`/api/plugins/${row.pluginKey}/enable`).send({}).then((r) => r);
+    await held.arrived;
+    expect((await enable).status).toBe(504);
+    held.release();
+    const blocked = await request(harness.app).post(`/api/plugins/${row.pluginKey}/enable`).send({});
+    expect(blocked.status).toBe(409);
+    expect(blocked.body.code).toBe("plugin_lifecycle_fenced");
+    expect(state.rows.get(row.id)!.status).toBe("ready");
+    expect(harness.appLifecycle.isFenced(row.id)).toBe(true);
+    expect(harness.appLifecycle.isQuiesced(row.id)).toBe(true);
+    expect(harness.workerManager.getWorker(row.id)).toBeDefined();
+    const reload = await harness.appLifecycle.restartWorker(row.id, {
+      source: "watcher",
+      epoch: harness.appLifecycle.currentEpoch(row.id),
+    });
+    expect(reload).toEqual({ superseded: true });
+
+    stop.mockRestore();
+    state.failWrite = null;
+    const disable = await request(harness.app).post(`/api/plugins/${row.pluginKey}/disable`).send({});
+    expect(disable.status).toBe(200);
+    expect(harness.appLifecycle.isFenced(row.id)).toBe(false);
+    expect(harness.workerManager.getWorker(row.id)).toBeUndefined();
+  });
+
+  it("N7b: a pending crash backoff cannot spawn while a stuck disable answers 504, and cleanup leaves no handle", async () => {
+    harness = await createHarness({ responseDeadlineMs: 300 });
+    const row = seed("deadline.m", "disabled");
+    expect((await request(harness.app).post(`/api/plugins/${row.pluginKey}/enable`).send({})).status).toBe(200);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const crashed = nextHandleEvent(harness, row.id, "crash");
+    harness.gate.crash();
+    await crashed;
+    expect(harness.workerManager.getWorker(row.id)?.status).toBe("backoff");
+    const spawned = harness.gate.count("spawned");
+    const statuses: string[] = [];
+    harness.workerManager.getWorker(row.id)!.on("ready" as never, () => void statuses.push("ready"));
+    const write = holdStatusWrite("disabled");
+
+    const disable = request(harness.app).post(`/api/plugins/${row.pluginKey}/disable`).send({}).then((r) => r);
+    await write.arrived;
+    await vi.advanceTimersByTimeAsync(300);
+    const res = await disable;
+    expect(res.status).toBe(504);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(harness.gate.count("spawned")).toBe(spawned);
+    expect(statuses).toEqual([]);
+
+    write.release();
+    vi.useRealTimers();
+    const del = await request(harness.app).delete(`/api/plugins/${row.pluginKey}`);
+    expect(del.status).toBe(200);
+    expect(harness.workerManager.getWorker(row.id)).toBeUndefined();
+    expect(harness.gate.count("spawned")).toBe(spawned);
+  });
+
+  it("N7c: an in-flight crash retry cannot publish running after a stuck disable answers 504", async () => {
+    harness = await createHarness({ hold: "initialize", responseDeadlineMs: 300 });
+    const row = seed("deadline.n", "disabled");
+    const enable = request(harness.app).post(`/api/plugins/${row.pluginKey}/enable`).send({}).then((r) => r);
+    await harness.gate.next("initialize-received");
+    harness.gate.release("initialize");
+    expect((await enable).status).toBe(200);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const crashed = nextHandleEvent(harness, row.id, "crash");
+    harness.gate.crash();
+    await crashed;
+    const seen = harness.gate.count("initialize-received");
+    await vi.advanceTimersByTimeAsync(2_000);
+    vi.useRealTimers();
+    await harness.gate.next("initialize-received", seen);
+    const spawned = harness.gate.count("spawned");
+    const write = holdStatusWrite("disabled");
+
+    const disable = request(harness.app).post(`/api/plugins/${row.pluginKey}/disable`).send({}).then((r) => r);
+    await write.arrived;
+    const res = await disable;
+    expect(res.status).toBe(504);
+    harness.gate.release("initialize");
+    write.release();
+    const del = await request(harness.app).delete(`/api/plugins/${row.pluginKey}`);
+    expect(del.status).toBe(200);
+    expect(harness.workerManager.getWorker(row.id)).toBeUndefined();
+    expect(harness.gate.count("spawned")).toBe(spawned);
+    expect(harness.gate.count("initialize-replied")).toBe(1);
   });
 
 });
