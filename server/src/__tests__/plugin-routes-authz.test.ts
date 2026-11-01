@@ -318,6 +318,27 @@ describe("plugin install and upgrade authz", () => {
     expect(mockLifecycle.unload).toHaveBeenCalledWith(pluginId, true);
   }, 20_000);
 
+  it("logs activity for disable and uninstall when the status is saved but teardown fails", async () => {
+    readyPlugin();
+    const { PluginTeardownError } = await import("../services/plugin-teardown-error.js");
+    const { logActivity } = await import("../services/activity-log.js");
+    vi.mocked(logActivity).mockClear();
+    mockLifecycle.disable.mockRejectedValue(new PluginTeardownError("paperclip.example", new Error("scheduler unavailable")));
+    mockLifecycle.unload.mockRejectedValue(new PluginTeardownError("paperclip.example", new Error("worker still alive")));
+
+    const { app } = await createApp(boardActor({ isInstanceAdmin: true }));
+    const disableRes = await request(app).post(`/api/plugins/${pluginId}/disable`).send({});
+    const uninstallRes = await request(app).delete(`/api/plugins/${pluginId}`);
+
+    expect(disableRes.status).toBe(400);
+    expect(disableRes.body.error).toContain("scheduler unavailable");
+    expect(uninstallRes.status).toBe(400);
+    expect(vi.mocked(logActivity).mock.calls.map(([, entry]) => [entry.action, entry.details?.teardownError])).toEqual([
+      ["plugin.disabled", expect.stringContaining("scheduler unavailable")],
+      ["plugin.uninstalled", expect.stringContaining("worker still alive")],
+    ]);
+  });
+
   it("allows instance admins to save company-scoped secret refs and sync plugin bindings", async () => {
     readyPlugin();
     const configJson = {
