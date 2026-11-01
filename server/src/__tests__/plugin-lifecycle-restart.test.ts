@@ -87,7 +87,7 @@ describe("pluginLifecycleManager.restartWorker", () => {
     await lifecycle.restartWorker("plugin-1");
 
     expect(loader.unloadSingle).toHaveBeenCalledWith("plugin-1", "example.plugin");
-    expect(loader.loadSingle).toHaveBeenCalledWith("plugin-1");
+    expect(loader.loadSingle).toHaveBeenCalledWith("plugin-1", { lease: expect.anything() });
     // The bare worker handle should NOT be bounced — the loader handles
     // worker (re)start as part of activate.
     expect(handle.restart).not.toHaveBeenCalled();
@@ -122,8 +122,8 @@ describe("pluginLifecycleManager.restartWorker", () => {
     expect(loader.loadSingle).not.toHaveBeenCalled();
     expect(handle.restart).toHaveBeenCalledTimes(1);
     expect(stopped).toHaveBeenCalledTimes(1);
-    expect(stopped).toHaveBeenCalledWith({ pluginId: "plugin-1", pluginKey: "example.plugin" });
+    expect(stopped).toHaveBeenCalledWith(expect.objectContaining({ pluginId: "plugin-1", pluginKey: "example.plugin", kind: "R" }));
     expect(started).toHaveBeenCalledTimes(1);
-    expect(started).toHaveBeenCalledWith({ pluginId: "plugin-1", pluginKey: "example.plugin" });
+    expect(started).toHaveBeenCalledWith(expect.objectContaining({ pluginId: "plugin-1", pluginKey: "example.plugin", kind: "R" }));
   });
 });

@@ -49,7 +49,7 @@ import {
   PLUGIN_STATUSES,
 } from "@paperclipai/shared";
 import { pluginRegistryService } from "../services/plugin-registry.js";
-import { PluginActivationError, pluginLifecycleManager } from "../services/plugin-lifecycle.js";
+import { pluginLifecycleManager } from "../services/plugin-lifecycle.js";
 import type { PluginLifecycleTimings } from "../services/plugin-lifecycle-shared.js";
 import { PluginTeardownError } from "../services/plugin-teardown-error.js";
 import {
@@ -552,8 +552,8 @@ export function pluginRoutes(
 
   function sendLifecycleError(res: Response, err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
-    if (err instanceof PluginActivationError) {
-      res.status(500).json({ error: message, code: err.code });
+    if ((err as { code?: unknown } | null)?.code === "plugin_activation_failed") {
+      res.status(500).json({ error: message, code: "plugin_activation_failed" });
       return;
     }
     const code = err instanceof HttpError
