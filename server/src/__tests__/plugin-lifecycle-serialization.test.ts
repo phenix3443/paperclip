@@ -408,12 +408,22 @@ describe("plugin lifecycle serialization through the real route wiring", () => {
     expect(persists[1]).toBeGreaterThan(state.calls.indexOf("worker:running:id-serial.e"));
   });
 
-  it("N14: a client that drops its DELETE does not stop the server, and a repeated soft DELETE is a 200", async () => {
-    harness = await createHarness();
-    const row = seed("serial.f", "ready");
+  it("N14: a client that drops its DELETE mid-teardown does not stop the server, and a repeated soft DELETE is a 200", async () => {
+    harness = await createHarness({ hold: "shutdown" });
+    const row = seed("serial.f", "disabled");
+    expect((await request(harness.app).post(`/api/plugins/${row.pluginKey}/enable`).send({})).status).toBe(200);
 
-    const aborted = request(harness.app).delete(`/api/plugins/${row.pluginKey}`).timeout(1);
-    await aborted.catch(() => undefined);
+    const dropped = request(harness.app).delete(`/api/plugins/${row.pluginKey}`);
+    const settled = dropped.then(() => "answered", () => "dropped");
+    await harness.gate.next("shutdown-received");
+    dropped.abort();
+    expect(await settled).toBe("dropped");
+    harness.gate.release("shutdown");
+    await harness.gate.next("shutdown-replied");
+    for (let i = 0; i < 200 && state.rows.get(row.id)!.status !== "uninstalled"; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(state.rows.get(row.id)!.status).toBe("uninstalled");
 
     const again = await request(harness.app).delete(`/api/plugins/${row.pluginKey}`);
     expect(again.status).toBe(200);
