@@ -8,3 +8,7 @@ export const setAgentAvatarSchema = z.object({
     .nullable(),
 }).strict();
 export type SetAgentAvatarInput = z.infer<typeof setAgentAvatarSchema>;
+/** Converted with this package's zod; see createProjectToolInputJsonSchema. */
+export function setAgentAvatarInputJsonSchema() {
+  return z.toJSONSchema(setAgentAvatarSchema);
+}

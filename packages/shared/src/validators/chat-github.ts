@@ -160,3 +160,10 @@ export const githubReviewAssessmentSchema = z
         message: "Duplicate findings are not allowed.",
       });
   });
+/** Converted with this package's zod; see createProjectToolInputJsonSchema. */
+export function githubReviewAssessmentInputJsonSchema() {
+  return z.toJSONSchema(githubReviewAssessmentSchema, {
+    target: "draft-7",
+    io: "input",
+  });
+}
