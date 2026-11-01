@@ -3401,6 +3401,9 @@ function lowTrustBoundaryIssueCondition(
 
 const BLOCKER_ATTENTION_OPEN_RECOVERY_TERMINAL_STATUSES = ["done", "cancelled"];
 export const BLOCKER_ATTENTION_MAX_DEPTH = 8;
+// The blocked inbox judges each root by its own walk, so a long but healthy
+// dependency chain must reach its leaf instead of being reported as truncated.
+export const BLOCKER_ATTENTION_MAX_DEPTH_PER_ROOT = 64;
 export const BLOCKER_ATTENTION_MAX_NODES = 2000;
 const BLOCKER_ATTENTION_INVOKABLE_AGENT_STATUSES = new Set([
   "active",
@@ -3846,12 +3849,15 @@ async function listIssueBlockerAttentionMap(
   const edgesByIssueId = new Map<string, IssueBlockerAttentionEdge[]>();
   for (const root of roots) nodesById.set(root.id, { ...root });
 
+  const maxDepth = options.truncatePerRoot
+    ? BLOCKER_ATTENTION_MAX_DEPTH_PER_ROOT
+    : BLOCKER_ATTENTION_MAX_DEPTH;
   let frontier = roots.map((root) => root.id);
   let truncated = false;
   const pendingFinalizeBlockerIssueIds = new Set<string>();
   for (
     let depth = 0;
-    frontier.length > 0 && depth < BLOCKER_ATTENTION_MAX_DEPTH;
+    frontier.length > 0 && depth < maxDepth;
     depth += 1
   ) {
     const nextFrontier = new Set<string>();
@@ -3985,7 +3991,7 @@ async function listIssueBlockerAttentionMap(
     let rootFrontier = [rootId];
     for (
       let depth = 0;
-      rootFrontier.length > 0 && depth < BLOCKER_ATTENTION_MAX_DEPTH;
+      rootFrontier.length > 0 && depth < maxDepth;
       depth += 1
     ) {
       const next: string[] = [];
@@ -4032,6 +4038,36 @@ async function listIssueBlockerAttentionMap(
     for (const row of runRows) {
       const issueId = issueIdByExecutionRunId.get(row.id);
       if (issueId) activeIssueIds.add(issueId);
+    }
+  }
+
+  // A run that is queued, or waiting on a retry that is still due, has not been
+  // checked out into executionRunId yet but is already the issue's next step.
+  // Running runs stay matched by executionRunId so a stale run cannot cover.
+  const pendingRunIssueIdSql = sql<string | null>`coalesce(
+    ${heartbeatRuns.contextSnapshot} ->> 'issueId',
+    ${heartbeatRuns.contextSnapshot} ->> 'taskId'
+  )`;
+  const pendingRunNow = new Date();
+  for (const chunk of chunkList(nodeIds, ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
+    const pendingRunRows: Array<{ issueId: string | null }> = await dbOrTx
+      .select({ issueId: pendingRunIssueIdSql })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          or(
+            eq(heartbeatRuns.status, "queued"),
+            and(
+              eq(heartbeatRuns.status, "scheduled_retry"),
+              gt(heartbeatRuns.scheduledRetryAt, pendingRunNow),
+            ),
+          ),
+          inArray(pendingRunIssueIdSql, chunk),
+        ),
+      );
+    for (const row of pendingRunRows) {
+      if (row.issueId) activeIssueIds.add(row.issueId);
     }
   }
 
@@ -4257,12 +4293,31 @@ async function listIssueBlockerAttentionMap(
     sampleStalledBlockerIdentifier: string | null;
     terminalBlockerIssueId?: string | null;
   };
+  // Diamonds in a deep chain would otherwise be re-walked once per path. A
+  // result is reused only when its walk met no cycle, so it does not depend on
+  // the caller's path. Cleared per root because `truncated` is per root.
+  const classifyPathCache = new Map<string, PathClassification>();
+  let classifyPathCycleHits = 0;
   const classifyPath = (
+    nodeId: string,
+    seen: Set<string>,
+  ): PathClassification => {
+    const cached = classifyPathCache.get(nodeId);
+    if (cached && !seen.has(nodeId)) return cached;
+    const cycleHitsBefore = classifyPathCycleHits;
+    const result = classifyPathUncached(nodeId, seen);
+    if (classifyPathCycleHits === cycleHitsBefore) {
+      classifyPathCache.set(nodeId, result);
+    }
+    return result;
+  };
+  const classifyPathUncached = (
     nodeId: string,
     seen: Set<string>,
   ): PathClassification => {
     const sample = blockerSampleIdentifier(nodesById.get(nodeId));
     if (truncated || seen.has(nodeId)) {
+      if (seen.has(nodeId)) classifyPathCycleHits += 1;
       return {
         covered: false,
         stalled: false,
@@ -4430,6 +4485,8 @@ async function listIssueBlockerAttentionMap(
     };
   };
 
+  // Reachability question, so one visited set shared across the walk is exact
+  // and keeps deep diamond-shaped graphs linear.
   const pathHasLiveWork = (nodeId: string, seen: Set<string>): boolean => {
     if (seen.has(nodeId)) return false;
     const node = nodesById.get(nodeId);
@@ -4442,8 +4499,7 @@ async function listIssueBlockerAttentionMap(
     )
       return true;
 
-    const nextSeen = new Set(seen);
-    nextSeen.add(nodeId);
+    seen.add(nodeId);
     return (edgesByIssueId.get(node.id) ?? []).some((edge) => {
       const blocker = nodesById.get(edge.blockerIssueId);
       if (
@@ -4451,7 +4507,7 @@ async function listIssueBlockerAttentionMap(
         !pendingFinalizeBlockerIssueIds.has(edge.blockerIssueId)
       )
         return false;
-      return pathHasLiveWork(edge.blockerIssueId, nextSeen);
+      return pathHasLiveWork(edge.blockerIssueId, seen);
     });
   };
 
@@ -4467,6 +4523,7 @@ async function listIssueBlockerAttentionMap(
     truncated = options.truncatePerRoot
       ? isRootTruncated(root.id)
       : graphTruncated;
+    classifyPathCache.clear();
     const topLevelEdges = (edgesByIssueId.get(root.id) ?? []).filter((edge) => {
       const blocker = nodesById.get(edge.blockerIssueId);
       return (
@@ -4570,9 +4627,12 @@ async function listIssueBlockerAttentionMap(
           stalledEntry?.result.sampleStalledBlockerIdentifier ??
           sampleStalledFromChain ??
           null,
-        blockingTreeLive: topLevelEdges.some((edge) =>
-          pathHasLiveWork(edge.blockerIssueId, new Set([root.id])),
-        ),
+        blockingTreeLive: (() => {
+          const liveWorkSeen = new Set([root.id]);
+          return topLevelEdges.some((edge) =>
+            pathHasLiveWork(edge.blockerIssueId, liveWorkSeen),
+          );
+        })(),
         directBlockerIssueId: sampleEntry?.edge.blockerIssueId ?? null,
         terminalBlockerIssueId,
         terminalBlocker: terminalBlockerNode
