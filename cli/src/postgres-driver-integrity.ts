@@ -69,15 +69,32 @@ function declaredPackageName(directory: string): string | null {
   }
 }
 
+const POSTGRES_SOURCE_SIGNATURE = ["connection.js", "query.js", "queue.js", "subscribe.js", "large.js"] as const;
+
+function postgresCopyRootOf(sourceDirectory: string): string {
+  const parent = path.dirname(sourceDirectory);
+  if (path.basename(sourceDirectory) !== "src") return sourceDirectory;
+  return ["cjs", "cf"].includes(path.basename(parent)) ? path.dirname(parent) : parent;
+}
+
 function scanPayload(payloadRoot: string): PayloadScan {
   const scan: PayloadScan = { links: [], packages: { postgres: [], "drizzle-orm": [] } };
   const pending = [payloadRoot];
   while (pending.length > 0) {
     const directory = pending.pop()!;
-    for (const name of INVENTORIED_PACKAGES) {
-      if (directory !== payloadRoot && (packageNameAt(directory) === name || declaredPackageName(directory) === name)) scan.packages[name].push(directory);
+    if (directory !== payloadRoot) {
+      const names = [packageNameAt(directory), declaredPackageName(directory)];
+      for (const name of INVENTORIED_PACKAGES) {
+        if (names.includes(name) && !scan.packages[name].includes(directory)) scan.packages[name].push(directory);
+      }
     }
-    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const entries = fs.readdirSync(directory, { withFileTypes: true });
+    const files = new Set(entries.filter((entry) => entry.isFile()).map((entry) => entry.name));
+    if (POSTGRES_SOURCE_SIGNATURE.every((file) => files.has(file))) {
+      const copy = postgresCopyRootOf(directory);
+      if (!scan.packages.postgres.includes(copy)) scan.packages.postgres.push(copy);
+    }
+    for (const entry of entries) {
       const location = path.join(directory, entry.name);
       if (entry.isDirectory()) pending.push(location);
       else if (entry.isSymbolicLink()) {

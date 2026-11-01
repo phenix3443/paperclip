@@ -191,6 +191,18 @@ describe("postgres driver payload verifier", () => {
     await expect(verifyPostgresDriverPayload(payload)).rejects.toThrow(/exactly one postgres driver.*@paperclipai\/db\/vendor\/pg/);
   });
 
+  it("rejects a renamed postgres copy found by its source files", async () => {
+    const renamed = path.join(payload, "node_modules", "@paperclipai", "db", "dist", "node_modules", "pgdrv");
+    copyDriver(renamed);
+    fs.rmSync(path.join(renamed, "package.json"));
+    await expect(verifyPostgresDriverPayload(payload)).rejects.toThrow(/exactly one postgres driver.*@paperclipai\/db\/dist\/node_modules\/pgdrv/);
+  });
+
+  it("rejects a bare copy of the driver's CommonJS sources", async () => {
+    fs.cpSync(path.join(PATCHED_POSTGRES_SOURCE, "cjs"), path.join(payload, "node_modules", "paperclipai", "lib", "cjs"), { recursive: true, dereference: true });
+    await expect(verifyPostgresDriverPayload(payload)).rejects.toThrow(/exactly one postgres driver.*node_modules\/paperclipai\/lib/);
+  });
+
   it("checks a drizzle-orm installed in a package's internal node_modules", async () => {
     writeDrizzle(path.join(payload, "node_modules", "@paperclipai", "db", "dist", "node_modules", "drizzle-orm"));
     const resolutions = await verifyPostgresDriverPayload(payload);
