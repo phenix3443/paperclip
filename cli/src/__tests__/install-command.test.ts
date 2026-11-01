@@ -206,6 +206,10 @@ describe("managed install commands", () => {
     expect(runCommand.mock.calls.filter(([command, args]) => command === "corepack" && args.includes("pack"))).toHaveLength(2);
     expect(runCommand.mock.calls.filter(([command, args]) => command === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs"))).toHaveLength(1);
     expect(runCommand.mock.calls.filter(([command, args]) => command === "npm" && args[0] === "pack")).toHaveLength(3);
+    const bundledPack = runCommand.mock.calls.find(([command, args]) => command === "npm" && args[0] === "pack" && args[1]?.includes("workspace-package-"));
+    expect(bundledPack?.[1]).toContain("--ignore-scripts");
+    const cliPack = runCommand.mock.calls.find(([command, args]) => command === "npm" && args[0] === "pack" && args[1] === "--pack-destination");
+    expect(cliPack?.[1]).not.toContain("--ignore-scripts");
     const postgresPack = runCommand.mock.calls.find(([command, args]) => command === "npm" && args[0] === "pack" && args[1]?.endsWith(path.join("packages", "db", "node_modules", "postgres")));
     expect(postgresPack).toBeDefined();
     const installCall = runCommand.mock.calls.find(([command, args]) => command === "npm" && args[0] === "install");
