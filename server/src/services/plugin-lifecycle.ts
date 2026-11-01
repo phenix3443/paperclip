@@ -715,6 +715,7 @@ export function pluginLifecycleManager(
         const result = await transition(pluginId, "error", error, plugin, op);
         emitDomain("plugin.error", { pluginId, pluginKey: result.pluginKey, error }, op);
         if (teardownError) throw teardownError;
+        shared.fenced.delete(pluginId);
         return result;
       });
     },

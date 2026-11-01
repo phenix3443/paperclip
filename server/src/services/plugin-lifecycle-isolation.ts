@@ -23,12 +23,12 @@ export type PluginQuiesceTarget = (plugin: PluginRecord, lease: PluginLifecycleL
 export function createPluginLifecycleIsolation(deps: PluginLifecycleIsolationDeps) {
   const { shared, workerManager, log } = deps;
 
-  function fence(pluginId: string, reason: string): void {
+  function fence(pluginId: string, reason: string, clearOnExit = true): void {
     const token = `${reason} (fenced at ${new Date().toISOString()})`;
     shared.fenced.set(pluginId, token);
     shared.quiesced.add(pluginId);
     workerManager?.revokeStarts?.(pluginId);
-    const handle = workerManager?.getWorker(pluginId);
+    const handle = clearOnExit ? workerManager?.getWorker(pluginId) : undefined;
     if (handle) {
       const onExit = () => {
         handle.off("exit", onExit);
@@ -90,11 +90,15 @@ export function createPluginLifecycleIsolation(deps: PluginLifecycleIsolationDep
           expiryStop = workerManager.stopWorker(pluginId).then(() => null, (err: unknown) => err);
         }
       },
-      async expiryCleanup(lease) {
+      async expiryCleanup(lease, bodyError) {
         const pluginId = getPluginId();
         if (!pluginId) return;
         const failures: unknown[] = [];
-        const record = (err: unknown) => void failures.push(err);
+        let rowUnproven = false;
+        const record = (err: unknown) => {
+          rowUnproven = true;
+          failures.push(err);
+        };
         const stopError = await expiryStop;
         if (stopError) failures.push(stopError);
         const plugin = await deps.getPlugin(pluginId).catch((err: unknown) => {
@@ -106,12 +110,13 @@ export function createPluginLifecycleIsolation(deps: PluginLifecycleIsolationDep
           if (teardownError) failures.push(teardownError);
           if (kind === "Q") {
             await quiesceTarget?.(plugin, lease).catch(record);
+            if (bodyError) record(bodyError);
           } else if (["ready", "installed", "upgrade_pending"].includes(plugin.status)) {
             await deps.markExpired(pluginId, plugin, lease).catch(record);
           }
         }
         if (failures.length > 0) {
-          fence(pluginId, "lifecycle deadline expired and cleanup failed");
+          fence(pluginId, "lifecycle deadline expired and cleanup failed", !rowUnproven);
           log.error({ pluginId, failures }, "plugin lifecycle: expiry cleanup failed");
         } else {
           shared.quiesced.add(pluginId);

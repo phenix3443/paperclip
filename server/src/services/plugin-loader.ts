@@ -56,6 +56,7 @@ import { pluginDatabaseService } from "./plugin-database.js";
 import { resolveBundledCatalogRoot } from "./bundled-plugins.js";
 
 const execFileAsync = promisify(execFile);
+const STARTUP_CONFIG_RPC_TIMEOUT_MS = 30_000;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = path.resolve(__dirname, "../../..");
 export const BUNDLED_LOCAL_PLUGIN_ROOT = path.join(REPO_ROOT, "packages", "plugins");
@@ -2426,7 +2427,9 @@ export function pluginLoader(
           await workerManager.call(pluginId, "configChanged", {
             config: (row.configJson ?? {}) as Record<string, unknown>,
             companyId: row.companyId,
-          }, deadlineAt === undefined ? undefined : Math.max(1, deadlineAt - Date.now()));
+          }, deadlineAt === undefined
+            ? undefined
+            : Math.max(1, Math.min(STARTUP_CONFIG_RPC_TIMEOUT_MS, deadlineAt - Date.now())));
         } catch (configErr) {
           // A single-tenant worker fails closed (CROSS_TENANT_CONFIG) rather
           // than collapse onto a second company's config — surface that at
