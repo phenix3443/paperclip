@@ -440,6 +440,29 @@ describe("checkout postgres driver expectation", () => {
       expect(() => readCheckoutPostgresDriver(checkout)).toThrow(/Cannot parse the patchedDependencies configuration/);
     });
 
+    it.each([
+      ["an indented root mapping", (patch: string) => `  patchedDependencies:\n    postgres@${EXPECTED.version}: ${patch}\n`],
+      ["an escaped section name", (patch: string) => `"\\u0070atchedDependencies":\n  postgres@${EXPECTED.version}: ${patch}\n`],
+      ["an escaped postgres key", (patch: string) => `patchedDependencies:\n  "\\u0070ostgres@${EXPECTED.version}": ${patch}\n`],
+      ["hex and solidus escapes", (patch: string) => `"patched\\x44ependencies":\n  'postgres@${EXPECTED.version}': "${patch.replace("/", "\\/")}"\n`],
+    ])("reads %s", (_label, body) => {
+      writeWorkspace(body(REPO_PATCH));
+      expect(readCheckoutPostgresDriver(checkout)).toEqual(EXPECTED);
+      fs.rmSync(path.join(checkout, REPO_PATCH));
+      expect(() => readCheckoutPostgresDriver(checkout)).toThrow(/Checkout patch for postgres@.* is missing/);
+    });
+
+    it.each([
+      ["an unknown escape", `"patched\\qDependencies":\n  postgres@${EXPECTED.version}: ${REPO_PATCH}\n`],
+      ["a top-level line it cannot read", `? patchedDependencies\n: \n  postgres@${EXPECTED.version}: ${REPO_PATCH}\n`],
+      ["a line indented less than the root mapping", `  packages:\n    - cli\npatchedDependencies:\n  postgres@${EXPECTED.version}: ${REPO_PATCH}\n`],
+      ["a second section", `patchedDependencies:\n  acpx@1.0.0: patches/acpx.patch\npatchedDependencies:\n  postgres@${EXPECTED.version}: ${REPO_PATCH}\n`],
+      ["an entry indented differently from the first", `patchedDependencies:\n  acpx@1.0.0: patches/acpx.patch\n    postgres@${EXPECTED.version}: ${REPO_PATCH}\n`],
+    ])("rejects %s", (_label, body) => {
+      writeWorkspace(body);
+      expect(() => readCheckoutPostgresDriver(checkout)).toThrow(/Cannot parse the patchedDependencies configuration/);
+    });
+
     it("rejects a postgres entry without a patch path", () => {
       writeWorkspace(`patchedDependencies:\n  postgres@${EXPECTED.version}:\n`);
       expect(() => readCheckoutPostgresDriver(checkout)).toThrow(/Checkout patch for postgres@.* is missing: no path/);

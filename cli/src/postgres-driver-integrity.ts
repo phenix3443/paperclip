@@ -44,15 +44,49 @@ function isPackageRelativePath(file: string): boolean {
   return file !== "" && !file.includes("\\") && !path.posix.isAbsolute(file) && path.posix.normalize(file) === file && !file.split("/").includes("..");
 }
 
-const PLAIN_START = String.raw`[^\s"'#{}\[\],&*!|>%@\x60]`;
-const YAML_KEY = String.raw`(?:"([^"]*)"|'([^']*)'|(${PLAIN_START}(?:[^:]*?[^\s:])?))`;
-const YAML_VALUE = String.raw`(?:"([^"]*)"|'([^']*)'|(${PLAIN_START}(?:.*?\S)?))`;
+const PLAIN_START = String.raw`(?![?:-]\s)[^\s"'#{}\[\],&*!|>%@\x60]`;
+const YAML_DOUBLE = String.raw`"((?:[^"\\]|\\.)*)"`;
+const YAML_SINGLE = String.raw`'((?:[^']|'')*)'`;
+const YAML_KEY = String.raw`(?:${YAML_DOUBLE}|${YAML_SINGLE}|(${PLAIN_START}(?:[^:]*?[^\s:])?))`;
+const YAML_VALUE = String.raw`(?:${YAML_DOUBLE}|${YAML_SINGLE}|(${PLAIN_START}(?:.*?\S)?))`;
 const YAML_COMMENT = String.raw`(?:\s+#.*)?\s*$`;
 const YAML_HEADER = new RegExp(String.raw`^${YAML_KEY}\s*:(?:\s+([^\s#].*?))?${YAML_COMMENT}`);
 const YAML_ENTRY = new RegExp(String.raw`^\s+${YAML_KEY}\s*:(?:\s+${YAML_VALUE})?${YAML_COMMENT}`);
 
-function yamlScalar(match: RegExpExecArray, first: number): string {
-  return match[first] ?? match[first + 1] ?? match[first + 2] ?? "";
+const YAML_ESCAPES: Record<string, string> = {
+  "0": "\0", a: "\x07", b: "\b", t: "\t", "\t": "\t", n: "\n", v: "\v", f: "\f", r: "\r", e: "\x1b",
+  " ": " ", '"': '"', "/": "/", "\\": "\\", N: "\x85", _: "\xa0", L: " ", P: " ",
+};
+const YAML_HEX_WIDTH: Record<string, number> = { x: 2, u: 4, U: 8 };
+
+function decodeDoubleQuoted(text: string): string | null {
+  let decoded = "";
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] !== "\\") {
+      decoded += text[index];
+      continue;
+    }
+    const code = text[++index];
+    const width = YAML_HEX_WIDTH[code];
+    if (width !== undefined) {
+      const hex = text.slice(index + 1, index + 1 + width);
+      const point = /^[0-9A-Fa-f]+$/.test(hex) && hex.length === width ? Number.parseInt(hex, 16) : Number.NaN;
+      if (!(point <= 0x10ffff)) return null;
+      decoded += String.fromCodePoint(point);
+      index += width;
+    } else if (Object.hasOwn(YAML_ESCAPES, code)) {
+      decoded += YAML_ESCAPES[code];
+    } else {
+      return null;
+    }
+  }
+  return decoded;
+}
+
+function yamlScalar(match: RegExpExecArray, first: number): string | null {
+  if (match[first] !== undefined) return decodeDoubleQuoted(match[first]);
+  if (match[first + 1] !== undefined) return match[first + 1].replaceAll("''", "'");
+  return match[first + 2] ?? "";
 }
 
 function isPostgresPatchKey(key: string): boolean {
@@ -65,21 +99,33 @@ function unparsedPatch(workspaceFile: string, line: string): Error {
 
 function workspacePatchEntries(workspaceFile: string): [string, string][] {
   const entries: [string, string][] = [];
+  let rootIndent: number | undefined;
+  let entryIndent: number | undefined;
   let inPatches = false;
-  for (const line of fs.readFileSync(workspaceFile, "utf8").replace(/^\uFEFF/, "").split(/\r?\n/)) {
+  let sawPatches = false;
+  for (const line of fs.readFileSync(workspaceFile, "utf8").replace(/^﻿/, "").split(/\r?\n/)) {
     if (line.trim() === "" || line.trim().startsWith("#")) continue;
-    if (/^\S/.test(line)) {
-      const header = YAML_HEADER.exec(line);
-      inPatches = header !== null && yamlScalar(header, 1) === "patchedDependencies";
-      if (inPatches && header?.[4] !== undefined && header?.[4] !== "{}") throw unparsedPatch(workspaceFile, line);
+    const indent = line.length - line.replace(/^ +/, "").length;
+    rootIndent ??= indent;
+    if (indent < rootIndent) throw unparsedPatch(workspaceFile, line);
+    if (indent === rootIndent) {
+      const header = YAML_HEADER.exec(line.slice(indent));
+      const key = header ? yamlScalar(header, 1) : null;
+      if (header === null || key === null) throw unparsedPatch(workspaceFile, line);
+      inPatches = key === "patchedDependencies";
+      entryIndent = undefined;
+      if (!inPatches) continue;
+      if (sawPatches || (header[4] !== undefined && header[4] !== "{}")) throw unparsedPatch(workspaceFile, line);
+      sawPatches = true;
       continue;
     }
     if (!inPatches) continue;
-    const entry = YAML_ENTRY.exec(line);
-    if (!entry) throw unparsedPatch(workspaceFile, line);
-    const key = yamlScalar(entry, 1);
-    if (key === "<<") throw unparsedPatch(workspaceFile, line);
-    if (isPostgresPatchKey(key)) entries.push([key, yamlScalar(entry, 4)]);
+    entryIndent ??= indent;
+    const entry = indent === entryIndent ? YAML_ENTRY.exec(line) : null;
+    const key = entry ? yamlScalar(entry, 1) : null;
+    const value = entry ? yamlScalar(entry, 4) : null;
+    if (key === null || value === null || key === "<<") throw unparsedPatch(workspaceFile, line);
+    if (isPostgresPatchKey(key)) entries.push([key, value]);
   }
   return entries;
 }
