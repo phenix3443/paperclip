@@ -896,10 +896,11 @@ export async function ensureLocalPluginBuilt(
   options: {
     processEnv?: NodeJS.ProcessEnv;
     repoRoot?: string;
+    signal?: AbortSignal;
     execFileAsyncImpl?: (
       file: string,
       args: readonly string[],
-      options: { cwd: string; timeout: number },
+      options: { cwd: string; timeout: number; signal?: AbortSignal },
     ) => Promise<{ stdout: string; stderr: string }>;
   } = {},
 ): Promise<void> {
@@ -929,7 +930,7 @@ export async function ensureLocalPluginBuilt(
       await runExecFileAsync(
         command.file,
         command.args,
-        { cwd: command.cwd, timeout: LOCAL_PLUGIN_AUTOBUILD_TIMEOUT_MS },
+        { cwd: command.cwd, timeout: LOCAL_PLUGIN_AUTOBUILD_TIMEOUT_MS, signal: options.signal },
       );
     }
   } catch (error) {
@@ -1305,7 +1306,7 @@ export function pluginLoader(
     if (!pkgJson) throw new Error(`Missing package.json at ${resolvedPackagePath}`);
 
     if (localPath && !prebuiltOnly) {
-      await ensureLocalPluginBuilt(resolvedPackagePath, pkgJson);
+      await ensureLocalPluginBuilt(resolvedPackagePath, pkgJson, { signal });
     }
 
     const manifestPath = resolveManifestPath(resolvedPackagePath, pkgJson);
@@ -2420,11 +2421,12 @@ export function pluginLoader(
       // round-trip is needed here.
       for (const row of configRows) {
         options.lease?.assertActive();
+        const deadlineAt = options.lease?.deadlineAt;
         try {
           await workerManager.call(pluginId, "configChanged", {
             config: (row.configJson ?? {}) as Record<string, unknown>,
             companyId: row.companyId,
-          });
+          }, deadlineAt === undefined ? undefined : Math.max(1, deadlineAt - Date.now()));
         } catch (configErr) {
           // A single-tenant worker fails closed (CROSS_TENANT_CONFIG) rather
           // than collapse onto a second company's config — surface that at

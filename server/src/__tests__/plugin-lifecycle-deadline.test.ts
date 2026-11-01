@@ -723,4 +723,21 @@ describe("plugin lifecycle response deadlines through the real route wiring", ()
     expect(harness.gate.count("initialize-replied")).toBe(1);
   });
 
+
+  it("N13: the exit of a fenced worker clears the fence for the next operation without reporting Q", async () => {
+    harness = await createHarness();
+    const row = seed("deadline.o", "disabled");
+    expect((await request(harness.app).post(`/api/plugins/${row.pluginKey}/enable`).send({})).status).toBe(200);
+    const pid = harness.workerManager.getWorker(row.id)!.diagnostics().pid!;
+    vi.spyOn(harness.workerManager, "stopWorker").mockRejectedValueOnce(new PluginWorkerStopError(row.id, pid));
+
+    expect((await request(harness.app).post(`/api/plugins/${row.pluginKey}/disable`).send({})).status).toBe(500);
+    expect(harness.appLifecycle.isFenced(row.id)).toBe(true);
+    const exited = nextHandleEvent(harness, row.id, "exit");
+    process.kill(pid, "SIGKILL");
+    await exited;
+    expect(harness.appLifecycle.isFenced(row.id)).toBe(false);
+    expect(harness.appLifecycle.isQuiesced(row.id)).toBe(true);
+  });
+
 });

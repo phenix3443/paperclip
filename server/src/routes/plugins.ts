@@ -2533,7 +2533,8 @@ export function pluginRoutes(
             try {
               const epoch = lifecycle.currentEpoch(plugin.id);
               await lifecycle.restartWorker(plugin.id, { source: "config", epoch, deadlineAt });
-            } catch {
+            } catch (restartErr) {
+              if (restartErr instanceof PluginLifecycleTimeoutError) throw restartErr;
               // Restart failure is non-fatal for the config save response.
             }
           }
@@ -2544,6 +2545,10 @@ export function pluginRoutes(
 
       res.json(result);
     } catch (err) {
+      if (err instanceof PluginLifecycleTimeoutError) {
+        sendLifecycleError(res, err);
+        return;
+      }
       const message = err instanceof Error ? err.message : String(err);
       res.status(400).json({ error: message });
     }

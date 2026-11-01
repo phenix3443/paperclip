@@ -138,6 +138,7 @@ export interface PluginLifecycleLease {
   readonly kind: PluginLifecycleOpKind;
   readonly released: boolean;
   readonly expired: boolean;
+  readonly deadlineAt?: number;
   assertActive(): void;
   assertCleanup(): void;
 }
@@ -147,7 +148,7 @@ interface MutableLease extends PluginLifecycleLease {
   release(): void;
 }
 
-function createLease(pluginKey: string, kind: PluginLifecycleOpKind): MutableLease {
+function createLease(pluginKey: string, kind: PluginLifecycleOpKind, deadlineAt?: number): MutableLease {
   let state: "active" | "expired" | "released" = "active";
   const assertCleanup = () => {
     if (state === "released") throw new LeaseReleasedError(pluginKey);
@@ -155,6 +156,7 @@ function createLease(pluginKey: string, kind: PluginLifecycleOpKind): MutableLea
   return {
     pluginKey,
     kind,
+    deadlineAt,
     get released() {
       return state === "released";
     },
@@ -240,7 +242,7 @@ export function createPluginLifecycleSerializer(
             releaseSlot();
             return;
           }
-          const lease = createLease(pluginKey, kind);
+          const lease = createLease(pluginKey, kind, deadlineAt);
           let responded = false;
           const deadlineTimer = deadlineAt === undefined
             ? undefined
