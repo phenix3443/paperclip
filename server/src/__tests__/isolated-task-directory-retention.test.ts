@@ -1,3 +1,9 @@
+import { retainProjectRepositoryEntries } from "../services/project-repository-retention.js";
+import { withIsolatedRepositorySourceLock } from "../services/isolated-remote-workspace-source.js";
+import { withExecutionWorkspaceLifecycleLock } from "../services/execution-workspace-lifecycle-lock.js";
+import { resolveDetachedRepositoryRetentionDir } from "../home-paths.js";
+import { receiptCases, retainedFixture } from "./helpers/detached-retention.js";
+import * as retentionInspection from "../services/detached-repository-retention.js";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -74,6 +80,37 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
     await db.$client.end({ timeout: 1 }); await database.cleanup(); await fs.rm(root, { recursive: true, force: true });
   });
 
+  it.each(receiptCases)("refuses retention history before removal hook (%s)", async state => {
+    const f = await fixture();
+    const retained = await retainedFixture(db, { id: f.workspaceId, companyId: f.companyId, sourceIssueId: f.issueId, cwd: f.cwd }, state);
+    const inspect = retentionInspection.inspectDetachedRepositoryRetention;
+    const spy = vi.spyOn(retentionInspection, "inspectDetachedRepositoryRetention").mockImplementation(async (...args) => {
+      const reasons = await inspect(...args);
+      if (state !== null && reasons.length) {
+        await fs.mkdir(retained.source, { recursive: true });
+        await fs.writeFile(path.join(retained.source, "late-unique"), "late unique bytes");
+      }
+      return reasons;
+    });
+    const beforeDelete = vi.fn(async () => {
+      await fs.mkdir(retained.source, { recursive: true });
+      await fs.writeFile(path.join(retained.source, "hook-write"), "hook unique bytes");
+    });
+    try {
+      const result = await f.expire({ beforeDelete });
+      if (state === null) expect(beforeDelete).toHaveBeenCalledTimes(1);
+      else {
+        expect(result).toMatchObject({ expired: false, skipReason: "detached_repository_retention" });
+        expect(beforeDelete).not.toHaveBeenCalled();
+        expect(spy).toHaveBeenCalled();
+        expect(await fs.readFile(path.join(retained.source, "late-unique"), "utf8")).toBe("late unique bytes");
+        expect(await fs.readFile(retained.file, "utf8")).toBe(retained.bytes);
+        expect(await exists(f.cwd)).toBe(true);
+      }
+      expect(await fs.readFile(path.join(retained.destination, "unique"), "utf8")).toBe("retained unique bytes");
+    } finally { spy.mockRestore(); }
+  }, 30_000);
+
   const settings = { dryRun: false, terminalDelayMs: 3 * DAY_MS, orphanGraceMs: 7 * DAY_MS };
   const restorePoints = (overrides: Partial<{ keyDurable: boolean }> = {}) => ({ storage: getStorageService(), terminalDelayMs: 3 * DAY_MS, keyDurable: true, ...overrides });
 
@@ -109,6 +146,50 @@ describeEmbeddedPostgres("isolated task directory retention", () => {
       authorizationActor: { type: "board", source: "local_implicit", isInstanceAdmin: true } });
     return { companyId, issueId, workspaceId, agentId, cwd, row, ledger, service, expire, reopen };
   }
+
+  it.each(["running_before", "queued_during", "archive_first", "move_first", "two_preparations"])("serializes detached retention with native consumers (%s)", async scenario => {
+    const f = await fixture();
+    const source = path.join(f.cwd, ".paperclip-repositories", "removed"); await fs.mkdir(source, { recursive: true });
+    await fs.writeFile(path.join(source, "unique"), "keep");
+    const runId = randomUUID();
+    if (scenario === "running_before") await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.agentId,
+      nativeIssueId: f.issueId, status: "running" });
+    if (scenario === "archive_first") await f.service().archiveWorkspaceUnderLifecycleLock({ id: f.workspaceId, closedAt: new Date(), patch: { status: "archived" } });
+    let entered!: () => void, release!: () => void;
+    const waiting = new Promise<void>(resolve => { entered = resolve; });
+    const barrier = new Promise<void>(resolve => { release = resolve; });
+    let checks = 0;
+    const prepare = (pause: boolean) => withIsolatedRepositorySourceLock(db, f.companyId, f.issueId, () => retainProjectRepositoryEntries({
+      cwd: f.cwd, active: new Set(), retention: { companyId: f.companyId, executionWorkspaceId: f.workspaceId, sourceIssueId: f.issueId,
+        runId: null, generation: 0, withLifecycleLock: work => withExecutionWorkspaceLifecycleLock(db, f.workspaceId, work),
+        afterGuard: async () => {
+          ++checks;
+          if (scenario === "queued_during" && checks === 2) await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId,
+            agentId: f.agentId, nativeIssueId: f.issueId, status: "queued" });
+          if (pause && checks === 1) { entered(); await barrier; }
+        } },
+    }));
+    if (["move_first", "two_preparations"].includes(scenario)) {
+      const first = prepare(true); await waiting;
+      let locks: Array<{ source_locked: boolean; lifecycle_locked: boolean }> = [];
+      await db.transaction(async tx => { locks = await tx.execute<{ source_locked: boolean; lifecycle_locked: boolean }>(sql`SELECT
+        pg_try_advisory_xact_lock(hashtextextended(${`isolated_repository_source:${f.companyId}:${f.issueId}`}, 0)) AS source_locked,
+        pg_try_advisory_xact_lock(hashtextextended(${`execution_workspace_lifecycle:${f.workspaceId}`}, 0)) AS lifecycle_locked`); });
+      expect(locks[0]).toEqual({ source_locked: false, lifecycle_locked: false });
+      const second = scenario === "two_preparations" ? prepare(false) : f.service().archiveWorkspaceUnderLifecycleLock({ id: f.workspaceId,
+        closedAt: new Date(), patch: { status: "archived" } });
+      release(); await first; await second;
+    } else await prepare(false);
+    const directory = resolveDetachedRepositoryRetentionDir({ companyId: f.companyId, executionWorkspaceId: f.workspaceId });
+    const files = (await fs.readdir(directory)).filter(name => name.endsWith(".json"));
+    if (["running_before", "archive_first"].includes(scenario)) { expect(files).toEqual([]); expect(await fs.readFile(path.join(source, "unique"), "utf8")).toBe("keep"); }
+    else {
+      expect(files).toHaveLength(1);
+      const receipt = JSON.parse(await fs.readFile(path.join(directory, files[0]!), "utf8"));
+      expect(receipt.state).toBe(scenario === "queued_during" ? "rolled_back" : "retained");
+      expect(await fs.readFile(path.join(scenario === "queued_during" ? source : receipt.destination, "unique"), "utf8")).toBe("keep");
+    }
+  }, 30_000);
 
   async function expectRestored(cwd: string) {
     expect(await fs.readFile(path.join(cwd, "report.md"), "utf8")).toBe("final report\n");

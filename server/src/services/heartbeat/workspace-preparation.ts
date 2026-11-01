@@ -1,3 +1,4 @@
+import { withExecutionWorkspaceLifecycleLock } from "../execution-workspace-lifecycle-lock.js";
 import { reserveFreshPluginTaskWorkspace, stageProviderFreshWorkspace } from "../provider-fresh-workspace.js";
 import { freshWorkspaceSchema, type PluginFreshWorkspace } from "@paperclipai/plugin-sdk";
 import { pluginRegistryService } from "../plugin-registry.js";
@@ -163,10 +164,10 @@ export async function prepareHeartbeatWorkspace(db: Db, input: HeartbeatWorkspac
     ?? input.reuse.existingExecutionWorkspace?.sourceIssueId ?? input.task.issueId;
   if (!sourceIssueId || input.reuse.isDotRun) return prepareHeartbeatWorkspaceLocked(db, input);
   return withIsolatedRepositorySourceLock(db, input.agent.companyId, sourceIssueId,
-    () => prepareHeartbeatWorkspaceLocked(db, input));
+    () => prepareHeartbeatWorkspaceLocked(db, input, sourceIssueId));
 }
 
-async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspacePreparationInput) {
+async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspacePreparationInput, lockedSourceIssueId?: string) {
   const { run, agent, controllerLease, nativeRunnerPreparationSpans } = input;
   const fresh = input.task.freshWorkspace?.mode === "fresh_isolated_workspace";
   const timeWorkspace = createHeartbeatPreparationTiming(run.id);
@@ -1065,6 +1066,19 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
       cwd: executionWorkspace.cwd,
       anchorRepoUrl: executionWorkspace.repoUrl,
       workspaces: repositoryRows,
+      onRetentionWarning: async warning => {
+        await appendRunEvent(run, { eventType: "workspace.detached_repository_warning", stream: "system", level: "warn", message: warning,
+          payload: { executionWorkspaceId: persistedExecutionWorkspace?.id ?? null } });
+      },
+      retention: persistedExecutionWorkspace?.sourceIssueId && persistedExecutionWorkspace.sourceIssueId === lockedSourceIssueId ? {
+        companyId: agent.companyId,
+        executionWorkspaceId: persistedExecutionWorkspace.id,
+        sourceIssueId: lockedSourceIssueId,
+        runId: run.id,
+        generation: typeof persistedExecutionWorkspace.metadata?.lifecycleGeneration === "number"
+          ? persistedExecutionWorkspace.metadata.lifecycleGeneration : 0,
+        withLifecycleLock: work => withExecutionWorkspaceLifecycleLock(db, persistedExecutionWorkspace!.id, work),
+      } : undefined,
       restoredContents: persistedExecutionWorkspace ? readGitCacheRestoration(persistedExecutionWorkspace)?.contents : undefined,
       sharedBase: { companyId: agent.companyId, projectId: executionWorkspace.projectId! },
       resolveGitAuth: workspaceGitAuthProvider,

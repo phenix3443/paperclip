@@ -1,3 +1,4 @@
+import { assertWorkspaceRetentionAllowsRemoval, workspaceRetentionBlockingReasons } from "./detached-repository-retention-guard.js";
 import { effectiveProjectWorkspacePolicy } from "./project-workspace-provider.js";
 import { inspectPluginWorkspace, removePluginWorkspace, restorePluginWorkspace, type WorkspaceWorkers } from "./plugin-workspaces.js";
 import { acquireExecutionWorkspaceLifecycleLock, withExecutionWorkspaceLifecycleLock } from "./execution-workspace-lifecycle-lock.js";
@@ -339,6 +340,8 @@ export type ExecutionWorkspaceServiceOptions = {
   workspaceCompactionDelayMs?: number | null;
   // Test hook. Runs after compaction moves directories out of the worktree and
   // before it re-checks the guard under the lifecycle lock.
+  beforeWorktreeRemoval?: (workspace: ExecutionWorkspaceRow) => Promise<void>;
+  beforeWorkspaceCompactionMove?: (workspace: ExecutionWorkspaceRow) => Promise<void>;
   afterWorkspaceCompactionMove?: (workspace: ExecutionWorkspaceRow) => Promise<void>;
   inspectGitCloseReadiness?: (workspace: ExecutionWorkspace) => Promise<{
     git: ExecutionWorkspaceCloseGitReadiness | null;
@@ -2394,6 +2397,8 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       ) {
         return null;
       }
+      if ((await workspaceRetentionBlockingReasons(tx, workspace)).length) return null;
+      await opts.beforeWorkspaceCompactionMove?.(workspace);
       const moved = await moveWorkspaceDirsToTrash(worktreePath, relativePaths);
       try {
         await opts.afterWorkspaceCompactionMove?.(workspace);
@@ -2455,7 +2460,10 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
         message: "execution workspace cleanup skipped because it was reopened",
       },
       onSkip: () => ({ cleaned: false, warnings: [], skippedReopened: true }),
-      write: () => runTerminalWorkspaceCleanup(workspace, expectedHeadSha),
+      write: async ({ tx }) => {
+        await assertWorkspaceRetentionAllowsRemoval(tx, workspace);
+        return runTerminalWorkspaceCleanup(workspace, expectedHeadSha);
+      },
     });
   }
 
@@ -2517,6 +2525,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           executionWorkspaceId: workspace.id,
         }),
         assertSafeToCleanup: () => assertTerminalCleanupGitStateUnchanged(workspace, expectedHeadSha),
+        beforeWorktreeRemoval: () => opts.beforeWorktreeRemoval?.(workspace) ?? Promise.resolve(),
         beforeBranchDelete: () => cleanupLock?.releaseBranchRefLock() ?? Promise.resolve(),
         expectedBranchHeadSha: expectedHeadSha,
         // Git index, HEAD, and branch-ref locks prevent a clean HEAD change
@@ -3133,7 +3142,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       } = await inspectWorkspace(executionWorkspace);
       const { deliveryState } = await assessDelivery(workspace, git);
       const warnings = [...gitWarnings];
-      const blockingReasons: string[] = [];
+      const blockingReasons: string[] = await workspaceRetentionBlockingReasons(db, workspace);
       if (!statusInspectionSucceeded) {
         blockingReasons.push("Paperclip could not verify the workspace git status. Retry before destructive cleanup.");
       }
@@ -4295,7 +4304,12 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
           const repositoryRows = await tx.select().from(projectWorkspaces).where(and(
             eq(projectWorkspaces.companyId, row.companyId), eq(projectWorkspaces.projectId, row.projectId!),
           )).orderBy(asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id));
+          await tx.update(executionWorkspaces).set({ status: "active", closedAt: null }).where(eq(executionWorkspaces.id, row.id));
+          try {
           await prepareProjectRepositoryWorkspaces({ cwd: targetCwd, anchorRepoUrl: row.repoUrl, workspaces: repositoryRows,
+            retention: { companyId: row.companyId, executionWorkspaceId: row.id, sourceIssueId: row.sourceIssueId!, runId: null,
+              generation: readExecutionWorkspaceLifecycleGeneration(row.metadata as Record<string, unknown> | null),
+              withLifecycleLock: work => work(tx) },
             sharedBase: { companyId: row.companyId, projectId: row.projectId! }, resolveGitAuth: gitAuth,
             prepareLocalSource: async sourceCwd => {
               const sourceIdentity = await fs.realpath(sourceCwd);
@@ -4304,6 +4318,9 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
                 await assertTaskWorkspaceExecutionAccess(tx, input.authorizationActor, issue.companyId, { issueId: issue.id, workspaceId: row.id });
               };
             } });
+          } finally {
+            await tx.update(executionWorkspaces).set({ status: row.status, closedAt: row.closedAt }).where(eq(executionWorkspaces.id, row.id));
+          }
         };
         const recorder = workspaceOperationService(db).createRecorder({
           companyId: row.companyId,

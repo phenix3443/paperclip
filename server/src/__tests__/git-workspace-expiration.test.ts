@@ -1,3 +1,5 @@
+import { receiptCases, retainedFixture } from "./helpers/detached-retention.js";
+import * as retentionInspection from "../services/detached-repository-retention.js";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -54,6 +56,37 @@ describeEmbeddedPostgres("reconstructable Git expiration", () => {
     if (previousInstance === undefined) delete process.env.PAPERCLIP_INSTANCE_ID; else process.env.PAPERCLIP_INSTANCE_ID = previousInstance;
     await db.$client.end({ timeout: 1 }); await database?.cleanup(); await fs.rm(root, { recursive: true, force: true });
   });
+
+  it.each(receiptCases)("refuses retention history before removal hook (%s)", async state => {
+    const f = await fixture();
+    const retained = await retainedFixture(db, { id: f.workspaceId, companyId: f.companyId, sourceIssueId: f.issueId, cwd: f.cwd }, state);
+    const inspect = retentionInspection.inspectDetachedRepositoryRetention;
+    const spy = vi.spyOn(retentionInspection, "inspectDetachedRepositoryRetention").mockImplementation(async (...args) => {
+      const reasons = await inspect(...args);
+      if (state !== null && reasons.length) {
+        await fs.mkdir(retained.source, { recursive: true });
+        await fs.writeFile(path.join(retained.source, "late-unique"), "late unique bytes");
+      }
+      return reasons;
+    });
+    const beforeDelete = vi.fn(async () => {
+      await fs.mkdir(retained.source, { recursive: true });
+      await fs.writeFile(path.join(retained.source, "hook-write"), "hook unique bytes");
+    });
+    try {
+      const result = await f.expire({ beforeDelete });
+      if (state === null) expect(beforeDelete).toHaveBeenCalledTimes(1);
+      else {
+        expect(result).toMatchObject({ expired: false, skipReason: "detached_repository_retention" });
+        expect(beforeDelete).not.toHaveBeenCalled();
+        expect(spy).toHaveBeenCalled();
+        expect(await fs.readFile(path.join(retained.source, "late-unique"), "utf8")).toBe("late unique bytes");
+        expect(await fs.readFile(retained.file, "utf8")).toBe(retained.bytes);
+        expect(await exists(f.cwd)).toBe(true);
+      }
+      expect(await fs.readFile(path.join(retained.destination, "unique"), "utf8")).toBe("retained unique bytes");
+    } finally { spy.mockRestore(); }
+  }, 30_000);
 
   async function fixture(managed = false, nested = false, withProject = managed) {
     const companyId = randomUUID(), issueId = randomUUID(), workspaceId = randomUUID();

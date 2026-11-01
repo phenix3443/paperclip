@@ -1,3 +1,4 @@
+import { assertWorkspaceRetentionAllowsRemoval } from "./detached-repository-retention-guard.js";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -209,6 +210,7 @@ export async function expireIsolatedTaskDirectory(db: Db, snapshot: Workspace, o
         if (!acquired[0]?.locked) throw new Error("lifecycle_busy");
         let [workspace] = await db.select().from(executionWorkspaces).where(and(eq(executionWorkspaces.id, snapshot.id),
           eq(executionWorkspaces.companyId, snapshot.companyId)));
+        await assertWorkspaceRetentionAllowsRemoval(tx, snapshot);
         if (!workspace || workspace.updatedAt.getTime() !== snapshot.updatedAt.getTime()) throw new Error("workspace_changed");
         if (!await issueBoundToWorkspace(tx, workspace)) throw new Error("issue_not_bound");
         if (!await isGitWorkspaceExpirationEligible(tx, workspace, options.now, undefined, { closedSiblingsAllowed: true })) {
@@ -506,6 +508,7 @@ async function inspectTaskDirectoryFolder(db: Db, companyId: string, name: strin
       if (await directoryState(folder) !== "present") throw new Error("task_directory_changed");
       const current = await folderRows(db, folder);
       if (current.some(row => !["archived", "cleanup_failed"].includes(row.status) || row.closedAt === null)) throw new Error("live_workspace");
+      for (const workspace of current) await assertWorkspaceRetentionAllowsRemoval(db, workspace);
       if (current.some(row => hasPendingTaskDirectoryRetention(row))) throw new Error("retention_pending");
       const [currentIssue] = await db.select({ executionWorkspaceId: issues.executionWorkspaceId }).from(issues)
         .where(and(eq(issues.companyId, companyId), eq(issues.id, name)));

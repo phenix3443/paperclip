@@ -1,3 +1,5 @@
+import { receiptCases, retainedFixture } from "./helpers/detached-retention.js";
+import * as retentionInspection from "../services/detached-repository-retention.js";
 import { EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -5,7 +7,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
 import {
   activityLog,
@@ -104,6 +106,7 @@ describeEmbeddedPostgres("terminal workspace compaction", () => {
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
   afterEach(async () => {
+    vi.restoreAllMocks(); vi.unstubAllEnvs();
     await db.delete(workspaceRuntimeServices);
     await db.delete(activityLog);
     await db.update(issues).set({ checkoutRunId: null, executionRunId: null, parentId: null });
@@ -246,6 +249,40 @@ describeEmbeddedPostgres("terminal workspace compaction", () => {
     }
     expect(await fs.readFile(path.join(worktreePath, "README.md"), "utf8")).toContain("uncommitted edit");
   }
+
+  it.each(receiptCases.flatMap(state => ["cleanup", "compaction"].map(removal => ({ state, removal }))))(
+    "refuses $removal with retention history before removal hook ($state)", async ({ state, removal }) => {
+      const home = await fs.mkdtemp(path.join(os.tmpdir(), "retention-removal-")); tempDirs.add(home);
+      vi.stubEnv("PAPERCLIP_HOME", home);
+      const seeded = await seedWorkspace({ populate: removal === "compaction" });
+      const retained = await retainedFixture(db, { id: seeded.executionWorkspaceId, companyId: seeded.companyId,
+        sourceIssueId: seeded.sourceIssueId, cwd: seeded.worktreePath }, state);
+      const inspect = retentionInspection.inspectDetachedRepositoryRetention;
+      const spy = vi.spyOn(retentionInspection, "inspectDetachedRepositoryRetention").mockImplementation(async (...args) => {
+        const reasons = await inspect(...args);
+        if (state !== null && reasons.length) {
+          await fs.mkdir(retained.source, { recursive: true }); await fs.writeFile(path.join(retained.source, "late-unique"), "late unique bytes");
+        }
+        return reasons;
+      });
+      const removalHook = vi.fn(async () => {
+        await fs.mkdir(retained.source, { recursive: true }); await fs.writeFile(path.join(retained.source, "hook-write"), "hook bytes");
+      });
+      const svc = service({ beforeWorktreeRemoval: removalHook, beforeWorkspaceCompactionMove: removalHook });
+      try {
+        await svc.sweepTerminalWorkspaces();
+        if (state === null) expect(removalHook).toHaveBeenCalledTimes(1);
+        else {
+          expect(spy).toHaveBeenCalled(); expect(removalHook).not.toHaveBeenCalled();
+          expect(await exists(seeded.worktreePath)).toBe(true);
+          expect(await fs.readFile(path.join(retained.source, "late-unique"), "utf8")).toBe("late unique bytes");
+          expect(await fs.readFile(retained.file, "utf8")).toBe(retained.bytes);
+          if (removal === "compaction") await expectRegenerablePresent(seeded.worktreePath, true);
+        }
+        expect(await fs.readFile(path.join(retained.destination, "unique"), "utf8")).toBe("retained unique bytes");
+      } finally { spy.mockRestore(); }
+    }, 30_000,
+  );
 
   it.each([false, true])("compacts an undelivered workspace and preserves source with Git expiration %s", async gitCacheExpirationEnabled => {
     const seeded = await seedWorkspace({ commitOnBranch: true });

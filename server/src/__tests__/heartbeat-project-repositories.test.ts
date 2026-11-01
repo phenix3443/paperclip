@@ -18,7 +18,7 @@ import { createWorkspaceGitOperationScheduler, WorkspaceGitScanError } from "../
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { createHeartbeatWorkspaceResolver } from "../services/heartbeat/workspaces.js";
-import { resolveManagedProjectWorkspaceDir, resolvePaperclipInstanceRoot } from "../home-paths.js";
+import { resolveDetachedRepositoryRetentionDir, resolveManagedProjectWorkspaceDir, resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { accessService } from "../services/access.js";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
@@ -822,9 +822,8 @@ suite("task project repository provisioning", () => {
       const continued = await admit();
       expect(continued.status).toBe("succeeded");
       expect(execute.mock.calls.filter(([input]) => input.runId === continued.id)).toHaveLength(1);
-      // Removing a configured repository detaches its files under the same task root.
-      const detachedRoot = path.join(taskCwd, ".paperclip-runtime", "detached-repositories");
-      const detached = await readdir(detachedRoot);
+      const detachedRoot = resolveDetachedRepositoryRetentionDir({ companyId, executionWorkspaceId: binding });
+      const detached = (await readdir(detachedRoot)).filter(name => !name.endsWith(".json"));
       expect(detached.length).toBeGreaterThan(0);
       const retained = await Promise.all(detached.map(name => readFile(path.join(detachedRoot, name, "private.txt"), "utf8").catch(() => null)));
       expect(retained).toContain(expectedBytes);
