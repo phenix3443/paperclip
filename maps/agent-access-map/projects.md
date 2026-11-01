@@ -37,7 +37,12 @@ Assert the relevant denied actor, owner, company or mode from Policy. Review the
 remaining operations before qualifying the whole capability.
 
 Gaps: Actual data operations exist; project discovery and private-resource permissions
-still apply.
+still apply. Project-MCP discovery isolates unavailable definitions and logs degraded
+availability. Omitted tools remain unavailable to calls; normal mode, company and
+input validation still apply. Focused source regressions cover
+[schema ownership and transport](../../server/src/__tests__/project-tool-schema-ownership.test.ts)
+and [conversion failure](../../server/src/__tests__/project-tool-conversion-failure.test.ts).
+This does not qualify live access or the remaining lifecycle operations.
 
 ## `task-context`
 

@@ -142,8 +142,8 @@ let createProjectToolInputJson: ReturnType<typeof buildCreateProjectToolInputJso
 // Callers must not run their own zod's toJSONSchema on shared schemas: a deployed
 // install can resolve a different zod copy for the server, and zod 4.6 record
 // processors crash under a 4.4 conversion context (ctx.deferred is undefined).
-export function createProjectToolInputJsonSchema() {
-  return createProjectToolInputJson ??= buildCreateProjectToolInputJsonSchema();
+export function createProjectToolInputJsonSchema(): z.core.JSONSchema.BaseSchema {
+  return structuredClone(createProjectToolInputJson ??= buildCreateProjectToolInputJsonSchema());
 }
 
 export const updateProjectSchema = objectWithoutDefaults(
