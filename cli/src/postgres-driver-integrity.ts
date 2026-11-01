@@ -44,23 +44,55 @@ function isPackageRelativePath(file: string): boolean {
   return file !== "" && !file.includes("\\") && !path.posix.isAbsolute(file) && path.posix.normalize(file) === file && !file.split("/").includes("..");
 }
 
+const PLAIN_START = String.raw`[^\s"'#{}\[\],&*!|>%@\x60]`;
+const YAML_KEY = String.raw`(?:"([^"]*)"|'([^']*)'|(${PLAIN_START}(?:[^:]*?[^\s:])?))`;
+const YAML_VALUE = String.raw`(?:"([^"]*)"|'([^']*)'|(${PLAIN_START}(?:.*?\S)?))`;
+const YAML_COMMENT = String.raw`(?:\s+#.*)?\s*$`;
+const YAML_HEADER = new RegExp(String.raw`^${YAML_KEY}\s*:(?:\s+([^\s#].*?))?${YAML_COMMENT}`);
+const YAML_ENTRY = new RegExp(String.raw`^\s+${YAML_KEY}\s*:(?:\s+${YAML_VALUE})?${YAML_COMMENT}`);
+
+function yamlScalar(match: RegExpExecArray, first: number): string {
+  return match[first] ?? match[first + 1] ?? match[first + 2] ?? "";
+}
+
+function isPostgresPatchKey(key: string): boolean {
+  return key === "postgres" || key.startsWith("postgres@");
+}
+
+function unparsedPatch(workspaceFile: string, line: string): Error {
+  return new Error(`Cannot parse the patchedDependencies configuration in ${workspaceFile}: ${line.trim()}`);
+}
+
+function workspacePatchEntries(workspaceFile: string): [string, string][] {
+  const entries: [string, string][] = [];
+  let inPatches = false;
+  for (const line of fs.readFileSync(workspaceFile, "utf8").replace(/^\uFEFF/, "").split(/\r?\n/)) {
+    if (line.trim() === "" || line.trim().startsWith("#")) continue;
+    if (/^\S/.test(line)) {
+      const header = YAML_HEADER.exec(line);
+      inPatches = header !== null && yamlScalar(header, 1) === "patchedDependencies";
+      if (inPatches && header?.[4] !== undefined && header?.[4] !== "{}") throw unparsedPatch(workspaceFile, line);
+      continue;
+    }
+    if (!inPatches) continue;
+    const entry = YAML_ENTRY.exec(line);
+    if (!entry) throw unparsedPatch(workspaceFile, line);
+    const key = yamlScalar(entry, 1);
+    if (key === "<<") throw unparsedPatch(workspaceFile, line);
+    if (isPostgresPatchKey(key)) entries.push([key, yamlScalar(entry, 4)]);
+  }
+  return entries;
+}
+
 function postgresPatchEntries(checkoutPath: string): [string, string][] {
   const manifest = readJson(path.join(checkoutPath, "package.json"), "checkout package.json");
   if (!isRecord(manifest)) throw new Error(`Checkout package.json in ${checkoutPath} is not an object.`);
   const patched = isRecord(manifest.pnpm) && isRecord(manifest.pnpm.patchedDependencies) ? manifest.pnpm.patchedDependencies : {};
   const entries = Object.entries(patched)
-    .filter(([key]) => key.startsWith("postgres@"))
+    .filter(([key]) => isPostgresPatchKey(key))
     .map(([key, value]): [string, string] => [key, typeof value === "string" ? value : ""]);
   const workspaceFile = path.join(checkoutPath, "pnpm-workspace.yaml");
-  if (fs.existsSync(workspaceFile)) {
-    let section = "";
-    for (const line of fs.readFileSync(workspaceFile, "utf8").split(/\r?\n/)) {
-      if (/^[^\s#]/.test(line)) section = line.split(":")[0].trim();
-      if (section !== "patchedDependencies") continue;
-      const match = /^\s*["']?(postgres@[^"':\s]+)["']?\s*:\s*["']?([^"'\s#]*)["']?\s*(?:#.*)?$/.exec(line);
-      if (match) entries.push([match[1], match[2]]);
-    }
-  }
+  if (fs.existsSync(workspaceFile)) entries.push(...workspacePatchEntries(workspaceFile));
   return entries;
 }
 
@@ -73,7 +105,7 @@ export function readCheckoutPostgresDriver(checkoutPath: string): PostgresDriver
   if (typeof version !== "string" || version === "") throw new Error(`Checkout postgres driver ${driverRoot} has no version.`);
   const entries = postgresPatchEntries(checkoutPath);
   if (entries.length === 0) return { version, files: {} };
-  const entry = entries.find(([key]) => key === `postgres@${version}`);
+  const entry = entries.find(([key]) => key === `postgres@${version}`) ?? entries.find(([key]) => key === "postgres");
   if (!entry) {
     throw new Error(`Checkout patches ${entries.map(([key]) => key).join(", ")} do not match the installed postgres@${version}.`);
   }
