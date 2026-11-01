@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import type { PluginStatus } from "@paperclipai/shared";
 import { HttpError } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import type { PluginLoader } from "./plugin-loader.js";
@@ -8,9 +9,39 @@ export type PluginLifecycleOpKind = "Q" | "A" | "R";
 
 export interface PluginLifecycleTimings {
   queueWaitMs?: number;
+  responseDeadlineMs?: number;
 }
 
 export const DEFAULT_PLUGIN_LIFECYCLE_QUEUE_WAIT_MS = 15_000;
+export const DEFAULT_PLUGIN_LIFECYCLE_RESPONSE_DEADLINE_MS = 60_000;
+
+export class PluginLifecycleTimeoutError extends HttpError {
+  readonly code = "plugin_lifecycle_timeout";
+  constructor(pluginKey: string, readonly phase: "queue" | "body" | "prepare") {
+    super(504, `Plugin ${pluginKey} lifecycle operation did not finish before its response deadline`, {
+      code: "plugin_lifecycle_timeout",
+      phase,
+    });
+    this.name = "PluginLifecycleTimeoutError";
+  }
+}
+
+export class PluginLifecycleFencedError extends HttpError {
+  readonly code = "plugin_lifecycle_fenced";
+  constructor(pluginKey: string, reason: string) {
+    super(409, `Plugin ${pluginKey} is fenced until a disable or uninstall succeeds: ${reason}`, {
+      code: "plugin_lifecycle_fenced",
+    });
+    this.name = "PluginLifecycleFencedError";
+  }
+}
+
+export class LeaseExpiredError extends Error {
+  constructor(pluginKey: string) {
+    super(`Lifecycle lease for plugin ${pluginKey} expired at its response deadline`);
+    this.name = "LeaseExpiredError";
+  }
+}
 
 export class PluginLifecycleBusyError extends HttpError {
   readonly code = "plugin_lifecycle_busy";
@@ -19,6 +50,14 @@ export class PluginLifecycleBusyError extends HttpError {
       code: "plugin_lifecycle_busy",
     });
     this.name = "PluginLifecycleBusyError";
+  }
+}
+
+export class PluginActivationError extends Error {
+  readonly code = "plugin_activation_failed";
+  constructor(message: string) {
+    super(message);
+    this.name = "PluginActivationError";
   }
 }
 
@@ -36,13 +75,56 @@ export class LeaseKeyMismatchError extends Error {
   }
 }
 
+export interface PluginLifecycleEventGeneration {
+  epoch?: number;
+  kind?: PluginLifecycleOpKind;
+}
+
+export interface PluginLifecycleEvents {
+  /** Emitted after a plugin is loaded (installed → ready). */
+  "plugin.loaded": { pluginId: string; pluginKey: string } & PluginLifecycleEventGeneration;
+  /** Emitted after a plugin transitions to ready (enabled). */
+  "plugin.enabled": { pluginId: string; pluginKey: string } & PluginLifecycleEventGeneration;
+  /** Emitted after a plugin is disabled (ready → disabled). */
+  "plugin.disabled": { pluginId: string; pluginKey: string; reason?: string } & PluginLifecycleEventGeneration;
+  /** Emitted after a plugin is unloaded (any → uninstalled). */
+  "plugin.unloaded": { pluginId: string; pluginKey: string; removeData: boolean } & PluginLifecycleEventGeneration;
+  /** Emitted on any status change. */
+  "plugin.status_changed": {
+    pluginId: string;
+    pluginKey: string;
+    previousStatus: PluginStatus;
+    newStatus: PluginStatus;
+  } & PluginLifecycleEventGeneration;
+  /** Emitted when a plugin enters an error state. */
+  "plugin.error": { pluginId: string; pluginKey: string; error: string } & PluginLifecycleEventGeneration;
+  /** Emitted when a plugin enters upgrade_pending. */
+  "plugin.upgrade_pending": { pluginId: string; pluginKey: string } & PluginLifecycleEventGeneration;
+  /** Emitted when a plugin worker process has been started. */
+  "plugin.worker_started": { pluginId: string; pluginKey: string } & PluginLifecycleEventGeneration;
+  /** Emitted when a plugin worker process has been stopped. */
+  "plugin.worker_stopped": { pluginId: string; pluginKey: string } & PluginLifecycleEventGeneration;
+}
+
+export interface PluginLifecycleOpOptions {
+  lease?: PluginLifecycleLease;
+  deadlineAt?: number;
+}
+
+export interface PluginLifecycleExclusiveOptions {
+  deadlineAt?: number;
+  pluginId?: () => string | undefined;
+}
+
 export interface PluginLoadOptions {
   lease?: PluginLifecycleLease;
   activate?: boolean;
+  deadlineAt?: number;
 }
 
 export interface PluginRestartOptions {
   lease?: PluginLifecycleLease;
+  deadlineAt?: number;
   source?: "watcher" | "config";
   epoch?: number;
 }
@@ -55,31 +137,52 @@ export interface PluginLifecycleLease {
   readonly pluginKey: string;
   readonly kind: PluginLifecycleOpKind;
   readonly released: boolean;
+  readonly expired: boolean;
+  readonly deadlineAt?: number;
   assertActive(): void;
   assertCleanup(): void;
 }
 
 interface MutableLease extends PluginLifecycleLease {
+  expire(): void;
   release(): void;
 }
 
-function createLease(pluginKey: string, kind: PluginLifecycleOpKind): MutableLease {
-  let released = false;
-  const assertHeld = () => {
-    if (released) throw new LeaseReleasedError(pluginKey);
+function createLease(pluginKey: string, kind: PluginLifecycleOpKind, deadlineAt?: number): MutableLease {
+  let state: "active" | "expired" | "released" = "active";
+  const assertCleanup = () => {
+    if (state === "released") throw new LeaseReleasedError(pluginKey);
   };
   return {
     pluginKey,
     kind,
+    deadlineAt,
     get released() {
-      return released;
+      return state === "released";
     },
-    assertActive: assertHeld,
-    assertCleanup: assertHeld,
+    get expired() {
+      return state !== "active";
+    },
+    assertActive() {
+      assertCleanup();
+      if (state === "expired") throw new LeaseExpiredError(pluginKey);
+    },
+    assertCleanup,
+    expire() {
+      if (state === "active") state = "expired";
+    },
     release() {
-      released = true;
+      state = "released";
     },
   };
+}
+
+export interface PluginLifecycleRunOptions {
+  queueWaitMs?: number;
+  deadlineAt?: number;
+  onSettled?: () => void;
+  onExpire?: (lease: PluginLifecycleLease) => void;
+  expiryCleanup?: (lease: PluginLifecycleLease, bodyError: unknown) => Promise<void>;
 }
 
 export interface PluginLifecycleSerializer {
@@ -87,7 +190,7 @@ export interface PluginLifecycleSerializer {
     pluginKey: string,
     kind: PluginLifecycleOpKind,
     fn: (lease: PluginLifecycleLease) => Promise<T>,
-    options?: { queueWaitMs?: number; onSettled?: () => void },
+    options?: PluginLifecycleRunOptions,
   ): Promise<T>;
 }
 
@@ -101,10 +204,12 @@ export function createPluginLifecycleSerializer(
       pluginKey: string,
       kind: PluginLifecycleOpKind,
       fn: (lease: PluginLifecycleLease) => Promise<T>,
-      options?: { queueWaitMs?: number; onSettled?: () => void },
+      options?: PluginLifecycleRunOptions,
     ): Promise<T> {
       const queueWaitMs =
         options?.queueWaitMs ?? defaults.queueWaitMs ?? DEFAULT_PLUGIN_LIFECYCLE_QUEUE_WAIT_MS;
+      const deadlineAt = options?.deadlineAt;
+      const remaining = () => (deadlineAt === undefined ? Infinity : deadlineAt - Date.now());
       const previous = tails.get(pluginKey) ?? Promise.resolve();
       let releaseSlot!: () => void;
       const slot = new Promise<void>((resolve) => {
@@ -118,38 +223,67 @@ export function createPluginLifecycleSerializer(
 
       return new Promise<T>((resolve, reject) => {
         let abandoned = false;
+        const deadlineFirst = remaining() < queueWaitMs;
         const timer = setTimeout(() => {
           abandoned = true;
-          reject(new PluginLifecycleBusyError(pluginKey));
-        }, queueWaitMs);
+          reject(deadlineFirst
+            ? new PluginLifecycleTimeoutError(pluginKey, "queue")
+            : new PluginLifecycleBusyError(pluginKey));
+        }, Math.max(0, Math.min(queueWaitMs, remaining())));
         timer.unref?.();
 
         void previous.then(() => {
           clearTimeout(timer);
+          if (!abandoned && remaining() <= 0) {
+            abandoned = true;
+            reject(new PluginLifecycleTimeoutError(pluginKey, "queue"));
+          }
           if (abandoned) {
             releaseSlot();
             return;
           }
-          const lease = createLease(pluginKey, kind);
+          const lease = createLease(pluginKey, kind, deadlineAt);
+          let responded = false;
+          const deadlineTimer = deadlineAt === undefined
+            ? undefined
+            : setTimeout(() => {
+              if (responded) return;
+              responded = true;
+              lease.expire();
+              try {
+                options?.onExpire?.(lease);
+              } catch (err) {
+                logger.warn({ err, pluginKey }, "plugin lifecycle: expiry hook failed");
+              }
+              reject(new PluginLifecycleTimeoutError(pluginKey, "body"));
+            }, remaining());
+          deadlineTimer?.unref?.();
           let settled: Promise<T>;
           try {
             settled = fn(lease);
           } catch (err) {
             settled = Promise.reject(err);
           }
+          const finish = async (outcome: { value?: T; error?: unknown; failed: boolean }) => {
+            if (deadlineTimer) clearTimeout(deadlineTimer);
+            if (lease.expired && options?.expiryCleanup) {
+              try {
+                await options.expiryCleanup(lease, outcome.failed ? outcome.error ?? new Error("failed") : null);
+              } catch (err) {
+                logger.warn({ err, pluginKey }, "plugin lifecycle: expiry cleanup failed");
+              }
+            }
+            lease.release();
+            options?.onSettled?.();
+            releaseSlot();
+            if (responded) return;
+            responded = true;
+            if (outcome.failed) reject(outcome.error);
+            else resolve(outcome.value as T);
+          };
           settled.then(
-            (value) => {
-              lease.release();
-              options?.onSettled?.();
-              releaseSlot();
-              resolve(value);
-            },
-            (err: unknown) => {
-              lease.release();
-              options?.onSettled?.();
-              releaseSlot();
-              reject(err);
-            },
+            (value) => finish({ value, failed: false }),
+            (error: unknown) => finish({ error, failed: true }),
           );
         });
       });
@@ -161,6 +295,7 @@ export interface PluginLifecycleShared {
   readonly emitter: EventEmitter;
   readonly serializer: PluginLifecycleSerializer;
   readonly quiesced: Set<string>;
+  readonly fenced: Map<string, string>;
   runtimeLoader: PluginLoader | undefined;
   registerWithdrawer(withdraw: (pluginId: string) => void): () => void;
   withdraw(pluginId: string): void;
@@ -168,7 +303,7 @@ export interface PluginLifecycleShared {
     pluginKey: string,
     kind: PluginLifecycleOpKind,
     fn: (lease: PluginLifecycleLease) => Promise<T>,
-    queueWaitMs?: number,
+    options?: Omit<PluginLifecycleRunOptions, "onSettled">,
   ): Promise<T>;
   emitAtRelease(lease: PluginLifecycleLease, event: string, payload: unknown): void;
   bumpEpoch(pluginId: string): number;
@@ -186,6 +321,7 @@ export function createPluginLifecycleShared(
   const epochs = new Map<string, number>();
   const lastBump = new Map<string, number>();
   const quiesced = new Set<string>();
+  const fenced = new Map<string, string>();
   let bumps = 0;
   const serializer = createPluginLifecycleSerializer(defaults);
   const pendingEvents = new WeakMap<PluginLifecycleLease, Array<[string, unknown]>>();
@@ -194,6 +330,7 @@ export function createPluginLifecycleShared(
     emitter,
     serializer,
     quiesced,
+    fenced,
     runtimeLoader: undefined,
     registerWithdrawer(withdraw) {
       withdrawers.add(withdraw);
@@ -208,7 +345,7 @@ export function createPluginLifecycleShared(
         }
       }
     },
-    exclusive(pluginKey, kind, fn, queueWaitMs) {
+    exclusive(pluginKey, kind, fn, options) {
       const queue: Array<[string, unknown]> = [];
       const flush = () => {
         for (const [event, payload] of queue.splice(0)) {
@@ -222,7 +359,7 @@ export function createPluginLifecycleShared(
       return serializer.run(pluginKey, kind, (lease) => {
         pendingEvents.set(lease, queue);
         return fn(lease);
-      }, { queueWaitMs, onSettled: flush });
+      }, { ...options, onSettled: flush });
     },
     emitAtRelease(lease, event, payload) {
       const queue = pendingEvents.get(lease);
@@ -239,13 +376,13 @@ export function createPluginLifecycleShared(
       return bumps;
     },
     changedSince(pluginId, mark) {
-      return (lastBump.get(pluginId) ?? 0) > mark || quiesced.has(pluginId);
+      return (lastBump.get(pluginId) ?? 0) > mark || quiesced.has(pluginId) || fenced.has(pluginId);
     },
     currentEpoch(pluginId) {
       return epochs.get(pluginId) ?? 0;
     },
     isCurrentGeneration(pluginId, epoch) {
-      return (epochs.get(pluginId) ?? 0) === epoch && !quiesced.has(pluginId);
+      return (epochs.get(pluginId) ?? 0) === epoch && !quiesced.has(pluginId) && !fenced.has(pluginId);
     },
   };
 }

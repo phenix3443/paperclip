@@ -50,7 +50,11 @@ import {
 } from "@paperclipai/shared";
 import { pluginRegistryService } from "../services/plugin-registry.js";
 import { pluginLifecycleManager } from "../services/plugin-lifecycle.js";
-import type { PluginLifecycleTimings } from "../services/plugin-lifecycle-shared.js";
+import {
+  PluginLifecycleFencedError,
+  PluginLifecycleTimeoutError,
+  type PluginLifecycleTimings,
+} from "../services/plugin-lifecycle-shared.js";
 import { PluginTeardownError } from "../services/plugin-teardown-error.js";
 import {
   getPluginUiContributionMetadata,
@@ -177,6 +181,7 @@ const UUID_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 const PLUGIN_API_BODY_LIMIT_BYTES = 1_000_000;
+const CONFIG_CHANGED_RPC_TIMEOUT_MS = 30_000;
 const PLUGIN_SCOPED_API_RESPONSE_HEADER_ALLOWLIST = new Set([
   "cache-control",
   "etag",
@@ -550,10 +555,38 @@ export function pluginRoutes(
     lifecycleTimings: lifecycleOptions?.lifecycleTimings,
   });
 
+  function armResponseDeadline(res: Response, deadlineAt: number): number {
+    const timer = setTimeout(() => setImmediate(() => {
+      if (res.headersSent) return;
+      res.status(504).json({
+        error: "Plugin lifecycle request did not finish before its response deadline",
+        code: "plugin_lifecycle_timeout",
+        phase: "response",
+      });
+      const ignore = () => res;
+      res.status = ignore as unknown as Response["status"];
+      res.json = ignore as unknown as Response["json"];
+      res.send = ignore as unknown as Response["send"];
+    }), Math.max(0, deadlineAt - Date.now()));
+    timer.unref?.();
+    res.once("close", () => clearTimeout(timer));
+    return deadlineAt;
+  }
+
+  /** True once the response guard has answered or is about to answer 504. */
+  function responseDeadlinePassed(res: Response, deadlineAt: number): boolean {
+    return res.headersSent || Date.now() >= deadlineAt;
+  }
+
   function sendLifecycleError(res: Response, err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
+    if (res.headersSent) return;
     if ((err as { code?: unknown } | null)?.code === "plugin_activation_failed") {
       res.status(500).json({ error: message, code: "plugin_activation_failed" });
+      return;
+    }
+    if (err instanceof PluginTeardownError) {
+      res.status(500).json({ error: message, code: "plugin_quiescence_failed" });
       return;
     }
     const code = err instanceof HttpError
@@ -562,8 +595,9 @@ export function pluginRoutes(
       && "code" in err.details
       ? (err.details as { code: unknown }).code
       : undefined;
-    if (err instanceof HttpError && (err.status === 409 || err.status === 400) && typeof code === "string") {
-      res.status(err.status).json({ error: message, code });
+    if (err instanceof HttpError && [400, 409, 504].includes(err.status) && typeof code === "string") {
+      const phase = (err.details as { phase?: unknown }).phase;
+      res.status(err.status).json(err.status === 504 ? { error: message, code, phase } : { error: message, code });
       return;
     }
     res.status(400).json({ error: message });
@@ -1199,6 +1233,7 @@ export function pluginRoutes(
    * - `500` — installation succeeded but manifest is missing (indicates a loader bug)
    */
   router.post("/plugins/install", async (req, res) => {
+    const deadlineAt = armResponseDeadline(res, lifecycle.responseDeadline());
     assertInstanceAdmin(req);
     assertPluginManagementVisible();
     const { packageName, version, isLocalPath } = req.body as PluginInstallRequest;
@@ -1263,23 +1298,44 @@ export function pluginRoutes(
     }
 
     try {
+      const abort = new AbortController();
       const installOptions = canonicalLocalPath !== undefined
-        ? { localPath: canonicalLocalPath }
-        : { packageName: trimmedPackage, version: version?.trim() };
+        ? { localPath: canonicalLocalPath, signal: abort.signal }
+        : { packageName: trimmedPackage, version: version?.trim(), signal: abort.signal };
 
-      const prepared = await loader.prepareInstall(installOptions);
+      // Admission ran past the deadline: the response guard answers 504
+      // (phase "response"); nothing is prepared.
+      if (responseDeadlinePassed(res, deadlineAt)) return;
+      let prepareTimer: NodeJS.Timeout | undefined;
+      const prepareDeadline = new Promise<never>((_, reject) => {
+        prepareTimer = setTimeout(() => {
+          abort.abort();
+          reject(new PluginLifecycleTimeoutError(trimmedPackage, "prepare"));
+        }, Math.max(0, deadlineAt - Date.now()));
+      });
+      prepareDeadline.catch(() => undefined);
+      const preparing = loader.prepareInstall(installOptions);
+      preparing.catch(() => undefined);
+      const prepared = await Promise.race([preparing, prepareDeadline]).finally(() => clearTimeout(prepareTimer));
 
       if (!prepared.manifest) {
         res.status(500).json({ error: "Plugin installed but manifest is missing" });
         return;
       }
 
+      let targetId = (await registry.getByKey(prepared.manifest.id))?.id;
       const existingPlugin = await lifecycle.exclusive(prepared.manifest.id, "A", async (lease) => {
+        targetId = (await registry.getByKey(prepared.manifest!.id))?.id ?? targetId;
+        if (targetId && lifecycle.isFenced(targetId)) {
+          throw new PluginLifecycleFencedError(prepared.manifest!.id, "a previous stop was not proven");
+        }
+        lease.assertActive();
         await loader.persistInstall(prepared);
         const persisted = await registry.getByKey(prepared.manifest!.id);
+        targetId = persisted?.id;
         if (persisted) await lifecycle.load(persisted.id, { lease });
         return persisted;
-      });
+      }, { deadlineAt, pluginId: () => targetId });
       if (existingPlugin) {
         const updated = await registry.getById(existingPlugin.id);
         await logPluginMutationActivity(req, "plugin.installed", existingPlugin.id, {
@@ -2067,6 +2123,7 @@ export function pluginRoutes(
    * Errors: 404 if plugin not found, 400 for lifecycle errors
    */
   router.delete("/plugins/:pluginId", async (req, res) => {
+    const deadlineAt = armResponseDeadline(res, lifecycle.responseDeadline());
     assertInstanceAdmin(req);
     assertPluginManagementVisible();
     const { pluginId } = req.params;
@@ -2080,7 +2137,7 @@ export function pluginRoutes(
 
     const activityDetails = { pluginId: plugin.id, pluginKey: plugin.pluginKey, purge };
     try {
-      const result = await lifecycle.unload(plugin.id, purge);
+      const result = await lifecycle.unload(plugin.id, purge, { deadlineAt });
       await logPluginMutationActivity(req, "plugin.uninstalled", plugin.id, activityDetails);
       publishGlobalLiveEvent({ type: "plugin.ui.updated", payload: { pluginId: plugin.id, action: "uninstalled" } });
       res.json(result);
@@ -2107,6 +2164,7 @@ export function pluginRoutes(
    * Errors: 404 if plugin not found, 400 for lifecycle errors
    */
   router.post("/plugins/:pluginId/enable", async (req, res) => {
+    const deadlineAt = armResponseDeadline(res, lifecycle.responseDeadline());
     assertInstanceAdmin(req);
     assertPluginManagementVisible();
     const { pluginId } = req.params;
@@ -2118,7 +2176,7 @@ export function pluginRoutes(
     }
 
     try {
-      const result = await lifecycle.enable(plugin.id);
+      const result = await lifecycle.enable(plugin.id, { deadlineAt });
       await logPluginMutationActivity(req, "plugin.enabled", plugin.id, {
         pluginId: plugin.id,
         pluginKey: plugin.pluginKey,
@@ -2145,6 +2203,7 @@ export function pluginRoutes(
    * Errors: 404 if plugin not found, 400 for lifecycle errors
    */
   router.post("/plugins/:pluginId/disable", async (req, res) => {
+    const deadlineAt = armResponseDeadline(res, lifecycle.responseDeadline());
     assertInstanceAdmin(req);
     assertPluginManagementVisible();
     const { pluginId } = req.params;
@@ -2159,7 +2218,7 @@ export function pluginRoutes(
 
     const activityDetails = { pluginId: plugin.id, pluginKey: plugin.pluginKey, reason: reason ?? null };
     try {
-      const result = await lifecycle.disable(plugin.id, reason);
+      const result = await lifecycle.disable(plugin.id, reason, { deadlineAt });
       await logPluginMutationActivity(req, "plugin.disabled", plugin.id, activityDetails);
       publishGlobalLiveEvent({ type: "plugin.ui.updated", payload: { pluginId: plugin.id, action: "disabled" } });
       res.json(result);
@@ -2320,6 +2379,7 @@ export function pluginRoutes(
    * Errors: 404 if plugin not found, 400 for lifecycle errors
    */
   router.post("/plugins/:pluginId/upgrade", async (req, res) => {
+    const deadlineAt = armResponseDeadline(res, lifecycle.responseDeadline());
     assertInstanceAdmin(req);
     assertPluginManagementVisible();
     const { pluginId } = req.params;
@@ -2338,7 +2398,7 @@ export function pluginRoutes(
       // 2. Compare capabilities
       // 3. If new capabilities, mark as upgrade_pending
       // 4. Otherwise, transition to ready
-      const result = await lifecycle.upgrade(plugin.id, version);
+      const result = await lifecycle.upgrade(plugin.id, version, { deadlineAt });
       await logPluginMutationActivity(req, "plugin.upgraded", plugin.id, {
         pluginId: plugin.id,
         pluginKey: plugin.pluginKey,
@@ -2401,6 +2461,7 @@ export function pluginRoutes(
    * - 404 if plugin not found
    */
   router.post("/plugins/:pluginId/config", async (req, res) => {
+    const deadlineAt = armResponseDeadline(res, lifecycle.responseDeadline());
     assertInstanceAdmin(req);
     assertPluginManagementVisible();
     const { pluginId } = req.params;
@@ -2445,6 +2506,8 @@ export function pluginRoutes(
     try {
       const secretRefs = extractSecretRefBindingsFromConfig(body.configJson, schema);
       await validatePluginSecretRefsForCompany(companyId, secretRefs);
+      // Admission ran past the deadline: the guard answers 504; save nothing.
+      if (responseDeadlinePassed(res, deadlineAt)) return;
       await secretService(db).syncSecretRefsForTarget(
         companyId,
         { targetType: "plugin", targetId: plugin.id },
@@ -2468,6 +2531,9 @@ export function pluginRoutes(
       // If the worker implements onConfigChanged, send the new config via RPC.
       // If it doesn't (METHOD_NOT_IMPLEMENTED), restart the worker so it picks
       // up the new config on re-initialize. If no worker is running, skip.
+      // Past the deadline the response guard answers 504; do not notify or
+      // restart the worker from a late continuation.
+      if (responseDeadlinePassed(res, deadlineAt)) return;
       if (bridgeDeps?.workerManager.isRunning(plugin.id)) {
         // Refresh the worker's authorized proactive company scopes so the
         // just-configured company can be acted on from proactive loops (e.g.
@@ -2482,23 +2548,28 @@ export function pluginRoutes(
         } catch {
           // Non-fatal: the set is rebuilt from the DB on the next worker start.
         }
+        if (responseDeadlinePassed(res, deadlineAt)) return;
 
         try {
           await bridgeDeps.workerManager.call(
             plugin.id,
             "configChanged",
             { config: body.configJson, companyId },
+            Math.max(1, Math.min(CONFIG_CHANGED_RPC_TIMEOUT_MS, deadlineAt - Date.now())),
           );
         } catch (rpcErr) {
           if (
             rpcErr instanceof JsonRpcCallError &&
             rpcErr.code === PLUGIN_RPC_ERROR_CODES.METHOD_NOT_IMPLEMENTED
           ) {
-            // Worker doesn't handle live config — restart it.
+            // Worker doesn't handle live config — restart it, unless the
+            // response deadline already passed while the RPC was pending.
+            if (responseDeadlinePassed(res, deadlineAt)) return;
             try {
               const epoch = lifecycle.currentEpoch(plugin.id);
-              await lifecycle.restartWorker(plugin.id, { source: "config", epoch });
-            } catch {
+              await lifecycle.restartWorker(plugin.id, { source: "config", epoch, deadlineAt });
+            } catch (restartErr) {
+              if (restartErr instanceof PluginLifecycleTimeoutError) throw restartErr;
               // Restart failure is non-fatal for the config save response.
             }
           }
@@ -2509,6 +2580,10 @@ export function pluginRoutes(
 
       res.json(result);
     } catch (err) {
+      if (err instanceof PluginLifecycleTimeoutError) {
+        sendLifecycleError(res, err);
+        return;
+      }
       const message = err instanceof Error ? err.message : String(err);
       res.status(400).json({ error: message });
     }

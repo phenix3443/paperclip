@@ -18,7 +18,10 @@ import {
 } from "./helpers/embedded-postgres.js";
 
 const mockLifecycle = vi.hoisted(() => ({
-  exclusive: vi.fn((_key: string, _kind: string, fn: (lease: object) => Promise<unknown>) => fn({})),
+  exclusive: vi.fn((_key: string, _kind: string, fn: (lease: object) => Promise<unknown>) =>
+    fn({ assertActive: () => undefined, assertCleanup: () => undefined })),
+  responseDeadline: vi.fn(() => Date.now() + 60_000),
+  isFenced: vi.fn(() => false),
   load: vi.fn(),
   upgrade: vi.fn(),
   unload: vi.fn(),

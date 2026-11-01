@@ -1648,6 +1648,49 @@ The host's plugin process manager must support:
 
 Each worker process is independent. There is no shared process pool or batch restart mechanism.
 
+#### 25.4.7 Lifecycle Completion Contract
+
+Lifecycle writes on one plugin run one at a time, in arrival order, whether they come from a route, the dev watcher, a config restart or startup. Different plugins never wait on each other.
+
+**Quiescence (Q).** A successful `POST /api/plugins/:pluginId/disable` or soft `DELETE /api/plugins/:pluginId` answers only after every earlier accepted operation on the plugin finished, the row is `disabled` (or `uninstalled`), the dev watcher stopped watching it, and no worker handle, start or crash retry for it remains. Q lasts until the next accepted `enable` or `install`. Watcher reloads, config restarts, crash retries and startup retries do not end it. `disable` on a `disabled` plugin and soft `DELETE` on an `uninstalled` plugin are idempotent and re-establish Q.
+
+**Activation (A).** A successful `POST /api/plugins/:pluginId/enable` or `POST /api/plugins/install` answers only after the target package's worker initialized and its jobs and tools are registered, with the row `ready`.
+
+Q is a property of a successful response. No endpoint reports it, and a `ready` or `disabled` row alone does not prove Q or A.
+
+**Bounds.** Every lifecycle write is answered within 60 seconds of arrival. Waiting for an earlier operation on the same plugin is limited to 15 seconds. These bounds limit the response, not the work: after a timeout the server keeps the plugin busy until the interrupted operation and its cleanup finish, and other writes on that plugin get `plugin_lifecycle_busy` meanwhile.
+
+| Response | Code | Meaning |
+| --- | --- | --- |
+| 200 | | Q or A holds as described above |
+| 400 | `invalid_transition` | The row state does not allow the operation; nothing changed |
+| 409 | `already_installed` | Install for a plugin that has a row other than soft `uninstalled` |
+| 409 | `plugin_lifecycle_busy` | An earlier operation still holds the plugin; nothing changed, retry later |
+| 409 | `plugin_lifecycle_fenced` | A previous stop could not be proven; only `disable` or soft `DELETE` are accepted until one succeeds |
+| 500 | `plugin_quiescence_failed` | Q was attempted but a teardown step failed or the worker did not exit; the row is in its target state, the plugin is fenced; retry the same Q |
+| 500 | `plugin_activation_failed` | A failed; the worker was torn down (or the plugin fenced) and the row is `error` |
+| 504 | `plugin_lifecycle_timeout` | The response deadline passed; `phase` tells which part was still running (see below) |
+
+What a 504 guarantees depends on its `phase`:
+
+- `queue`: the operation was never accepted, because the earlier operation on the plugin still held it. Nothing changed.
+- `prepare`: `install` package preparation was still running. It is aborted and its late result is discarded without writing a row.
+- `body`: the accepted operation was still running. In the same step that sends the 504 the host revokes the plugin's right to start workers, so neither a crash retry nor a late continuation can bring the worker back; the plugin then settles to `error`, its Q target state, or fenced.
+- `response`: the route itself was still waiting outside the operation. Before the operation was accepted (looking up the plugin, checking a local install path) this means nothing changed: a continuation that resumes after the deadline does not prepare a package, start an operation, notify the worker or restart it. After the operation finished (for example writing the activity log) the operation's result stands, so an `enable` or `install` may have reached A and the row reads `ready`; the response just did not say so in time.
+
+A config save (`POST /api/plugins/:pluginId/config`) is bound by the same deadline and answers 504 with `phase: "response"`. If the deadline passed before the save started (looking up the plugin, validating secret refs), nothing was saved. If it passed after the save, the config is stored: a late continuation neither notifies nor restarts the worker, but a `configChanged` call already in flight may still reach it. A worker that was not told picks up the config on its next start. Read the config back to learn which case happened.
+
+**Recovery.** After a lost response, a 5xx or a 504, read the row and issue Q again, then A:
+
+| Row | Q | Then A, same package | Then A, new package |
+| --- | --- | --- | --- |
+| `ready` | `disable` (or soft `DELETE`) | `enable` | soft `DELETE`, then `install` |
+| `disabled` | `disable` again | `enable` | soft `DELETE`, then `install` |
+| `error`, `upgrade_pending`, `installed` | soft `DELETE` | `install` | `install` |
+| `uninstalled` (soft) | soft `DELETE` again | `install` | `install` |
+
+Soft `DELETE` followed by `install` reuses the row, its id, plugin data and company config.
+
 ## 26. Plugin Observability
 
 ### 26.1 Logging

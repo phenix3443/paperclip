@@ -28,7 +28,7 @@ import { finishServiceShutdown } from "../shutdown.js";
  */
 import { existsSync } from "node:fs";
 import { readdir, readFile, rm, stat } from "node:fs/promises";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -56,6 +56,73 @@ import { pluginDatabaseService } from "./plugin-database.js";
 import { resolveBundledCatalogRoot } from "./bundled-plugins.js";
 
 const execFileAsync = promisify(execFile);
+const LOCAL_PLUGIN_BUILD_MAX_BUFFER_BYTES = 1024 * 1024;
+
+export function runLocalPluginBuildCommand(
+  file: string,
+  args: readonly string[],
+  options: { cwd: string; timeout: number; signal?: AbortSignal; maxBuffer?: number },
+): Promise<{ stdout: string; stderr: string }> {
+  const maxBuffer = options.maxBuffer ?? LOCAL_PLUGIN_BUILD_MAX_BUFFER_BYTES;
+  return new Promise((resolve, reject) => {
+    const child = spawn(file, [...args], { cwd: options.cwd, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    const output = { stdout: "", stderr: "" };
+    const bytes = { stdout: 0, stderr: 0 };
+    let killed = false;
+    let overflow: Error | null = null;
+    const collect = (stream: "stdout" | "stderr") => (chunk: Buffer) => {
+      if (overflow) return;
+      const remaining = maxBuffer - bytes[stream];
+      if (chunk.length > remaining) {
+        output[stream] += chunk.subarray(0, remaining).toString();
+        bytes[stream] = maxBuffer;
+        overflow = Object.assign(new Error(`${stream} maxBuffer length exceeded`), {
+          code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+        });
+        stop();
+        return;
+      }
+      output[stream] += chunk.toString();
+      bytes[stream] += chunk.length;
+    };
+    child.stdout?.on("data", collect("stdout"));
+    child.stderr?.on("data", collect("stderr"));
+    const killGroup = () => {
+      try {
+        if (child.pid) process.kill(-child.pid, "SIGKILL");
+      } catch {
+        child.kill("SIGKILL");
+      }
+    };
+    const stop = () => {
+      killed = true;
+      killGroup();
+    };
+    const timer = setTimeout(stop, options.timeout);
+    if (options.signal?.aborted) stop();
+    else options.signal?.addEventListener("abort", stop, { once: true });
+    child.once("exit", () => killGroup());
+    child.once("error", (err) => {
+      clearTimeout(timer);
+      options.signal?.removeEventListener("abort", stop);
+      reject(Object.assign(err, { ...output, killed }));
+    });
+    child.once("close", (code, signal) => {
+      clearTimeout(timer);
+      options.signal?.removeEventListener("abort", stop);
+      if (overflow) {
+        reject(Object.assign(overflow, { ...output, killed, signal }));
+        return;
+      }
+      if (code === 0 && !killed) {
+        resolve({ ...output });
+        return;
+      }
+      reject(Object.assign(new Error(`Command failed: ${file} ${args.join(" ")}`), { code, signal, killed, ...output }));
+    });
+  });
+}
+const STARTUP_CONFIG_RPC_TIMEOUT_MS = 30_000;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = path.resolve(__dirname, "../../..");
 export const BUNDLED_LOCAL_PLUGIN_ROOT = path.join(REPO_ROOT, "packages", "plugins");
@@ -323,6 +390,8 @@ export interface PluginLoaderOptions {
  * Options for installing a single plugin package.
  */
 export interface PluginInstallOptions {
+  signal?: AbortSignal;
+
   /**
    * npm package name to install (e.g. "paperclip-plugin-linear" or "@acme/plugin-linear").
    * Either packageName or localPath must be set.
@@ -894,10 +963,11 @@ export async function ensureLocalPluginBuilt(
   options: {
     processEnv?: NodeJS.ProcessEnv;
     repoRoot?: string;
+    signal?: AbortSignal;
     execFileAsyncImpl?: (
       file: string,
       args: readonly string[],
-      options: { cwd: string; timeout: number },
+      options: { cwd: string; timeout: number; signal?: AbortSignal },
     ) => Promise<{ stdout: string; stderr: string }>;
   } = {},
 ): Promise<void> {
@@ -915,7 +985,7 @@ export async function ensureLocalPluginBuilt(
   const manualBuildCommand = buildLocalPluginRecoveryCommand(packageRoot, pkgJson, { repoRoot: options.repoRoot });
   if (typeof packageName !== "string" || packageName.trim().length === 0 || !manualBuildCommand) return;
 
-  const runExecFileAsync = options.execFileAsyncImpl ?? execFileAsync;
+  const runExecFileAsync = options.execFileAsyncImpl ?? runLocalPluginBuildCommand;
   const buildCommands = buildLocalPluginBuildCommands(packageRoot, pkgJson, {
     repoRoot: options.repoRoot,
     needsBuild: missingEntrypoints.length > 0,
@@ -927,7 +997,7 @@ export async function ensureLocalPluginBuilt(
       await runExecFileAsync(
         command.file,
         command.args,
-        { cwd: command.cwd, timeout: LOCAL_PLUGIN_AUTOBUILD_TIMEOUT_MS },
+        { cwd: command.cwd, timeout: LOCAL_PLUGIN_AUTOBUILD_TIMEOUT_MS, signal: options.signal },
       );
     }
   } catch (error) {
@@ -1224,7 +1294,8 @@ export function pluginLoader(
   async function fetchAndValidate(
     installOptions: PluginInstallOptions,
   ): Promise<DiscoveredPlugin> {
-    const { packageName, localPath, version, installDir } = installOptions;
+    const { packageName, localPath, version, installDir, signal } = installOptions;
+    signal?.throwIfAborted();
     if (prebuiltOnly && !localPath) throw new Error("Managed plugins must come from the current image catalog");
 
     if (!packageName && !localPath) {
@@ -1270,7 +1341,7 @@ export function pluginLoader(
         await execFileAsync(
           "npm",
           ["install", spec, "--prefix", targetInstallDir, "--save", "--ignore-scripts"],
-          { timeout: 120_000 }, // 2 minute timeout for npm install
+          { timeout: 120_000, signal },
         );
       } catch (err) {
         throw new Error(`npm install failed for ${spec}: ${String(err)}`);
@@ -1302,7 +1373,7 @@ export function pluginLoader(
     if (!pkgJson) throw new Error(`Missing package.json at ${resolvedPackagePath}`);
 
     if (localPath && !prebuiltOnly) {
-      await ensureLocalPluginBuilt(resolvedPackagePath, pkgJson);
+      await ensureLocalPluginBuilt(resolvedPackagePath, pkgJson, { signal });
     }
 
     const manifestPath = resolveManifestPath(resolvedPackagePath, pkgJson);
@@ -1751,8 +1822,10 @@ export function pluginLoader(
       return this.persistInstall(await this.prepareInstall(installOptions));
     },
 
-    prepareInstall(installOptions: PluginInstallOptions): Promise<DiscoveredPlugin> {
-      return fetchAndValidate(installOptions);
+    async prepareInstall(installOptions: PluginInstallOptions): Promise<DiscoveredPlugin> {
+      const prepared = await fetchAndValidate(installOptions);
+      installOptions.signal?.throwIfAborted();
+      return prepared;
     },
 
     async persistInstall(discovered: DiscoveredPlugin): Promise<DiscoveredPlugin> {
@@ -2414,11 +2487,18 @@ export function pluginLoader(
       // worker's proactive company scopes before startup); no second listConfigs
       // round-trip is needed here.
       for (const row of configRows) {
+        options.lease?.assertActive();
+        const deadlineAt = options.lease?.deadlineAt;
         try {
-          await workerManager.call(pluginId, "configChanged", {
+          const params = {
             config: (row.configJson ?? {}) as Record<string, unknown>,
             companyId: row.companyId,
-          });
+          };
+          if (deadlineAt === undefined) await workerManager.call(pluginId, "configChanged", params);
+          else {
+            const timeoutMs = Math.max(1, Math.min(STARTUP_CONFIG_RPC_TIMEOUT_MS, deadlineAt - Date.now()));
+            await workerManager.call(pluginId, "configChanged", params, timeoutMs);
+          }
         } catch (configErr) {
           // A single-tenant worker fails closed (CROSS_TENANT_CONFIG) rather
           // than collapse onto a second company's config — surface that at
@@ -2450,6 +2530,7 @@ export function pluginLoader(
       const jobDeclarations = manifest.jobs ?? [];
       options.lease?.assertActive();
       await jobStore.syncJobDeclarations(pluginId, jobDeclarations);
+      options.lease?.assertActive();
       await jobScheduler.registerPlugin(pluginId);
       if (jobDeclarations.length > 0) {
         registered.jobs = jobDeclarations.length;
@@ -2474,6 +2555,7 @@ export function pluginLoader(
       // any previous subscriptions for this plugin are preserved if the
       // worker is restarting.
       // ------------------------------------------------------------------
+      options.lease?.assertActive();
       const _scopedBus = eventBus.forPlugin(pluginKey);
       registered.eventSubscriptions = eventBus.subscriptionCount(pluginKey);
 
