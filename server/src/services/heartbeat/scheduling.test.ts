@@ -1,3 +1,4 @@
+// Monitor generation transition contract: https://github.com/phenix3443/paperclip/issues/355
 import { randomUUID } from "node:crypto";
 import type { Db } from "@paperclipai/db";
 import {
