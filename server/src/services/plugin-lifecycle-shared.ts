@@ -28,6 +28,13 @@ export class LeaseReleasedError extends Error {
   }
 }
 
+export class LeaseKeyMismatchError extends Error {
+  constructor(leaseKey: string, targetKey: string) {
+    super(`Lifecycle lease for plugin ${leaseKey} cannot be used for plugin ${targetKey}`);
+    this.name = "LeaseKeyMismatchError";
+  }
+}
+
 export interface PluginLifecycleLease {
   readonly pluginKey: string;
   readonly kind: PluginLifecycleOpKind;

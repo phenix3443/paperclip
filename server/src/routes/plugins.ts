@@ -562,8 +562,8 @@ export function pluginRoutes(
       && "code" in err.details
       ? (err.details as { code: unknown }).code
       : undefined;
-    if (err instanceof HttpError && err.status === 409 && typeof code === "string") {
-      res.status(409).json({ error: message, code });
+    if (err instanceof HttpError && (err.status === 409 || err.status === 400) && typeof code === "string") {
+      res.status(err.status).json({ error: message, code });
       return;
     }
     res.status(400).json({ error: message });

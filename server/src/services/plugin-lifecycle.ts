@@ -48,11 +48,14 @@ import { badRequest, notFound } from "../errors.js";
 import { PluginTeardownError } from "./plugin-teardown-error.js";
 import { logger } from "../middleware/logger.js";
 import {
+  LeaseKeyMismatchError,
   pluginLifecycleSharedFor,
   type PluginLifecycleLease,
   type PluginLifecycleOpKind,
   type PluginLifecycleTimings,
 } from "./plugin-lifecycle-shared.js";
+
+const INVALID_TRANSITION = { code: "invalid_transition" } as const;
 
 // ---------------------------------------------------------------------------
 // Lifecycle state machine
@@ -390,6 +393,7 @@ export function pluginLifecycleManager(
     if (!isValidTransition(plugin.status, to)) {
       throw badRequest(
         `Invalid lifecycle transition: ${plugin.status} → ${to} for plugin ${plugin.pluginKey}`,
+        INVALID_TRANSITION,
       );
     }
   }
@@ -460,6 +464,8 @@ export function pluginLifecycleManager(
     if (lease) {
       if (kind === "Q") lease.assertCleanup();
       else lease.assertActive();
+      const target = await requirePlugin(pluginId);
+      if (target.pluginKey !== lease.pluginKey) throw new LeaseKeyMismatchError(lease.pluginKey, target.pluginKey);
       return body({ lease, kind });
     }
     const plugin = await requirePlugin(pluginId);
@@ -599,6 +605,7 @@ export function pluginLifecycleManager(
           throw badRequest(
             `Cannot enable plugin in status '${plugin.status}'. ` +
               `Plugin must be in 'disabled', 'error', or 'upgrade_pending' status to be enabled.`,
+            INVALID_TRANSITION,
           );
         }
 
@@ -624,6 +631,7 @@ export function pluginLifecycleManager(
           throw badRequest(
             `Cannot disable plugin in status '${plugin.status}'. ` +
               `Plugin must be in 'ready' or 'disabled' status to be disabled.`,
+            INVALID_TRANSITION,
           );
         }
 
@@ -762,6 +770,7 @@ export function pluginLifecycleManager(
           throw badRequest(
             `Cannot upgrade plugin in status '${plugin.status}'. ` +
               `Plugin must be in 'ready' or 'upgrade_pending' status to be upgraded.`,
+            INVALID_TRANSITION,
           );
         }
 
@@ -836,6 +845,7 @@ export function pluginLifecycleManager(
         throw badRequest(
           `Cannot start worker for plugin in status '${plugin.status}'. ` +
             `Plugin must be in 'ready' status.`,
+          INVALID_TRANSITION,
         );
       }
 
@@ -879,6 +889,7 @@ export function pluginLifecycleManager(
           throw badRequest(
             `Cannot restart worker for plugin in status '${plugin.status}'. ` +
               `Plugin must be in 'ready' status.`,
+            INVALID_TRANSITION,
           );
         }
 

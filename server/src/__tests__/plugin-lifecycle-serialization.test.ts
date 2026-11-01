@@ -509,4 +509,36 @@ describe("plugin lifecycle serialization through the real route wiring", () => {
     expect(harness.workerManager.getWorker(row.id)).toBeUndefined();
     expect(statuses.at(-1)).toBe("error");
   });
+
+  it("a lease held for one plugin cannot run a lifecycle operation on another plugin", async () => {
+    harness = await createHarness();
+    const holder = seed("serial.m", "ready");
+    const target = seed("serial.n", "disabled");
+    const callsBefore = state.calls.length;
+
+    const outcome = await harness.appLifecycle
+      .exclusive(holder.pluginKey, "A", (lease) => harness!.appLifecycle.enable(target.id, { lease }))
+      .then(() => null, (err: unknown) => err);
+
+    expect((outcome as Error | null)?.name).toBe("LeaseKeyMismatchError");
+    expect(state.rows.get(target.id)!.status).toBe("disabled");
+    expect(state.calls.slice(callsBefore)).not.toContain("row:ready");
+    expect(harness.workerManager.getWorker(target.id)).toBeUndefined();
+  });
+
+  it("disable from a state without a Q transition answers 400 invalid_transition with no side effect", async () => {
+    harness = await createHarness();
+    const row = seed("serial.o", "error");
+    const disabled = vi.fn();
+    harness.appLifecycle.on("plugin.disabled", disabled);
+    const callsBefore = state.calls.length;
+
+    const res = await request(harness.app).post(`/api/plugins/${row.pluginKey}/disable`).send({});
+
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("invalid_transition");
+    expect(state.rows.get(row.id)!.status).toBe("error");
+    expect(state.calls.slice(callsBefore).filter((call) => call.startsWith("row:"))).toEqual([]);
+    expect(disabled).not.toHaveBeenCalled();
+  });
 });
