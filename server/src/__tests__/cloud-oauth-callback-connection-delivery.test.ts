@@ -1,6 +1,6 @@
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { activityLog, connectionGrants, createDb, databaseWorkPending, issueThreadInteractions, toolOauthStates, toolPolicies, toolProfiles, type Db } from "@paperclipai/db";
+import { activityLog, companyMemberships, connectionGrants, createDb, databaseWorkPending, issueThreadInteractions, toolApplications, toolConnections, toolOauthStates, toolPolicies, toolProfiles, type Db } from "@paperclipai/db";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../services/delivery-work-notifications.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { arrangeOAuthCallback, OAUTH_CALLBACK_MODES, type OAuthCallbackMode } from "./helpers/oauth-callback-delivery-fixture.js";
@@ -55,7 +55,27 @@ describePostgres("cloud OAuth callback transaction notifies the connection deliv
     await delivery.settle(baseline + 1);
     await expectEffects(f, delivery, false);
     expect((await f.read()).connection).toMatchObject({ status: "draft", enabled: false });
+    expect((await db.select().from(toolApplications).where(eq(toolApplications.id, f.connection.applicationId)))[0]).toMatchObject({ status: "draft" });
     expect(f.later.finishCatalog).toHaveBeenCalledOnce();
+  });
+
+  it.each(["shared", "per_agent"] as const)("%s reauthorization retires the exact access request through its own transaction", async policy => {
+    fixture = await arrangeOAuthCallback(db, REAUTHORIZATION);
+    const f = fixture;
+    await db.delete(connectionGrants).where(eq(connectionGrants.connectionId, f.connection.id));
+    await db.update(toolConnections).set({ credentialPolicy: policy }).where(eq(toolConnections.id, f.connection.id));
+    if (policy === "per_agent") {
+      await db.update(companyMemberships).set({ membershipRole: "admin" }).where(eq(companyMemberships.companyId, f.companyId));
+      await db.update(toolOauthStates).set({ subjectUserId: null, subjectAgentId: f.agentId }).where(eq(toolOauthStates.connectionId, f.connection.id));
+    }
+    const delivery = await f.startDelivery();
+    const baseline = delivery.sweeps;
+    await expectEffects(f, delivery, false);
+    await f.callback();
+    await delivery.settle(baseline + 1);
+    await expectEffects(f, delivery, true);
+    expect((await f.read()).grants).toEqual([expect.objectContaining(policy === "shared"
+      ? { kind: "organization", isDefault: true, status: "active" } : { kind: "agent", subjectAgentId: f.agentId, status: "active" })]);
   });
 
   it("an equivalent raw reauthorization write leaves the idle worker asleep until an explicit wake", async () => {
