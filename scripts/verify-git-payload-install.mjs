@@ -53,6 +53,7 @@ fs.mkdirSync(stagedPayload);
 try {
   await runCommand("bash", ["scripts/build-npm.sh", "--skip-checks", "--skip-typecheck"], { cwd: repoRoot, maxBuffer: 32 * 1024 * 1024 });
   await runCommand("corepack", ["pnpm", "-r", "--filter", "@paperclipai/server...", "--if-present", "run", "build"], { cwd: repoRoot, maxBuffer: 32 * 1024 * 1024 });
+  await runCommand("bash", ["scripts/prepare-server-ui-dist.sh"], { cwd: repoRoot, env: { ...process.env, PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }, maxBuffer: 32 * 1024 * 1024 });
   const { version, expected } = await packGitPayload({ checkoutPath: repoRoot, stagingRoot, stagedPayload, runCommand });
   const checkoutExpected = readCheckoutPostgresDriver(repoRoot);
   if (JSON.stringify(expected) !== JSON.stringify(checkoutExpected)) throw new Error("packGitPayload expectation differs from the checkout driver.");
