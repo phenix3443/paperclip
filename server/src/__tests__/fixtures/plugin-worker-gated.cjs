@@ -29,8 +29,8 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line
   const message = JSON.parse(line);
   if (message.method === "initialize") {
     gate("initialize", () => {
-      send({ jsonrpc: "2.0", id: message.id, result: { ok: true, supportedMethods: ["getData"] } });
       report("initialize-replied");
+      send({ jsonrpc: "2.0", id: message.id, result: { ok: true, supportedMethods: ["getData"] } });
     });
   } else if (message.method === "shutdown") {
     gate("shutdown", () => {
