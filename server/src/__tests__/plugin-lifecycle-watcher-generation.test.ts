@@ -27,6 +27,7 @@ const state = vi.hoisted(() => ({
   calls: [] as string[],
   watchers: [] as FakeWatcher[],
   configs: new Map<string, { pluginId: string; companyId: string; configJson: unknown }>(),
+  pluginState: new Map<string, unknown>(),
   holdActivation: null as null | { pluginId: string; isStopped: () => boolean; paused: () => void; release: Promise<void> },
 }));
 
@@ -93,8 +94,10 @@ vi.mock("../services/plugin-registry.js", async () => {
       uninstall: async (id: string, removeData: boolean) => {
         const row = state.rows.get(id);
         if (!row) return null;
-        if (removeData) state.rows.delete(id);
-        else row.status = "uninstalled";
+        if (removeData) {
+          state.rows.delete(id);
+          for (const key of [...state.pluginState.keys()]) if (key.startsWith(`${id}:`)) state.pluginState.delete(key);
+        } else row.status = "uninstalled";
         state.calls.push("row:uninstalled");
         return clone(row);
       },
@@ -142,6 +145,7 @@ const { createPluginDevWatcher } = await import("../services/plugin-dev-watcher.
 const { ensureBundledPlugins } = await import("../services/bundled-plugins.js");
 const { pluginLoader } = await import("../services/plugin-loader.js");
 const { pluginRegistryService } = await import("../services/plugin-registry.js");
+const { createHostClientHandlers } = await import("@paperclipai/plugin-sdk");
 
 const GATED_WORKER = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures", "plugin-worker-gated.cjs");
 const DEBOUNCE_SETTLE_MS = 800;
@@ -155,7 +159,7 @@ function manifest(id: string, version = "1.0.0"): PaperclipPluginManifestV1 {
     description: id,
     author: "Paperclip",
     categories: ["automation"],
-    capabilities: ["ui.page.register"],
+    capabilities: ["ui.page.register", "plugin.state.read", "plugin.state.write"],
     entrypoints: { worker: "dist/worker.js" },
   } as PaperclipPluginManifestV1;
 }
@@ -263,7 +267,22 @@ async function createHarness() {
       jobScheduler: { registerPlugin: async () => undefined, unregisterPlugin: async () => undefined, stop: noop },
       jobStore: { syncJobDeclarations: async () => undefined },
       toolDispatcher: { registerPluginTools: noop, unregisterPluginTools: noop },
-      buildHostHandlers: () => ({}),
+      buildHostHandlers: (pluginId: string, pluginManifest: PaperclipPluginManifestV1) =>
+        createHostClientHandlers({
+          pluginId,
+          capabilities: pluginManifest.capabilities,
+          services: {
+            state: {
+              get: async ({ stateKey }: { stateKey: string }) => state.pluginState.get(`${pluginId}:${stateKey}`) ?? null,
+              set: async ({ stateKey, value }: { stateKey: string; value: unknown }) => {
+                state.pluginState.set(`${pluginId}:${stateKey}`, value);
+              },
+              delete: async ({ stateKey }: { stateKey: string }) => {
+                state.pluginState.delete(`${pluginId}:${stateKey}`);
+              },
+            },
+          } as never,
+        }),
       instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
     } as never,
   );
@@ -379,6 +398,7 @@ beforeEach(() => {
   state.watchers.splice(0);
   state.holdActivation = null;
   state.configs.clear();
+  state.pluginState.clear();
 });
 
 afterEach(async () => {
@@ -521,6 +541,8 @@ describe("watcher and config reload generations through the real app, route and 
     await boot(h, row);
     const fake = h.watcherFor(row.packagePath!)!;
     expect((await request(h.app).post(`/api/plugins/${row.pluginKey}/data/marker`).send({})).body.data).toEqual({ marker: "A" });
+    const written = await request(h.app).post(`/api/plugins/${row.pluginKey}/data/state-write`).send({ params: { value: { kept: "from-A" } } });
+    expect(written.body.data).toEqual({ written: true });
 
     expect((await request(h.app).post(`/api/plugins/${row.pluginKey}/disable`).send({})).status).toBe(200);
     h.rewriteBundle(row.packagePath!, "B");
@@ -542,6 +564,9 @@ describe("watcher and config reload generations through the real app, route and 
     expect(state.rows.get(row.id)).toMatchObject({ id: row.id, version: "1.0.0", packagePath: row.packagePath, status: "ready" });
     const stored = await request(h.app).get(`/api/plugins/${row.pluginKey}/config`).query({ companyId: "company-1" });
     expect(stored.body).toEqual(config);
+    const kept = await request(h.app).post(`/api/plugins/${row.pluginKey}/data/state-read`).send({});
+    expect(kept.status).toBe(200);
+    expect(kept.body.data).toEqual({ value: { kept: "from-A" } });
   });
 
   it("N11: a disable that arrives while a config restart holds the plugin drains it, then quiesces", async () => {
