@@ -26,7 +26,8 @@ const state = vi.hoisted(() => ({
   rows: new Map<string, Row>(),
   calls: [] as string[],
   watchers: [] as FakeWatcher[],
-  nextPackagePath: null as string | null,
+  configs: new Map<string, { pluginId: string; companyId: string; configJson: unknown }>(),
+  holdActivation: null as null | { pluginId: string; isStopped: () => boolean; paused: () => void; release: Promise<void> },
 }));
 
 vi.mock("chokidar", () => {
@@ -58,8 +59,30 @@ vi.mock("../services/plugin-registry.js", async () => {
       getById: async (id: string) => clone(state.rows.get(id)),
       getByKey: async (key: string) => clone([...state.rows.values()].find((row) => row.pluginKey === key)),
       listByStatus: async (status: string) => [...state.rows.values()].filter((row) => row.status === status).map(clone),
-      listConfigs: async () => [],
-      upsertConfig: async (pluginId: string, companyId: string, input: { configJson: unknown }) => ({ pluginId, companyId, configJson: input.configJson }),
+      listInstalled: async () => [...state.rows.values()].filter((row) => row.status !== "uninstalled").map(clone),
+      listConfigs: async (pluginId: string) => {
+        const hold = state.holdActivation;
+        if (hold && hold.pluginId === pluginId && hold.isStopped()) {
+          state.holdActivation = null;
+          hold.paused();
+          await hold.release;
+        }
+        return [...state.configs.values()].filter((config) => config.pluginId === pluginId);
+      },
+      getConfig: async (pluginId: string, companyId: string) => state.configs.get(`${pluginId}:${companyId}`) ?? null,
+      update: async (id: string, patch: { version?: string; manifest?: PaperclipPluginManifestV1; packagePath?: string }) => {
+        const row = state.rows.get(id);
+        if (!row) return null;
+        if (patch.version) row.version = patch.version;
+        if (patch.manifest) row.manifestJson = patch.manifest;
+        if (patch.packagePath) row.packagePath = patch.packagePath;
+        return clone(row);
+      },
+      upsertConfig: async (pluginId: string, companyId: string, input: { configJson: unknown }) => {
+        const config = { pluginId, companyId, configJson: input.configJson };
+        state.configs.set(`${pluginId}:${companyId}`, config);
+        return config;
+      },
       updateStatus: async (id: string, patch: { status: string; lastError: string | null }) => {
         const row = state.rows.get(id);
         if (!row) return null;
@@ -75,7 +98,7 @@ vi.mock("../services/plugin-registry.js", async () => {
         state.calls.push("row:uninstalled");
         return clone(row);
       },
-      install: async (input: { packageName: string }, manifest: PaperclipPluginManifestV1) => {
+      install: async (input: { packageName: string; packagePath?: string }, manifest: PaperclipPluginManifestV1) => {
         const existing = [...state.rows.values()].find((row) => row.pluginKey === manifest.id);
         if (existing && existing.status !== "uninstalled") {
           throw conflict(`Plugin already installed: ${manifest.id}`, { code: "already_installed" });
@@ -95,7 +118,7 @@ vi.mock("../services/plugin-registry.js", async () => {
           version: manifest.version,
           manifestJson: manifest,
           lastError: null,
-          packagePath: state.nextPackagePath ?? row.packagePath,
+          packagePath: input.packagePath ?? row.packagePath,
         });
         state.rows.set(row.id, row);
         state.calls.push("row:installed");
@@ -117,6 +140,8 @@ const { pluginLifecycleManager } = await import("../services/plugin-lifecycle.js
 const { createPluginWorkerManager } = await import("../services/plugin-worker-manager.js");
 const { createPluginDevWatcher } = await import("../services/plugin-dev-watcher.js");
 const { ensureBundledPlugins } = await import("../services/bundled-plugins.js");
+const { pluginLoader } = await import("../services/plugin-loader.js");
+const { pluginRegistryService } = await import("../services/plugin-registry.js");
 
 const GATED_WORKER = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures", "plugin-worker-gated.cjs");
 const DEBOUNCE_SETTLE_MS = 800;
@@ -189,11 +214,26 @@ function deferred() {
   return { promise, resolve };
 }
 
-function writePackage(dir: string, name: string) {
-  const packagePath = path.join(dir, name);
+function writeBundle(packagePath: string, gate: { socketPath: string }, marker: string) {
+  const holdFile = path.join(path.dirname(packagePath), "gate-hold");
+  writeFileSync(
+    path.join(packagePath, "dist", "worker.js"),
+    [
+      `process.env.GATE_SOCKET = ${JSON.stringify(gate.socketPath)};`,
+      `process.env.GATE_HOLD = require("node:fs").readFileSync(${JSON.stringify(holdFile)}, "utf8");`,
+      `process.env.BUNDLE_MARKER = ${JSON.stringify(marker)};`,
+      `require(${JSON.stringify(GATED_WORKER)});`,
+      "",
+    ].join("\n"),
+  );
+}
+
+function writePackage(dir: string, gate: { socketPath: string }, key: string, dirName = key) {
+  const packagePath = path.join(dir, dirName);
   mkdirSync(path.join(packagePath, "dist"), { recursive: true });
-  writeFileSync(path.join(packagePath, "package.json"), JSON.stringify({ name, paperclipPlugin: { worker: "dist/worker.js" } }));
-  writeFileSync(path.join(packagePath, "dist", "worker.js"), "// bundle\n");
+  writeFileSync(path.join(packagePath, "package.json"), JSON.stringify({ name: key, paperclipPlugin: { manifest: "dist/manifest.mjs", worker: "dist/worker.js" } }));
+  writeFileSync(path.join(packagePath, "dist", "manifest.mjs"), `export default ${JSON.stringify(manifest(key))};\n`);
+  writeBundle(packagePath, gate, "A");
   return packagePath;
 }
 
@@ -203,65 +243,30 @@ async function createHarness() {
   const dir = mkdtempSync(path.join(os.tmpdir(), "plugin-watch-gen-"));
   const gate = await createGate(dir);
   const workerManager = createPluginWorkerManager();
-  const appLifecycle = pluginLifecycleManager({} as never, { workerManager });
+  const startWorker = workerManager.startWorker.bind(workerManager);
+  workerManager.startWorker = (async (id: string, ...rest: unknown[]) => {
+    state.calls.push(`worker:start:${id}`);
+    return (startWorker as (...args: unknown[]) => unknown)(id, ...rest);
+  }) as typeof workerManager.startWorker;
+  const db = { transaction: async (fn: (tx: unknown) => unknown) => fn({}) };
+  const appLifecycle = pluginLifecycleManager(db as never, { workerManager });
+  writeFileSync(path.join(dir, "gate-hold"), "");
 
-  let hold = "";
-  let marker = "A";
-  let activationGate: { promise: Promise<void>; paused: () => void } | null = null;
-  const loader = {
-    hasRuntimeServices: () => true,
-    async loadSingle(id: string, loadOptions?: { lease?: unknown }) {
-      const row = state.rows.get(id)!;
-      if (row.status === "installed") {
-        await appLifecycle.load(id, { lease: loadOptions?.lease } as never);
-        return { plugin: { ...row }, success: true, registered: {} };
-      }
-      if (activationGate) {
-        const current = activationGate;
-        activationGate = null;
-        current.paused();
-        await current.promise;
-      }
-      try {
-        state.calls.push(`worker:start:${id}`);
-        workerManager.allowStarts?.(id);
-        await workerManager.startWorker(id, {
-          entrypointPath: GATED_WORKER,
-          manifest: row.manifestJson,
-          config: {},
-          instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
-          apiVersion: 1,
-          hostHandlers: {},
-          env: { GATE_SOCKET: gate.socketPath, GATE_HOLD: hold, BUNDLE_MARKER: marker },
-        } as never);
-        return { plugin: { ...row }, success: true, registered: {} };
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        await appLifecycle.markError(id, `Activation failed: ${message}`, { lease: loadOptions?.lease } as never);
-        return { plugin: { ...row }, success: false, error: message, registered: {} };
-      }
-    },
-    async unloadSingle(id: string) {
-      state.calls.push(`worker:stop:${id}`);
-      if (workerManager.getWorker(id)) await workerManager.stopWorker(id);
-    },
-    async cleanupInstallArtifacts() {},
-    async loadManifest() {
-      return null;
-    },
-    async prepareInstall(installOptions: { packageName?: string; localPath?: string }) {
-      const name = installOptions.packageName ?? path.basename(installOptions.localPath ?? "");
-      return { manifest: manifest(name), packageName: name, version: "1.0.0" };
-    },
-    async persistInstall(discovered: { manifest: PaperclipPluginManifestV1; packageName: string }) {
-      const { pluginRegistryService } = await import("../services/plugin-registry.js");
-      await pluginRegistryService({} as never).install({ packageName: discovered.packageName } as never, discovered.manifest);
-      return discovered;
-    },
-    async installPlugin(installOptions: { packageName?: string; localPath?: string }) {
-      return this.persistInstall(await this.prepareInstall(installOptions));
-    },
-  };
+  const noop = () => undefined;
+  const loader = pluginLoader(
+    db as never,
+    { localPluginDir: path.join(dir, "local-plugins"), enableNpmDiscovery: false },
+    {
+      workerManager,
+      lifecycleManager: appLifecycle,
+      eventBus: { forPlugin: noop, subscriptionCount: () => 0, clearPlugin: noop },
+      jobScheduler: { registerPlugin: async () => undefined, unregisterPlugin: async () => undefined, stop: noop },
+      jobStore: { syncJobDeclarations: async () => undefined },
+      toolDispatcher: { registerPluginTools: noop, unregisterPluginTools: noop },
+      buildHostHandlers: () => ({}),
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+    } as never,
+  );
 
   const app = express();
   app.use(express.json());
@@ -269,7 +274,7 @@ async function createHarness() {
     req.actor = { type: "board", userId: "admin", source: "session", isInstanceAdmin: true, companyIds: ["company-1"] } as never;
     next();
   });
-  app.use("/api", pluginRoutes({} as never, loader as never, undefined, undefined, undefined, { workerManager } as never));
+  app.use("/api", pluginRoutes(db as never, loader, undefined, undefined, undefined, { workerManager } as never));
   app.use(errorHandler);
 
   const heldLookups: Array<() => void> = [];
@@ -293,18 +298,21 @@ async function createHarness() {
     restarts,
     heldLookups,
     setHold(next: string) {
-      hold = next;
+      writeFileSync(path.join(dir, "gate-hold"), next);
     },
-    setMarker(next: string) {
-      marker = next;
+    rewriteBundle(packagePath: string, marker: string) {
+      writeBundle(packagePath, gate, marker);
+    },
+    writePackage(key: string, dirName?: string) {
+      return writePackage(dir, gate, key, dirName);
     },
     setHoldLookups(next: boolean) {
       holdLookups = next;
     },
-    pauseNextActivation() {
+    pauseNextActivation(pluginId: string) {
       const released = deferred();
       const paused = deferred();
-      activationGate = { promise: released.promise, paused: paused.resolve };
+      state.holdActivation = { pluginId, isStopped: () => !workerManager.getWorker(pluginId), paused: paused.resolve, release: released.promise };
       return { paused: paused.promise, release: released.resolve };
     },
     watcherFor(packagePath: string) {
@@ -329,7 +337,7 @@ function seed(h: Harness, key: string, status: string) {
     id: `id-${key}`,
     pluginKey: key,
     packageName: key,
-    packagePath: writePackage(h.dir, key),
+    packagePath: h.writePackage(key),
     version: "1.0.0",
     status,
     lastError: null,
@@ -369,7 +377,8 @@ beforeEach(() => {
   state.rows.clear();
   state.calls.splice(0);
   state.watchers.splice(0);
-  state.nextPackagePath = null;
+  state.holdActivation = null;
+  state.configs.clear();
 });
 
 afterEach(async () => {
@@ -398,7 +407,7 @@ describe("watcher and config reload generations through the real app, route and 
 
     h.setHold("");
     const spawned = h.gate.count("spawned");
-    const install = await request(h.app).post("/api/plugins/install").send({ packageName: row.pluginKey });
+    const install = await request(h.app).post("/api/plugins/install").send({ packageName: row.packagePath, isLocalPath: true });
     expect(install.status).toBe(200);
     expect(h.gate.count("spawned") - spawned).toBe(1);
     expect(h.workerManager.getWorker(row.id)?.status).toBe("running");
@@ -433,7 +442,7 @@ describe("watcher and config reload generations through the real app, route and 
     const row = seed(h, "gen.n2b", "ready");
     await boot(h, row);
 
-    const pause = h.pauseNextActivation();
+    const pause = h.pauseNextActivation(row.id);
     const config = request(h.app).post(`/api/plugins/${row.pluginKey}/config`).send({ companyId: "company-1", configJson: { a: 1 } }).then((r) => r);
     await pause.paused;
 
@@ -486,9 +495,8 @@ describe("watcher and config reload generations through the real app, route and 
     const oldLookups = h.heldLookups.splice(0);
 
     expect((await request(h.app).delete(`/api/plugins/${row.pluginKey}`)).status).toBe(200);
-    const newPath = writePackage(h.dir, "gen.n4b-next");
-    state.nextPackagePath = newPath;
-    const install = request(h.app).post("/api/plugins/install").send({ packageName: row.pluginKey }).then((r) => r);
+    const newPath = h.writePackage(row.pluginKey, "gen.n4b-next");
+    const install = request(h.app).post("/api/plugins/install").send({ packageName: newPath, isLocalPath: true }).then((r) => r);
     await h.gate.next("initialize-received", h.gate.count("initialize-received"));
     h.gate.release("initialize");
     expect((await install).status).toBe(200);
@@ -508,11 +516,14 @@ describe("watcher and config reload generations through the real app, route and 
     harness = await createHarness();
     const h = harness;
     const row = seed(h, "gen.n8", "ready");
+    const config = { pluginId: row.id, companyId: "company-1", configJson: { kept: true } };
+    state.configs.set(`${row.id}:company-1`, config);
     await boot(h, row);
     const fake = h.watcherFor(row.packagePath!)!;
+    expect((await request(h.app).post(`/api/plugins/${row.pluginKey}/data/marker`).send({})).body.data).toEqual({ marker: "A" });
 
     expect((await request(h.app).post(`/api/plugins/${row.pluginKey}/disable`).send({})).status).toBe(200);
-    h.setMarker("B");
+    h.rewriteBundle(row.packagePath!, "B");
     for (let i = 0; i < 3; i += 1) fake.emit(path.join(row.packagePath!, "dist", "worker.js"));
     await delay(DEBOUNCE_SETTLE_MS);
 
@@ -529,6 +540,8 @@ describe("watcher and config reload generations through the real app, route and 
     expect(data.status).toBe(200);
     expect(data.body.data).toEqual({ marker: "B" });
     expect(state.rows.get(row.id)).toMatchObject({ id: row.id, version: "1.0.0", packagePath: row.packagePath, status: "ready" });
+    const stored = await request(h.app).get(`/api/plugins/${row.pluginKey}/config`).query({ companyId: "company-1" });
+    expect(stored.body).toEqual(config);
   });
 
   it("N11: a disable that arrives while a config restart holds the plugin drains it, then quiesces", async () => {
@@ -537,7 +550,7 @@ describe("watcher and config reload generations through the real app, route and 
     const row = seed(h, "gen.n11", "ready");
     await boot(h, row);
 
-    const pause = h.pauseNextActivation();
+    const pause = h.pauseNextActivation(row.id);
     const config = request(h.app).post(`/api/plugins/${row.pluginKey}/config`).send({ companyId: "company-1", configJson: { a: 1 } }).then((r) => r);
     await pause.paused;
     const disable = request(h.app).post(`/api/plugins/${row.pluginKey}/disable`).send({}).then((r) => r);
@@ -556,31 +569,40 @@ describe("watcher and config reload generations through the real app, route and 
     expect(h.gate.count("spawned")).toBe(spawned);
   });
 
-  it("N12: bundled startup records ready through the app lifecycle without spawning; a later disable waits for the startup activation", async () => {
+  it("N12: bundled startup records ready without spawning; a route disable racing the real loadAll activation waits for it, then quiesces", async () => {
     harness = await createHarness();
     const h = harness;
-    const packagePath = writePackage(h.dir, "gen.n12");
-    state.nextPackagePath = packagePath;
+    h.setHold("initialize");
+    const packagePath = h.writePackage("gen.n12");
     const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
 
     await ensureBundledPlugins(
-      [{ key: "gen", pluginKey: "gen.n12", localPath: packagePath } as never],
-      { registry: (await import("../services/plugin-registry.js")).pluginRegistryService({} as never) as never, loader: h.loader as never, lifecycle: h.appLifecycle, logger: logger as never, bundleManifestExists: () => true } as never,
+      [{ key: "gen", pluginKey: "gen.n12", localPath: packagePath }],
+      { registry: pluginRegistryService({} as never) as never, loader: h.loader, lifecycle: h.appLifecycle, logger: logger as never, bundleManifestExists: () => true },
       { reinstallUninstalled: false },
     );
     const row = state.rows.get("id-gen.n12")!;
-    expect(row.status).toBe("ready");
+    expect(row).toMatchObject({ status: "ready", packagePath });
     expect(h.gate.count("spawned")).toBe(0);
+    expect(h.workerManager.getWorker(row.id)).toBeUndefined();
 
-    const startup = h.loader.loadSingle(row.id);
+    const startup = h.loader.loadAll();
     await h.gate.next("initialize-received");
     expect(h.gate.count("spawned")).toBe(1);
-    h.gate.release("initialize");
-    await startup;
 
-    expect((await request(h.app).post(`/api/plugins/${row.pluginKey}/disable`).send({})).status).toBe(200);
+    const disable = request(h.app).post(`/api/plugins/${row.pluginKey}/disable`).send({}).then((r) => r);
+    expect(await within(disable, 200)).toBe("pending");
+    expect(h.workerManager.getWorker(row.id)).toBeDefined();
+
+    h.gate.release("initialize");
+    const result = await startup;
+    expect(result).toMatchObject({ total: 1, succeeded: 1, failed: 0 });
+    expect((await disable).status).toBe(200);
+
     expect(h.gate.count("spawned")).toBe(1);
+    expect(state.rows.get(row.id)!.status).toBe("disabled");
     expect(h.workerManager.getWorker(row.id)).toBeUndefined();
+    expect(h.appLifecycle.isQuiesced(row.id)).toBe(true);
   });
 
   it("N18: a reload scheduled before a queued disable is superseded, and the following enable runs alone", async () => {
