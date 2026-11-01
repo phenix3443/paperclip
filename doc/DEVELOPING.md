@@ -3279,3 +3279,5 @@ The shared `runChildProcess` helper records child stdin stream errors through
 The helper still waits for the child and preserves its exit status and output.
 Run `pnpm exec vitest run packages/adapter-utils/src/server-utils.test.ts` to
 verify broken-pipe handling, normal input delivery and process cleanup.
+
+B-native review-generation source reconstruction is tracked in [#346](https://github.com/phenix3443/paperclip/issues/346). Its staging branch is not a release source.
