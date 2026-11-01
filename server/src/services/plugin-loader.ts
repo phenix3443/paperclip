@@ -2468,12 +2468,15 @@ export function pluginLoader(
         options.lease?.assertActive();
         const deadlineAt = options.lease?.deadlineAt;
         try {
-          await workerManager.call(pluginId, "configChanged", {
+          const params = {
             config: (row.configJson ?? {}) as Record<string, unknown>,
             companyId: row.companyId,
-          }, deadlineAt === undefined
-            ? undefined
-            : Math.max(1, Math.min(STARTUP_CONFIG_RPC_TIMEOUT_MS, deadlineAt - Date.now())));
+          };
+          if (deadlineAt === undefined) await workerManager.call(pluginId, "configChanged", params);
+          else {
+            const timeoutMs = Math.max(1, Math.min(STARTUP_CONFIG_RPC_TIMEOUT_MS, deadlineAt - Date.now()));
+            await workerManager.call(pluginId, "configChanged", params, timeoutMs);
+          }
         } catch (configErr) {
           // A single-tenant worker fails closed (CROSS_TENANT_CONFIG) rather
           // than collapse onto a second company's config — surface that at
