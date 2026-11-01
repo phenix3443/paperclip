@@ -3120,6 +3120,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               lastStatusDecisionId: issues.lastStatusDecisionId,
               workspaceBindingRevision: issues.workspaceBindingRevision,
               executionState: issues.executionState,
+              executionPolicy: issues.executionPolicy,
               createdAt: issues.createdAt,
             })
             .from(issues)

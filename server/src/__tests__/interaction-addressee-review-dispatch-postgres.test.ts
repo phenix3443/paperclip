@@ -12,6 +12,7 @@ import {
   companyMemberships,
   createDb,
   heartbeatRuns,
+  runIdentityContexts,
   issueThreadInteractions,
   issueComments,
   chatActions, chatConversations, chatDeliveries, chatEndpoints, chatExternalPrincipals,
@@ -286,7 +287,8 @@ describeEmbeddedPostgres("pending interaction addressee dispatch during review (
     expect(executeCallsForAgent(f.reviewer.id)).toHaveLength(0);
   });
 
-  it("records quota installation proof from a real admitted reviewer before monitor retry", async () => {
+  it.each(["valid", "source-identity-install", "source-identity-retry", "scheduled-question"])(
+    "records quota installation proof from a real admitted reviewer before monitor retry (%s)", async mode => {
     const f = await currentAgentFixture();
     const policy = normalizeIssueExecutionPolicy({ stages: [{ type: "review", participants: [{ type: "agent", agentId: f.reviewer.id }] }] })!;
     await db.update(issues).set({ status: "in_progress", executionPolicy: policy, executionState: null,
@@ -321,6 +323,20 @@ describeEmbeddedPostgres("pending interaction addressee dispatch during review (
       const transition = applyIssueMonitorPolicyTransition({ issue: before, policy: installedPolicy,
         previousPolicy: normalizeIssueExecutionPolicy(before.executionPolicy), requestedStatus: before.status,
         requestedAssigneePatch: {}, actor: { agentId: null, userId: null }, monitorExplicitlyUpdated: true });
+      if (mode === "source-identity-install") {
+        const [foreignIdentity] = await db.select().from(runIdentityContexts)
+          .where(eq(runIdentityContexts.id, String(f.actor.identityContextId)));
+        expect(foreignIdentity).toMatchObject({ runId: f.run.id, status: "accepted" });
+        expect(foreignIdentity.runId).not.toBe(source.id);
+        await db.update(heartbeatRuns).set({ activeIdentityContextId: foreignIdentity.id }).where(eq(heartbeatRuns.id, source.id));
+        await expect(issueService(db).update(f.issue.id, { ...transition.patch, executionPolicy: installedPolicy }))
+          .rejects.toThrow();
+        const [unchanged] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
+        expect(unchanged.monitorNextCheckAt).toBeNull();
+        expect((await db.select().from(activityLog).where(eq(activityLog.entityId, f.issue.id)))
+          .filter(row => row.action === "issue.review_quota_monitor_installed")).toHaveLength(0);
+        return;
+      }
       const installed = await issueService(db).update(f.issue.id, { ...transition.patch, executionPolicy: installedPolicy });
       expect(installed).toBeTruthy();
       const proof = (await db.select().from(activityLog).where(eq(activityLog.entityId, f.issue.id)))
@@ -329,7 +345,31 @@ describeEmbeddedPostgres("pending interaction addressee dispatch during review (
         details: { version: 1, sourceRunId: source.id, sourceGeneration: source.contextSnapshot?.reviewerAssignmentGeneration,
           installedGeneration: issueExecutionGeneration(installed!), nextCheckAt } });
       expect(issueExecutionGeneration(installed!)).not.toBe(source.contextSnapshot?.reviewerAssignmentGeneration);
+      if (mode === "scheduled-question") {
+        expect(await heartbeat.tickTimers(new Date(nextCheckAt))).toMatchObject({ enqueued: 0 });
+        const [held] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
+        expect(held).toMatchObject({ monitorNextCheckAt: new Date(nextCheckAt), monitorWakeRequestedAt: null, monitorAttemptCount: 0 });
+        expect(held.executionPolicy).toEqual(installed!.executionPolicy);
+        expect(held.executionState).toEqual(installed!.executionState);
+        expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, source.id))).toHaveLength(0);
+        expect(executeCallsForAgent(f.reviewer.id)).toHaveLength(1);
+        return;
+      }
       await db.update(issueThreadInteractions).set({ status: "cancelled" }).where(eq(issueThreadInteractions.id, question.id));
+      if (mode === "source-identity-retry") {
+        const [foreignIdentity] = await db.select().from(runIdentityContexts)
+          .where(eq(runIdentityContexts.id, String(f.actor.identityContextId)));
+        expect(foreignIdentity).toMatchObject({ runId: f.run.id, status: "accepted" });
+        expect(foreignIdentity.runId).not.toBe(source.id);
+        await db.update(heartbeatRuns).set({ activeIdentityContextId: foreignIdentity.id }).where(eq(heartbeatRuns.id, source.id));
+        await expect(heartbeat.triggerIssueMonitor(f.issue.id, { now: new Date(nextCheckAt), actorType: "user", actorId: f.board.userId }))
+          .rejects.toThrow();
+        const [held] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
+        expect(held).toMatchObject({ monitorNextCheckAt: new Date(nextCheckAt), monitorWakeRequestedAt: null, monitorAttemptCount: 0 });
+        expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, source.id))).toHaveLength(0);
+        expect(executeCallsForAgent(f.reviewer.id)).toHaveLength(1);
+        return;
+      }
       for (const fault of ["policy", "state", "responsible", "participant", "assignee", "missing-G", "wrong-G",
         "provider-work", "native", "source-agent", "source-issue", "source-status", "proof-version", "proof-actor",
         "proof-action", "proof-source", "proof-generation", "proof-schedule", "successor"]) {
