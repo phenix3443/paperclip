@@ -1923,6 +1923,8 @@ export {
   type UpdateAgentPermissions,
   projectDiscoverySchema,
   createProjectSchema,
+  createProjectToolSchema,
+  createProjectToolJsonSchema,
   updateProjectSchema,
   addProjectAccessMemberSchema,
   createProjectWorkspaceSchema,

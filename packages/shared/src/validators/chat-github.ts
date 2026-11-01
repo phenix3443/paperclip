@@ -160,3 +160,10 @@ export const githubReviewAssessmentSchema = z
         message: "Duplicate findings are not allowed.",
       });
   });
+
+let assessmentJsonSchema: ReturnType<typeof z.toJSONSchema> | undefined;
+export function githubReviewAssessmentJsonSchema() {
+  return structuredClone(assessmentJsonSchema ??= z.toJSONSchema(githubReviewAssessmentSchema, {
+    target: "draft-7", io: "input",
+  }));
+}

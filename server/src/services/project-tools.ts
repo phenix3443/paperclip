@@ -1,18 +1,26 @@
-import { projectDiscoverySchema, createProjectSchema, createIssueSchema, setIssueTitleSchema, requiredQualityReviewSchema } from "@paperclipai/shared";
+import { projectDiscoverySchema, createProjectToolSchema, createProjectToolJsonSchema, createIssueSchema, setIssueTitleSchema, requiredQualityReviewSchema } from "@paperclipai/shared";
 import { z } from "zod";
 import { CAPABILITY_SEMANTIC_TOOL_CATALOG } from "../vendor/paperclip-runner/index.js";
 import { badRequest } from "../errors.js";
 
 export const PROJECT_TOOL_NAMES = ["create_project", "list_project_repositories", "list_projects"];
-export function projectToolDefinitions(workMode: string, includeTask = false) {
+export function projectToolDefinitions(workMode: string, includeTask = false, onDefinitionError?: (name: string, error: unknown) => void) {
   return CAPABILITY_SEMANTIC_TOOL_CATALOG.filter(tool =>
     (PROJECT_TOOL_NAMES.includes(tool.operationId) || includeTask && ["create_task", "set_task_title"].includes(tool.operationId))
     && tool.allowedModes.includes(workMode as "standard"),
-  ).map(tool => ({ name: tool.operationId, description: tool.description,
-    inputSchema: tool.operationId === "create_project"
-      ? z.toJSONSchema(createProjectSchema.extend({ idempotencyKey: z.string().min(1).max(255) }))
-      : tool.inputSchema,
-  }));
+  ).flatMap(tool => {
+    try {
+      return [{ name: tool.operationId, description: tool.description,
+        inputSchema: tool.operationId === "create_project"
+          ? createProjectToolJsonSchema()
+          : tool.inputSchema,
+      }];
+    } catch (error) {
+      if (!onDefinitionError) throw error;
+      onDefinitionError(tool.operationId, error);
+      return [];
+    }
+  });
 }
 
 /** All transports use the normal authenticated API, including its validation and audit path. */
@@ -35,7 +43,7 @@ export async function callProjectTool(input: {
     path += `?${query}`;
   }
   else if (input.name === "create_project") {
-    body = createProjectSchema.extend({ idempotencyKey: z.string().min(1).max(255) }).parse(args);
+    body = createProjectToolSchema.parse(args);
   } else if (input.name === "create_task") {
     const key = z.string().min(1).max(150).parse(args.idempotencyKey);
     path = `/companies/${input.companyId}/issues`;

@@ -133,6 +133,15 @@ export const createProjectSchema = z.object({
 
 export type CreateProject = z.infer<typeof createProjectSchema>;
 
+export const createProjectToolSchema = createProjectSchema.extend({
+  idempotencyKey: z.string().min(1).max(255),
+});
+
+let projectToolJsonSchema: ReturnType<typeof z.toJSONSchema> | undefined;
+export function createProjectToolJsonSchema() {
+  return structuredClone(projectToolJsonSchema ??= z.toJSONSchema(createProjectToolSchema));
+}
+
 export const updateProjectSchema = objectWithoutDefaults(
   z.object(projectFields),
 ).partial();

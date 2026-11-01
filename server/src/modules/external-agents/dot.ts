@@ -10,7 +10,7 @@ import type { heartbeatService } from "../../services/heartbeat.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { and, asc, eq, gt, inArray, isNull, sql } from "drizzle-orm";
 import { z } from "zod";
-import { DOT_AGENT_TOOL_GUIDANCE, GROK_BOT_AGENT_TOOL_GUIDANCE, setAgentAvatarSchema, type SetAgentAvatarInput } from "@paperclipai/shared";
+import { DOT_AGENT_TOOL_GUIDANCE, GROK_BOT_AGENT_TOOL_GUIDANCE, setAgentAvatarSchema, setAgentAvatarJsonSchema, type SetAgentAvatarInput } from "@paperclipai/shared";
 import { setAgentProfileAvatar } from "../../services/agent-profile-avatar.js";
 import { consumeDotHistoryReceipt } from "../../services/dot-assignment-follow-up.js";
 import { getStorageService } from "../../storage/index.js";
@@ -603,7 +603,7 @@ export function createDotRunnerMcpTools(db: Db, heartbeat?: DotHeartbeat, transf
   return {
     async listTools(principal) { const provider = await providerFor(principal); const available = provider === "grok_bot" ? grokDefinitions : definitions;
       return provider ? available.map(d => ({ name: d.name, description: d.description,
-      inputSchema: z.toJSONSchema(d.schema) as { type: "object"; properties: Record<string, unknown> },
+      inputSchema: (d.schema === setAgentAvatarSchema ? setAgentAvatarJsonSchema() : z.toJSONSchema(d.schema)) as { type: "object"; properties: Record<string, unknown> },
       annotations: { readOnlyHint: ["paperclip_dot_capabilities", "paperclip_dot_tasks", "paperclip_dot_inbox", "paperclip_dot_read", "paperclip_dot_operation_status"].includes(d.name.replace("paperclip_grok_", "paperclip_dot_")), destructiveHint: false, idempotentHint: true, openWorldHint: true } })) : []; },
     async callTool(principal, name, raw) {
       const provider = await providerFor(principal);

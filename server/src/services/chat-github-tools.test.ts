@@ -22,18 +22,17 @@ import { GITHUB_BOT_TOOLS, githubGuestBotConnectionForSession } from "./chat-git
 describe("GitHub review tool contract", () => {
   it("tells new bots which review sections Paperclip renders", () => {
     const submit = GITHUB_BOT_TOOLS.find(tool => tool.name === "submit_review")!;
-    const properties = submit.schema.properties!;
-    expect(properties.summary).toMatchObject({
+    expect(submit.schema.properties).toMatchObject({ summary: {
       description: expect.stringContaining("Review body only"),
       maxLength: 24000,
-    });
-    expect(properties.summary).toMatchObject({
+    } });
+    expect(submit.schema.properties).toMatchObject({ summary: {
       description: expect.stringContaining("Paperclip adds"),
-    });
-    expect(properties.rationale).toMatchObject({
+    } });
+    expect(submit.schema.properties).toMatchObject({ rationale: {
       description: expect.stringContaining("Do not repeat the summary"),
       maxLength: 12000,
-    });
+    } });
   });
 });
 
