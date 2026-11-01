@@ -2087,6 +2087,16 @@ type IssueRelationSummaryMap = {
 type PublicIssueUpdateRead = {
   readCondition: SQL<boolean> | undefined;
   requireUnresolvedBlocker?: boolean;
+  requireDependencyReady?: boolean;
+  resolveCommentReopen?: (issue: typeof issues.$inferSelect, hasBlockers: boolean) => Record<string, unknown>;
+};
+
+type BlockerUpdateFact = {
+  id: string;
+  status: string;
+  identifier: string | null;
+  title: string;
+  executionWorkspaceId?: string | null;
 };
 
 type ReadableIssueRelationOptions = {
@@ -7849,7 +7859,7 @@ export function issueService(db: Db) {
     issueIds: string[],
     dbOrTx: DbReader = db,
     publicRead?: ReadableIssueRelationOptions,
-    readProof?: { readCondition: SQL<boolean> | undefined; readableIds: Set<string> },
+    readProof?: { readCondition: SQL<boolean> | undefined; readableIds: Set<string>; blockerFacts?: Map<string, BlockerUpdateFact> },
   ): Promise<Map<string, IssueRelationSummaryMap>> {
     const uniqueIssueIds = [...new Set(issueIds)];
     const empty = new Map<string, IssueRelationSummaryMap>();
@@ -7868,6 +7878,7 @@ export function issueService(db: Db) {
           ...proofColumns,
           currentIssueId: issueRelations.relatedIssueId,
           relatedId: issues.id,
+          ...(readProof?.blockerFacts ? { executionWorkspaceId: issues.executionWorkspaceId } : {}),
           identifier: issues.identifier,
           title: issues.title,
           status: issues.status,
@@ -7910,6 +7921,7 @@ export function issueService(db: Db) {
     ]);
 
     for (const row of blockedByRows) {
+      readProof?.blockerFacts?.set(row.relatedId, { ...row, id: row.relatedId });
       if (proof && row.readable === true) proof.readableIds.add(row.relatedId);
       empty
         .get(row.currentIssueId)
@@ -8046,7 +8058,7 @@ export function issueService(db: Db) {
     publicRead?: { readCondition: SQL<boolean> | undefined; readableIds: Set<string>; existingIds: Set<string> },
     cycleCandidates?: string[],
   ) {
-    const known = new Map<string, { id: string; status: string; identifier: string | null; title: string }>();
+    const known = new Map<string, BlockerUpdateFact>();
     const deduped = [...new Set(blockedByIssueIds)];
     if (deduped.some((candidate) => candidate === issueId)) {
       throw unprocessable("Issue cannot be blocked by itself");
@@ -8061,7 +8073,7 @@ export function issueService(db: Db) {
             FOR UPDATE`,
       );
       const relatedIssues = await dbOrTx
-        .select({ id: issues.id, status: issues.status, identifier: issues.identifier, title: issues.title, ...(publicRead ? { readable: sql<boolean>`${publicRead.readCondition ?? sql<boolean>`false`}` } : {}) })
+        .select({ id: issues.id, status: issues.status, identifier: issues.identifier, title: issues.title, ...(publicRead ? { readable: sql<boolean>`${publicRead.readCondition ?? sql<boolean>`false`}`, executionWorkspaceId: issues.executionWorkspaceId } : {}) })
         .from(issues)
         .where(
           and(eq(issues.companyId, companyId), inArray(issues.id, deduped)),
@@ -11516,7 +11528,15 @@ export function issueService(db: Db) {
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
       postCommitActions?: IssuePostCommitAction[],
-      options: { bindRuntimeSharedWorkspace?: boolean; publicRead?: PublicIssueUpdateRead } = {},
+      options: {
+        bindRuntimeSharedWorkspace?: boolean;
+        publicRead?: PublicIssueUpdateRead;
+        preparedPublicUpdate?: {
+          existing: typeof issues.$inferSelect;
+          relations: Awaited<ReturnType<typeof preparePublicBlockerReplacement>>;
+          quotaLocked: boolean;
+        };
+      } = {},
     ) => {
       const ownedActivityPublications: ActivityPublication[] = [];
       const activityPublications =
@@ -11533,7 +11553,7 @@ export function issueService(db: Db) {
         data.companyGuard !== undefined
           ? and(eq(issues.id, id), eq(issues.companyId, data.companyGuard))
           : eq(issues.id, id);
-      const existing = await dbOrTx
+      const existing = options.preparedPublicUpdate?.existing ?? await dbOrTx
         .select()
         .from(issues)
         .where(idPredicate)
@@ -11824,14 +11844,14 @@ export function issueService(db: Db) {
       }
 
       const runUpdate = async (tx: any) => {
-        if (parseObject(parseObject(patch.executionPolicy).monitor).serviceName === PROVIDER_QUOTA_MONITOR_SERVICE_NAME)
+        if (parseObject(parseObject(patch.executionPolicy).monitor).serviceName === PROVIDER_QUOTA_MONITOR_SERVICE_NAME && !options.preparedPublicUpdate?.quotaLocked)
           await tx.select({ id: companies.id }).from(companies).where(eq(companies.id, existing.companyId)).for("share");
         const changesPrivacy = issueData.visibility !== undefined || issueData.parentId !== undefined || issueData.projectId !== undefined;
-        if (changesPrivacy) await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`issue-privacy-tree:${existing.companyId}`}, 0))`);
+        if (changesPrivacy && !options.preparedPublicUpdate) await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`issue-privacy-tree:${existing.companyId}`}, 0))`);
         // The receipt baseline must be read under the same row lock as the
         // write. Otherwise a concurrent update can be mistaken for a change
         // made by this request.
-        const receiptExisting = await tx
+        const receiptExisting = options.preparedPublicUpdate?.existing ?? await tx
           .select()
           .from(issues)
           .where(idPredicate)
@@ -11929,27 +11949,23 @@ export function issueService(db: Db) {
           });
           assertLegacyRunTaskOwnership(actorRun, receiptExisting);
         }
-        const readProof = options.publicRead ? { ...options.publicRead, readableIds: new Set<string>() } : undefined;
-        let previousRelationSummaries = new Map<string, IssueRelationSummaryMap>();
-        if (readProof && blockedByIssueIds !== undefined) {
-          previousRelationSummaries = await getIssueRelationSummaryMap(existing.companyId, [id], tx, undefined, readProof);
-        }
-        let retainedBlockerIds: string[] = [];
-        let knownBlockers: Map<string, { id: string; status: string; identifier: string | null; title: string }> | undefined;
-        if (readProof && requestedBlockedByIssueIds !== undefined) {
-          const currentIds = (previousRelationSummaries.get(id)?.blockedBy ?? []).map(row => row.id);
-          retainedBlockerIds = currentIds.filter(id => !readProof.readableIds.has(id));
-          blockedByIssueIds = [...new Set([
-            ...retainedBlockerIds,
-            ...requestedBlockedByIssueIds,
-          ])].sort();
-          const requestedRows = await validateBlockedByIssueIds(id, receiptExisting.companyId, requestedBlockedByIssueIds, tx,
-            { ...readProof, existingIds: new Set(currentIds) }, blockedByIssueIds);
-          knownBlockers = new Map((previousRelationSummaries.get(id)?.blockedBy ?? []).map(row => [row.id, row]));
-          for (const [id, row] of requestedRows) knownBlockers.set(id, row);
+        const prepared = options.preparedPublicUpdate?.relations ??
+          await preparePublicBlockerReplacement(tx, receiptExisting, requestedBlockedByIssueIds, options.publicRead);
+        const { readProof, retainedBlockerIds, knownBlockers } = prepared;
+        let { previousRelationSummaries } = prepared;
+        blockedByIssueIds = prepared.nextIds;
+        if (options.publicRead?.requireDependencyReady) {
+          const nextBlockers = (blockedByIssueIds ?? []).map(id => knownBlockers?.get(id));
+          if (nextBlockers.some(row => !row || row.status !== "done")) {
+            throw conflict("Issue follow-up blocked by unresolved blockers");
+          }
+          const pendingFinalize = await listPendingFinalizeBlockerIssueIds(tx, receiptExisting.companyId,
+            nextBlockers.flatMap(row => row?.executionWorkspaceId
+              ? [{ blockerIssueId: row.id, executionWorkspaceId: row.executionWorkspaceId }] : []));
+          if (pendingFinalize.size > 0) throw conflict("Issue follow-up blocked by unresolved blockers");
         }
         if (options.publicRead?.requireUnresolvedBlocker &&
-          ![...knownBlockers?.values() ?? []].some(row => row.status !== "done" && row.status !== "cancelled")) {
+          !(blockedByIssueIds ?? []).some(id => knownBlockers?.get(id)?.status !== "done")) {
           throw unprocessable("Entering blocked requires unresolved blockers, a pending interaction/approval, or unblockDescriptor");
         }
         if (readProof) await validateProgress(tx, readProof.readableIds, knownBlockers);
@@ -14628,6 +14644,36 @@ export function issueService(db: Db) {
     },
   };
 
+  async function preparePublicBlockerReplacement(
+    tx: any,
+    existing: typeof issues.$inferSelect,
+    requestedIds: string[] | undefined,
+    publicRead: PublicIssueUpdateRead | undefined,
+  ) {
+    const id = existing.id;
+    let nextIds = requestedIds;
+    const readProof = publicRead ? { ...publicRead, readableIds: new Set<string>(), blockerFacts: new Map<string, BlockerUpdateFact>() } : undefined;
+    let previousRelationSummaries = new Map<string, IssueRelationSummaryMap>();
+    if (readProof && requestedIds !== undefined) {
+      previousRelationSummaries = await getIssueRelationSummaryMap(existing.companyId, [id], tx, undefined, readProof);
+    }
+    let retainedBlockerIds: string[] = [];
+    let knownBlockers: Map<string, BlockerUpdateFact> | undefined;
+    if (readProof && requestedIds !== undefined) {
+      const currentIds = (previousRelationSummaries.get(id)?.blockedBy ?? []).map(row => row.id);
+      retainedBlockerIds = currentIds.filter(id => !readProof.readableIds.has(id));
+      nextIds = [...new Set([
+        ...retainedBlockerIds,
+        ...requestedIds,
+      ])].sort();
+      const requestedRows = await validateBlockedByIssueIds(id, existing.companyId, requestedIds, tx,
+        { ...readProof, existingIds: new Set(currentIds) }, nextIds);
+      knownBlockers = new Map(readProof.blockerFacts);
+      for (const [id, row] of requestedRows) knownBlockers.set(id, row);
+    }
+    return { readProof, previousRelationSummaries, retainedBlockerIds, knownBlockers, nextIds };
+  }
+
   type IssueServiceApi = typeof service & {
     updateReadable: (
       id: string,
@@ -14669,8 +14715,34 @@ export function issueService(db: Db) {
     );
   };
 
-  serviceApi.updateReadable = (id, data, publicRead, dbOrTx = db, publications, actions) =>
-    service.update(id, data, dbOrTx, publications, actions, { publicRead });
+  serviceApi.updateReadable = async (id, data, publicRead, dbOrTx = db, publications, actions) => {
+    if (!publicRead.resolveCommentReopen) {
+      return service.update(id, data, dbOrTx, publications, actions, { publicRead });
+    }
+    const queuedPublications = publications ?? [];
+    const queuedActions = actions ?? [];
+    const apply = async (tx: any) => {
+      const predicate = and(eq(issues.id, id), ...(data.companyGuard ? [eq(issues.companyId, data.companyGuard)] : []));
+      const [before] = await tx.select().from(issues).where(predicate);
+      if (!before) return null;
+      const quotaLocked = [data.executionPolicy, before.executionPolicy].some(policy =>
+        parseObject(parseObject(policy).monitor).serviceName === PROVIDER_QUOTA_MONITOR_SERVICE_NAME);
+      if (quotaLocked) await tx.select({ id: companies.id }).from(companies).where(eq(companies.id, before.companyId)).for("share");
+      if (data.visibility !== undefined || data.parentId !== undefined || data.projectId !== undefined) {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`issue-privacy-tree:${before.companyId}`}, 0))`);
+      }
+      const [existing] = await tx.select().from(issues).where(predicate).for("update");
+      if (!existing) return null;
+      const relations = await preparePublicBlockerReplacement(tx, existing, data.blockedByIssueIds, publicRead);
+      const intentPatch = publicRead.resolveCommentReopen!(existing, (relations.nextIds?.length ?? 0) > 0);
+      return service.update(id, { ...data, ...intentPatch }, tx, queuedPublications, queuedActions,
+        { publicRead, preparedPublicUpdate: { existing, relations, quotaLocked } });
+    };
+    const result = await (dbOrTx === db ? db.transaction(apply) : apply(dbOrTx));
+    if (dbOrTx === db && !publications) for (const publication of queuedPublications) publishActivity(publication);
+    if (dbOrTx === db && !actions) await executeIssuePostCommitActions(db, queuedActions);
+    return result;
+  };
 
   return serviceApi;
 }

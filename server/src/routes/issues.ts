@@ -14571,10 +14571,12 @@ export function issueRoutes(
       ) {
         return;
       }
+      const replacesPublicBlockers = Array.isArray(req.body.blockedByIssueIds);
       if (
         resumeRequested === true &&
         !(await assertExplicitResumeIntentAllowed(req, res, existing, {
           resumeIntent: true,
+          skipDependencyReadiness: replacesPublicBlockers,
         }))
       )
         return;
@@ -14588,7 +14590,9 @@ export function issueRoutes(
         req.actor.type === "agent" &&
         reopenRequested === true
       ) {
-        if (!(await assertExplicitResumeIntentAllowed(req, res, existing)))
+        if (!(await assertExplicitResumeIntentAllowed(req, res, existing, {
+          skipDependencyReadiness: replacesPublicBlockers,
+        })))
           return;
       }
       await assertIssueEnvironmentSelection(
@@ -14639,7 +14643,7 @@ export function issueRoutes(
         resumeRequested !== true &&
         agentStatusTransitionRequiresResumeAuthority &&
         !(await assertExplicitResumeIntentAllowed(req, res, existing, {
-          skipDependencyReadiness: plainBlockedCancellation,
+          skipDependencyReadiness: plainBlockedCancellation || replacesPublicBlockers,
         }))
       ) {
         return;
@@ -14665,7 +14669,7 @@ export function issueRoutes(
           actorType: actor.actorType,
           actorId: actor.actorId,
         });
-      const effectiveMoveToTodoRequested =
+      let effectiveMoveToTodoRequested =
         !assigneeSelfCommentOnTerminal &&
         !(isBlocked && !!commentBody && (await getExecutionBlocker(db, existing.companyId, existing.id))?.workspaceRepairRequired) &&
         (explicitMoveToTodoRequested ||
@@ -14679,16 +14683,17 @@ export function issueRoutes(
               checkoutRunId: existing.checkoutRunId,
               executionRunId: existing.executionRunId,
               issueExecutionState: existing.executionState,
-              requestAddsExplicitBlockers:
-                Array.isArray(req.body.blockedByIssueIds) &&
-                req.body.blockedByIssueIds.length > 0,
+              requestAddsExplicitBlockers: false,
             })) ||
           shouldResumeInProgressScheduledRetry);
+      const resolveCommentReopenInUpdate = replacesPublicBlockers && !!commentBody &&
+        effectiveMoveToTodoRequested && !explicitMoveToTodoRequested &&
+        !shouldResumeInProgressScheduledRetry && updateFields.status === undefined;
       const updateReferenceSummaryBefore = titleOrDescriptionChanged
         ? await issueReferencesSvc.listIssueReferenceSummary(existing.id)
         : null;
-      const hasUnresolvedFirstClassBlockers =
-        isBlocked && effectiveMoveToTodoRequested
+      let hasUnresolvedFirstClassBlockers =
+        isBlocked && effectiveMoveToTodoRequested && !replacesPublicBlockers
           ? (await svc.getDependencyReadiness(existing.id))
               .unresolvedBlockerCount > 0
           : false;
@@ -14790,6 +14795,7 @@ export function issueRoutes(
       if (
         commentBody &&
         effectiveMoveToTodoRequested &&
+        !resolveCommentReopenInUpdate &&
         (isClosed ||
           (isBlocked && !hasUnresolvedFirstClassBlockers) ||
           shouldResumeInProgressScheduledRetry) &&
@@ -14843,6 +14849,7 @@ export function issueRoutes(
         req.body.executionPolicy !== undefined && monitorChanged,
       );
 
+      const updateFieldsBeforeTransition = { ...updateFields };
       const transition: ReturnType<typeof applyIssueExecutionPolicyTransition> = expectedStatusVersion !== undefined
         ? { patch: {} }
         : applyIssueExecutionPolicyTransition({
@@ -15240,7 +15247,43 @@ export function issueRoutes(
         updateFields.status === "done" || updateFields.status === "cancelled";
       const readProof = Array.isArray(issueUpdateData.blockedByIssueIds)
         ? await metadataReadProof(req, existing.companyId) : null;
-      const publicRead = readProof ? { readCondition: readProof.condition, requireUnresolvedBlocker } : null;
+      const publicRead = readProof ? {
+        readCondition: readProof.condition,
+        requireUnresolvedBlocker,
+        resolveCommentReopen: resolveCommentReopenInUpdate
+          ? (lockedIssue: IssueRouteSnapshot, hasBlockers: boolean): Record<string, unknown> => {
+              if (executionPolicyTransitionInputFingerprint(lockedIssue) !== executionPolicyTransitionInputFingerprint(existing)) {
+                throw conflict("The task changed while this update was prepared. Refresh and retry.", { code: "execution_policy_transition_stale" });
+              }
+              effectiveMoveToTodoRequested = !hasBlockers;
+              hasUnresolvedFirstClassBlockers = hasBlockers;
+              if (hasBlockers) return {};
+              const lockedTransition = applyIssueExecutionPolicyTransition({
+                issue: lockedIssue, policy: nextExecutionPolicy, previousPolicy: previousExecutionPolicy,
+                requestedStatus: "todo",
+                requestedAssigneePatch: { assigneeAgentId: normalizedAssigneeAgentId,
+                  assigneeUserId: req.body.assigneeUserId },
+                actor: { agentId: actor.agentId ?? null, userId: actor.actorType === "user" ? actor.actorId : null },
+                allowBoardOverride: req.actor.type === "board" && req.actor.source !== "mcp_oauth",
+                commentBody, reviewRequest, monitorExplicitlyUpdated: req.body.executionPolicy !== undefined && monitorChanged,
+              });
+              if (lockedTransition.decision) throw conflict("A comment reopen cannot decide an execution stage");
+              const intentPatch: Record<string, unknown> = { status: "todo", ...lockedTransition.patch };
+              for (const key of Object.keys(transition.patch)) {
+                if (!(key in intentPatch)) intentPatch[key] = key in updateFieldsBeforeTransition
+                  ? Reflect.get(updateFieldsBeforeTransition, key) : Reflect.get(lockedIssue, key);
+              }
+              if (updateFields.unblockDescriptor && intentPatch.status !== "blocked") {
+                throw unprocessable("unblockDescriptor requires blocked status");
+              }
+              Object.assign(updateFields, intentPatch);
+              return intentPatch;
+            }
+          : undefined,
+        requireDependencyReady: isBlocked && (resumeRequested === true ||
+          (req.actor.type === "agent" && (reopenRequested === true ||
+            (agentStatusTransitionRequiresResumeAuthority && !plainBlockedCancellation)))),
+      } : null;
       const updateRawIssue = (tx?: Parameters<typeof svc.update>[2]) => {
         if (tx) {
           if (shouldCollectCompletionPublication) {

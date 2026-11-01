@@ -32,9 +32,13 @@ const mockIssueService = vi.hoisted(() => ({
 function readableMockIssueService() {
   return {
     ...mockIssueService,
-    updateReadable: async (id: string, patch: Record<string, unknown>, _read: unknown, ...args: unknown[]) => {
+    updateReadable: async (id: string, patch: Record<string, unknown>, read: {
+      resolveCommentReopen?: (issue: Record<string, unknown>, hasBlockers: boolean) => Record<string, unknown>;
+    }, ...args: unknown[]) => {
       const previousRelations = await mockIssueService.getRelationSummaries(id);
-      const receipt = await mockIssueService.update(id, patch, ...args);
+      const intentPatch = read.resolveCommentReopen?.(await mockIssueService.getByIdForUpdate(id, args[0]),
+        Array.isArray(patch.blockedByIssueIds) && patch.blockedByIssueIds.length > 0) ?? {};
+      const receipt = await mockIssueService.update(id, { ...patch, ...intentPatch }, ...args);
       return { ...receipt, previousRelations, publicReceipt: receipt };
     },
     getReadableRelationSummaries: async (id: string, options: { enrich?: (relations: unknown) => Promise<unknown> }) => {

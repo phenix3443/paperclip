@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
+import { eq } from "drizzle-orm";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -10,7 +11,10 @@ import {
   companies,
   companyMemberships,
   createDb,
+  executionWorkspaces,
+  workspaceOperations,
   heartbeatRuns,
+  heartbeatRunEvents,
   issueAccessGrants,
   issueComments,
   issueReferenceMentions,
@@ -27,6 +31,13 @@ import {
 vi.mock("../services/issue-assignment-wakeup.js", () => ({
   queueIssueAssignmentWakeup: vi.fn(),
 }));
+
+vi.mock("../services/heartbeat.js", async (importOriginal) => {
+  const original = await importOriginal<typeof import("../services/heartbeat.js")>();
+  return { ...original, heartbeatService: (...args: Parameters<typeof original.heartbeatService>) => ({
+    ...original.heartbeatService(...args), wakeup: vi.fn(async () => null),
+  }) };
+});
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -46,8 +57,8 @@ function agentActor(companyId: string, agentId: string): Express.Request["actor"
   return { type: "agent", agentId, companyId, runId: null, source: "agent_jwt" };
 }
 
-async function createApp(db: Db, actor: Express.Request["actor"]) {
-  const { issueRoutes } = await import("../routes/issues.js");
+async function createApp(db: Db, actor: Express.Request["actor"], routeModule?: string) {
+  const { issueRoutes } = await import(routeModule ?? "../routes/issues.js");
   const { projectRoutes } = await import("../routes/projects.js");
   const { activityRoutes } = await import("../routes/activity.js");
   const app = express();
@@ -60,7 +71,7 @@ async function createApp(db: Db, actor: Express.Request["actor"]) {
   app.use("/api", projectRoutes(db));
   app.use("/api", activityRoutes(db));
   app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-    res.status(err.status ?? 500).json({ error: err.message ?? "Internal server error" });
+    res.status(err.status ?? 500).json({ error: err.message ?? "Internal server error", ...(err.details ? { details: err.details } : {}) });
   });
   return app;
 }
@@ -79,11 +90,14 @@ describeEmbeddedPostgres("issue access grant and locked edge routes", { concurre
   }, 120_000);
 
   afterEach(async () => {
+    await db.delete(workspaceOperations);
+    await db.delete(executionWorkspaces);
     await db.delete(issueReferenceMentions);
     await db.delete(issueComments);
     await db.delete(issueRelations);
     await db.delete(activityLog);
     await db.delete(issueAccessGrants);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(projectAccessMembers);
@@ -256,6 +270,156 @@ describeEmbeddedPostgres("issue access grant and locked edge routes", { concurre
     expect(JSON.stringify(response.body)).not.toContain(fixture.privateIssueId);
   }, 20_000);
 
+  it.each(["blocked", "done"] as const)("uses the effective set for implicit comment reopen from %s", async (status) => {
+    const fixture = await seedFixture();
+    const { issueService } = await import("../services/issues.js");
+    const svc = issueService(db);
+    await svc.update(fixture.openIssue.id, { status, assigneeAgentId: fixture.assignedAgent.id,
+      blockedByIssueIds: [fixture.privateIssueId] });
+    const stageId = randomUUID();
+    const completedState = { status: "completed" as const, currentStageId: null, currentStageIndex: null,
+      currentStageType: null, currentParticipant: null, returnAssignee: null, completedStageIds: [stageId],
+      lastDecisionId: null, lastDecisionOutcome: "approved" as const, changesRequestedCount: 0 };
+    if (status === "done") await db.update(issues).set({
+      executionPolicy: { mode: "normal", stages: [{ id: stageId, type: "review",
+        participants: [{ type: "agent", agentId: fixture.sharedAgent.id }] }] },
+      executionState: completedState,
+    }).where(eq(issues.id, fixture.openIssue.id));
+    const app = await createApp(db, boardActor(fixture.companyId, fixture.memberId));
+    const retained = await request(app).patch(`/api/issues/${fixture.openIssue.id}`)
+      .send({ comment: "Dependency edit", blockedByIssueIds: [] });
+    expect(retained.status, JSON.stringify(retained.body)).toBe(200);
+    expect(retained.body.status).toBe(status);
+    if (status === "done") expect(retained.body.executionState).toEqual(completedState);
+    expect(JSON.stringify(retained.body)).not.toContain(fixture.privateIssueId);
+    await db.insert(issueAccessGrants).values({ issueId: fixture.privateIssueId,
+      subjectType: "user", subjectId: fixture.memberId, source: "explicit" });
+    const cleared = await request(app).patch(`/api/issues/${fixture.openIssue.id}`)
+      .send({ comment: "Dependencies cleared", blockedByIssueIds: [] });
+    expect(cleared.status, JSON.stringify(cleared.body)).toBe(200);
+    expect(cleared.body.status).toBe("todo");
+    if (status === "done") expect(cleared.body.executionState).toBeNull();
+    expect(cleared.body.changes.status).toEqual({ from: status, to: "todo" });
+    expect((await svc.getRelationSummaries(fixture.openIssue.id)).blockedBy).toEqual([]);
+  }, 20_000);
+
+  it.each([false, true])("resumes against the effective replacement with a readable blocker: %s", async (readable) => {
+    const fixture = await seedFixture();
+    const { issueService } = await import("../services/issues.js");
+    const svc = issueService(db);
+    await svc.update(fixture.openIssue.id, { status: "blocked", blockedByIssueIds: [fixture.privateIssueId] });
+    if (readable) await db.insert(issueAccessGrants).values({ issueId: fixture.privateIssueId,
+      subjectType: "user", subjectId: fixture.memberId, source: "explicit" });
+    const app = await createApp(db, boardActor(fixture.companyId, fixture.memberId));
+    const response = await request(app).patch(`/api/issues/${fixture.openIssue.id}`)
+      .send({ resume: true, comment: "Please continue", blockedByIssueIds: [], title: "Resumed" });
+    expect(response.status, JSON.stringify(response.body)).toBe(readable ? 200 : 409);
+    if (readable) {
+      expect(response.body).toMatchObject({ status: "todo", blockedByIssueIds: [] });
+      expect((await svc.getRelationSummaries(fixture.openIssue.id)).blockedBy).toEqual([]);
+    } else {
+      expect(JSON.stringify(response.body)).not.toContain(fixture.privateIssueId);
+      expect(await svc.getById(fixture.openIssue.id)).toMatchObject({ status: "blocked", title: "Open issue" });
+      expect((await svc.getRelationSummaries(fixture.openIssue.id)).blockedBy.map(row => row.id))
+        .toEqual([fixture.privateIssueId]);
+    }
+  }, 20_000);
+
+  it("retains the workspace-finalize barrier when resuming with a hidden done blocker", async () => {
+    const fixture = await seedFixture();
+    const { issueService } = await import("../services/issues.js");
+    const svc = issueService(db);
+    const [workspace] = await db.insert(executionWorkspaces).values({ companyId: fixture.companyId,
+      mode: "isolated", strategyType: "git_worktree", name: "Private blocker workspace" }).returning();
+    await db.update(issues).set({ status: "done", executionWorkspaceId: workspace!.id })
+      .where(eq(issues.id, fixture.privateIssueId));
+    await db.insert(workspaceOperations).values({ companyId: fixture.companyId,
+      executionWorkspaceId: workspace!.id, issueId: fixture.privateIssueId,
+      phase: "worktree_prepare", status: "succeeded" });
+    expect(await svc.getById(fixture.privateIssueId)).toMatchObject({ executionWorkspaceId: workspace!.id, status: "done" });
+    await svc.update(fixture.openIssue.id, { status: "blocked", blockedByIssueIds: [fixture.privateIssueId] });
+    expect(await svc.getDependencyReadiness(fixture.openIssue.id)).toMatchObject({ isDependencyReady: false,
+      pendingFinalizeBlockerIssueIds: [fixture.privateIssueId] });
+    const app = await createApp(db, boardActor(fixture.companyId, fixture.memberId));
+    const response = await request(app).patch(`/api/issues/${fixture.openIssue.id}`)
+      .send({ resume: true, comment: "Continue", blockedByIssueIds: [], title: "Must roll back" });
+    expect(response.status, JSON.stringify(response.body)).toBe(409);
+    expect(JSON.stringify(response.body)).not.toContain(fixture.privateIssueId);
+    expect(await svc.getById(fixture.openIssue.id)).toMatchObject({ status: "blocked", title: "Open issue" });
+    await db.insert(workspaceOperations).values({ companyId: fixture.companyId,
+      executionWorkspaceId: workspace!.id, issueId: fixture.privateIssueId,
+      phase: "workspace_finalize", status: "succeeded", startedAt: new Date(Date.now() + 1_000) });
+    const finalized = await request(app).patch(`/api/issues/${fixture.openIssue.id}`)
+      .send({ resume: true, comment: "Continue", blockedByIssueIds: [] });
+    expect(finalized.status, JSON.stringify(finalized.body)).toBe(200);
+    expect(finalized.body.status).toBe("todo");
+    expect(finalized.body.blockedByIssueIds).toEqual([]);
+    expect((await svc.getRelationSummaries(fixture.openIssue.id)).blockedBy.map(row => row.id))
+      .toEqual([fixture.privateIssueId]);
+  }, 20_000);
+
+  it.each([false, true])("uses grants committed before the replacement obtains its root lock: %s", async (grantBeforeRead) => {
+    const fixture = await seedFixture();
+    const { issueService } = await import("../services/issues.js");
+    const svc = issueService(db);
+    await svc.update(fixture.openIssue.id, { blockedByIssueIds: [fixture.privateIssueId] });
+    if (!grantBeforeRead) await db.insert(issueAccessGrants).values({ issueId: fixture.privateIssueId,
+      subjectType: "user", subjectId: fixture.memberId, source: "explicit" });
+    const app = await createApp(db, boardActor(fixture.companyId, fixture.memberId));
+    let release!: () => void, locked!: () => void, requested!: () => void;
+    const released = new Promise<void>(resolve => { release = resolve; });
+    const rootLocked = new Promise<void>(resolve => { locked = resolve; });
+    const lockRequested = new Promise<void>(resolve => { requested = resolve; });
+    const holding = db.transaction(async tx => {
+      await svc.getByIdForUpdate(fixture.openIssue.id, tx);
+      locked();
+      await released;
+    });
+    await rootLocked;
+    const previousDebug = db.$client.options.debug;
+    db.$client.options.debug = (_connection, query, parameters) => {
+      if (/for update/i.test(query) && parameters.includes(fixture.openIssue.id)) requested();
+    };
+    const replacing = request(app).patch(`/api/issues/${fixture.openIssue.id}`)
+      .send({ blockedByIssueIds: [] }).then(value => value);
+    try {
+      await lockRequested;
+      if (grantBeforeRead) await db.insert(issueAccessGrants).values({ issueId: fixture.privateIssueId,
+        subjectType: "user", subjectId: fixture.memberId, source: "explicit" });
+      else await db.update(issueAccessGrants).set({ revokedAt: new Date() })
+        .where(eq(issueAccessGrants.issueId, fixture.privateIssueId));
+      release();
+      await holding;
+      const result = await replacing;
+      expect(result.status, JSON.stringify(result.body)).toBe(200);
+      expect(result.body.blockedByIssueIds).toEqual([]);
+      expect((await svc.getRelationSummaries(fixture.openIssue.id)).blockedBy.map(row => row.id))
+        .toEqual(grantBeforeRead ? [] : [fixture.privateIssueId]);
+    } finally {
+      release();
+      await holding;
+      await replacing;
+      db.$client.options.debug = previousDebug;
+    }
+  }, 20_000);
+
+  it("does not count a removed readable blocker when validating entry into blocked", async () => {
+    const fixture = await seedFixture();
+    await db.insert(issueRelations).values({ companyId: fixture.companyId,
+      issueId: fixture.privateIssueId, relatedIssueId: fixture.openIssue.id, type: "blocks" });
+    await db.insert(issueAccessGrants).values({ issueId: fixture.privateIssueId,
+      subjectType: "user", subjectId: fixture.memberId, source: "explicit" });
+    const app = await createApp(db, boardActor(fixture.companyId, fixture.memberId));
+    const response = await request(app).patch(`/api/issues/${fixture.openIssue.id}`)
+      .send({ status: "blocked", blockedByIssueIds: [], title: "Must roll back" });
+    expect(response.status, JSON.stringify(response.body)).toBe(422);
+    const { issueService } = await import("../services/issues.js");
+    const svc = issueService(db);
+    expect(await svc.getById(fixture.openIssue.id)).toMatchObject({ status: "todo", title: "Open issue" });
+    expect((await svc.getRelationSummaries(fixture.openIssue.id)).blockedBy.map(row => row.id))
+      .toEqual([fixture.privateIssueId]);
+  }, 20_000);
+
   it("projects blocker audit references for the current reader while preserving internal facts", async () => {
     const fixture = await seedFixture();
     await db.insert(issueRelations).values({
@@ -311,6 +475,38 @@ describeEmbeddedPostgres("issue access grant and locked edge routes", { concurre
     expect((await svc.getRelationSummaries(fixture.openIssue.id)).blockedBy.map(row => row.id))
       .toEqual([fixture.privateIssueId]);
   }, 20_000);
+
+  it.skipIf(!process.env.PAPERCLIP_PATCH_COST_BASELINE)("compares rejected hidden-blocker resume HTTP costs with B0", async () => {
+    const fixture = await seedFixture();
+    const { issueService } = await import("../services/issues.js");
+    await issueService(db).update(fixture.openIssue.id, { status: "blocked", blockedByIssueIds: [fixture.privateIssueId] });
+    const actor = boardActor(fixture.companyId, fixture.memberId);
+    const apps = { B0: await createApp(db, actor, process.env.PAPERCLIP_PATCH_COST_BASELINE),
+      WIP: await createApp(db, actor, process.env.PAPERCLIP_PATCH_COST_WIP ?? process.env.PAPERCLIP_PATCH_COST_BASELINE),
+      candidate: await createApp(db, actor) };
+    const samples: Record<string, Array<{ elapsedMs: number; queries: Array<{ query: string; parameters: unknown[] }> }>> = { B0: [], WIP: [], candidate: [] };
+    const previousDebug = db.$client.options.debug;
+    try {
+      for (let round = -2; round < 10; round += 1) {
+        for (const name of (round % 2 === 0 ? ["B0", "WIP", "candidate"] : ["candidate", "WIP", "B0"]) as Array<keyof typeof apps>) {
+          const queries: Array<{ query: string; parameters: unknown[] }> = [];
+          db.$client.options.debug = (_connection, query, parameters) => { queries.push({ query, parameters }); };
+          const start = performance.now();
+          const response = await request(apps[name]).patch(`/api/issues/${fixture.openIssue.id}`)
+            .send({ resume: true, comment: "Continue", blockedByIssueIds: [] });
+          const elapsedMs = performance.now() - start;
+          expect(response.status, JSON.stringify(response.body)).toBe(409);
+          if (name === "candidate") expect(JSON.stringify(response.body)).not.toContain(fixture.privateIssueId);
+          if (round >= 0) samples[name].push({ elapsedMs, queries });
+        }
+      }
+      const report = { fixture: { issues: 3, privateProject: true, retainedHiddenBlocker: true },
+        scope: "HTTP handler and proof construction; authentication middleware is unmeasured", samples };
+      process.stdout.write(JSON.stringify({ patchResumeCosts: report }) + "\n");
+      expect(Math.max(...samples.candidate.map(row => row.queries.length)))
+        .toBeLessThanOrEqual(Math.min(...samples.B0.map(row => row.queries.length)));
+    } finally { db.$client.options.debug = previousDebug; }
+  }, 90_000);
 
   it("requires explicit owner/admin break-glass and records both audit evidence and an owner-visible notice", async () => {
     const fixture = await seedFixture();

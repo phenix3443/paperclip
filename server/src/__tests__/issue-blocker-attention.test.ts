@@ -1740,12 +1740,14 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     const blockedByIssueIds = withTarget ? [visibleId] : [];
     const previousDebug = db.$client.options.debug;
     const rollback = new Error("query probe rollback");
-    const measure = async (publicMode: boolean) => {
+    const measure = async (publicMode: boolean, prepared = false) => {
       let queries = 0;
       db.$client.options.debug = () => { queries += 1; };
       try {
         await db.transaction(async tx => {
-          if (publicMode) await svc.updateReadable(rootId, { blockedByIssueIds }, { readCondition }, tx);
+          if (publicMode) await svc.updateReadable(rootId, { blockedByIssueIds }, {
+            readCondition, ...(prepared ? { resolveCommentReopen: () => ({}) } : {}),
+          }, tx);
           else await svc.update(rootId, { blockedByIssueIds }, tx);
           throw rollback;
         });
@@ -1758,9 +1760,11 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     };
     const rawQueries = await measure(false);
     const publicQueries = await measure(true);
+    const preparedQueries = await measure(true, true);
+    expect(preparedQueries).toBeLessThanOrEqual(rawQueries);
     expect(rawQueries).toBeGreaterThan(0);
     expect(publicQueries).toBeLessThanOrEqual(rawQueries);
-    process.stdout.write(JSON.stringify({ replacementQueryProbe: { withTarget, rawQueries, publicQueries } }) + "\n");
+    process.stdout.write(JSON.stringify({ replacementQueryProbe: { withTarget, rawQueries, publicQueries, preparedQueries } }) + "\n");
   });
 
   it("omits unreadable direct and terminal relations while preserving raw relations", async () => {
