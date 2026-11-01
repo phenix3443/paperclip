@@ -44,6 +44,20 @@ function isPackageRelativePath(file: string): boolean {
   return file !== "" && !file.includes("\\") && !path.posix.isAbsolute(file) && path.posix.normalize(file) === file && !file.split("/").includes("..");
 }
 
+const YAML_SCALAR = String.raw`(?:"([^"]*)"|'([^']*)'|([^\s"'#:{}\[\],](?:[^#:]*[^\s#:])?))`;
+const YAML_VALUE = String.raw`(?:"([^"]*)"|'([^']*)'|([^\s"'#{}\[\],](?:[^#]*[^\s#])?))`;
+const YAML_KEY = new RegExp(String.raw`^${YAML_SCALAR}\s*:`);
+const YAML_ENTRY = new RegExp(String.raw`^\s+${YAML_SCALAR}\s*:(?:\s+${YAML_VALUE})?\s*(?:#.*)?$`);
+const MENTIONS_POSTGRES = /(?:^|[\s"'{,])postgres@/;
+
+function yamlScalar(match: RegExpExecArray, first: number): string {
+  return match[first] ?? match[first + 1] ?? match[first + 2] ?? "";
+}
+
+function unparsedPatch(workspaceFile: string, line: string): Error {
+  return new Error(`Cannot parse the postgres patch configuration in ${workspaceFile}: ${line.trim()}`);
+}
+
 function postgresPatchEntries(checkoutPath: string): [string, string][] {
   const manifest = readJson(path.join(checkoutPath, "package.json"), "checkout package.json");
   if (!isRecord(manifest)) throw new Error(`Checkout package.json in ${checkoutPath} is not an object.`);
@@ -55,10 +69,18 @@ function postgresPatchEntries(checkoutPath: string): [string, string][] {
   if (fs.existsSync(workspaceFile)) {
     let section = "";
     for (const line of fs.readFileSync(workspaceFile, "utf8").split(/\r?\n/)) {
-      if (/^[^\s#]/.test(line)) section = line.split(":")[0].trim();
+      if (line.trim() === "" || line.trim().startsWith("#")) continue;
+      if (/^\S/.test(line)) {
+        const header = YAML_KEY.exec(line);
+        section = header ? yamlScalar(header, 1) : "";
+        if (section === "patchedDependencies" && MENTIONS_POSTGRES.test(line.slice(header![0].length))) throw unparsedPatch(workspaceFile, line);
+        continue;
+      }
       if (section !== "patchedDependencies") continue;
-      const match = /^\s*["']?(postgres@[^"':\s]+)["']?\s*:\s*["']?([^"'\s#]*)["']?\s*(?:#.*)?$/.exec(line);
-      if (match) entries.push([match[1], match[2]]);
+      const entry = YAML_ENTRY.exec(line);
+      const key = entry ? yamlScalar(entry, 1) : "";
+      if (entry && key.startsWith("postgres@")) entries.push([key, yamlScalar(entry, 4)]);
+      else if (!entry && MENTIONS_POSTGRES.test(line)) throw unparsedPatch(workspaceFile, line);
     }
   }
   return entries;

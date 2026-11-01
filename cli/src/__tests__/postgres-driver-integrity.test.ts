@@ -363,6 +363,52 @@ describe("checkout postgres driver expectation", () => {
     expect(() => readCheckoutPostgresDriver(checkout)).toThrow(/postgres@3\.4\.8 do not match the installed/);
   });
 
+  describe("with patch configuration only in pnpm-workspace.yaml", () => {
+    const spacedPatch = "patches/postgres patched.patch";
+
+    beforeEach(() => {
+      writeJson("package.json", { name: "paperclip" });
+      fs.copyFileSync(path.join(checkout, REPO_PATCH), path.join(checkout, spacedPatch));
+    });
+
+    it("reads a quoted section, a quoted key and a quoted path containing a space", () => {
+      writeWorkspace(`"patchedDependencies":\n  "postgres@${EXPECTED.version}": "${spacedPatch}" # patched driver\n`);
+      expect(readCheckoutPostgresDriver(checkout)).toEqual(EXPECTED);
+    });
+
+    it("reads a single-quoted key and an unquoted path containing a space", () => {
+      writeWorkspace(`patchedDependencies:\n  'postgres@${EXPECTED.version}': ${spacedPatch}\n`);
+      expect(readCheckoutPostgresDriver(checkout)).toEqual(EXPECTED);
+    });
+
+    it("rejects a quoted path containing a space whose patch file is missing instead of treating it as unpatched", () => {
+      fs.rmSync(path.join(checkout, spacedPatch));
+      writeWorkspace(`patchedDependencies:\n  postgres@${EXPECTED.version}: "${spacedPatch}"\n`);
+      expect(() => readCheckoutPostgresDriver(checkout)).toThrow(/Checkout patch for postgres@.* is missing: patches\/postgres patched\.patch/);
+    });
+
+    it("rejects a quoted section whose patch file is missing instead of treating it as unpatched", () => {
+      fs.rmSync(path.join(checkout, REPO_PATCH));
+      writeWorkspace(`"patchedDependencies":\n  postgres@${EXPECTED.version}: ${REPO_PATCH}\n`);
+      expect(() => readCheckoutPostgresDriver(checkout)).toThrow(/Checkout patch for postgres@.* is missing/);
+    });
+
+    it("rejects a flow mapping that names postgres", () => {
+      writeWorkspace(`patchedDependencies: { postgres@${EXPECTED.version}: ${REPO_PATCH} }\n`);
+      expect(() => readCheckoutPostgresDriver(checkout)).toThrow(/Cannot parse the postgres patch configuration/);
+    });
+
+    it("rejects a postgres line it cannot parse", () => {
+      writeWorkspace(`patchedDependencies:\n  postgres@${EXPECTED.version} ${REPO_PATCH}\n`);
+      expect(() => readCheckoutPostgresDriver(checkout)).toThrow(/Cannot parse the postgres patch configuration/);
+    });
+
+    it("rejects a postgres entry without a patch path", () => {
+      writeWorkspace(`patchedDependencies:\n  postgres@${EXPECTED.version}:\n`);
+      expect(() => readCheckoutPostgresDriver(checkout)).toThrow(/Checkout patch for postgres@.* is missing: no path/);
+    });
+  });
+
   it("rejects a configured patch file that does not exist", () => {
     fs.rmSync(path.join(checkout, REPO_PATCH));
     expect(() => readCheckoutPostgresDriver(checkout)).toThrow(/Checkout patch for postgres@.* is missing/);
