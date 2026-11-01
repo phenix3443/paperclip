@@ -1,0 +1,122 @@
+name: Fixed original CI merge-tree comparison
+run-name: '${{ inputs.execution_key }} / ${{ inputs.expected_control_sha }}'
+on:
+  workflow_dispatch:
+    inputs:
+      expected_control_sha:
+        description: Exact independently approved diagnostic commit
+        required: true
+        type: string
+      execution_key:
+        description: Recorded one-time execution key
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: original-ci-41235773036-comparison-1
+  cancel-in-progress: false
+jobs:
+  compare:
+    if: github.repository == 'phenix3443/paperclip' && github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - { arm: base, lane: chat, sha: 75fa37f30fc1e65d1e936fcc58ad507cb53f88bb }
+          - { arm: merge, lane: chat, sha: 9535ae08127e8ea4e4b951e77d21bb23763be002 }
+          - { arm: base, lane: e2e, sha: 75fa37f30fc1e65d1e936fcc58ad507cb53f88bb }
+          - { arm: merge, lane: e2e, sha: 9535ae08127e8ea4e4b951e77d21bb23763be002 }
+    steps:
+      - name: Initialize bounded evidence and validate dispatch
+        env:
+          EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+          EXECUTION_KEY: ${{ inputs.execution_key }}
+        run: |
+          set -euo pipefail
+          echo "COMPARISON_START_MS=$(date +%s%3N)" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/ci-merge-tree/sanitized"
+          echo '{"result":"setup_not_completed","evidence":"incomplete"}' > "$RUNNER_TEMP/ci-merge-tree/sanitized/status.json"
+          [[ "$GITHUB_SHA" == "$EXPECTED_CONTROL_SHA" ]]
+          [[ "$GITHUB_REF" =~ ^refs/tags/ci-merge-tree-[a-zA-Z0-9.-]+$ ]]
+          [[ "$EXECUTION_KEY" == 'original-ci-41235773036-attempt-1-comparison-1' ]]
+      - name: Checkout reviewed control bytes
+        id: control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: phenix3443/paperclip
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
+      - name: Checkout immutable upstream source
+        id: source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: paperclipai/paperclip
+          ref: ${{ matrix.sha }}
+          fetch-depth: 2
+          path: source
+          persist-credentials: false
+      - name: Install exact Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24.11.0
+          package-manager-cache: false
+      - name: Install exact pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86
+        with:
+          version: 9.15.4
+          run_install: false
+      - name: Execute one lane and finalize evidence
+        id: execute
+        env:
+          EXPECTED_CONTROL_SHA: ${{ inputs.expected_control_sha }}
+          EXECUTION_KEY: ${{ inputs.execution_key }}
+          ARM: ${{ matrix.arm }}
+          LANE: ${{ matrix.lane }}
+        run: node control/scripts/ci-merge-tree/run.mjs "$ARM" "$LANE" "$GITHUB_WORKSPACE/source" "$RUNNER_TEMP/ci-merge-tree" "$COMPARISON_START_MS"
+      - name: Verify safe upload set
+        id: seal
+        if: always() && steps.control.outcome == 'success'
+        env:
+          CHECKOUT_OUTCOME: ${{ steps.source.outcome }}
+        run: node control/scripts/ci-merge-tree/seal.mjs "$RUNNER_TEMP/ci-merge-tree/sanitized" "$CHECKOUT_OUTCOME"
+      - name: Seal minimal evidence when control checkout fails
+        id: fallback
+        if: always() && steps.control.outcome != 'success'
+        run: |
+          python3 - <<'PYCODE'
+          import os, json, hashlib
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'ci-merge-tree' / 'sanitized'
+          root.mkdir(parents=True, exist_ok=True)
+          files = {'status.json': {'result': 'control_checkout_failure', 'evidence': 'incomplete'}, 'capture-gaps.json': [{'kind': 'control_unavailable'}]}
+          manifest = []
+          for name, value in files.items():
+              data = json.dumps(value).encode()
+              (root / name).write_bytes(data)
+              manifest.append({'name': name, 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
+          (root / 'manifest.json').write_text(json.dumps({'schema': 1, 'files': manifest}))
+          PYCODE
+      - name: Upload only sanitized evidence
+        id: upload
+        if: always() && (steps.seal.outcome == 'success' || steps.fallback.outcome == 'success')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: original-ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.arm }}-${{ matrix.lane }}
+          path: ${{ runner.temp }}/ci-merge-tree/sanitized/
+          retention-days: 7
+          compression-level: 6
+          if-no-files-found: error
+          include-hidden-files: false
+      - name: Preserve execution and upload conclusions
+        if: always()
+        env:
+          EXECUTION_OUTCOME: ${{ steps.execute.outcome }}
+          UPLOAD_OUTCOME: ${{ steps.upload.outcome }}
+        run: |
+          [[ "$EXECUTION_OUTCOME" == 'success' && "$UPLOAD_OUTCOME" == 'success' ]]
+          node -e 'const fs=require("node:fs");const s=JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP+"/ci-merge-tree/sanitized/status.json"));if(s.evidence==="incomplete")process.exit(1)'

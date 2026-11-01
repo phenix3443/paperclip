@@ -6,6 +6,10 @@ import { isNode24ImageTag } from "./node-image-policy.mjs";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const expectedEngine = ">=24.11.0";
 const expectedTypes = "^24.0.0";
+const fixedDiagnosticWorkflows = new Set([
+  ".github/workflows/ci-merge-tree-check.yml",
+  ".github/workflows/ci-merge-tree-comparison.yml",
+]);
 const failures = [];
 const skippedDirectories = new Set([".git", ".paperclip", "coverage", "data", "dist", "node_modules"]);
 
@@ -44,6 +48,7 @@ walk(workflowRoot, (filePath) => {
     ? /(?:^|\n)  runner_binaries:\n[\s\S]*?(?=\n  [a-z_]+:\n|$)/.exec(source)
     : null;
   for (const match of source.matchAll(/node-version:\s*["']?([^\s"'#]+)/g)) {
+    if (match[1] === "24.11.0" && fixedDiagnosticWorkflows.has(relative(filePath))) continue;
     if (match[1] === "24.21.0" && packProducer
       && match.index >= packProducer.index
       && match.index < packProducer.index + packProducer[0].length) continue;
