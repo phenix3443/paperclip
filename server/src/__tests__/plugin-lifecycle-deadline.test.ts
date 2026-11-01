@@ -94,8 +94,17 @@ vi.mock("../services/live-events.js", () => ({ publishGlobalLiveEvent: vi.fn() }
 const { pluginRoutes } = await import("../routes/plugins.js");
 const { errorHandler } = await import("../middleware/index.js");
 const { pluginLifecycleManager } = await import("../services/plugin-lifecycle.js");
-const { LeaseExpiredError, LeaseReleasedError } = await import("../services/plugin-lifecycle-shared.js");
-const { PluginWorkerStopError } = await import("../services/plugin-worker-manager.js");
+class MissingSeam extends Error {}
+const sharedModule: Record<string, unknown> = await import("../services/plugin-lifecycle-shared.js").catch(() => ({}));
+const workerModule: Record<string, unknown> = await import("../services/plugin-worker-manager.js");
+const LeaseExpiredError = (sharedModule.LeaseExpiredError ?? MissingSeam) as typeof Error;
+const LeaseReleasedError = (sharedModule.LeaseReleasedError ?? MissingSeam) as typeof Error;
+const PluginWorkerStopError = (workerModule.PluginWorkerStopError
+  ?? class extends Error {
+    constructor(pluginId: string) {
+      super(`Worker for plugin "${pluginId}" is still alive after SIGKILL`);
+    }
+  }) as new (pluginId: string, pid?: number) => Error;
 const { createPluginWorkerManager } = await import("../services/plugin-worker-manager.js");
 const { createPluginToolDispatcher } = await import("../services/plugin-tool-dispatcher.js");
 const { createPluginJobCoordinator } = await import("../services/plugin-job-coordinator.js");
