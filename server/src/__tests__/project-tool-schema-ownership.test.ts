@@ -82,6 +82,12 @@ describe("project tool input contract", () => {
     expect(projectToolDefinitions("standard", true).map(tool => tool.name)).toEqual(available);
   });
 
+  it("does not suppress a failing discovery error handler", () => {
+    faults.add("create_project");
+    expect(() => projectToolDefinitions("standard", true, () => { throw new Error("warning sink unavailable"); }))
+      .toThrow("warning sink unavailable");
+  });
+
   it.each(["standard", "planning", "conversation", "ask"])("keeps %s tool visibility with and without task context", mode => {
     for (const task of [false, true]) {
       const tools = projectToolDefinitions(mode, task).map(tool => tool.name);
