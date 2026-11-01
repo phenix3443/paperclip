@@ -11,7 +11,10 @@ const mockRegistry = vi.hoisted(() => ({
 }));
 
 const mockLifecycle = vi.hoisted(() => ({
-  exclusive: vi.fn((_key: string, _kind: string, fn: (lease: object) => Promise<unknown>) => fn({})),
+  exclusive: vi.fn((_key: string, _kind: string, fn: (lease: object) => Promise<unknown>) =>
+    fn({ assertActive: () => undefined, assertCleanup: () => undefined })),
+  responseDeadline: vi.fn(() => Date.now() + 60_000),
+  isFenced: vi.fn(() => false),
   load: vi.fn(),
   upgrade: vi.fn(),
   unload: vi.fn(),
@@ -236,6 +239,7 @@ describe("plugin install and upgrade authz", () => {
     expect(loader.prepareInstall).toHaveBeenCalledWith({
       packageName: "paperclip-plugin-example",
       version: undefined,
+      signal: expect.any(AbortSignal),
     });
     expect(loader.persistInstall).toHaveBeenCalledWith(discovered);
     expect(mockLifecycle.exclusive).toHaveBeenCalledWith("paperclip.example", "A", expect.any(Function));
@@ -321,9 +325,10 @@ describe("plugin install and upgrade authz", () => {
     expect(uninstallRes.status).toBe(200);
     expect(mockRegistry.getById).not.toHaveBeenCalled();
     expect(mockRegistry.getByKey).toHaveBeenCalledWith(pluginKey);
-    expect(mockLifecycle.disable).toHaveBeenCalledWith(pluginId, undefined);
-    expect(mockLifecycle.enable).toHaveBeenCalledWith(pluginId);
-    expect(mockLifecycle.unload).toHaveBeenCalledWith(pluginId, true);
+    const deadline = { deadlineAt: expect.any(Number) };
+    expect(mockLifecycle.disable).toHaveBeenCalledWith(pluginId, undefined, deadline);
+    expect(mockLifecycle.enable).toHaveBeenCalledWith(pluginId, deadline);
+    expect(mockLifecycle.unload).toHaveBeenCalledWith(pluginId, true, deadline);
   }, 20_000);
 
   it("logs activity for disable and uninstall when the status is saved but teardown fails", async () => {
@@ -338,9 +343,11 @@ describe("plugin install and upgrade authz", () => {
     const disableRes = await request(app).post(`/api/plugins/${pluginId}/disable`).send({});
     const uninstallRes = await request(app).delete(`/api/plugins/${pluginId}`);
 
-    expect(disableRes.status).toBe(400);
+    expect(disableRes.status).toBe(500);
+    expect(disableRes.body).toMatchObject({ code: "plugin_quiescence_failed" });
     expect(disableRes.body.error).toContain("scheduler unavailable");
-    expect(uninstallRes.status).toBe(400);
+    expect(uninstallRes.status).toBe(500);
+    expect(uninstallRes.body).toMatchObject({ code: "plugin_quiescence_failed" });
     expect(vi.mocked(logActivity).mock.calls.map(([, entry]) => [entry.action, entry.details?.teardownError])).toEqual([
       ["plugin.disabled", expect.stringContaining("scheduler unavailable")],
       ["plugin.uninstalled", expect.stringContaining("worker still alive")],

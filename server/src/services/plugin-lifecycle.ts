@@ -48,8 +48,11 @@ import { badRequest, notFound } from "../errors.js";
 import { PluginTeardownError } from "./plugin-teardown-error.js";
 import { logger } from "../middleware/logger.js";
 import {
+  DEFAULT_PLUGIN_LIFECYCLE_RESPONSE_DEADLINE_MS,
   LeaseKeyMismatchError,
+  PluginLifecycleFencedError,
   pluginLifecycleSharedFor,
+  type PluginLifecycleRunOptions,
   type PluginLifecycleLease,
   type PluginLifecycleOpKind,
   type PluginLifecycleTimings,
@@ -162,6 +165,12 @@ type LifecycleEventPayload<K extends LifecycleEventName> = PluginLifecycleEvents
 
 export interface PluginLifecycleOpOptions {
   lease?: PluginLifecycleLease;
+  deadlineAt?: number;
+}
+
+export interface PluginLifecycleExclusiveOptions {
+  deadlineAt?: number;
+  pluginId?: () => string | undefined;
 }
 
 export interface PluginLifecycleManager {
@@ -260,7 +269,12 @@ export interface PluginLifecycleManager {
     pluginKey: string,
     kind: PluginLifecycleOpKind,
     fn: (lease: PluginLifecycleLease) => Promise<T>,
+    options?: PluginLifecycleExclusiveOptions,
   ): Promise<T>;
+
+  responseDeadline(): number;
+
+  isFenced(pluginId: string): boolean;
 
   currentEpoch(pluginId: string): number;
 
@@ -459,12 +473,82 @@ export function pluginLifecycleManager(
     shared.emitAtRelease(op.lease, event, { ...payload, epoch: shared.currentEpoch(payload.pluginId), kind: op.kind });
   }
 
+  function fence(pluginId: string, reason: string): void {
+    shared.fenced.set(pluginId, reason);
+    shared.quiesced.add(pluginId);
+    workerManager?.revokeStarts?.(pluginId);
+    log.warn({ pluginId, reason }, "plugin lifecycle: plugin fenced");
+  }
+
+  function assertNotFenced(pluginId: string, pluginKey: string): void {
+    const reason = shared.fenced.get(pluginId);
+    if (reason !== undefined) throw new PluginLifecycleFencedError(pluginKey, reason);
+  }
+
+  function expiryHooks(
+    getPluginId: () => string | undefined,
+    kind: PluginLifecycleOpKind,
+  ): Pick<PluginLifecycleRunOptions, "onExpire" | "expiryCleanup"> {
+    let expiryStop: Promise<unknown> = Promise.resolve(null);
+    return {
+      onExpire() {
+        const pluginId = getPluginId();
+        if (!pluginId) return;
+        workerManager?.revokeStarts?.(pluginId);
+        shared.quiesced.add(pluginId);
+        shared.bumpEpoch(pluginId);
+        shared.withdraw(pluginId);
+        if (workerManager?.getWorker(pluginId)) {
+          expiryStop = workerManager.stopWorker(pluginId).then(() => null, (err: unknown) => err);
+        }
+      },
+      async expiryCleanup(lease, bodyError) {
+        const pluginId = getPluginId();
+        if (!pluginId) return;
+        const failures: unknown[] = [];
+        const stopError = await expiryStop;
+        if (stopError) failures.push(stopError);
+        const plugin = await registry.getById(pluginId).catch((err: unknown) => {
+          failures.push(err);
+          return null;
+        });
+        if (plugin) {
+          const op: LifecycleOp = { lease, kind: "Q" };
+          if (kind !== "Q" && isValidTransition(plugin.status, "error")) {
+            await runOp(pluginId, "Q", { lease }, async () => {
+              const teardownError = await tryDeactivatePluginRuntime(pluginId, plugin.pluginKey, op);
+              if (teardownError) failures.push(teardownError);
+              await transition(pluginId, "error", "lifecycle deadline expired", plugin, op);
+              emitDomain("plugin.error", { pluginId, pluginKey: plugin.pluginKey, error: "lifecycle deadline expired" }, op);
+            }).catch((err: unknown) => failures.push(err));
+          } else {
+            const teardownError = await tryDeactivatePluginRuntime(pluginId, plugin.pluginKey, op);
+            if (teardownError) failures.push(teardownError);
+            if (kind === "Q" && bodyError) failures.push(bodyError);
+          }
+        }
+        if (failures.length > 0) {
+          fence(pluginId, "lifecycle deadline expired and cleanup failed");
+          log.error({ pluginId, failures }, "plugin lifecycle: expiry cleanup failed");
+        } else {
+          shared.quiesced.add(pluginId);
+        }
+      },
+    };
+  }
+
   function exclusive<T>(
     pluginKey: string,
     kind: PluginLifecycleOpKind,
     fn: (lease: PluginLifecycleLease) => Promise<T>,
+    options?: PluginLifecycleExclusiveOptions,
   ): Promise<T> {
-    return shared.exclusive(pluginKey, kind, fn, lifecycleTimings?.queueWaitMs);
+    const getPluginId = options?.pluginId;
+    return shared.exclusive(pluginKey, kind, fn, {
+      queueWaitMs: lifecycleTimings?.queueWaitMs,
+      deadlineAt: options?.deadlineAt,
+      ...(getPluginId ? expiryHooks(getPluginId, kind) : {}),
+    });
   }
 
   async function runOp<T>(
@@ -479,10 +563,14 @@ export function pluginLifecycleManager(
       else lease.assertActive();
       const target = await requirePlugin(pluginId);
       if (target.pluginKey !== lease.pluginKey) throw new LeaseKeyMismatchError(lease.pluginKey, target.pluginKey);
+      if (kind === "A") assertNotFenced(pluginId, target.pluginKey);
       return body({ lease, kind });
     }
     const plugin = await requirePlugin(pluginId);
-    return exclusive(plugin.pluginKey, kind, (granted) => body({ lease: granted, kind }));
+    return exclusive(plugin.pluginKey, kind, (granted) => {
+      if (kind === "A") assertNotFenced(pluginId, plugin.pluginKey);
+      return body({ lease: granted, kind });
+    }, { deadlineAt: options?.deadlineAt, pluginId: () => pluginId });
   }
 
   function beginQuiescence(pluginId: string, op: LifecycleOp): void {
@@ -557,10 +645,27 @@ export function pluginLifecycleManager(
   ): Promise<unknown> {
     try {
       await deactivatePluginRuntime(pluginId, pluginKey, op);
-      return null;
     } catch (err) {
       return err ?? new Error(`Failed to deactivate plugin ${pluginKey}`);
     }
+    if (workerManager?.getWorker(pluginId)) {
+      return new Error(`Worker for plugin ${pluginKey} is still registered after teardown`);
+    }
+    return null;
+  }
+
+  async function quiesceRuntime(
+    pluginId: string,
+    pluginKey: string,
+    op: LifecycleOp,
+  ): Promise<unknown> {
+    const teardownError = await tryDeactivatePluginRuntime(pluginId, pluginKey, op);
+    if (teardownError) {
+      fence(pluginId, teardownError instanceof Error ? teardownError.message : String(teardownError));
+    } else {
+      shared.fenced.delete(pluginId);
+    }
+    return teardownError;
   }
 
   // -----------------------------------------------------------------------
@@ -641,7 +746,7 @@ export function pluginLifecycleManager(
         }
 
         beginQuiescence(pluginId, op);
-        const teardownError = await tryDeactivatePluginRuntime(pluginId, plugin.pluginKey, op);
+        const teardownError = await quiesceRuntime(pluginId, plugin.pluginKey, op);
         if (plugin.status === "disabled") {
           if (teardownError) throw new PluginTeardownError(plugin.pluginKey, teardownError);
           return plugin;
@@ -676,12 +781,12 @@ export function pluginLifecycleManager(
             emitDomain("plugin.unloaded", { pluginId, pluginKey: plugin.pluginKey, removeData: true }, op);
             return deleted as PluginRecord | null;
           }
-          const teardownError = await tryDeactivatePluginRuntime(pluginId, plugin.pluginKey, op);
+          const teardownError = await quiesceRuntime(pluginId, plugin.pluginKey, op);
           if (teardownError) throw new PluginTeardownError(plugin.pluginKey, teardownError);
           return plugin;
         }
 
-        const teardownError = await tryDeactivatePluginRuntime(pluginId, plugin.pluginKey, op);
+        const teardownError = await quiesceRuntime(pluginId, plugin.pluginKey, op);
         if (teardownError && removeData) throw teardownError;
         if (!teardownError) await pluginLoaderInstance.cleanupInstallArtifacts(plugin);
 
@@ -718,7 +823,7 @@ export function pluginLifecycleManager(
         // because we are intentionally taking the plugin offline.
         const plugin = await requirePlugin(pluginId);
         beginQuiescence(pluginId, op);
-        const teardownError = await tryDeactivatePluginRuntime(pluginId, plugin.pluginKey, op);
+        const teardownError = await quiesceRuntime(pluginId, plugin.pluginKey, op);
 
         const result = await transition(pluginId, "error", error, plugin, op);
         emitDomain("plugin.error", { pluginId, pluginKey: result.pluginKey, error }, op);
@@ -942,6 +1047,14 @@ export function pluginLifecycleManager(
     },
 
     exclusive,
+
+    responseDeadline(): number {
+      return Date.now() + (lifecycleTimings?.responseDeadlineMs ?? DEFAULT_PLUGIN_LIFECYCLE_RESPONSE_DEADLINE_MS);
+    },
+
+    isFenced(pluginId: string): boolean {
+      return shared.fenced.has(pluginId);
+    },
 
     currentEpoch(pluginId: string): number {
       return shared.currentEpoch(pluginId);

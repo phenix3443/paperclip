@@ -323,6 +323,8 @@ export interface PluginLoaderOptions {
  * Options for installing a single plugin package.
  */
 export interface PluginInstallOptions {
+  signal?: AbortSignal;
+
   /**
    * npm package name to install (e.g. "paperclip-plugin-linear" or "@acme/plugin-linear").
    * Either packageName or localPath must be set.
@@ -1224,7 +1226,8 @@ export function pluginLoader(
   async function fetchAndValidate(
     installOptions: PluginInstallOptions,
   ): Promise<DiscoveredPlugin> {
-    const { packageName, localPath, version, installDir } = installOptions;
+    const { packageName, localPath, version, installDir, signal } = installOptions;
+    signal?.throwIfAborted();
     if (prebuiltOnly && !localPath) throw new Error("Managed plugins must come from the current image catalog");
 
     if (!packageName && !localPath) {
@@ -1270,7 +1273,7 @@ export function pluginLoader(
         await execFileAsync(
           "npm",
           ["install", spec, "--prefix", targetInstallDir, "--save", "--ignore-scripts"],
-          { timeout: 120_000 }, // 2 minute timeout for npm install
+          { timeout: 120_000, signal }, // 2 minute timeout for npm install
         );
       } catch (err) {
         throw new Error(`npm install failed for ${spec}: ${String(err)}`);
@@ -1751,8 +1754,10 @@ export function pluginLoader(
       return this.persistInstall(await this.prepareInstall(installOptions));
     },
 
-    prepareInstall(installOptions: PluginInstallOptions): Promise<DiscoveredPlugin> {
-      return fetchAndValidate(installOptions);
+    async prepareInstall(installOptions: PluginInstallOptions): Promise<DiscoveredPlugin> {
+      const prepared = await fetchAndValidate(installOptions);
+      installOptions.signal?.throwIfAborted();
+      return prepared;
     },
 
     async persistInstall(discovered: DiscoveredPlugin): Promise<DiscoveredPlugin> {
@@ -2414,6 +2419,7 @@ export function pluginLoader(
       // worker's proactive company scopes before startup); no second listConfigs
       // round-trip is needed here.
       for (const row of configRows) {
+        options.lease?.assertActive();
         try {
           await workerManager.call(pluginId, "configChanged", {
             config: (row.configJson ?? {}) as Record<string, unknown>,
