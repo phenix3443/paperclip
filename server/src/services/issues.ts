@@ -5842,9 +5842,6 @@ function blockedChainOwner(
   const terminal = terminalBlockerIssueId
     ? issuesById.get(terminalBlockerIssueId)
     : undefined;
-  if (terminal && terminal.id !== row.id && terminal.visibility !== "open") {
-    return unknown;
-  }
   const actor = terminal ?? row;
   const agent = (agentId: string): IssueBlockedInboxOwner => ({
     type: "agent",
@@ -5899,6 +5896,7 @@ async function listIssueBlockedInboxAttentionMap(
   dbOrTx: any,
   companyId: string,
   issueRows: BlockedInboxIssueRow[],
+  readCondition?: SQL<boolean>,
 ): Promise<Map<string, IssueBlockedInboxAttention>> {
   const rowIssueIds = [...new Set(issueRows.map((row) => row.id))];
   const result = new Map<string, IssueBlockedInboxAttention>();
@@ -5907,7 +5905,7 @@ async function listIssueBlockedInboxAttentionMap(
   const [graphIssueRows, graphRelationRows, companyAgentRows] =
     await Promise.all([
       dbOrTx
-        .select()
+        .select({ ...getTableColumns(issues), readable: sql<boolean>`${readCondition ?? sql<boolean>`false`}` })
         .from(issues)
         .where(
           and(
@@ -5943,7 +5941,16 @@ async function listIssueBlockedInboxAttentionMap(
         .where(eq(agents.companyId, companyId)),
     ]);
 
-  const graphIssues = graphIssueRows as IssueRow[];
+  const graphIssues = graphIssueRows as Array<IssueRow & { readable: boolean | null }>;
+  const readableIds = new Set(graphIssues.filter((issue) => issue.readable === true).map((issue) => issue.id));
+  const readableIssue = (issueId: string | null | undefined) =>
+    issueId && readableIds.has(issueId) ? issuesById.get(issueId) : undefined;
+  const sampleIds = new Map<string, string | null>();
+  for (const issue of graphIssues) {
+    for (const sample of new Set([issue.id, issue.identifier].filter((value): value is string => !!value))) {
+      sampleIds.set(sample, sampleIds.has(sample) ? null : issue.id);
+    }
+  }
   const graphRelations = graphRelationRows as Array<{
     companyId: string;
     blockerIssueId: string;
@@ -6518,12 +6525,9 @@ async function listIssueBlockedInboxAttentionMap(
     const blockerCycle = blockerCycleByIssueId.get(row.id);
     if (row.status === "blocked" && blockerCycle) {
       const cycleIssues = blockerCycle.links.map((link) => link.issueId);
-      // Hidden issues are named generically and never chosen as owner.
       const visibleCycleIssue = (issueId: string) => {
         const issue = issuesById.get(issueId);
-        return issue && (issue.id === row.id || issue.visibility === "open")
-          ? issue
-          : undefined;
+        return issue && readableIds.has(issueId) ? issue : undefined;
       };
       const cycleLabel = (issueId: string) => {
         const issue = visibleCycleIssue(issueId);
@@ -6624,6 +6628,39 @@ async function listIssueBlockedInboxAttentionMap(
     }
   }
 
+  for (const [issueId, attention] of result) {
+    const chain = blockerAttentionByIssueId.get(issueId);
+    if (!chain || !["needs_attention", "stalled"].includes(chain.state)) continue;
+    if (!["blocked_by_dependency_cycle", "blocked_chain_stalled", "blocked_by_uninvokable_assignee",
+      "blocked_by_unassigned_issue", "blocked_by_assigned_backlog_issue", "blocked_by_cancelled_issue",
+      "invalid_review_participant", "in_review_without_action_path"].includes(attention.reason)) continue;
+    attention.sourceIssue = issueRef(readableIssue(attention.sourceIssue?.id));
+    if (attention.reason === "blocked_by_dependency_cycle") {
+      const cycle = blockerCycleByIssueId.get(issueId);
+      if (!cycle || !cycle.links.every((link) => readableIssue(link.issueId) && readableIssue(link.blockerIssueId))) {
+        attention.owner = { type: "unknown", agentId: null, userId: null, label: null };
+        attention.leafIssue = null;
+        attention.sampleIssueIdentifier = null;
+        attention.action = { label: "Inspect dependency cycle", detail: "A dependency cycle was detected. Some tasks cannot be displayed." };
+      }
+      continue;
+    }
+    const sample = attention.sampleIssueIdentifier;
+    const sampleReadable = Boolean(sample && readableIssue(sampleIds.get(sample)));
+    const terminal = readableIssue(attention.leafIssue?.id ?? chain.terminalBlockerIssueId);
+    attention.leafIssue = issueRef(readableIssue(attention.leafIssue?.id));
+    attention.recoveryIssue = issueRef(readableIssue(attention.recoveryIssue?.id));
+    attention.sampleIssueIdentifier = sampleReadable ? sample : null;
+    if (!terminal) {
+      attention.owner = { type: "unknown", agentId: null, userId: null, label: null };
+      attention.reason = "blocked_chain_stalled";
+      attention.severity = "high";
+      attention.stoppedSinceAt = isoDate(readableIssue(issueId)?.updatedAt);
+    }
+    if (!terminal || !sampleReadable) {
+      attention.action = { label: "Inspect blocker chain", detail: "Inspect the stalled blocker or review leaf and make the next owner/action explicit." };
+    }
+  }
   return result;
 }
 
@@ -6863,7 +6900,7 @@ async function listBlockedInboxIssues(
     blockedByMapForIssues(dbOrTx, companyId, issueIds),
     listIssueBlockerAttentionMap(dbOrTx, companyId, withRuns),
     listIssueReviewAttentionMap(dbOrTx, companyId, withRuns),
-    listIssueBlockedInboxAttentionMap(dbOrTx, companyId, withRuns),
+    listIssueBlockedInboxAttentionMap(dbOrTx, companyId, withRuns, filters?.readCondition),
     includeLiveDescendantSummary
       ? liveDescendantCountMapForIssues(dbOrTx, companyId, issueIds)
       : Promise.resolve(new Map<string, number>()),
@@ -6987,7 +7024,7 @@ async function countBlockedInboxIssues(
   if (rows.length === 0) return 0;
 
   const blockedInboxAttentionByIssueId =
-    await listIssueBlockedInboxAttentionMap(dbOrTx, companyId, rows);
+    await listIssueBlockedInboxAttentionMap(dbOrTx, companyId, rows, filters?.readCondition);
   const rawSearchInput = filters?.q?.trim() ?? "";
   const rawSearch = rawSearchInput.toLowerCase();
   const commentSearchMatchIssueIds = new Set<string>();
@@ -8743,7 +8780,7 @@ export function issueService(db: Db) {
         filters?.listProjection === "index" ? Promise.resolve(new Map<string, IssueBlockerAttention>()) : listIssueBlockerAttentionMap(db, companyId, withRuns),
         filters?.listProjection === "index" ? Promise.resolve(new Map<string, IssueReviewAttention>()) : listIssueReviewAttentionMap(db, companyId, withRuns),
         includeBlockedInboxAttention
-          ? listIssueBlockedInboxAttentionMap(db, companyId, withRuns)
+          ? listIssueBlockedInboxAttentionMap(db, companyId, withRuns, filters?.readCondition)
           : Promise.resolve(new Map<string, IssueBlockedInboxAttention>()),
       ]);
 
