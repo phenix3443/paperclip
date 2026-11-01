@@ -242,7 +242,10 @@ describe("plugin install and upgrade authz", () => {
       signal: expect.any(AbortSignal),
     });
     expect(loader.persistInstall).toHaveBeenCalledWith(discovered);
-    expect(mockLifecycle.exclusive).toHaveBeenCalledWith("paperclip.example", "A", expect.any(Function));
+    expect(mockLifecycle.exclusive).toHaveBeenCalledWith("paperclip.example", "A", expect.any(Function), {
+      deadlineAt: expect.any(Number),
+      pluginId: expect.any(Function),
+    });
     expect(mockLifecycle.load).toHaveBeenCalledWith(pluginId, { lease: expect.anything() });
   }, 20_000);
 
