@@ -3482,6 +3482,19 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
       for (const candidate of candidates) {
         let workspace = candidate.workspace;
         signal?.throwIfAborted();
+        // Retention is a permanent refusal, not a retry obligation. Settle it
+        // under the existing lifecycle lock, then reconsider on a native change.
+        // Destructive consumers still check again if this assessment allowed work.
+        const retentionHeld = await withExecutionWorkspaceLifecycleLock(db, workspace.id, async tx => {
+          const [fresh] = await tx.select().from(executionWorkspaces).where(and(
+            eq(executionWorkspaces.id, workspace.id), eq(executionWorkspaces.companyId, workspace.companyId),
+          ));
+          return !fresh || (await workspaceRetentionBlockingReasons(tx, fresh)).length > 0;
+        });
+        if (retentionHeld) {
+          result.skippedUndelivered += 1;
+          continue;
+        }
         // Trash deletion is part of compaction, so a sweep that skips compaction
         // also leaves leftover trash for a later sweep.
         if (options.compact !== false) await purgeCompactionTrashIfDue(workspace);

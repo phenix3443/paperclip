@@ -46,16 +46,32 @@ describe("detached repository custody", () => {
     return { file: path.join(directory, names[0]!), value: JSON.parse(await fs.readFile(path.join(directory, names[0]!), "utf8")) };
   }
   it("preserves dirty, ignored, stashed and private Git data by inode", async () => {
+    git(cwd, "init", "-q");
+    await fs.appendFile(path.resolve(cwd, git(cwd, "rev-parse", "--git-path", "info/exclude")), "\n/.paperclip-repositories/\n");
+    await fs.writeFile(path.join(source, "tracked"), "private commit"); git(source, "add", "."); git(source, "commit", "-qm", "unpublished work");
     await fs.writeFile(path.join(source, "tracked"), "stash"); git(source, "stash", "push", "-qm", "private stash");
     git(source, "update-ref", "refs/private/keep", "HEAD");
     await fs.writeFile(path.join(source, "tracked"), "dirty");
     await fs.writeFile(path.join(source, ".git", "info", "exclude"), "ignored\n");
     await fs.writeFile(path.join(source, "ignored"), "ignored bytes"); await fs.writeFile(path.join(source, "untracked"), "untracked bytes");
     const original = await fs.stat(source), stash = git(source, "stash", "list"), refs = git(source, "show-ref");
+    async function inventory(directory: string): Promise<Record<string, string>> {
+      const found: Record<string, string> = {};
+      async function walk(relative: string) {
+        const target = path.join(directory, relative), stat = await fs.lstat(target);
+        if (stat.isSymbolicLink()) found[relative] = `link:${await fs.readlink(target)}`;
+        else if (stat.isDirectory()) for (const child of (await fs.readdir(target)).sort()) await walk(path.join(relative, child));
+        else found[relative] = `${stat.dev}:${stat.ino}:${stat.mode}:${(await fs.readFile(target)).toString("base64")}`;
+      }
+      await walk(""); return found;
+    }
+    const before = await inventory(source);
     expect(await preserveDetachedRepositories({ cwd, active: new Set(), retention: scope })).toEqual([]);
     const { value } = await receipt();
     expect(value.state).toBe("retained"); expect(value.history.map((h: { state: string }) => h.state)).toEqual(["pending", "retained"]);
     expect((await fs.stat(value.destination)).ino).toBe(original.ino);
+    expect(await inventory(value.destination)).toEqual(before);
+    expect(git(cwd, "status", "--porcelain=v1", "--untracked-files=all", "--ignored")).toBe("");
     expect(git(value.destination, "stash", "list")).toBe(stash); expect(git(value.destination, "show-ref")).toBe(refs);
     for (const [file, bytes] of [["tracked", "dirty"], ["ignored", "ignored bytes"], ["untracked", "untracked bytes"]]) expect(await fs.readFile(path.join(value.destination, file!), "utf8")).toBe(bytes);
     expect(await fs.lstat(source).catch(() => null)).toBeNull();

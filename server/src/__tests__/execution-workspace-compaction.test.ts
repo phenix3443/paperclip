@@ -1,4 +1,5 @@
 import { receiptCases, retainedFixture } from "./helpers/detached-retention.js";
+import * as nestedWorktrees from "../services/nested-repository-worktrees.js";
 import * as retentionInspection from "../services/detached-repository-retention.js";
 import { EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { execFile } from "node:child_process";
@@ -8,7 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import {
   activityLog,
   agents,
@@ -267,6 +268,27 @@ describeEmbeddedPostgres("terminal workspace compaction", () => {
     expect(destroy).not.toHaveBeenCalled(); expect(await fs.readFile(path.join(retained, "unique"), "utf8")).toBe("legacy bytes");
   }, 30_000);
 
+  it.each([false, true])("settles retained history without another removal deadline (Git expiration %s)", async gitCacheExpirationEnabled => {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "retention-idle-")); tempDirs.add(home); vi.stubEnv("PAPERCLIP_HOME", home);
+    const seeded = await seedWorkspace();
+    await retainedFixture(db, { id: seeded.executionWorkspaceId, companyId: seeded.companyId,
+      sourceIssueId: seeded.sourceIssueId, cwd: seeded.worktreePath }, "retained");
+    const svc = service({ gitCacheExpirationEnabled });
+    expect(await svc.sweepTerminalWorkspaces()).toMatchObject({ compacted: 0, archived: 0 });
+    expect(await svc.nextTerminalWorkspaceSweepAt()).toBeNull();
+    // Passive scheduler queries must stay in memory once this cycle settles.
+    const selects = vi.spyOn(db, "select");
+    for (let i = 0; i < 3; i++) expect(await svc.nextTerminalWorkspaceSweepAt()).toBeNull();
+    expect(selects).not.toHaveBeenCalled(); selects.mockRestore();
+    await expectRegenerablePresent(seeded.worktreePath, true);
+    // A new native producer still causes the next sweep to do useful work.
+    const next = await seedWorkspace();
+    svc.terminalWorkspaceWorkSettled(new Set([`workspace:${next.executionWorkspaceId}`]));
+    expect(await svc.sweepTerminalWorkspaces()).toMatchObject({ compacted: 1 });
+    await expectRegenerablePresent(next.worktreePath, false);
+    expect(await svc.nextTerminalWorkspaceSweepAt()).not.toBeNull();
+  }, 30_000);
+
   it("refuses manual destruction when retention appears after readiness", async () => {
     const home = await fs.mkdtemp(path.join(os.tmpdir(), "retention-manual-")); tempDirs.add(home); vi.stubEnv("PAPERCLIP_HOME", home);
     const seeded = await seedWorkspace({ populate: false });
@@ -292,8 +314,14 @@ describeEmbeddedPostgres("terminal workspace compaction", () => {
       const seeded = await seedWorkspace({ populate: removal === "compaction" });
       const retained = await retainedFixture(db, { id: seeded.executionWorkspaceId, companyId: seeded.companyId,
         sourceIssueId: seeded.sourceIssueId, cwd: seeded.worktreePath }, state);
+      const readiness = await service().getCloseReadiness(seeded.executionWorkspaceId);
+      if (state !== null) expect(readiness?.blockingReasons.join(" ")).toContain(retained.file);
       const inspect = retentionInspection.inspectDetachedRepositoryRetention;
       const spy = vi.spyOn(retentionInspection, "inspectDetachedRepositoryRetention").mockImplementation(async (...args) => {
+        await db.transaction(async tx => {
+          const [lock] = await tx.execute(sql`select pg_try_advisory_xact_lock(hashtextextended(${`execution_workspace_lifecycle:${seeded.executionWorkspaceId}`}, 0)) as acquired`);
+          expect(lock?.acquired).toBe(false);
+        });
         const reasons = await inspect(...args);
         if (state !== null && reasons.length) {
           await fs.mkdir(retained.source, { recursive: true }); await fs.writeFile(path.join(retained.source, "late-unique"), "late unique bytes");
@@ -303,11 +331,13 @@ describeEmbeddedPostgres("terminal workspace compaction", () => {
       const removalHook = vi.fn(async () => {
         await fs.mkdir(retained.source, { recursive: true }); await fs.writeFile(path.join(retained.source, "hook-write"), "hook bytes");
       });
+      const releaseRefs = vi.spyOn(nestedWorktrees, "releaseNestedRepositoryWorktrees");
       const svc = service({ beforeWorktreeRemoval: removalHook, beforeWorkspaceCompactionMove: removalHook });
       try {
         await svc.sweepTerminalWorkspaces();
         if (state === null) expect(removalHook).toHaveBeenCalledTimes(1);
         else {
+          expect(releaseRefs).not.toHaveBeenCalled();
           expect(spy).toHaveBeenCalled(); expect(removalHook).not.toHaveBeenCalled();
           expect(await exists(seeded.worktreePath)).toBe(true);
           expect(await fs.readFile(path.join(retained.source, "late-unique"), "utf8")).toBe("late unique bytes");

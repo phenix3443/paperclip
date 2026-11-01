@@ -30,3 +30,13 @@ Those writes follow the checkout. Later path writes can recreate the old entry;
 they remain in place because retention history permanently blocks removal. A
 matching digest is diagnostic evidence only. No scan or repeated guard proves
 that unknown writers have stopped.
+
+Failed workspace persistence does not bypass retention: cleanup of a reconstructed
+workspace re-reads its native identity and history under the source and lifecycle
+locks before teardown or removal. Without a verified durable identity, the new
+directory remains in place and preparation reports the original persistence error.
+
+Retention refusal creates no removal retry deadline. The existing terminal worker
+reconsiders a held workspace when a native workspace or issue change triggers it;
+retained history alone does not keep the worker waking. Locked removal guards
+remain authoritative even if history appears after that scheduling assessment.

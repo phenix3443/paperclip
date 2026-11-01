@@ -1,4 +1,5 @@
-import { readExecutionWorkspaceLifecycleGeneration } from "../execution-workspace-lifecycle-state.js";
+import { metadataHasReopenPendingConsumption, readExecutionWorkspaceLifecycleGeneration } from "../execution-workspace-lifecycle-state.js";
+import { assertWorkspaceRetentionAllowsRemoval } from "../detached-repository-retention-guard.js";
 import { withExecutionWorkspaceLifecycleLock } from "../execution-workspace-lifecycle-lock.js";
 import { reserveFreshPluginTaskWorkspace, stageProviderFreshWorkspace } from "../provider-fresh-workspace.js";
 import { freshWorkspaceSchema, type PluginFreshWorkspace } from "@paperclipai/plugin-sdk";
@@ -966,38 +967,37 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
   } catch (error) {
     if (executionWorkspace.created) {
       try {
-        await cleanupExecutionWorkspaceArtifacts({
-          workspace: {
-            companyId: agent.companyId,
-            id:
-              reusableExistingExecutionWorkspace?.id ??
-              workspaceReuseRequest.requestedExecutionWorkspaceId ??
-              `transient-${run.id}`,
-            cwd: executionWorkspace.cwd,
-            providerType:
-              executionWorkspace.strategy === "git_worktree"
-                ? "git_worktree"
-                : "local_fs",
-            providerRef: executionWorkspace.worktreePath,
-            branchName: executionWorkspace.branchName,
-            repoUrl: executionWorkspace.repoUrl,
-            baseRef: executionWorkspace.repoRef,
-            projectId: resolvedProjectId,
-            projectWorkspaceId: resolvedProjectWorkspaceId,
-            sourceIssueId: issueRef?.id ?? null,
-            metadata: nextExecutionWorkspaceMetadata,
-          },
-          projectWorkspace: {
-            cwd: resolvedWorkspace.cwd,
-            cleanupCommand: null,
-          },
-          cleanupCommand: configSnapshot?.cleanupCommand ?? null,
-          teardownCommand:
-            configSnapshot?.teardownCommand ??
-            projectExecutionWorkspacePolicy?.workspaceStrategy
-              ?.teardownCommand ??
-            null,
-          recorder: workspaceOperationRecorder,
+        const previous = reusableExistingExecutionWorkspace ?? existingExecutionWorkspace;
+        // Failed persistence cannot confer ownership on a transient ID. Keep the
+        // realized directory when no native identity can be verified.
+        if (!previous || !lockedSourceIssueId) throw new Error("Workspace cleanup identity is unverified");
+        await withExecutionWorkspaceLifecycleLock(db, previous.id, async tx => {
+          const [workspace] = await tx.select().from(executionWorkspacesTable).where(and(
+            eq(executionWorkspacesTable.companyId, agent.companyId), eq(executionWorkspacesTable.id, previous.id),
+          ));
+          if (!workspace || workspace.sourceIssueId !== lockedSourceIssueId || workspace.cwd !== executionWorkspace.cwd
+            || (workspace.providerRef && workspace.providerRef !== executionWorkspace.cwd)
+            || workspace.providerType !== (executionWorkspace.strategy === "git_worktree" ? "git_worktree" : "local_fs")
+            || !["active", "idle", "in_review"].includes(workspace.status) || workspace.closedAt
+            || metadataHasReopenPendingConsumption(workspace.metadata)
+            || readExecutionWorkspaceLifecycleGeneration(workspace.metadata) !== readExecutionWorkspaceLifecycleGeneration(previous.metadata)) {
+            throw new Error("Workspace cleanup identity changed");
+          }
+          await assertWorkspaceRetentionAllowsRemoval(tx, workspace);
+          await cleanupExecutionWorkspaceArtifacts({
+            workspace,
+            projectWorkspace: {
+              cwd: resolvedWorkspace.cwd,
+              cleanupCommand: null,
+            },
+            cleanupCommand: configSnapshot?.cleanupCommand ?? null,
+            teardownCommand:
+              configSnapshot?.teardownCommand ??
+              projectExecutionWorkspacePolicy?.workspaceStrategy
+                ?.teardownCommand ??
+              null,
+            recorder: workspaceOperationRecorder,
+          });
         });
       } catch (cleanupError) {
         logger.warn(

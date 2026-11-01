@@ -263,6 +263,8 @@ describeEmbeddedPostgres("reconstructable Git expiration", () => {
 
   it("keeps active repository bytes, excludes and local settings unchanged during retention", async () => {
     const f = await nestedFixture();
+    const legacy = path.join(f.cwd, ".paperclip-runtime", "detached-repositories", "old", "unique");
+    await fs.mkdir(path.dirname(legacy), { recursive: true }); await fs.writeFile(legacy, "legacy bytes must stay\n");
     const removed = path.join(f.cwd, ".paperclip-repositories", "removed"); git(f.cwd, "clone", "-q", f.nestedRemote, removed);
     await fs.writeFile(path.join(removed, "private"), "removed bytes");
     async function inventory(directory: string): Promise<Record<string, string>> {
@@ -287,6 +289,11 @@ describeEmbeddedPostgres("reconstructable Git expiration", () => {
     const [file] = (await fs.readdir(directory)).filter(name => name.endsWith(".json"));
     const receipt = JSON.parse(await fs.readFile(path.join(directory, file!), "utf8")); expect(receipt.state).toBe("retained");
     expect(await fs.readFile(path.join(receipt.destination, "private"), "utf8")).toBe("removed bytes");
+    expect(await fs.readFile(legacy, "utf8")).toBe("legacy bytes must stay\n");
+    const readiness = await executionWorkspaceService(db).getCloseReadiness(f.workspaceId);
+    expect(readiness?.blockingReasons.join(" ")).toContain(path.dirname(path.dirname(legacy)));
+    expect(await f.expire()).toMatchObject({ expired: false, skipReason: "detached_repository_retention" });
+    expect(await fs.readFile(legacy, "utf8")).toBe("legacy bytes must stay\n");
   });
 
   it("expires a nested workspace and its unused private base with the generated ignore entry", async () => {

@@ -30,7 +30,7 @@ type Input = { cwd: string; active: ReadonlySet<string>; retention?: CustodyScop
 async function git(cwd: string, args: string[]) {
   return (await execFile("git", ["-c", "core.fsmonitor=false", "-c", `core.hooksPath=${os.devNull}`, "-C", cwd, ...args], {
     timeout: 60_000, maxBuffer: 16 * 1024 * 1024,
-    env: { ...sanitizeRuntimeServiceBaseEnv(process.env), GIT_TERMINAL_PROMPT: "0" },
+    env: { ...sanitizeRuntimeServiceBaseEnv(process.env), GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0" },
   })).stdout;
 }
 async function stat(target: string) {
