@@ -59,6 +59,10 @@ controls.push(expect({ entry: "paperclipai runtime setup pi", mode: "cli", exit:
   timedOut: piSetup.error?.code === "ETIMEDOUT", stdout: piReceipt?.status ?? "", receipt: piReceipt,
   stderr: (piSetup.stderr ?? String(piSetup.error ?? "")).slice(-2000) },
   piSetup.status === 0 && piReceipt?.status === "installed_verified"));
+let reverified = null;
+try { reverified = (await verifyPostgresDriverPayload(prefix)).length; } catch (error) { reverified = String(error?.message ?? error).slice(0, 2000); }
+controls.push(expect({ entry: "verify payload again after runtime setup pi", mode: "reuse", exit: typeof reverified === "number" ? 0 : 1,
+  stdout: typeof reverified === "number" ? `${reverified} callers` : reverified }, reverified === resolutions.length));
 for (const { import: esm, require: cjs } of resolutions) {
   for (const entry of [esm, cjs]) {
     const closed = runProbe(entry, "closed"), live = runProbe(entry, "live");
