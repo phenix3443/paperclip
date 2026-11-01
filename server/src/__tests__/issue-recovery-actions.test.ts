@@ -1283,10 +1283,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       participants: [{ type: "agent", agentId: f.managerId }] }] })!;
     const submitted = applyIssueExecutionPolicyTransition({ issue: original, policy, requestedStatus: "done",
       actor: { agentId: f.coderId, userId: null }, requestedAssigneePatch: {} });
-    // Preserve the cross-agent legacy assignment before admission computes G0.
     await db.update(issues).set({ ...submitted.patch, executionPolicy: policy, assigneeAgentId: f.coderId })
       .where(eq(issues.id, f.sourceIssueId));
-    // Keep automatic completion recovery parked until this test calls the real reconciler.
     const [question] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId,
       issueId: f.sourceIssueId, kind: "ask_user_questions", status: "pending", continuationPolicy: "wake_assignee",
       payload: { version: 1, questions: [{ id: "scope", prompt: "Continue?", selectionMode: "single", required: true,
@@ -1334,7 +1332,6 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
 
-    // Rejection of legacy evidence remains explicit; only restore the real admitted source afterward.
     for (const missing of ["identity", "generation"] as const) {
       const context = { ...source.contextSnapshot };
       if (missing === "generation") delete context.reviewerAssignmentGeneration;

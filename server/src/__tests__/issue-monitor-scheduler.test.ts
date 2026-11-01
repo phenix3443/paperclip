@@ -498,7 +498,6 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     const [original] = await db.select().from(issues).where(eq(issues.id, issueId));
     const submitted = applyIssueExecutionPolicyTransition({ issue: original, policy, requestedStatus: "done",
       requestedAssigneePatch: {}, actor: { agentId: assigneeAgentId }, commentBody: "Ready for review" });
-    // Keep the cross-agent legacy assignment before the real admission stamps G0.
     await db.update(issues).set({ ...submitted.patch, assigneeAgentId }).where(eq(issues.id, issueId));
     const [question] = await db.insert(issueThreadInteractions).values({ companyId, issueId,
       kind: "ask_user_questions", status: "pending", continuationPolicy: "wake_assignee", createdByAgentId: assigneeAgentId,
