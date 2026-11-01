@@ -105,6 +105,42 @@ currently check identity/version, not Postgres content. `deploy.py` adds its own
 approval/receipt checks. Read its code and `docs/paperclip/patched-release.md`
 only for ownership; do not invoke it, even with `--check`, in this task.
 
+## Revision: one patched root driver (supersedes items 1 and 2)
+
+This revision replaces the Postgres carrier chosen in items 1 and 2 below; the
+goal, the verifier contract in items 3 and 4 and every other gate stay.
+
+Bundling the patched driver inside db and the CLI breaks the real final graph.
+`drizzle-orm/postgres-js/driver.js` starts with a top-level `import "postgres"`.
+npm hoists `drizzle-orm` to the install root, so it resolves Postgres from the
+root `node_modules`, where no copy remains once db and the CLI nest theirs. The
+public-install verifier failed exactly there:
+`Cannot find package 'postgres' imported from /consumer/node_modules/drizzle-orm/postgres-js/driver.js`.
+Bundling `drizzle-orm` as well would create a second drizzle copy shared by the
+server's queries and db's schema, which is a compatibility risk this fix should
+not take.
+
+Instead:
+
+1. Keep db and the CLI on the ordinary `postgres` dependency. The installer
+   packs the workspace driver after the frozen install has applied the
+   repository patch (`npm pack` of the patched package directory) and adds that
+   tarball to the payload install and to `payload-packages.json`. npm installs
+   it as the single root copy and deduplicates the `^3.4.9` ranges of db, the
+   CLI and the drizzle peer onto it. The tarball is distributed only inside the
+   payload; it is never published to, or overwrites, the public registry
+   package of the same name and version.
+2. The tarball shares the registry name and version, so identity is proven by
+   bytes, not by version: record the registry tarball, the source patch, the
+   patched tarball and the four driver files, with expected hashes from the
+   independent reference.
+3. The verifier requires exactly one Postgres copy, at the payload root, with
+   the patched bytes, and requires that db, the CLI and every installed
+   `drizzle-orm/postgres-js` driver resolve both ESM and CommonJS entries to
+   that one physical package. It does not assume where npm puts `drizzle-orm`.
+   Final-install checks also import `@paperclipai/db` and `@paperclipai/server`
+   for real, and the public-install verifier consumes the delivered tarball set.
+
 ## Smallest proposed implementation
 
 Use the existing bundled-package module and patch selector. Do not add a runtime

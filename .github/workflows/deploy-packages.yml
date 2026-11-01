@@ -12,6 +12,13 @@ on:
     paths:
       - .github/workflows/deploy-packages.yml
       - cli/src/commands/install.ts
+      - cli/src/postgres-driver-integrity.ts
+      - packages/db/package.json
+      - patches/postgres@*.patch
+      - scripts/generate-npm-package-json.mjs
+      - scripts/postgres-close-probe.mjs
+      - scripts/prepare-bundled-package.mjs
+      - scripts/verify-postgres-final-install.mjs
   workflow_dispatch:
 
 permissions:
@@ -118,6 +125,27 @@ jobs:
             console.log(`${manifest.files.length} packages for ${manifest.sha} (${manifest.version})`);
           '
           du -sh "$PACKAGES_DIR"
+
+      - name: Verify postgres in clean final installs
+        run: |
+          set -o pipefail
+          umask 022
+          npm install --global npm@11.19.0 --no-audit --no-fund
+          pinned_node() { npm exec --yes --package=node@24.22.1 -- node "$@"; }
+          pinned_node --version && npm --version
+          for attempt in 1 2; do
+            HOME="$RUNNER_TEMP/final-home-$attempt" pinned_node scripts/verify-postgres-final-install.mjs \
+              "$PACKAGES_DIR" "$RUNNER_TEMP/final-install-$attempt" 2>&1 | tee "$RUNNER_TEMP/final-install-$attempt.log"
+          done
+          node -e '
+            const fs = require("node:fs");
+            const pick = report => JSON.stringify({ expectedDriver: report.expectedDriver, resolutions: report.resolutions,
+              controls: report.controls.map(({ entry, mode, exit, stdout, nullWrite }) => ({ entry, mode, exit, stdout, nullWrite })) });
+            const [first, second] = [1, 2].map(attempt => JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/final-install-${attempt}/report.json`, "utf8")));
+            if (first.failures || second.failures || pick(first) !== pick(second)) throw new Error("clean final installs disagree");
+            console.log(JSON.stringify(first, null, 2));
+          ' | tee "$RUNNER_TEMP/postgres-final-install.json"
+          { echo "## Postgres final install"; echo; echo '```json'; cat "$RUNNER_TEMP/postgres-final-install.json"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
       # Diagnostics only: the report never fails the job.
       - name: Report memory
