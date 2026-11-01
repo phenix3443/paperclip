@@ -1,6 +1,6 @@
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { activityLog, connectionGrants, createDb, databaseWorkPending, issueThreadInteractions, toolApplications, toolConnections, toolProfiles, type Db } from "@paperclipai/db";
+import { activityLog, connectionGrants, createDb, databaseWorkPending, issueThreadInteractions, toolApplications, toolConnections, toolPolicies, toolProfiles, type Db } from "@paperclipai/db";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../services/delivery-work-notifications.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { arrangeOAuthCallback, OAUTH_CALLBACK_MODES, type OAuthCallbackMode } from "./helpers/oauth-callback-delivery-fixture.js";
@@ -118,12 +118,13 @@ describePostgres("direct OAuth callback transactions notify the connection deliv
   });
 
   it.each([
-    ...MODES.flatMap(mode => ["narrowed policy", "changed tool"].map(gap => [mode, gap] as const)),
+    ...MODES.flatMap(mode => ["narrowed policy", "weaker permission", "changed tool"].map(gap => [mode, gap] as const)),
     ["direct organization", "ambiguous identity"] as const,
   ])("%s callback with %s notifies without retiring the card", async (mode, gap) => {
     fixture = await arrangeOAuthCallback(db, mode);
     const f = fixture;
     if (gap === "narrowed policy") await db.update(toolProfiles).set({ defaultAction: "deny" }).where(eq(toolProfiles.companyId, f.companyId));
+    if (gap === "weaker permission") await db.insert(toolPolicies).values({ companyId: f.companyId, name: "Ask first", policyType: "require_approval", selectors: { issueId: f.issueId } });
     if (gap === "changed tool") await db.update(issueThreadInteractions).set({ payload: { ...f.intent.payload, accessRequest: { connectionId: f.connection.id,
       tools: [{ catalogEntryId: f.tool.id, toolName: "different-tool", versionHash: "v1", permission: "allowed" }] } } }).where(eq(issueThreadInteractions.id, f.intent.id));
     if (gap === "ambiguous identity") await db.insert(connectionGrants).values({ companyId: f.companyId, connectionId: f.connection.id, kind: "organization", status: "active" });
@@ -132,6 +133,7 @@ describePostgres("direct OAuth callback transactions notify the connection deliv
     await f.callback();
     await delivery.settle(baseline + 1);
     await expectEffects(f, delivery, false);
+    expect(isolated.grantNotifications).toBe(mode === "direct organization" ? 1 : 0);
   });
 
   it.each(MODES)("%s callback followed by a duplicate notification retires the card once", async mode => {
