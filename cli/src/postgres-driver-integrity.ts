@@ -145,6 +145,24 @@ function inventoryPackages(nodeModules: string, inventory: PackageInventory = []
   return inventory;
 }
 
+function packageRootOf(location: string): string | null {
+  let directory = path.dirname(location);
+  for (let parent = path.dirname(directory); parent !== directory; directory = parent, parent = path.dirname(directory)) {
+    const name = path.basename(directory);
+    if (name.startsWith(".") || name === "node_modules") continue;
+    if (path.basename(parent) === "node_modules" && !name.startsWith("@")) return directory;
+    if (path.basename(parent).startsWith("@") && path.basename(path.dirname(parent)) === "node_modules") return directory;
+  }
+  return null;
+}
+
+function isSamePackageFileLink(payloadRoot: string, location: string, target: string): boolean {
+  const owner = packageRootOf(location);
+  if (!owner || !inside(payloadRoot, owner) || !inside(owner, target) || !fs.statSync(target).isFile()) return false;
+  const nested = (candidate: string) => path.relative(owner, candidate).split(path.sep).includes("node_modules");
+  return !nested(location) && !nested(target);
+}
+
 function findForbiddenLinks(payloadRoot: string): string[] {
   const forbidden: string[] = [];
   const pending = [payloadRoot];
@@ -156,7 +174,8 @@ function findForbiddenLinks(payloadRoot: string): string[] {
       else if (entry.isSymbolicLink()) {
         const binLink = path.basename(directory) === ".bin" && path.basename(path.dirname(directory)) === "node_modules";
         const target = fs.existsSync(location) ? fs.realpathSync(location) : null;
-        if (!binLink || !target || !inside(payloadRoot, target) || fs.statSync(location).isDirectory()) forbidden.push(location);
+        const allowedBinLink = binLink && target !== null && inside(payloadRoot, target) && !fs.statSync(location).isDirectory();
+        if (!allowedBinLink && !(target !== null && isSamePackageFileLink(payloadRoot, location, target))) forbidden.push(location);
       }
     }
   }
