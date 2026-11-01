@@ -6,7 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
-import { GIT_PAYLOAD_SKILL_PACKAGES, packGitPayload, prepareGitPayloadSkills } from "../cli/src/commands/install.ts";
+import { GIT_PAYLOAD_SKILL_PACKAGES, packGitPayload, prepareGitPayloadSkills, unifyGitPayloadVersions } from "../cli/src/commands/install.ts";
 import { readCheckoutPostgresDriver, readPostgresDriverRecord, verifyPostgresDriverPayload } from "../cli/src/postgres-driver-integrity.ts";
 
 const execFileAsync = promisify(execFile);
@@ -85,6 +85,7 @@ try {
   await runCommand("corepack", ["pnpm", "-r", "--filter", "@paperclipai/server...", "--if-present", "run", "build"], { cwd: repoRoot, maxBuffer: 32 * 1024 * 1024 });
   await runCommand("bash", ["scripts/prepare-server-ui-dist.sh"], { cwd: repoRoot, env: { ...process.env, PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }, maxBuffer: 32 * 1024 * 1024 });
   prepareGitPayloadSkills(repoRoot);
+  await unifyGitPayloadVersions(repoRoot, runCommand);
   const { version, expected } = await packGitPayload({ checkoutPath: repoRoot, stagingRoot, stagedPayload, runCommand });
   const checkoutExpected = readCheckoutPostgresDriver(repoRoot);
   if (JSON.stringify(expected) !== JSON.stringify(checkoutExpected)) throw new Error("packGitPayload expectation differs from the checkout driver.");
@@ -104,6 +105,12 @@ try {
     const driver = path.relative(stagedPayload, path.join(copy, "postgres-js", "driver.js"));
     if (!verifiedDrizzle.has(driver)) throw new Error(`drizzle-orm copy ${path.relative(stagedPayload, copy)} was not verified.`);
   }
+  const [serverCopy] = packageCopies(stagedPayload, "@paperclipai/server");
+  const sdkCopies = packageCopies(stagedPayload, "@paperclipai/plugin-sdk");
+  const sdkRange = serverCopy && JSON.parse(fs.readFileSync(path.join(serverCopy, "package.json"), "utf8")).dependencies?.["@paperclipai/plugin-sdk"];
+  const sdkVersion = sdkCopies.length === 1 && JSON.parse(fs.readFileSync(path.join(sdkCopies[0], "package.json"), "utf8")).version;
+  if (!sdkRange || sdkCopies.length !== 1 || sdkRange !== sdkVersion) throw new Error(`server depends on @paperclipai/plugin-sdk ${sdkRange}; payload has ${sdkCopies.length} copies at ${sdkVersion}.`);
+  console.log(`server @paperclipai/plugin-sdk ${sdkRange} matches the installed ${path.relative(stagedPayload, sdkCopies[0])}@${sdkVersion}`);
   verifySkills(stagedPayload);
   const cliVersion = JSON.parse(fs.readFileSync(path.join(repoRoot, "cli", "package.json"), "utf8")).version;
   const { stdout } = await runCommand(path.join(stagedPayload, "node_modules", ".bin", "paperclipai"), ["--version"], { cwd: workRoot });
