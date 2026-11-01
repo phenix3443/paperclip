@@ -1959,7 +1959,7 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     } finally { restore?.(); release(); beforeClaimCheck = null; await Promise.all([wakePromise, explicitRetryPromise]); }
   });
 
-  it.each(["manual", "scheduled"] as const)("rejects an older queued wake and admits the consumed ordinary monitor generation (%s)", async mode => {
+  it.each(["manual", "scheduled", "scheduled-paused"] as const)("rejects an older queued wake and admits the consumed ordinary monitor generation (%s)", async mode => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const [author] = await db.insert(agents).values({ companyId, name: "Author", role: "engineer", adapterType: "codex_local" }).returning();
     const policy = normalizeIssueExecutionPolicy({ stages: [{ type: "review", participants: [{ type: "agent", agentId }] }] })!;
@@ -2001,6 +2001,22 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
           status: "pending", continuationPolicy: "wake_assignee", payload: { version: 1, prompt: "Keep review pending" }, createdByAgentId: agentId });
         return execute();
       });
+      if (mode === "scheduled-paused") {
+        await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+        try {
+          expect(await heartbeat.tickTimers(new Date())).toMatchObject({ enqueued: 0 });
+          const [held] = await db.select().from(issues).where(eq(issues.id, original.id));
+          expect(held).toMatchObject({ monitorNextCheckAt: installed!.monitorNextCheckAt, monitorWakeRequestedAt: null, monitorAttemptCount: 0 });
+          expect(held.executionPolicy).toEqual(installed!.executionPolicy);
+          expect(held.executionState).toEqual(installed!.executionState);
+          expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
+            .filter(run => run.contextSnapshot?.source === "issue.monitor")).toHaveLength(0);
+          expect(mockAdapterExecute).not.toHaveBeenCalled();
+        } finally {
+          await db.update(agents).set({ status: "idle" }).where(eq(agents.id, agentId));
+        }
+        return;
+      }
       if (mode === "manual") expect(await heartbeat.triggerIssueMonitor(original.id, { now: new Date(), actorType: "user", actorId: "responsible-user" })).toMatchObject({ outcome: "triggered" });
       else expect(await heartbeat.tickTimers(new Date())).toMatchObject({ enqueued: 1 });
       await drainHeartbeatRunsToQuiescence(db, heartbeat);
