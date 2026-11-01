@@ -40,5 +40,7 @@ readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line
     });
   } else if (message.method === "getData") {
     send({ jsonrpc: "2.0", id: message.id, result: { marker: process.env.BUNDLE_MARKER || null } });
+  } else if (message.id !== undefined && message.method) {
+    send({ jsonrpc: "2.0", id: message.id, error: { code: -32004, message: `${message.method} not implemented` } });
   }
 });
