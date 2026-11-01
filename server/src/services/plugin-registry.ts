@@ -150,7 +150,7 @@ export function pluginRegistryService(db: Db) {
       if (existing) {
         if (existing.status !== "uninstalled") {
           if (options.idempotent && sameBundledPluginRegistration(existing, input.packageName, manifest)) return existing;
-          throw conflict(`Plugin already installed: ${manifest.id}`);
+          throw conflict(`Plugin already installed: ${manifest.id}`, { code: "already_installed" });
         }
 
         // Reinstall after soft-delete: reactivate the existing row so plugin-scoped
@@ -198,7 +198,7 @@ export function pluginRegistryService(db: Db) {
         throw conflict(`Plugin registration differs from the current image: ${manifest.id}`);
       } catch (error) {
         if (isPluginKeyConflict(error)) {
-          throw conflict(`Plugin already installed: ${manifest.id}`);
+          throw conflict(`Plugin already installed: ${manifest.id}`, { code: "already_installed" });
         }
         throw error;
       }

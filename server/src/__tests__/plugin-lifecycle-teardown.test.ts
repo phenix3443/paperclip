@@ -13,6 +13,7 @@ vi.mock("../services/plugin-registry.js", () => ({
 import { pluginLifecycleManager } from "../services/plugin-lifecycle.js";
 import { PluginTeardownError } from "../services/plugin-teardown-error.js";
 import { pluginLoader, type PluginLoader, type PluginRuntimeServices } from "../services/plugin-loader.js";
+import { createPluginHostServiceCleanup } from "../services/plugin-host-service-cleanup.js";
 
 function plugin(status: string) {
   return { id: "plugin-1", pluginKey: "example.plugin", status, manifestJson: { id: "example.plugin" } };
@@ -109,5 +110,91 @@ describe("plugin lifecycle teardown failures", () => {
     expect(registered).toBe(false);
     expect(mockRegistry.uninstall).toHaveBeenCalledWith("plugin-1", true);
     expect(cleanupInstallArtifacts).toHaveBeenCalledTimes(1);
+  });
+
+  it("disposes host services inside teardown for disable, a repeated disable, restart and upgrade, keeping the new generation", async () => {
+    let row: Record<string, unknown> = plugin("ready");
+    mockRegistry.getById.mockImplementation(async () => row);
+    mockRegistry.updateStatus.mockImplementation(async (_id: string, patch: Record<string, unknown>) => {
+      row = { ...row, ...patch };
+      return row;
+    });
+    let running = false;
+    const workerManager = {
+      getWorker: () => (running ? { restart: vi.fn() } : undefined),
+      stopWorker: vi.fn(async () => {
+        running = false;
+      }),
+      revokeStarts: vi.fn(),
+      allowStarts: vi.fn(),
+    };
+    const disposers = new Map<string, () => void>();
+    let cleanup: ReturnType<typeof createPluginHostServiceCleanup> | undefined;
+    const runtime = {
+      workerManager,
+      jobScheduler: { unregisterPlugin: vi.fn().mockResolvedValue(undefined) },
+      eventBus: { clearPlugin: vi.fn() },
+      toolDispatcher: { unregisterPluginTools: vi.fn() },
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      disposeHostServices: (pluginId: string) => cleanup!.disposePlugin(pluginId),
+    } as unknown as PluginRuntimeServices;
+    const generations: Array<ReturnType<typeof vi.fn>> = [];
+    const activate = () => {
+      const dispose = vi.fn(() => {
+        expect(running).toBe(false);
+      });
+      generations.push(dispose);
+      cleanup!.register("plugin-1", dispose);
+      running = true;
+    };
+    const loader = pluginLoader({} as never, {}, runtime);
+    vi.spyOn(loader, "loadSingle").mockImplementation(async () => {
+      activate();
+      return { success: true, plugin: row, registered: {} } as never;
+    });
+    vi.spyOn(loader, "upgradePlugin").mockResolvedValue({
+      oldManifest: { capabilities: [], version: "1.0.0" },
+      newManifest: { capabilities: [], version: "1.1.0" },
+      discovered: { version: "1.1.0" },
+    } as never);
+    const lifecycle = pluginLifecycleManager({} as never, { loader, workerManager: workerManager as never });
+    cleanup = createPluginHostServiceCleanup(lifecycle, disposers);
+    activate();
+
+    await lifecycle.disable("plugin-1");
+    expect(generations[0]).toHaveBeenCalledTimes(1);
+    expect(disposers.size).toBe(0);
+
+    await lifecycle.disable("plugin-1");
+    expect(generations[0]).toHaveBeenCalledTimes(1);
+
+    await lifecycle.enable("plugin-1");
+    expect(generations).toHaveLength(2);
+    expect(generations[1]).not.toHaveBeenCalled();
+
+    await lifecycle.restartWorker("plugin-1");
+    expect(generations[1]).toHaveBeenCalledTimes(1);
+    expect(generations[2]).not.toHaveBeenCalled();
+
+    await lifecycle.upgrade("plugin-1");
+    expect(generations[2]).toHaveBeenCalledTimes(1);
+    expect(generations).toHaveLength(4);
+    expect(generations[3]).not.toHaveBeenCalled();
+    expect(disposers.get("plugin-1")).toBe(generations[3]);
+    expect(row.status).toBe("ready");
+  });
+
+  it("registering host services over a stale generation disposes the stale one", () => {
+    const disposers = new Map<string, () => void>();
+    const cleanup = createPluginHostServiceCleanup({ on: vi.fn(), off: vi.fn() }, disposers);
+    const stale = vi.fn();
+    const fresh = vi.fn();
+
+    cleanup.register("plugin-1", stale);
+    cleanup.register("plugin-1", fresh);
+
+    expect(stale).toHaveBeenCalledTimes(1);
+    expect(fresh).not.toHaveBeenCalled();
+    expect(disposers.get("plugin-1")).toBe(fresh);
   });
 });

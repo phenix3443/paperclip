@@ -115,6 +115,7 @@ describe("pluginLoader.loadAll error retry", () => {
     expect(runtimeServices.lifecycleManager.markError).toHaveBeenCalledWith(
       erroredPlugin.id,
       expect.stringContaining("Activation failed"),
+      { lease: undefined },
     );
   });
 

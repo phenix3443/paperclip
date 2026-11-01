@@ -50,6 +50,7 @@ import {
 } from "@paperclipai/shared";
 import { pluginRegistryService } from "../services/plugin-registry.js";
 import { pluginLifecycleManager } from "../services/plugin-lifecycle.js";
+import type { PluginLifecycleTimings } from "../services/plugin-lifecycle-shared.js";
 import { PluginTeardownError } from "../services/plugin-teardown-error.js";
 import {
   getPluginUiContributionMetadata,
@@ -96,7 +97,7 @@ import {
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import { secretService } from "../services/secrets.js";
-import { badRequest, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
+import { HttpError, badRequest, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
 
 /**
  * Floor: when the hosting operator hides the Plugins settings surface
@@ -539,13 +540,34 @@ export function pluginRoutes(
   toolDeps?: PluginRouteToolDeps,
   bridgeDeps?: PluginRouteBridgeDeps,
   toolGatewayDeps?: PluginRouteToolGatewayDeps,
+  lifecycleOptions?: { lifecycleTimings?: PluginLifecycleTimings },
 ) {
   const router = Router();
   const registry = pluginRegistryService(db);
   const lifecycle = pluginLifecycleManager(db, {
     loader,
     workerManager: bridgeDeps?.workerManager ?? webhookDeps?.workerManager,
+    lifecycleTimings: lifecycleOptions?.lifecycleTimings,
   });
+
+  function sendLifecycleError(res: Response, err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    if ((err as { code?: unknown } | null)?.code === "plugin_activation_failed") {
+      res.status(500).json({ error: message, code: "plugin_activation_failed" });
+      return;
+    }
+    const code = err instanceof HttpError
+      && typeof err.details === "object"
+      && err.details !== null
+      && "code" in err.details
+      ? (err.details as { code: unknown }).code
+      : undefined;
+    if (err instanceof HttpError && (err.status === 409 || err.status === 400) && typeof code === "string") {
+      res.status(err.status).json({ error: message, code });
+      return;
+    }
+    res.status(400).json({ error: message });
+  }
   const issuesSvc = issueService(db);
 
   function matchScopedApiRoute(route: PluginApiRouteDeclaration, method: string, requestPath: string) {
@@ -1245,17 +1267,20 @@ export function pluginRoutes(
         ? { localPath: canonicalLocalPath }
         : { packageName: trimmedPackage, version: version?.trim() };
 
-      const discovered = await loader.installPlugin(installOptions);
+      const prepared = await loader.prepareInstall(installOptions);
 
-      if (!discovered.manifest) {
+      if (!prepared.manifest) {
         res.status(500).json({ error: "Plugin installed but manifest is missing" });
         return;
       }
 
-      // Transition to ready state
-      const existingPlugin = await registry.getByKey(discovered.manifest.id);
+      const existingPlugin = await lifecycle.exclusive(prepared.manifest.id, "A", async (lease) => {
+        await loader.persistInstall(prepared);
+        const persisted = await registry.getByKey(prepared.manifest!.id);
+        if (persisted) await lifecycle.load(persisted.id, { lease });
+        return persisted;
+      });
       if (existingPlugin) {
-        await lifecycle.load(existingPlugin.id);
         const updated = await registry.getById(existingPlugin.id);
         await logPluginMutationActivity(req, "plugin.installed", existingPlugin.id, {
           pluginId: existingPlugin.id,
@@ -1271,8 +1296,7 @@ export function pluginRoutes(
         res.status(500).json({ error: "Plugin installed but not found in registry" });
       }
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      res.status(400).json({ error: message });
+      sendLifecycleError(res, err);
     }
   });
 
@@ -2068,8 +2092,7 @@ export function pluginRoutes(
         });
         publishGlobalLiveEvent({ type: "plugin.ui.updated", payload: { pluginId: plugin.id, action: "uninstalled" } });
       }
-      const message = err instanceof Error ? err.message : String(err);
-      res.status(400).json({ error: message });
+      sendLifecycleError(res, err);
     }
   });
 
@@ -2104,8 +2127,7 @@ export function pluginRoutes(
       publishGlobalLiveEvent({ type: "plugin.ui.updated", payload: { pluginId: plugin.id, action: "enabled" } });
       res.json(result);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      res.status(400).json({ error: message });
+      sendLifecycleError(res, err);
     }
   });
 
@@ -2149,8 +2171,7 @@ export function pluginRoutes(
         });
         publishGlobalLiveEvent({ type: "plugin.ui.updated", payload: { pluginId: plugin.id, action: "disabled" } });
       }
-      const message = err instanceof Error ? err.message : String(err);
-      res.status(400).json({ error: message });
+      sendLifecycleError(res, err);
     }
   });
 
@@ -2328,8 +2349,7 @@ export function pluginRoutes(
       publishGlobalLiveEvent({ type: "plugin.ui.updated", payload: { pluginId: plugin.id, action: "upgraded" } });
       res.json(result);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      res.status(400).json({ error: message });
+      sendLifecycleError(res, err);
     }
   });
 

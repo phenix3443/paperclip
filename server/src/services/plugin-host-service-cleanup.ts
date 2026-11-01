@@ -1,6 +1,7 @@
-import type { PluginLifecycleManager } from "./plugin-lifecycle.js";
+import type { PluginLifecycleEventGeneration, PluginLifecycleManager } from "./plugin-lifecycle.js";
 
-type LifecycleLike = Pick<PluginLifecycleManager, "on" | "off">;
+type LifecycleLike = Pick<PluginLifecycleManager, "on" | "off"> &
+  Partial<Pick<PluginLifecycleManager, "currentEpoch">>;
 
 export interface PluginWorkerRuntimeEvent {
   type: "plugin.worker.crashed" | "plugin.worker.restarted";
@@ -8,6 +9,8 @@ export interface PluginWorkerRuntimeEvent {
 }
 
 export interface PluginHostServiceCleanupController {
+  register(pluginId: string, dispose: () => void): void;
+  disposePlugin(pluginId: string): void;
   handleWorkerEvent(event: PluginWorkerRuntimeEvent): void;
   disposeAll(): void;
   teardown(): void;
@@ -26,18 +29,33 @@ export function createPluginHostServiceCleanup(
     }
   };
 
-  const handleWorkerStopped = ({ pluginId }: { pluginId: string }) => {
-    runDispose(pluginId);
+  const isStaleOrActivating = (payload: PluginLifecycleEventGeneration & { pluginId: string }) =>
+    payload.kind !== undefined
+    && (payload.kind !== "Q" || payload.epoch !== lifecycle.currentEpoch?.(payload.pluginId));
+
+  const handleWorkerStopped = (payload: PluginLifecycleEventGeneration & { pluginId: string }) => {
+    if (isStaleOrActivating(payload)) return;
+    runDispose(payload.pluginId);
   };
 
-  const handlePluginUnloaded = ({ pluginId }: { pluginId: string }) => {
-    runDispose(pluginId, true);
+  const handlePluginUnloaded = (payload: PluginLifecycleEventGeneration & { pluginId: string }) => {
+    if (isStaleOrActivating(payload)) return;
+    runDispose(payload.pluginId, true);
   };
 
   lifecycle.on("plugin.worker_stopped", handleWorkerStopped);
   lifecycle.on("plugin.unloaded", handlePluginUnloaded);
 
   return {
+    register(pluginId, dispose) {
+      runDispose(pluginId, true);
+      disposers.set(pluginId, dispose);
+    },
+
+    disposePlugin(pluginId) {
+      runDispose(pluginId, true);
+    },
+
     handleWorkerEvent(event) {
       if (event.type === "plugin.worker.crashed") {
         runDispose(event.pluginId);

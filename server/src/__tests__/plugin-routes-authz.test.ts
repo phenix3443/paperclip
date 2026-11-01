@@ -11,6 +11,7 @@ const mockRegistry = vi.hoisted(() => ({
 }));
 
 const mockLifecycle = vi.hoisted(() => ({
+  exclusive: vi.fn((_key: string, _kind: string, fn: (lease: object) => Promise<unknown>) => fn({})),
   load: vi.fn(),
   upgrade: vi.fn(),
   unload: vi.fn(),
@@ -61,6 +62,8 @@ async function createApp(
 
   const loader = {
     installPlugin: vi.fn(),
+    prepareInstall: vi.fn(),
+    persistInstall: vi.fn(),
     ...loaderOverrides,
   };
 
@@ -185,7 +188,7 @@ describe("plugin install and upgrade authz", () => {
       .send({ packageName: "paperclip-plugin-example" });
 
     expect(res.status).toBe(403);
-    expect(loader.installPlugin).not.toHaveBeenCalled();
+    expect(loader.prepareInstall).not.toHaveBeenCalled();
   }, 20_000);
 
   it("allows instance admins to install plugins", async () => {
@@ -219,7 +222,10 @@ describe("plugin install and upgrade authz", () => {
         isInstanceAdmin: true,
         companyIds: [],
       },
-      { installPlugin: vi.fn().mockResolvedValue(discovered) },
+      {
+        prepareInstall: vi.fn().mockResolvedValue(discovered),
+        persistInstall: vi.fn().mockResolvedValue(discovered),
+      },
     );
 
     const res = await request(app)
@@ -227,11 +233,13 @@ describe("plugin install and upgrade authz", () => {
       .send({ packageName: "paperclip-plugin-example" });
 
     expect(res.status).toBe(200);
-    expect(loader.installPlugin).toHaveBeenCalledWith({
+    expect(loader.prepareInstall).toHaveBeenCalledWith({
       packageName: "paperclip-plugin-example",
       version: undefined,
     });
-    expect(mockLifecycle.load).toHaveBeenCalledWith(pluginId);
+    expect(loader.persistInstall).toHaveBeenCalledWith(discovered);
+    expect(mockLifecycle.exclusive).toHaveBeenCalledWith("paperclip.example", "A", expect.any(Function));
+    expect(mockLifecycle.load).toHaveBeenCalledWith(pluginId, { lease: expect.anything() });
   }, 20_000);
 
   it("rejects plugin upgrades for non-admin board users", async () => {
@@ -1160,7 +1168,7 @@ describe("operator-hidden plugin management floor", () => {
       expect(res.status, `${name}: ${JSON.stringify(res.body)}`).toBe(403);
       expect(res.body.details, name).toMatchObject({ code: "settings_operator_managed" });
     }
-    expect(loader.installPlugin).not.toHaveBeenCalled();
+    expect(loader.prepareInstall).not.toHaveBeenCalled();
     expect(mockLifecycle.enable).not.toHaveBeenCalled();
     expect(mockLifecycle.disable).not.toHaveBeenCalled();
     expect(mockLifecycle.upgrade).not.toHaveBeenCalled();
