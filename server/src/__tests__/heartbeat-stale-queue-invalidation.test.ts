@@ -1931,6 +1931,28 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     } finally { restore?.(); release(); beforeClaimCheck = null; await wakePromise; }
   });
 
+  it("settles a manually admitted review from its linked operator receipt before comment authors", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const [author] = await db.insert(agents).values({ companyId, name: "Author", role: "engineer", adapterType: "codex_local" }).returning();
+    const policy = normalizeIssueExecutionPolicy({ stages: [{ type: "review", participants: [{ type: "agent", agentId }] }] })!;
+    const [original] = await db.insert(issues).values({ companyId, title: "Operator review identity",
+      status: "in_progress", assigneeAgentId: author.id, executionPolicy: policy }).returning();
+    const transition = applyIssueExecutionPolicyTransition({ issue: original, policy, requestedStatus: "done",
+      requestedAssigneePatch: {}, actor: { agentId: author.id }, commentBody: "Ready for review" });
+    await db.update(issues).set(transition.patch).where(eq(issues.id, original.id));
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: original.id,
+      authorUserId: "another-comment-author", body: "Additional context" }).returning();
+    const run = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "manual", manualUserWake: true,
+      requestedByActorType: "user", requestedByActorId: "responsible-user", payload: { issueId: original.id },
+      contextSnapshot: { issueId: original.id, wakeCommentId: message.id } });
+    expect(run).toBeTruthy();
+    const [task] = await db.select().from(issues).where(eq(issues.id, original.id));
+    expect(task.responsibleUserId).toBe("responsible-user");
+    expect(run!.contextSnapshot?.reviewerAssignmentGeneration).toBe(issueExecutionGeneration(task));
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    expect(countExecuteCallsForRun(run!.id)).toBe(1);
+  });
+
   it("stamps a submitted review after settling responsibility and ignores caller generation", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const [author] = await db.insert(agents).values({ companyId, name: "Author", role: "engineer", adapterType: "codex_local" }).returning();

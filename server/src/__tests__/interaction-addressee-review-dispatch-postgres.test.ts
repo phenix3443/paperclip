@@ -4,6 +4,7 @@ import request from "supertest";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  agentWakeupRequests,
   agents,
   authUsers,
   companies,
@@ -27,7 +28,7 @@ import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.j
 import { truncateTablesWithDeadlockRetry } from "./helpers/truncate-with-deadlock-retry.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
-  vi.fn(async () => ({
+  vi.fn(async (_context: unknown) => ({
     exitCode: 0,
     signal: null,
     timedOut: false,
@@ -333,6 +334,8 @@ describeEmbeddedPostgres("pending interaction addressee dispatch during review (
     const response = await request(app(f.actor)).post(`/api/issues/${f.issue.id}/interactions`).send(body);
     expect(response.status, JSON.stringify(response.body)).toBe(status);
     expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.companyId, f.companyId))).toHaveLength(0);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toHaveLength(0);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.addressee.id))).toHaveLength(0);
     expect(executeCallsForAgent(f.addressee.id)).toHaveLength(0);
     await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.run.id));
   });

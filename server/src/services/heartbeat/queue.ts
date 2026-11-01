@@ -4438,27 +4438,6 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             .returning()
             .then((rows) => rows[0]);
 
-          const reviewState = parseIssueExecutionState(issue.executionState);
-          if (newRun.retryOfRunId) {
-            const [sourceRun] = await tx.select().from(heartbeatRuns).where(and(
-              eq(heartbeatRuns.id, newRun.retryOfRunId), eq(heartbeatRuns.companyId, issue.companyId),
-              eq(heartbeatRuns.agentId, agentId))).for("no key update");
-            if (!sourceRun || boundRunIssueId(sourceRun) !== issue.id) throw conflict("Review retry source is unavailable");
-            const generation = sourceRun.contextSnapshot?.reviewerAssignmentGeneration;
-            const context = { ...newRun.contextSnapshot };
-            delete context.reviewerAssignmentGeneration;
-            if (typeof generation === "string") context.reviewerAssignmentGeneration = generation;
-            [newRun] = await tx.update(heartbeatRuns).set({ contextSnapshot: context })
-              .where(eq(heartbeatRuns.id, newRun.id)).returning();
-          } else if (issue.status === "in_review" && reviewState?.status === "pending" &&
-              reviewState.currentStageType === "review" && reviewState.currentParticipant?.type === "agent" &&
-              reviewState.currentParticipant.agentId === agentId) {
-            const settledIssue = await settleNewReviewRunIdentity(tx as unknown as Db, newRun, Boolean(failedChatRetry));
-            [newRun] = await tx.update(heartbeatRuns).set({ contextSnapshot: {
-              ...newRun.contextSnapshot, reviewerAssignmentGeneration: issueExecutionGeneration(settledIssue),
-            } }).where(eq(heartbeatRuns.id, newRun.id)).returning();
-          }
-
           if (ownsReconstructionContinuation) {
             await tx.update(issueRecoveryActions).set({ evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({
               continuationDelivery: "delivered", continuationRunId: newRun.id,
@@ -4504,6 +4483,27 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 payload: withQueuedCommentIdsInWakePayload(payload, adoptedCommentIds),
               })
               .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+          }
+
+          const reviewState = parseIssueExecutionState(issue.executionState);
+          if (newRun.retryOfRunId) {
+            const [sourceRun] = await tx.select().from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.id, newRun.retryOfRunId), eq(heartbeatRuns.companyId, issue.companyId),
+              eq(heartbeatRuns.agentId, agentId))).for("no key update");
+            if (!sourceRun || boundRunIssueId(sourceRun) !== issue.id) throw conflict("Review retry source is unavailable");
+            const generation = sourceRun.contextSnapshot?.reviewerAssignmentGeneration;
+            const context = { ...newRun.contextSnapshot };
+            delete context.reviewerAssignmentGeneration;
+            if (typeof generation === "string") context.reviewerAssignmentGeneration = generation;
+            [newRun] = await tx.update(heartbeatRuns).set({ contextSnapshot: context })
+              .where(eq(heartbeatRuns.id, newRun.id)).returning();
+          } else if (issue.status === "in_review" && reviewState?.status === "pending" &&
+              reviewState.currentStageType === "review" && reviewState.currentParticipant?.type === "agent" &&
+              reviewState.currentParticipant.agentId === agentId) {
+            const settledIssue = await settleNewReviewRunIdentity(tx as unknown as Db, newRun, Boolean(failedChatRetry));
+            [newRun] = await tx.update(heartbeatRuns).set({ contextSnapshot: {
+              ...newRun.contextSnapshot, reviewerAssignmentGeneration: issueExecutionGeneration(settledIssue),
+            } }).where(eq(heartbeatRuns.id, newRun.id)).returning();
           }
 
           // executionRunId is NOT stamped here (enqueueWakeup queues the run but
