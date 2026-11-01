@@ -92,6 +92,7 @@ const { pluginRoutes } = await import("../routes/plugins.js");
 const { errorHandler } = await import("../middleware/index.js");
 const { pluginLifecycleManager } = await import("../services/plugin-lifecycle.js");
 const { LeaseExpiredError, LeaseReleasedError } = await import("../services/plugin-lifecycle-shared.js");
+const { PluginWorkerStopError } = await import("../services/plugin-worker-manager.js");
 const { createPluginWorkerManager } = await import("../services/plugin-worker-manager.js");
 const { createPluginToolDispatcher } = await import("../services/plugin-tool-dispatcher.js");
 const { createPluginJobCoordinator } = await import("../services/plugin-job-coordinator.js");
@@ -233,10 +234,15 @@ async function createHarness(options: { hold?: string; queueWaitMs?: number; res
       }
     },
     async unloadSingle(id: string, pluginKey: string) {
-      await scheduler.unregisterPlugin(id);
+      const failures: unknown[] = [];
+      await scheduler.unregisterPlugin(id).catch((err: unknown) => void failures.push(err));
       toolDispatcher.unregisterPluginTools(pluginKey);
       state.calls.push(`tools:unregister:${pluginKey}`);
-      if (workerManager.getWorker(id)) await workerManager.stopWorker(id);
+      if (workerManager.getWorker(id)) {
+        state.calls.push(`worker:stop:${id}`);
+        await workerManager.stopWorker(id).catch((err: unknown) => void failures.push(err));
+      }
+      if (failures.length > 0) throw new AggregateError(failures, failures.map((f) => String(f)).join("; "));
     },
     async cleanupInstallArtifacts() {},
     async prepareInstall(installOptions: { packageName: string; signal?: AbortSignal }) {
@@ -278,6 +284,7 @@ async function createHarness(options: { hold?: string; queueWaitMs?: number; res
   return {
     app,
     loader,
+    scheduler,
     gate,
     workerManager,
     appLifecycle,
@@ -500,6 +507,54 @@ describe("plugin lifecycle response deadlines through the real route wiring", ()
     await expect(harness.appLifecycle.markError(row.id, "late", lease)).rejects.toBeInstanceOf(LeaseReleasedError);
     await expect(harness.appLifecycle.enable(row.id, lease)).rejects.toBeInstanceOf(LeaseReleasedError);
     expect(harness.gate.count("spawned")).toBe(0);
+  });
+
+
+  it("N13: a stop that is not proven answers 500, keeps the handle, fences enable, and a later disable clears the fence", async () => {
+    harness = await createHarness();
+    const row = seed("deadline.i", "disabled");
+    expect((await request(harness.app).post(`/api/plugins/${row.pluginKey}/enable`).send({})).status).toBe(200);
+    const pid = harness.workerManager.getWorker(row.id)!.diagnostics().pid;
+    const stop = vi.spyOn(harness.workerManager, "stopWorker").mockRejectedValueOnce(new PluginWorkerStopError(row.id, pid ?? undefined));
+
+    const failed = await request(harness.app).post(`/api/plugins/${row.pluginKey}/disable`).send({});
+    expect(failed.status).toBe(500);
+    expect(failed.body.code).toBe("plugin_quiescence_failed");
+    expect(harness.workerManager.getWorker(row.id)).toBeDefined();
+    expect(state.rows.get(row.id)!.status).toBe("disabled");
+    expect(harness.appLifecycle.isFenced(row.id)).toBe(true);
+
+    const fenced = await request(harness.app).post(`/api/plugins/${row.pluginKey}/enable`).send({});
+    expect(fenced.status).toBe(409);
+    expect(fenced.body.code).toBe("plugin_lifecycle_fenced");
+    expect(state.rows.get(row.id)!.status).toBe("disabled");
+
+    stop.mockRestore();
+    const retried = await request(harness.app).post(`/api/plugins/${row.pluginKey}/disable`).send({});
+    expect(retried.status).toBe(200);
+    expect(harness.workerManager.getWorker(row.id)).toBeUndefined();
+    expect(harness.appLifecycle.isFenced(row.id)).toBe(false);
+    expect((await request(harness.app).post(`/api/plugins/${row.pluginKey}/enable`).send({})).status).toBe(200);
+  });
+
+  it("N7d: a scheduler unregister failure still stops the worker, answers 500 quiescence failed, and a fixed retry clears the fence", async () => {
+    harness = await createHarness();
+    const row = seed("deadline.j", "disabled");
+    expect((await request(harness.app).post(`/api/plugins/${row.pluginKey}/enable`).send({})).status).toBe(200);
+    harness.scheduler.unregisterPlugin.mockRejectedValueOnce(new Error("scheduler unavailable"));
+    const callsBefore = state.calls.length;
+
+    const failed = await request(harness.app).post(`/api/plugins/${row.pluginKey}/disable`).send({});
+    expect(failed.status).toBe(500);
+    expect(failed.body.code).toBe("plugin_quiescence_failed");
+    expect(failed.body.error).toContain("scheduler unavailable");
+    expect(state.calls.slice(callsBefore)).toContain(`worker:stop:${row.id}`);
+    expect(harness.workerManager.getWorker(row.id)).toBeUndefined();
+    expect(harness.appLifecycle.isFenced(row.id)).toBe(true);
+
+    const retried = await request(harness.app).post(`/api/plugins/${row.pluginKey}/disable`).send({});
+    expect(retried.status).toBe(200);
+    expect(harness.appLifecycle.isFenced(row.id)).toBe(false);
   });
 
 });
