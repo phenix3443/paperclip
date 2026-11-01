@@ -21,7 +21,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { issueReadSqlCondition } from "../services/authorization.js";
+import { issueReadSqlCondition, issueReadSqlProof } from "../services/authorization.js";
 import { BLOCKER_ATTENTION_MAX_NODES, issueService } from "../services/issues.js";
 import { buildIssueGraphLivenessIncidentKey } from "../services/recovery/origins.js";
 
@@ -1538,16 +1538,96 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     const noise = Array.from({ length: 2050 }, () => ({ companyId, title: "Unrelated private task", status: "todo", visibility: "private", privacyParentIssueId: ancestry.at(-1) }));
     for (let index = 0; index < noise.length; index += 100) await db.insert(issues).values(noise.slice(index, index + 100));
     const readCondition = await issueReadSqlCondition(db, { type: "board", userId: "cost-reader", ignoreInstanceAdmin: true });
+    const readProof = process.env.PAPERCLIP_INBOX_FIXED_POINT
+      ? await issueReadSqlProof(db, { type: "board", userId: "cost-reader", ignoreInstanceAdmin: true }, { companyId })
+      : undefined;
     const queries: Array<{ query: string; parameters: unknown[] }> = [];
     const previousDebug = db.$client.options.debug;
     db.$client.options.debug = (_connection, query, parameters) => { queries.push({ query, parameters }); };
     try {
+      if (process.env.PAPERCLIP_INBOX_COMPARE_BASELINE) {
+        const paths = [process.env.PAPERCLIP_COST_BASELINE_MODULE, process.env.PAPERCLIP_COST_WIP_MODULE, process.env.PAPERCLIP_COST_AUTH_MODULE];
+        if (paths.some(path => !path)) throw new Error("Comparison requires exact baseline/WIP/auth snapshots");
+        const [baseline, wip, originalAuth] = await Promise.all(paths.map(path => import(path!)));
+        const variants = [
+          { name: "B0", service: baseline.issueService(db), fixed: false },
+          { name: "WIP", service: wip.issueService(db), fixed: false },
+          { name: "A1", service: svc, fixed: true },
+        ];
+        const actor = { type: "board" as const, userId: "cost-reader", ignoreInstanceAdmin: true };
+        const entries = Object.fromEntries(variants.map(v => [v.name, [] as number[]]));
+        const graphTimes = Object.fromEntries(variants.map(v => [v.name, [] as number[]]));
+        const counts = Object.fromEntries(variants.map(v => [v.name, [] as number[]]));
+        const statements = new Map<string, { query: string; parameters: unknown[] }>();
+        const output = new Map<string, string>();
+        const entryQueries = new Map<string, Array<typeof queries>>();
+        for (let iteration = 0; iteration < 12; iteration++) {
+          for (const variant of iteration % 2 ? [...variants].reverse() : variants) {
+            queries.length = 0;
+            const started = performance.now();
+            const proof = variant.fixed ? await issueReadSqlProof(db, actor, { companyId }) : undefined;
+            const condition = proof?.condition ?? await originalAuth.issueReadSqlCondition(db, actor);
+            const filters = { attention: "blocked", issueIds: [rootId], readCondition: condition, readProof: proof };
+            const rows = process.env.PAPERCLIP_INBOX_COST_ENTRY === "count"
+              ? await variant.service.count(companyId, filters)
+              : await variant.service.list(companyId, filters);
+            entries[variant.name]!.push(performance.now() - started);
+            counts[variant.name]!.push(queries.length);
+            const graph = queries.find(q => q.query.includes('"issues"."status" <>'));
+            expect(graph).toBeDefined();
+            statements.set(variant.name, graph!);
+            const recorded = entryQueries.get(variant.name) ?? [];
+            recorded.push([...queries]);
+            entryQueries.set(variant.name, recorded);
+            output.set(variant.name, JSON.stringify(rows));
+            if (typeof rows === "number") expect(rows).toBe(1);
+            else expect(rows.map((row: { id: string }) => row.id)).toEqual([rootId]);
+          }
+        }
+        expect(output.get("A1")).toBe(output.get("WIP"));
+        if (process.env.PAPERCLIP_INBOX_COST_REPORT) {
+          const { writeFile } = await import("node:fs/promises");
+          await writeFile(process.env.PAPERCLIP_INBOX_COST_REPORT + ".partial", JSON.stringify({ counts, entryQueries: [...entryQueries] }));
+        }
+        for (const variant of variants.filter(v => v.name !== "B0"))
+          expect(Math.max(...counts[variant.name]!.slice(2)), variant.name).toBeLessThanOrEqual(Math.min(...counts.B0!.slice(2)));
+        for (let iteration = 0; iteration < 12; iteration++) {
+          for (const variant of iteration % 2 ? [...variants].reverse() : variants) {
+            const statement = statements.get(variant.name)!;
+            const started = performance.now();
+            const rows = await db.$client.unsafe(statement.query, statement.parameters as never[]);
+            graphTimes[variant.name]!.push(performance.now() - started);
+            expect(rows.length).toBe(2068);
+          }
+        }
+        const statistics = (values: number[]) => {
+          const measured = values.slice(2), sorted = [...measured].sort((a, b) => a - b);
+          return { medianMs: (sorted[4]! + sorted[5]!) / 2, maxMs: Math.max(...measured), warmups: values.slice(0, 2), samples: measured };
+        };
+        const results = [];
+        for (const variant of variants) {
+          const statement = statements.get(variant.name)!;
+          const plan = await db.$client.unsafe(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${statement.query}`, statement.parameters as never[]);
+          results.push({ variant: variant.name, entry: statistics(entries[variant.name]!), graph: statistics(graphTimes[variant.name]!),
+            queries: counts[variant.name], graphRows: 2068, outputBytes: Buffer.byteLength(output.get(variant.name)!),
+            entryQueries: entryQueries.get(variant.name), plan });
+        }
+        const report = { entry: process.env.PAPERCLIP_INBOX_COST_ENTRY ?? "list", fixture: { issues: 2068, ancestryDepth: 16, reader: "cost-reader" },
+          order: "forward/reverse alternating; 2 warmups and 10 measured per variant", predicateConstructionIncluded: true,
+          authMiddleware: "UNMEASURED", classificationVisits: "UNMEASURED", results };
+        if (process.env.PAPERCLIP_INBOX_COST_REPORT) {
+          const { writeFile } = await import("node:fs/promises");
+          await writeFile(process.env.PAPERCLIP_INBOX_COST_REPORT, JSON.stringify(report));
+        }
+        process.stdout.write(JSON.stringify({ interleavedInboxCost: results.map(({ entryQueries: _queries, plan: _plan, ...summary }) => summary) }) + "\n");
+        return;
+      }
       const elapsed: number[] = [];
       let queryCount = 0, outputBytes = 0;
       for (let iteration = 0; iteration < 12; iteration++) {
         queries.length = 0;
         const started = performance.now();
-        const rows = await svc.list(companyId, { attention: "blocked", issueIds: [rootId], readCondition });
+        const rows = await svc.list(companyId, { attention: "blocked", issueIds: [rootId], readCondition: readProof?.condition ?? readCondition, readProof });
         const duration = performance.now() - started;
         if (iteration >= 2) elapsed.push(duration);
         queryCount = queries.length;
@@ -1565,12 +1645,22 @@ describeEmbeddedPostgres("issue blocker attention", () => {
         graphRows = rows.length;
       }
       const plan = await db.$client.unsafe(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${query.query}`, query.parameters as never[]);
+      if (readProof) {
+        const recursiveLoops: number[] = [];
+        const visit = (node: { [key: string]: unknown; Plans?: Array<Record<string, unknown>> }) => {
+          if (node["Node Type"] === "Recursive Union") recursiveLoops.push(Number(node["Actual Loops"]));
+          for (const child of node.Plans ?? []) visit(child);
+        };
+        visit(plan[0]["QUERY PLAN"][0].Plan);
+        expect(recursiveLoops.length).toBeGreaterThan(0);
+        expect(Math.max(...recursiveLoops)).toBe(1);
+      }
       const statistics = (values: number[]) => ({ medianMs: [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)], maxMs: Math.max(...values) });
       process.stdout.write(JSON.stringify({ inboxCost: process.env.PAPERCLIP_INBOX_COST_CAPTURE, queryCount, graphRows, ancestryDepth: 16, outputBytes, entry: statistics(elapsed), graph: statistics(graphElapsed), plan }) + "\n");
     } finally {
       db.$client.options.debug = previousDebug;
     }
-  }, 90_000);
+  }, process.env.PAPERCLIP_INBOX_COMPARE_BASELINE ? 180_000 : 90_000);
 
   it("preserves unreadable blockers on public replacement and checks the effective set before starting", async () => {
     const { companyId, agentId } = await createCompany("EDP");

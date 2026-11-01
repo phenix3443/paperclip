@@ -1,4 +1,5 @@
-import { and, eq, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
+import { alias, type AnyPgColumn } from "drizzle-orm/pg-core";
+import { and, eq, inArray, isNull, or, sql, type SQL, type SQLWrapper } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { withHumanDirectedWork } from "./human-directed-work.js";
 import { hasOwnerChatInstructionAuthority } from "./owner-chat-instruction-authority.js";
@@ -605,29 +606,49 @@ export async function canActorReadProjectPrivacy(db: Db | DbTransaction, actor: 
 /** One predicate for direct reads and SQL pushdown. Grants flow only from a task
  * to its privacy descendants, never from a child to its ancestors or siblings.
  * UNION bounds traversal even if historical data contains a cycle. */
-function issuePrivacyPrincipalCondition(actor: AuthorizationActor): SQL<boolean> {
-  const principal = issuePrivacyPrincipal(actor);
+type PrivacySubject = ReturnType<typeof issuePrivacyPrincipal>;
+type PrivacyNode = { [K in "id" | "companyId" | "visibility" | "projectId" | "responsibleUserId" | "createdByUserId" | "assigneeUserId" | "assigneeAgentId"]: SQLWrapper };
+
+function issueReadGrant(principal: PrivacySubject, node: PrivacyNode): SQL<boolean> {
   const implicit = principal?.type === "agent"
-    ? sql`n.assignee_agent_id = ${principal.id}`
+    ? sql`${node.assigneeAgentId} = ${principal.id}`
     : principal?.type === "user"
-      ? sql`(n.responsible_user_id = ${principal.id} or n.created_by_user_id = ${principal.id} or n.assignee_user_id = ${principal.id})`
+      ? sql`(${node.responsibleUserId} = ${principal.id} or ${node.createdByUserId} = ${principal.id} or ${node.assigneeUserId} = ${principal.id})`
       : sql`false`;
   const grant = principal ? sql`exists (
-    select 1 from ${issueAccessGrants} g where g.issue_id = n.id
+    select 1 from ${issueAccessGrants} g where g.issue_id = ${node.id}
       and g.subject_type = ${principal.type} and g.subject_id = ${principal.id}
       and g.revoked_at is null
   )` : sql`false`;
   const projectMember = principal ? sql`exists (
     select 1 from ${projectAccessMembers} m
     join ${projects} p on p.id = m.project_id and p.company_id = m.company_id
-    where p.id = n.project_id and p.company_id = n.company_id and p.visibility = 'private'
+    where p.id = ${node.projectId} and p.company_id = ${node.companyId} and p.visibility = 'private'
       and m.subject_type = ${principal.type} and m.subject_id = ${principal.id}
   )` : sql`false`;
+  return sql<boolean>`(${implicit} or ${grant} or ${projectMember})`;
+}
+
+function issueReadRestricted(node: Pick<PrivacyNode, "visibility" | "projectId" | "companyId">): SQL<boolean> {
+  return sql<boolean>`(${node.visibility} = 'private' or exists (
+    select 1 from ${projects} private_project where private_project.id = ${node.projectId}
+      and private_project.company_id = ${node.companyId} and private_project.visibility = 'private'))`;
+}
+
+const issueReadBinding = Symbol("issueReadRowBinding");
+export type IssueReadRowBinding = Readonly<{ id: AnyPgColumn; companyId: AnyPgColumn; [issueReadBinding]: true }>;
+export function issueReadRowBinding(table: { id: AnyPgColumn; companyId: AnyPgColumn }): IssueReadRowBinding {
+  return { id: table.id, companyId: table.companyId, [issueReadBinding]: true };
+}
+
+function issuePrivacyPrincipalCondition(principal: PrivacySubject, binding = issueReadRowBinding(issues)): SQL<boolean> {
+  const node = alias(issues, "n");
+  const restricted = alias(issues, "restricted");
   return sql<boolean>`exists (
     with recursive privacy_ancestors as (
       select p.id, p.company_id, p.privacy_parent_issue_id, p.visibility, p.project_id,
         p.responsible_user_id, p.created_by_user_id, p.assignee_user_id, p.assignee_agent_id
-      from issues p where p.id = ${issues.id} and p.company_id = ${issues.companyId}
+      from issues p where p.id = ${binding.id} and p.company_id = ${binding.companyId}
       union
       (select p.id, p.company_id, p.privacy_parent_issue_id, p.visibility, p.project_id,
         p.responsible_user_id, p.created_by_user_id, p.assignee_user_id, p.assignee_agent_id
@@ -639,30 +660,98 @@ function issuePrivacyPrincipalCondition(actor: AuthorizationActor): SQL<boolean>
         limit 1
       ) p
       where c.privacy_parent_issue_id is not null
-        and (p.visibility = 'private' or exists (select 1 from projects pp where pp.id = p.project_id and pp.company_id = p.company_id and pp.visibility = 'private'))
+        and ${issueReadRestricted(alias(issues, "p"))}
       limit 1)
     )
     select 1 from privacy_ancestors n
-    where ${implicit} or ${grant} or ${projectMember}
-      or not exists (
-        select 1 from privacy_ancestors restricted
-        left join projects private_project on private_project.id = restricted.project_id
-          and private_project.company_id = restricted.company_id
-        where restricted.visibility = 'private' or private_project.visibility = 'private'
-      )
+    where ${issueReadGrant(principal, node)}
+      or not exists (select 1 from privacy_ancestors restricted where ${issueReadRestricted(restricted)})
   )`;
 }
 
-function issuePrivacyCondition(actor: AuthorizationActor): SQL<boolean> {
-  const own = issuePrivacyPrincipalCondition(actor);
+function issueReadSubjects(actor: AuthorizationActor) {
   const userIds = actor.type === "agent"
     ? [...new Set([actor.onBehalfOfUserId, actor.authorizingUserId].filter((id): id is string => !!id))] : [];
-  // Shared agent grants cannot amplify either the task owner or external authorizer.
-  return userIds.reduce((condition, userId) => sql<boolean>`(${condition}
-    and ${issuePrivacyPrincipalCondition({ type: "board", userId, ignoreInstanceAdmin: true })}
-    and exists (select 1 from ${companyMemberships} m where m.company_id = ${issues.companyId}
-      and m.principal_type = 'user' and m.principal_id = ${userId} and m.status = 'active'))`, own);
+  return { principals: [issuePrivacyPrincipal(actor), ...userIds.map(id => ({ type: "user" as const, id }))], userIds };
 }
+
+function issueReadMembership(userId: string, company: SQLWrapper): SQL<boolean> {
+  return sql<boolean>`exists (select 1 from ${companyMemberships} m where m.company_id = ${company}
+    and m.principal_type = 'user' and m.principal_id = ${userId} and m.status = 'active')`;
+}
+
+function issueReadScalar(subjects: ReturnType<typeof issueReadSubjects>, binding = issueReadRowBinding(issues)): SQL<boolean> {
+  const conditions = subjects.principals.map(principal => issuePrivacyPrincipalCondition(principal, binding));
+  conditions.push(...subjects.userIds.map(id => issueReadMembership(id, binding.companyId)));
+  return sql<boolean>`(${sql.join(conditions, sql` and `)})`;
+}
+
+function issuePrivacyCondition(actor: AuthorizationActor): SQL<boolean> {
+  return issueReadScalar(issueReadSubjects(actor));
+}
+
+function issueReadFixedPoint(subjects: ReturnType<typeof issueReadSubjects>, companyId: string, binding: IssueReadRowBinding): SQL<boolean> {
+  const source = alias(issues, "privacy_fact");
+  const node = alias(issues, "n");
+  const slots = sql.join(subjects.principals.map((_, index) => sql`(${index}::integer)`), sql`, `);
+  const grants = sql.join(subjects.principals.map((principal, index) =>
+    sql`(s.slot = ${index} and ${issueReadGrant(principal, node)})`), sql` or `);
+  const membership = subjects.userIds.map(id => issueReadMembership(id, sql`${companyId}::uuid`));
+  return sql<boolean>`(${binding.id} in (
+    with recursive acl_nodes as materialized (
+      select ${source.id}, ${source.companyId}, ${source.privacyParentIssueId}, ${source.visibility}, ${source.projectId},
+        ${source.responsibleUserId}, ${source.createdByUserId}, ${source.assigneeUserId}, ${source.assigneeAgentId},
+        ${issueReadRestricted(source)} as restricted
+      from ${issues} privacy_fact where ${source.companyId} = ${companyId}
+    ), acl_readable(company_id, id, subject_slot) as (
+      select n.company_id, n.id, s.slot from acl_nodes n cross join (values ${slots}) s(slot)
+      where (${grants}) or (not n.restricted and not exists (
+        select 1 from acl_nodes p where p.company_id = n.company_id
+          and p.id = n.privacy_parent_issue_id and p.restricted))
+      union
+      select child.company_id, child.id, r.subject_slot from acl_readable r
+      join acl_nodes parent on parent.company_id = r.company_id and parent.id = r.id
+      join acl_nodes child on child.company_id = parent.company_id and child.privacy_parent_issue_id = parent.id
+      where parent.restricted
+    ) select id from acl_readable group by company_id, id having count(distinct subject_slot) = ${subjects.principals.length}
+  ) ${membership.length ? sql`and ${sql.join(membership, sql` and `)}` : sql``})`;
+}
+
+export interface IssueReadProof {
+  readonly companyId: string;
+  readonly condition: SQL<boolean>;
+  forRow(binding: IssueReadRowBinding, strategy: "scalar" | "companyFixedPoint"): SQL<boolean>;
+}
+
+async function issueReadAuthority(db: Db | DbTransaction, actor: AuthorizationActor) {
+  const subjects = issueReadSubjects(actor);
+  if (actor.authorizingUserId) return { subjects, bypass: false };
+  if (issuePrivacyMode() !== "enforce" || actor.source === "local_implicit" || actor.isInstanceAdmin)
+    return { subjects, bypass: true };
+  const bypass = actor.type === "board" && !actor.ignoreInstanceAdmin && actor.source !== "cloud_tenant"
+    && await db.select({ id: instanceUserRoles.id }).from(instanceUserRoles)
+      .where(and(eq(instanceUserRoles.userId, actor.userId ?? ""), eq(instanceUserRoles.role, "instance_admin")))
+      .limit(1).then(rows => rows.length > 0);
+  return { subjects, bypass };
+}
+
+export async function issueReadSqlProof(db: Db | DbTransaction, actor: AuthorizationActor, scope: { companyId: string }): Promise<IssueReadProof> {
+  const authority = await issueReadAuthority(db, actor);
+  const condition = authority.bypass ? sql<boolean>`true` : issueReadScalar(authority.subjects);
+  const companyId = scope.companyId;
+  return {
+    companyId,
+    condition,
+    forRow(binding, strategy) {
+      if (binding[issueReadBinding] !== true) throw new Error("Issue read proof requires a trusted row binding");
+      const expression = authority.bypass ? sql<boolean>`true`
+        : strategy === "companyFixedPoint" ? issueReadFixedPoint(authority.subjects, companyId, binding)
+        : issueReadScalar(authority.subjects, binding);
+      return sql<boolean>`(${binding.companyId} = ${companyId} and (${expression}))`;
+    },
+  };
+}
+
 export async function canActorReadIssuePrivacy(db: Db | DbTransaction, actor: AuthorizationActor, issue: IssuePrivacyRow) {
   return db.select({ id: issues.id }).from(issues)
     .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId), issuePrivacyCondition(actor)))
@@ -671,14 +760,8 @@ export async function canActorReadIssuePrivacy(db: Db | DbTransaction, actor: Au
 
 /** Filter every externally reachable task query with the same privacy predicate. */
 export async function issueReadSqlCondition(db: Db | DbTransaction, actor: AuthorizationActor): Promise<SQL<boolean>> {
-  if (actor.authorizingUserId) return issuePrivacyCondition(actor);
-  if (issuePrivacyMode() !== "enforce") return sql<boolean>`true`;
-  if (actor.source === "local_implicit" || actor.isInstanceAdmin) return sql<boolean>`true`;
-  if (actor.type === "board" && !actor.ignoreInstanceAdmin && actor.source !== "cloud_tenant"
-    && await db.select({ id: instanceUserRoles.id }).from(instanceUserRoles)
-      .where(and(eq(instanceUserRoles.userId, actor.userId ?? ""), eq(instanceUserRoles.role, "instance_admin")))
-      .limit(1).then(rows => rows.length > 0)) return sql<boolean>`true`;
-  return issuePrivacyCondition(actor);
+  const authority = await issueReadAuthority(db, actor);
+  return authority.bypass ? sql<boolean>`true` : issueReadScalar(authority.subjects);
 }
 
 /** SQL equivalent used for project list/search pushdown. */

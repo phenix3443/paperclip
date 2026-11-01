@@ -11,7 +11,7 @@ import { badRequest, forbidden } from "../errors.js";
 import { agentActionAuditService } from "../services/agent-action-audit.js";
 import { logActivity } from "../services/activity-log.js";
 import { canActorReadHeartbeatRun } from "../services/heartbeat-run-privacy.js";
-import { issueReadSqlCondition } from "../services/authorization.js";
+import { issueReadSqlProof, issueReadSqlCondition } from "../services/authorization.js";
 import { caseActivityReadSqlCondition } from "../services/case-activity-access.js";
 
 /** Max rows a single CSV export will stream (guards against runaway exports). */
@@ -237,7 +237,8 @@ export function activityRoutes(db: Db) {
       entityType: req.query.entityType as string | undefined,
       entityId: req.query.entityId as string | undefined,
       limit: normalizeActivityLimit(Number(req.query.limit)),
-      readCondition: await issueReadSqlCondition(db, req.actor),
+      readCondition: (await issueReadSqlProof(db, req.actor.isInstanceAdmin === false
+        ? { ...req.actor, ignoreInstanceAdmin: true } : req.actor, { companyId })).condition,
       caseReadCondition: await caseActivityReadSqlCondition(db, req.actor),
     };
     const result = await svc.listReadable(filters);
@@ -363,8 +364,8 @@ export function activityRoutes(db: Db) {
       res.json(await svc.inputFactsForIssue(issue.companyId, issue.id, parsed.data));
       return;
     }
-    const readCondition = await issueReadSqlCondition(db, req.actor.isInstanceAdmin === false
-      ? { ...req.actor, ignoreInstanceAdmin: true } : req.actor);
+    const readCondition = (await issueReadSqlProof(db, req.actor.isInstanceAdmin === false
+      ? { ...req.actor, ignoreInstanceAdmin: true } : req.actor, { companyId: issue.companyId })).condition;
     const result = await svc.forIssueReadable(issue.id, readCondition, req.query.view === "recent" ? 50 : undefined);
     res.json(result);
   });

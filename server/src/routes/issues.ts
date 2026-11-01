@@ -353,6 +353,7 @@ import {
 import {
   authorizationDeniedDetails,
   issueReadSqlCondition,
+  issueReadSqlProof,
   projectReadSqlCondition,
 } from "../services/authorization.js";
 import { stalledReviewDecisionService } from "../services/stalled-review-decisions.js";
@@ -5504,10 +5505,10 @@ export function issueRoutes(
     return { id: issue.id, identifier: issue.identifier, locked: true };
   }
 
-  function metadataReadCondition(req: Request) {
-    return issueReadSqlCondition(db, req.actor.isInstanceAdmin === false
+  function metadataReadProof(req: Request, companyId: string) {
+    return issueReadSqlProof(db, req.actor.isInstanceAdmin === false
       ? { ...req.actor, ignoreInstanceAdmin: true }
-      : req.actor);
+      : req.actor, { companyId });
   }
 
   function readableRelationOptions(readCondition: Awaited<ReturnType<typeof issueReadSqlCondition>>, companyId: string) {
@@ -8859,12 +8860,14 @@ export function issueRoutes(
     const uuidFilters = uuidQuery.values;
     const offset = parsedOffset ?? 0;
 
+    const readProof = await metadataReadProof(req, companyId);
     const listFilters: IssueFilters = {
       issueIds,
       parentIds,
       oneChildPerParent,
       listProjection: view === "index" || view === "rows" ? view : undefined,
-      readCondition: await issueReadSqlCondition(db, req.actor),
+      readCondition: readProof.condition,
+      readProof,
       attention: attention === "blocked" ? "blocked" : undefined,
       status: req.query.status as string | string[] | undefined,
       assigneeAgentId,
@@ -8913,7 +8916,7 @@ export function issueRoutes(
     // readCondition is a Drizzle SQL object with cyclic internal references;
     // actor identity already scopes the coordinator key, so only serializable
     // request filters belong in its normalized query.
-    const { readCondition: _readCondition, ...requestKeyFilters } = listFilters;
+    const { readCondition: _readCondition, readProof: _readProof, ...requestKeyFilters } = listFilters;
     const requestKey = issueListRequestKey({
       req,
       companyId,
@@ -9113,8 +9116,10 @@ export function issueRoutes(
     }
     const countUuidFilters = countUuidQuery.values;
 
+    const readProof = await metadataReadProof(req, companyId);
     const blockedCountFilters = {
-      readCondition: await issueReadSqlCondition(db, req.actor),
+      readCondition: readProof.condition,
+      readProof,
       attention: "blocked",
       status: req.query.status as string | string[] | undefined,
       assigneeAgentId: req.query.assigneeAgentId as string | undefined,
@@ -9343,7 +9348,8 @@ export function issueRoutes(
     );
     if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
-    const readCondition = await metadataReadCondition(req);
+    const readProof = await metadataReadProof(req, issue.companyId);
+    const readCondition = readProof.condition;
 
     const wakeCommentId =
       typeof req.query.wakeCommentId === "string" &&
@@ -9670,7 +9676,8 @@ export function issueRoutes(
     );
     if (!issue) return;
     if (!(await timing.time("authorization", () => assertIssueReadAllowed(req, res, issue, { allowBreakGlass: true })))) return;
-    const readCondition = await metadataReadCondition(req);
+    const readProof = await metadataReadProof(req, issue.companyId);
+    const readCondition = readProof.condition;
     // Saved cards are structural conversation data. Include their local
     // projection before first paint, independently of slow recovery, workspace
     // and related-task enrichment. This never refreshes external providers.
@@ -15231,9 +15238,9 @@ export function issueRoutes(
         updateFields.status === "done";
       const shouldCollectTerminalIssueActions =
         updateFields.status === "done" || updateFields.status === "cancelled";
-      const publicRead = Array.isArray(issueUpdateData.blockedByIssueIds)
-        ? { readCondition: await metadataReadCondition(req), requireUnresolvedBlocker }
-        : null;
+      const readProof = Array.isArray(issueUpdateData.blockedByIssueIds)
+        ? await metadataReadProof(req, existing.companyId) : null;
+      const publicRead = readProof ? { readCondition: readProof.condition, requireUnresolvedBlocker } : null;
       const updateRawIssue = (tx?: Parameters<typeof svc.update>[2]) => {
         if (tx) {
           if (shouldCollectCompletionPublication) {

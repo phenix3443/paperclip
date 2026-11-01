@@ -24,7 +24,7 @@ import { assertNoCaseHandoffMutation, cancelCaseHandoffsForIssue, completeTermin
 import { measureRunPhase } from "./execution-preparation-timing.js";
 import { automaticReadRecoveryCleanupCondition, directHumanCommentCondition, humanCreatedIssueCondition, pendingUserRequestCondition, pendingUserRequestRowCondition, touchedByUserCondition, userParticipationActivityCondition } from "./issue-participation.js";
 import { resolveProjectDefaultWorkspaceId } from "./project-default-workspace.js";
-import { type AuthorizationActor, executionWorkspaceReadSqlCondition, projectReadSqlCondition } from "./authorization.js";
+import { type AuthorizationActor, type IssueReadProof, issueReadRowBinding, executionWorkspaceReadSqlCondition, projectReadSqlCondition } from "./authorization.js";
 import { assertExecutionWorkspaceRecordAccess, assertTaskWorkspaceSourceProjectAccess } from "./task-workspace-access.js";
 import { type TaskWorkspaceSelection, type TaskWorkspaceIntent } from "@paperclipai/shared";
 import { executionWorkspaceService } from "./execution-workspaces.js";
@@ -1934,6 +1934,7 @@ export interface IssueFilters {
   hasPlanDocument?: boolean;
   lowTrustBoundary?: LowTrustBoundary & { companyId: string };
   readCondition?: SQL<boolean>;
+  readProof?: IssueReadProof;
   q?: string;
   limit?: number;
   offset?: number;
@@ -5955,15 +5956,21 @@ async function listIssueBlockedInboxAttentionMap(
   companyId: string,
   issueRows: BlockedInboxIssueRow[],
   readCondition?: SQL<boolean>,
+  readProof?: IssueReadProof,
 ): Promise<Map<string, IssueBlockedInboxAttention>> {
   const rowIssueIds = [...new Set(issueRows.map((row) => row.id))];
   const result = new Map<string, IssueBlockedInboxAttention>();
   if (rowIssueIds.length === 0) return result;
 
+  const graphCondition = readProof
+    ? readProof.companyId === companyId
+      ? readProof.forRow(issueReadRowBinding(issues), "companyFixedPoint")
+      : sql<boolean>`false`
+    : readCondition ?? sql<boolean>`false`;
   const [graphIssueRows, graphRelationRows, companyAgentRows] =
     await Promise.all([
       dbOrTx
-        .select({ ...getTableColumns(issues), readable: sql<boolean>`${readCondition ?? sql<boolean>`false`}` })
+        .select({ ...getTableColumns(issues), readable: sql<boolean>`${graphCondition}` })
         .from(issues)
         .where(
           and(
@@ -6958,7 +6965,7 @@ async function listBlockedInboxIssues(
     readableBlockedByMapForIssues(dbOrTx, companyId, issueIds, filters?.readCondition),
     listIssueBlockerAttentionMap(dbOrTx, companyId, withRuns, { publicRead: { readCondition: filters?.readCondition } }),
     listIssueReviewAttentionMap(dbOrTx, companyId, withRuns),
-    listIssueBlockedInboxAttentionMap(dbOrTx, companyId, withRuns, filters?.readCondition),
+    listIssueBlockedInboxAttentionMap(dbOrTx, companyId, withRuns, filters?.readCondition, filters?.readProof),
     includeLiveDescendantSummary
       ? liveDescendantCountMapForIssues(dbOrTx, companyId, issueIds)
       : Promise.resolve(new Map<string, number>()),
@@ -7082,7 +7089,7 @@ async function countBlockedInboxIssues(
   if (rows.length === 0) return 0;
 
   const blockedInboxAttentionByIssueId =
-    await listIssueBlockedInboxAttentionMap(dbOrTx, companyId, rows, filters?.readCondition);
+    await listIssueBlockedInboxAttentionMap(dbOrTx, companyId, rows, filters?.readCondition, filters?.readProof);
   const rawSearchInput = filters?.q?.trim() ?? "";
   const rawSearch = rawSearchInput.toLowerCase();
   const commentSearchMatchIssueIds = new Set<string>();
@@ -8892,7 +8899,7 @@ export function issueService(db: Db) {
         filters?.listProjection === "index" ? Promise.resolve(new Map<string, IssueBlockerAttention>()) : listIssueBlockerAttentionMap(db, companyId, withRuns, { publicRead: { readCondition: filters?.readCondition } }),
         filters?.listProjection === "index" ? Promise.resolve(new Map<string, IssueReviewAttention>()) : listIssueReviewAttentionMap(db, companyId, withRuns),
         includeBlockedInboxAttention
-          ? listIssueBlockedInboxAttentionMap(db, companyId, withRuns, filters?.readCondition)
+          ? listIssueBlockedInboxAttentionMap(db, companyId, withRuns, filters?.readCondition, filters?.readProof)
           : Promise.resolve(new Map<string, IssueBlockedInboxAttention>()),
       ]);
 

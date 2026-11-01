@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { agents, companies, companyMemberships, createDb, issueAccessGrants, issues, projectAccessMembers, projects, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { canActorReadIssuePrivacy, issueReadSqlCondition, type AuthorizationActor } from "../services/authorization.js";
+import { canActorReadIssuePrivacy, issueReadSqlCondition, issueReadSqlProof, issueReadRowBinding, type IssueReadProof, type AuthorizationActor } from "../services/authorization.js";
 import { issueService } from "../services/issues.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { recursiveIssueWork, seedPrivacyFixture } from "./helpers/privacy-query-fixture.js";
@@ -11,6 +11,81 @@ describe("privacy ancestry query work", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>, db: ReturnType<typeof createDb>;
   beforeAll(async () => { database = await startEmbeddedPostgresTestDatabase("privacy-query-"); db = createDb(database.connectionString); }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
   afterAll(async () => { await db?.$client.end(); await database?.cleanup(); });
+
+  async function readableProofIds(companyId: string, actor: AuthorizationActor, supplied?: IssueReadProof) {
+    const proof = supplied ?? await issueReadSqlProof(db, actor, { companyId });
+    const condition = await issueReadSqlCondition(db, actor);
+    const rows = await db.select({ id: issues.id,
+      reference: sql<boolean>`${condition}`,
+      scalar: sql<boolean>`${proof.forRow(issueReadRowBinding(issues), "scalar")}`,
+      fixed: sql<boolean>`${proof.forRow(issueReadRowBinding(issues), "companyFixedPoint")}`,
+    }).from(issues).where(eq(issues.companyId, companyId)).orderBy(issues.id);
+    for (const row of rows) {
+      expect(row.scalar, row.id).toBe(row.reference);
+      expect(row.fixed, row.id).toBe(row.reference);
+    }
+    return rows.filter(row => row.reference).map(row => row.id);
+  }
+
+  it("binds one request proof to canonical and aliased rows without changing scalar visibility", async () => {
+    const { issueReadSqlProof, issueReadRowBinding } = await import("../services/authorization.js");
+    const { alias } = await import("drizzle-orm/pg-core");
+    const companyId = randomUUID(), otherCompanyId = randomUUID(), userId = randomUUID();
+    await db.insert(companies).values([companyId, otherCompanyId].map(id => ({ id, name: "Proof binding", issuePrefix: `P${id.slice(0, 7)}` })));
+    const [root, leaf, foreign] = await db.insert(issues).values([
+      { companyId, title: "Public root", visibility: "open" },
+      { companyId, title: "Private leaf", visibility: "private" },
+      { companyId: otherCompanyId, title: "Foreign public", visibility: "open" },
+    ]).returning();
+    const actor: AuthorizationActor = { type: "board", userId, authorizingUserId: userId };
+    const proof = await issueReadSqlProof(db, actor, { companyId });
+    const bound = alias(issues, "proof_outer");
+    const read = () => db.select({ id: bound.id,
+      scalar: sql<boolean>`${proof.forRow(issueReadRowBinding(bound), "scalar")}`,
+      fixed: sql<boolean>`${proof.forRow(issueReadRowBinding(bound), "companyFixedPoint")}`,
+    }).from(bound).where(inArray(bound.id, [root!.id, leaf!.id, foreign!.id])).orderBy(bound.id);
+    expect(await read()).toEqual(expect.arrayContaining([
+      { id: root!.id, scalar: true, fixed: true },
+      { id: leaf!.id, scalar: false, fixed: false },
+      { id: foreign!.id, scalar: false, fixed: false },
+    ]));
+    await db.insert(issueAccessGrants).values({ issueId: leaf!.id, subjectType: "user", subjectId: userId, source: "explicit" });
+    expect((await read()).find(row => row.id === leaf!.id)).toMatchObject({ scalar: true, fixed: true });
+    await db.update(issueAccessGrants).set({ revokedAt: new Date() }).where(eq(issueAccessGrants.issueId, leaf!.id));
+    expect((await read()).find(row => row.id === leaf!.id)).toMatchObject({ scalar: false, fixed: false });
+    const canonical = await db.select({ id: issues.id,
+      readable: sql<boolean>`${proof.forRow(issueReadRowBinding(issues), "companyFixedPoint")}`,
+    }).from(issues).where(eq(issues.id, root!.id));
+    expect(canonical).toEqual([{ id: root!.id, readable: true }]);
+  });
+
+  it("retains legal exemptions and forces external-authorizer privacy before rollout bypasses", async () => {
+    const companyId = randomUUID(), userId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Proof exemptions", issuePrefix: `P${companyId.slice(0, 7)}` });
+    const [open, hidden] = await db.insert(issues).values([
+      { companyId, title: "Open", visibility: "open" }, { companyId, title: "Hidden", visibility: "private" },
+    ]).returning();
+    const saved = process.env.PAPERCLIP_ISSUE_PRIVACY_MODE;
+    try {
+      process.env.PAPERCLIP_ISSUE_PRIVACY_MODE = "enforce";
+      expect(await readableProofIds(companyId, { type: "none" })).toEqual([open!.id]);
+      expect(await readableProofIds(companyId, { type: "board", userId, isInstanceAdmin: true }))
+        .toEqual([open!.id, hidden!.id].sort());
+      for (const mode of ["off", "shadow", "enforce"]) {
+        process.env.PAPERCLIP_ISSUE_PRIVACY_MODE = mode;
+        const actor: AuthorizationActor = { type: "board", userId, source: "local_implicit", isInstanceAdmin: true };
+        const bypass = await issueReadSqlProof(db, actor, { companyId });
+        const query = db.select({ id: issues.id }).from(issues)
+          .where(bypass.forRow(issueReadRowBinding(issues), "companyFixedPoint"));
+        expect(query.toSQL().sql).not.toContain("acl_nodes");
+        expect(await readableProofIds(companyId, actor)).toEqual([open!.id, hidden!.id].sort());
+        expect(await readableProofIds(companyId, { ...actor, authorizingUserId: userId })).toEqual([open!.id]);
+      }
+    } finally {
+      if (saved === undefined) delete process.env.PAPERCLIP_ISSUE_PRIVACY_MODE;
+      else process.env.PAPERCLIP_ISSUE_PRIVACY_MODE = saved;
+    }
+  });
 
   it("does not rescan company tasks when resolving absent privacy parents", async () => {
     const f = await seedPrivacyFixture(db, { name: "open roots", count: 1200, participated: 0, history: 0, comments: 0 });
@@ -35,8 +110,7 @@ describe("privacy ancestry query work", () => {
     const privacyRows = new Map((await db.select().from(issues).where(eq(issues.companyId, companyId))).map(row => [row.id, row]));
     const actor: AuthorizationActor = { type: "board", userId, authorizingUserId: userId };
     const [grant] = await db.insert(issueAccessGrants).values({ issueId: ids.child!, subjectType: "user", subjectId: userId, source: "explicit" }).returning();
-    const condition = await issueReadSqlCondition(db, actor);
-    const read = async () => (await db.select({ id: issues.id }).from(issues).where(and(eq(issues.companyId,companyId),condition))).map(row=>row.id).sort();
+    const read = () => readableProofIds(companyId, actor);
     expect(await read()).toEqual([ids.child!,ids.grandchild!].sort());
     await db.update(issueAccessGrants).set({ revokedAt:new Date() }).where(eq(issueAccessGrants.id,grant!.id));
     expect(await read()).toEqual([]);
@@ -57,7 +131,13 @@ describe("privacy ancestry query work", () => {
     const [parent]=await db.insert(issues).values({companyId,title:"Ancestor",visibility:"private",createdByUserId:"someone-else"}).returning();
     const [child]=await db.insert(issues).values({companyId,title:"Descendant",visibility:"private",privacyParentIssueId:parent!.id,createdByUserId:"someone-else"}).returning();
     const actor:AuthorizationActor={type:"agent",agentId:agent!.id,onBehalfOfUserId:owner,authorizingUserId:authorizer};
-    const readable=()=>canActorReadIssuePrivacy(db,actor,child!);
+    const proof = await issueReadSqlProof(db, actor, { companyId });
+    const readable = async () => {
+      const ids = await readableProofIds(companyId, actor, proof);
+      const original = await canActorReadIssuePrivacy(db, actor, child!);
+      expect(ids.includes(child!.id)).toBe(original);
+      return original;
+    };
     await db.insert(issueAccessGrants).values({issueId:parent!.id,subjectType:"agent",subjectId:agent!.id,source:"explicit"});
     expect(await readable()).toBe(false);
     await db.insert(issueAccessGrants).values({issueId:parent!.id,subjectType:"user",subjectId:owner,source:"explicit"});
@@ -72,6 +152,7 @@ describe("privacy ancestry query work", () => {
     await db.update(issueAccessGrants).set({revokedAt:null}).where(eq(issueAccessGrants.id,grant!.id));
     await db.update(companyMemberships).set({status:"archived"}).where(and(eq(companyMemberships.companyId,companyId),eq(companyMemberships.principalId,owner)));
     expect(await readable()).toBe(false);
+    expect(await readableProofIds(companyId, { ...actor, onBehalfOfUserId: authorizer })).toContain(child!.id);
   });
 
   it("applies fresh inherited project membership before list pagination", async () => {
@@ -110,8 +191,7 @@ describe("privacy ancestry query work", () => {
     const [parent] = await db.insert(issues).values({ companyId, title: "Open parent in private project", visibility: "open", projectId: project!.id, privacyParentIssueId: grandparent!.id, createdByUserId: "other-user" }).returning();
     const [child] = await db.insert(issues).values({ companyId, title: "Private child", visibility: "private", privacyParentIssueId: parent!.id, createdByUserId: "other-user" }).returning();
     const actor: AuthorizationActor = { type: "board", userId, authorizingUserId: userId };
-    const condition = await issueReadSqlCondition(db, actor);
-    const read = async () => (await db.select({ id: issues.id }).from(issues).where(and(eq(issues.id, child!.id), condition))).map(row => row.id);
+    const read = async () => (await readableProofIds(companyId, actor)).filter(id => id === child!.id);
     expect(await canActorReadIssuePrivacy(db, actor, child!)).toBe(false);
     const [grant] = await db.insert(issueAccessGrants).values({ issueId: grandparent!.id, subjectType: "user", subjectId: userId, source: "explicit" }).returning();
     expect(await read()).toEqual([child!.id]);

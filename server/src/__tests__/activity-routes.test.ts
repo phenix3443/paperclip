@@ -54,6 +54,7 @@ vi.mock("../services/authorization.js", async (importOriginal) => {
   return {
     ...actual,
     issueReadSqlCondition: vi.fn(async () => ({}) as any),
+    issueReadSqlProof: vi.fn(async (_db, _actor, { companyId }) => ({ companyId, condition: {}, forRow: () => ({}) })),
   };
 });
 
