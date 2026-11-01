@@ -259,6 +259,17 @@ export type GitPayloadPackOptions = {
   buildEnv?: (extra?: NodeJS.ProcessEnv) => NodeJS.ProcessEnv;
 };
 
+export const GIT_PAYLOAD_SKILL_PACKAGES = ["server", "packages/adapters/claude-local", "packages/adapters/codex-local"] as const;
+
+export function prepareGitPayloadSkills(checkoutPath: string): void {
+  const source = path.join(checkoutPath, "skills");
+  for (const packageDir of GIT_PAYLOAD_SKILL_PACKAGES) {
+    const destination = path.join(checkoutPath, packageDir, "skills");
+    fs.rmSync(destination, { recursive: true, force: true });
+    fs.cpSync(source, destination, { recursive: true });
+  }
+}
+
 export async function packGitPayload({ checkoutPath, stagingRoot, stagedPayload, runCommand, buildEnv = gitBuildEnv }: GitPayloadPackOptions): Promise<{ version: string; expected: PostgresDriverExpectation }> {
   const expected = readCheckoutPostgresDriver(checkoutPath);
   const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
@@ -332,6 +343,7 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     await runCommand("bash", ["scripts/build-npm.sh", "--skip-checks", "--skip-typecheck"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("corepack", ["pnpm", "-r", "--filter", "@paperclipai/server...", "--if-present", "run", "build"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("bash", ["scripts/prepare-server-ui-dist.sh"], { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
+    prepareGitPayloadSkills(checkoutPath);
     const { version, expected } = await packGitPayload({ checkoutPath, stagingRoot, stagedPayload, runCommand, buildEnv });
     await verifyPayload(stagedPayload, expected);
     await smokePayload(stagedPayload, version, runCommand);
