@@ -14,6 +14,7 @@ interface BlockedReasonChipProps {
   severity: IssueBlockedInboxSeverity;
   compact?: boolean;
   className?: string;
+  title?: string;
 }
 
 type IconComponent = ComponentType<{ className?: string; "aria-hidden"?: boolean | "true" | "false" }>;
@@ -52,6 +53,7 @@ export function BlockedReasonChip({
   severity,
   compact = false,
   className,
+  title,
 }: BlockedReasonChipProps) {
   const variant = blockedReasonVariant(reason);
   const label = blockedVariantLabel(variant);
@@ -63,6 +65,7 @@ export function BlockedReasonChip({
       data-variant={variant}
       data-severity={severity}
       aria-label={`Reason: ${label}, severity ${severity}`}
+      title={title}
       className={cn(
         "inline-flex shrink-0 items-center gap-1 rounded-md border px-2 py-0.5 text-(length:--text-nano) font-medium leading-tight sm:text-(length:--text-micro)",
         VARIANT_STYLES[variant],
