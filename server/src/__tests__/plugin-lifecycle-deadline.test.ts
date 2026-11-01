@@ -27,6 +27,7 @@ const state = vi.hoisted(() => ({
   prepareHold: null as null | Promise<void>,
   afterStart: null as null | { promise: Promise<void>; reached: () => void },
   failWrite: null as null | string,
+  heldKeyRead: null as null | { promise: Promise<void>; reached: () => void },
   prepareSignal: null as null | AbortSignal,
   heldWrite: null as null | { status: string; promise: Promise<void>; reached: () => void },
 }));
@@ -41,7 +42,15 @@ vi.mock("../services/plugin-registry.js", async () => {
   return {
     pluginRegistryService: () => ({
       getById: (id: string) => read(clone(state.rows.get(id))),
-      getByKey: async (key: string) => clone([...state.rows.values()].find((row) => row.pluginKey === key)),
+      getByKey: async (key: string) => {
+        const held = state.heldKeyRead;
+        if (held) {
+          state.heldKeyRead = null;
+          held.reached();
+          await held.promise;
+        }
+        return clone([...state.rows.values()].find((row) => row.pluginKey === key));
+      },
       listByStatus: async (status: string) => [...state.rows.values()].filter((row) => row.status === status).map(clone),
       updateStatus: async (id: string, patch: { status: string; lastError: string | null }) => {
         const held = state.heldWrite;
@@ -180,7 +189,7 @@ async function createGate() {
 
 type Harness = Awaited<ReturnType<typeof createHarness>>;
 
-async function createHarness(options: { hold?: string; queueWaitMs?: number; responseDeadlineMs?: number; failActivation?: boolean } = {}) {
+async function createHarness(options: { hold?: string; queueWaitMs?: number; responseDeadlineMs?: number; failActivation?: boolean; companyIds?: string[] } = {}) {
   const gate = await createGate();
   const workerManager = createPluginWorkerManager();
   const appLifecycle = pluginLifecycleManager({} as never, { workerManager });
@@ -289,7 +298,7 @@ async function createHarness(options: { hold?: string; queueWaitMs?: number; res
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    req.actor = { type: "board", userId: "admin", source: "session", isInstanceAdmin: true, companyIds: [] } as never;
+    req.actor = { type: "board", userId: "admin", source: "session", isInstanceAdmin: true, companyIds: options.companyIds ?? [] } as never;
     next();
   });
   app.use("/api", pluginRoutes(
@@ -354,6 +363,7 @@ beforeEach(() => {
   state.prepareSignal = null;
   state.afterStart = null;
   state.failWrite = null;
+  state.heldKeyRead = null;
   vi.useRealTimers();
   vi.restoreAllMocks();
 });
@@ -738,6 +748,54 @@ describe("plugin lifecycle response deadlines through the real route wiring", ()
     await exited;
     expect(harness.appLifecycle.isFenced(row.id)).toBe(false);
     expect(harness.appLifecycle.isQuiesced(row.id)).toBe(true);
+  });
+
+
+  it("admission: a plugin lookup held past the deadline answers 504 and its late continuation changes nothing", async () => {
+    harness = await createHarness({ responseDeadlineMs: 300 });
+    const row = seed("deadline.p", "disabled");
+    expect((await request(harness.app).post(`/api/plugins/${row.pluginKey}/enable`).send({})).status).toBe(200);
+    let release!: () => void;
+    let reached!: () => void;
+    const arrived = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    state.heldKeyRead = {
+      promise: new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+      reached,
+    };
+    const callsBefore = state.calls.length;
+
+    const disable = request(harness.app).post(`/api/plugins/${row.pluginKey}/disable`).send({}).then((r) => r);
+    await arrived;
+    const res = await disable;
+    expect(res.status).toBe(504);
+    expect(res.body).toMatchObject({ code: "plugin_lifecycle_timeout", phase: "response" });
+
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(state.calls.slice(callsBefore)).toEqual([]);
+    expect(state.rows.get(row.id)!.status).toBe("ready");
+    expect(harness.workerManager.getWorker(row.id)?.status).toBe("running");
+  });
+
+  it("response: work held after the operation succeeded still answers 504 at the deadline", async () => {
+    harness = await createHarness({ responseDeadlineMs: 300, companyIds: ["company-1"] });
+    const row = seed("deadline.q", "disabled");
+    const { logActivity } = await import("../services/activity-log.js");
+    let release!: () => void;
+    vi.mocked(logActivity).mockImplementationOnce(() => new Promise<void>((resolve) => {
+      release = resolve;
+    }) as never);
+
+    const res = await request(harness.app).post(`/api/plugins/${row.pluginKey}/enable`).send({});
+    expect(res.status).toBe(504);
+    expect(res.body).toMatchObject({ code: "plugin_lifecycle_timeout", phase: "response" });
+    expect(state.rows.get(row.id)!.status).toBe("ready");
+    expect(harness.workerManager.getWorker(row.id)?.status).toBe("running");
+    release();
   });
 
 });

@@ -554,6 +554,24 @@ export function pluginRoutes(
     lifecycleTimings: lifecycleOptions?.lifecycleTimings,
   });
 
+  function armResponseDeadline(res: Response, deadlineAt: number): number {
+    const timer = setTimeout(() => setImmediate(() => {
+      if (res.headersSent) return;
+      res.status(504).json({
+        error: "Plugin lifecycle request did not finish before its response deadline",
+        code: "plugin_lifecycle_timeout",
+        phase: "response",
+      });
+      const ignore = () => res;
+      res.status = ignore as unknown as Response["status"];
+      res.json = ignore as unknown as Response["json"];
+      res.send = ignore as unknown as Response["send"];
+    }), Math.max(0, deadlineAt - Date.now()));
+    timer.unref?.();
+    res.once("close", () => clearTimeout(timer));
+    return deadlineAt;
+  }
+
   function sendLifecycleError(res: Response, err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     if (res.headersSent) return;
@@ -1209,7 +1227,7 @@ export function pluginRoutes(
    * - `500` — installation succeeded but manifest is missing (indicates a loader bug)
    */
   router.post("/plugins/install", async (req, res) => {
-    const deadlineAt = lifecycle.responseDeadline();
+    const deadlineAt = armResponseDeadline(res, lifecycle.responseDeadline());
     assertInstanceAdmin(req);
     assertPluginManagementVisible();
     const { packageName, version, isLocalPath } = req.body as PluginInstallRequest;
@@ -2097,7 +2115,7 @@ export function pluginRoutes(
    * Errors: 404 if plugin not found, 400 for lifecycle errors
    */
   router.delete("/plugins/:pluginId", async (req, res) => {
-    const deadlineAt = lifecycle.responseDeadline();
+    const deadlineAt = armResponseDeadline(res, lifecycle.responseDeadline());
     assertInstanceAdmin(req);
     assertPluginManagementVisible();
     const { pluginId } = req.params;
@@ -2138,7 +2156,7 @@ export function pluginRoutes(
    * Errors: 404 if plugin not found, 400 for lifecycle errors
    */
   router.post("/plugins/:pluginId/enable", async (req, res) => {
-    const deadlineAt = lifecycle.responseDeadline();
+    const deadlineAt = armResponseDeadline(res, lifecycle.responseDeadline());
     assertInstanceAdmin(req);
     assertPluginManagementVisible();
     const { pluginId } = req.params;
@@ -2177,7 +2195,7 @@ export function pluginRoutes(
    * Errors: 404 if plugin not found, 400 for lifecycle errors
    */
   router.post("/plugins/:pluginId/disable", async (req, res) => {
-    const deadlineAt = lifecycle.responseDeadline();
+    const deadlineAt = armResponseDeadline(res, lifecycle.responseDeadline());
     assertInstanceAdmin(req);
     assertPluginManagementVisible();
     const { pluginId } = req.params;
@@ -2353,7 +2371,7 @@ export function pluginRoutes(
    * Errors: 404 if plugin not found, 400 for lifecycle errors
    */
   router.post("/plugins/:pluginId/upgrade", async (req, res) => {
-    const deadlineAt = lifecycle.responseDeadline();
+    const deadlineAt = armResponseDeadline(res, lifecycle.responseDeadline());
     assertInstanceAdmin(req);
     assertPluginManagementVisible();
     const { pluginId } = req.params;
