@@ -34,9 +34,10 @@ import {
   heartbeatService,
 } from "../services/heartbeat.ts";
 import { runningProcesses } from "../adapters/index.ts";
+import { issueService } from "../services/issues.js";
 import { recoveryService } from "../services/recovery/service.ts";
 import { withQueuedCommentIdsInWakePayload } from "../services/issue-queued-comment-queue.ts";
-import { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy, issueExecutionGeneration } from "../services/issue-execution-policy.js";
+import { applyIssueMonitorPolicyTransition, applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy, issueExecutionGeneration } from "../services/issue-execution-policy.js";
 import { createAdmissionTransactionScope, createWakeAdmissionWriter } from "../modules/wake-queue/adapters/postgres.js";
 import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapters/postgres.js";
 import { reserveRunBudget } from "../services/budget-reservations.js";
@@ -1956,6 +1957,64 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       if (["queued", "accounting", "provider", "retry"].includes(phase))
         expect(task.executionState).toMatchObject({ changesRequestedCount: 2 });
     } finally { restore?.(); release(); beforeClaimCheck = null; await Promise.all([wakePromise, explicitRetryPromise]); }
+  });
+
+  it.each(["manual", "scheduled"] as const)("rejects an older queued wake and admits the consumed ordinary monitor generation (%s)", async mode => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const [author] = await db.insert(agents).values({ companyId, name: "Author", role: "engineer", adapterType: "codex_local" }).returning();
+    const policy = normalizeIssueExecutionPolicy({ stages: [{ type: "review", participants: [{ type: "agent", agentId }] }] })!;
+    const [original] = await db.insert(issues).values({ companyId, title: "Ordinary monitor review",
+      status: "in_progress", assigneeAgentId: author.id, executionPolicy: policy }).returning();
+    const submitted = applyIssueExecutionPolicyTransition({ issue: original, policy, requestedStatus: "done",
+      requestedAssigneePatch: {}, actor: { agentId: author.id }, commentBody: "Ready for review" });
+    await db.update(issues).set(submitted.patch).where(eq(issues.id, original.id));
+    let entered = false;
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    beforeClaimCheck = async () => { entered = true; await held; };
+    const wake = heartbeat.wakeup(agentId, { source: "automation", triggerDetail: "system", reason: "issue_execution_stage_started",
+      payload: { issueId: original.id }, requestedByActorType: "agent", requestedByActorId: author.id,
+      contextSnapshot: { issueId: original.id } });
+    const execute = mockAdapterExecute.getMockImplementation()!;
+    try {
+      expect(await waitForCondition(async () => entered)).toBe(true);
+      const [older] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      const [before] = await db.select().from(issues).where(eq(issues.id, original.id));
+      expect(older.contextSnapshot?.reviewerAssignmentGeneration).toBe(issueExecutionGeneration(before));
+      const nextCheckAt = new Date().toISOString();
+      const installedPolicy = normalizeIssueExecutionPolicy({ ...before.executionPolicy!, monitor: { nextCheckAt, notes: "Review check" } })!;
+      const transition = applyIssueMonitorPolicyTransition({ issue: before, policy: normalizeIssueExecutionPolicy(installedPolicy),
+        previousPolicy: normalizeIssueExecutionPolicy(before.executionPolicy), requestedStatus: before.status,
+        requestedAssigneePatch: {}, actor: { agentId }, monitorExplicitlyUpdated: true });
+      const installed = await issueService(db).update(original.id, { ...transition.patch, executionPolicy: installedPolicy, actorAgentId: agentId });
+      expect(issueExecutionGeneration(installed!)).not.toBe(older.contextSnapshot?.reviewerAssignmentGeneration);
+      expect(await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({ companyId, runId: older.id,
+        expectedStatus: "queued", now: new Date() })).toMatchObject({ outcome: "cancelled", errorCode: "issue_review_participant_changed" });
+      release(); beforeClaimCheck = null; await wake;
+      mockAdapterExecute.mockImplementation(async () => {
+        const [current] = await db.select().from(issues).where(eq(issues.id, original.id));
+        const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+        const monitorRun = runs.find(run => run.contextSnapshot?.source === "issue.monitor")!;
+        expect(monitorRun.contextSnapshot?.reviewerAssignmentGeneration).toBe(issueExecutionGeneration(current));
+        expect(monitorRun.activeIdentityContextId).toBeTruthy();
+        await db.insert(issueThreadInteractions).values({ companyId, issueId: original.id, kind: "request_confirmation",
+          status: "pending", continuationPolicy: "wake_assignee", payload: { version: 1, prompt: "Keep review pending" }, createdByAgentId: agentId });
+        return execute();
+      });
+      if (mode === "manual") expect(await heartbeat.triggerIssueMonitor(original.id, { now: new Date(), actorType: "user", actorId: "responsible-user" })).toMatchObject({ outcome: "triggered" });
+      else expect(await heartbeat.tickTimers(new Date())).toMatchObject({ enqueued: 1 });
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      const monitorRun = runs.find(run => run.contextSnapshot?.source === "issue.monitor")!;
+      expect(monitorRun).toMatchObject({ status: "succeeded", errorCode: null });
+      expect(monitorRun.contextSnapshot?.reviewerAssignmentGeneration).not.toBe(older.contextSnapshot?.reviewerAssignmentGeneration);
+      expect(countExecuteCallsForRun(older.id)).toBe(0);
+      expect(countExecuteCallsForRun(monitorRun.id)).toBe(1);
+      const [consumed] = await db.select().from(issues).where(eq(issues.id, original.id));
+      expect(consumed).toMatchObject({ monitorNextCheckAt: null, monitorAttemptCount: 1 });
+      const { monitor: previousMonitor, ...reviewHistory } = before.executionState!;
+      expect(consumed.executionState).toMatchObject(reviewHistory);
+    } finally { release(); beforeClaimCheck = null; mockAdapterExecute.mockImplementation(execute); await wake; }
   });
 
   it("settles a manually admitted review from its linked operator receipt before comment authors", async () => {

@@ -4,6 +4,7 @@ import request from "supertest";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  activityLog,
   agentWakeupRequests,
   agents,
   authUsers,
@@ -19,7 +20,9 @@ import {
 } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
-import { issueExecutionGeneration, normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
+import { PROVIDER_QUOTA_MONITOR_SERVICE_NAME } from "@paperclipai/shared";
+import { issueService } from "../services/issues.js";
+import { applyIssueMonitorPolicyTransition, issueExecutionGeneration, normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
 import { chatChannelService, type ChatChannelServiceOptions } from "../services/chat-channels.js";
 import { createDurableChatWakeupRequest } from "../services/durable-chat-wakeup.js";
 import { initializeRunIdentity } from "../services/run-identity.js";
@@ -281,6 +284,131 @@ describeEmbeddedPostgres("pending interaction addressee dispatch during review (
     await drainHeartbeatRunsToQuiescence(db, heartbeat);
     expect(executeCallsForAgent(f.assignee.id)).toHaveLength(0);
     expect(executeCallsForAgent(f.reviewer.id)).toHaveLength(0);
+  });
+
+  it("records quota installation proof from a real admitted reviewer before monitor retry", async () => {
+    const f = await currentAgentFixture();
+    const policy = normalizeIssueExecutionPolicy({ stages: [{ type: "review", participants: [{ type: "agent", agentId: f.reviewer.id }] }] })!;
+    await db.update(issues).set({ status: "in_progress", executionPolicy: policy, executionState: null,
+      executionRunId: f.run.id, checkoutRunId: f.run.id }).where(eq(issues.id, f.issue.id));
+    const [question] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issue.id,
+      kind: "ask_user_questions", status: "pending", continuationPolicy: "wake_assignee", payload: f.body.payload,
+      createdByAgentId: f.assignee.id }).returning();
+    const execute = mockAdapterExecute.getMockImplementation()!;
+    mockAdapterExecute.mockImplementation(async () => ({ exitCode: 1, signal: null, timedOut: false,
+      errorMessage: "Provider usage quota reached", errorCode: "provider_quota", errorFamily: "provider_quota",
+      executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false }, errorFamily: "provider_quota" },
+      summary: "", provider: "test", model: "test-model" }));
+    try {
+      const response = await request(app(f.actor)).patch(`/api/issues/${f.issue.id}`)
+        .send({ status: "done", comment: "Ready for independent review" });
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.run.id));
+      expect(await waitForCondition(async () => executeCallsForAgent(f.reviewer.id).length === 1)).toBe(true);
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      const sources = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.reviewer.id));
+      expect(sources).toHaveLength(1);
+      const source = sources[0];
+      expect(source).toMatchObject({ status: "failed", errorCode: "provider_quota" });
+      expect(source.activeIdentityContextId).toBeTruthy();
+      const [before] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
+      expect(source.contextSnapshot?.reviewerAssignmentGeneration).toBe(issueExecutionGeneration(before));
+      const nextCheckAt = new Date(Date.now() + 60_000).toISOString();
+      const installedPolicy = { ...normalizeIssueExecutionPolicy(before.executionPolicy)!, monitor: { nextCheckAt, scheduledBy: "assignee" as const,
+        kind: "external_service" as const, serviceName: PROVIDER_QUOTA_MONITOR_SERVICE_NAME, externalRef: source.id,
+        notes: null, timeoutAt: null, maxAttempts: null, recoveryPolicy: "wake_owner" as const } };
+      const transition = applyIssueMonitorPolicyTransition({ issue: before, policy: installedPolicy,
+        previousPolicy: normalizeIssueExecutionPolicy(before.executionPolicy), requestedStatus: before.status,
+        requestedAssigneePatch: {}, actor: { agentId: null, userId: null }, monitorExplicitlyUpdated: true });
+      const installed = await issueService(db).update(f.issue.id, { ...transition.patch, executionPolicy: installedPolicy });
+      expect(installed).toBeTruthy();
+      const proof = (await db.select().from(activityLog).where(eq(activityLog.entityId, f.issue.id)))
+        .find(row => row.action === "issue.review_quota_monitor_installed");
+      expect(proof).toMatchObject({ actorType: "system", actorId: "review_quota_monitor", runId: source.id,
+        details: { version: 1, sourceRunId: source.id, sourceGeneration: source.contextSnapshot?.reviewerAssignmentGeneration,
+          installedGeneration: issueExecutionGeneration(installed!), nextCheckAt } });
+      expect(issueExecutionGeneration(installed!)).not.toBe(source.contextSnapshot?.reviewerAssignmentGeneration);
+      await db.update(issueThreadInteractions).set({ status: "cancelled" }).where(eq(issueThreadInteractions.id, question.id));
+      for (const fault of ["policy", "state", "responsible", "participant", "assignee", "missing-G", "wrong-G",
+        "provider-work", "native", "source-agent", "source-issue", "source-status", "proof-version", "proof-actor",
+        "proof-action", "proof-source", "proof-generation", "proof-schedule", "successor"]) {
+        const taskPatch = fault === "policy" ? { executionPolicy: { ...installed!.executionPolicy, maxReviewRounds: 4 } }
+          : fault === "state" ? { executionState: { ...installed!.executionState, lastDecisionId: randomUUID() } }
+          : fault === "responsible" ? { responsibleUserId: null }
+          : fault === "participant" ? { executionState: { ...installed!.executionState, currentParticipant: { type: "agent", agentId: f.addressee.id, userId: null } } }
+          : fault === "assignee" ? { assigneeAgentId: f.addressee.id } : null;
+        if (taskPatch) await db.update(issues).set(taskPatch).where(eq(issues.id, f.issue.id));
+        const sourceContext = { ...source.contextSnapshot };
+        if (fault === "missing-G") delete sourceContext.reviewerAssignmentGeneration;
+        if (fault === "wrong-G") sourceContext.reviewerAssignmentGeneration = "forged";
+        if (fault === "source-issue") sourceContext.issueId = randomUUID();
+        await db.update(heartbeatRuns).set({ contextSnapshot: sourceContext,
+          ...(fault === "provider-work" ? { resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: true } } } : {}),
+          ...(fault === "native" ? { runtimeMode: "native" } : {}),
+          ...(fault === "source-agent" ? { agentId: f.addressee.id } : {}),
+          ...(fault === "source-status" ? { status: "succeeded" } : {}),
+        }).where(eq(heartbeatRuns.id, source.id));
+        await db.update(activityLog).set({
+          ...(fault === "proof-actor" ? { actorType: "agent", actorId: f.reviewer.id } : {}),
+          ...(fault === "proof-action" ? { action: "issue.monitor_scheduled" } : {}),
+          details: { ...proof!.details,
+            ...(fault === "proof-version" ? { version: 2 } : {}),
+            ...(fault === "proof-source" ? { sourceGeneration: "forged" } : {}),
+            ...(fault === "proof-generation" ? { installedGeneration: "forged" } : {}),
+            ...(fault === "proof-schedule" ? { nextCheckAt: new Date(0).toISOString() } : {}),
+          },
+        }).where(eq(activityLog.id, proof!.id));
+        const [successor] = fault === "successor" ? await db.insert(heartbeatRuns).values({ companyId: f.companyId,
+          agentId: f.reviewer.id, retryOfRunId: source.id, status: "cancelled", contextSnapshot: source.contextSnapshot }).returning() : [];
+        try {
+          await expect(heartbeat.triggerIssueMonitor(f.issue.id, { now: new Date(nextCheckAt), actorType: "user", actorId: f.board.userId }), fault).rejects.toThrow();
+          const [held] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
+          expect(held, fault).toMatchObject({ monitorNextCheckAt: new Date(nextCheckAt), monitorWakeRequestedAt: null, monitorAttemptCount: 0 });
+          expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, source.id))).length, fault).toBe(successor ? 1 : 0);
+          expect(executeCallsForAgent(f.reviewer.id), fault).toHaveLength(1);
+        } finally {
+          if (successor) await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, successor.id));
+          await db.update(heartbeatRuns).set({ contextSnapshot: source.contextSnapshot, resultJson: source.resultJson,
+            runtimeMode: source.runtimeMode, agentId: source.agentId, status: source.status }).where(eq(heartbeatRuns.id, source.id));
+          await db.update(activityLog).set({ actorType: proof!.actorType, actorId: proof!.actorId,
+            action: proof!.action, details: proof!.details }).where(eq(activityLog.id, proof!.id));
+          await db.update(issues).set({ executionPolicy: installed!.executionPolicy, executionState: installed!.executionState,
+            responsibleUserId: installed!.responsibleUserId, assigneeAgentId: installed!.assigneeAgentId,
+            monitorNextCheckAt: installed!.monitorNextCheckAt, monitorWakeRequestedAt: null }).where(eq(issues.id, f.issue.id));
+        }
+      }
+      const triggered = await heartbeat.triggerIssueMonitor(f.issue.id, { now: new Date(nextCheckAt), actorType: "user", actorId: f.board.userId });
+      expect(triggered).toMatchObject({ outcome: "triggered" });
+      const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, source.id));
+      expect(retry).toMatchObject({ status: "scheduled_retry", scheduledRetryReason: "execution_review_participant_recovery" });
+      const [consumed] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
+      expect(consumed).toMatchObject({ monitorNextCheckAt: null, monitorAttemptCount: 1 });
+      const { monitor: previousMonitor, ...reviewHistory } = before.executionState!;
+      expect(consumed.executionState).toMatchObject(reviewHistory);
+      expect(retry.contextSnapshot?.reviewerAssignmentGeneration).toBe(issueExecutionGeneration(consumed));
+      expect(retry.contextSnapshot?.reviewerAssignmentGeneration).not.toBe(source.contextSnapshot?.reviewerAssignmentGeneration);
+      mockAdapterExecute.mockImplementation(async context => {
+        const { runId } = context as { runId: string };
+        const [currentRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+        const approved = await request(app({ type: "agent", source: "agent_jwt", companyId: f.companyId,
+          agentId: f.reviewer.id, runId, identityContextId: currentRun.activeIdentityContextId,
+          responsibleUserId: currentRun.responsibleUserId })).patch(`/api/issues/${f.issue.id}`)
+          .send({ status: "done", comment: "Approved the current submission" });
+        expect(approved.status, JSON.stringify(approved.body)).toBe(200);
+        return execute(context);
+      });
+      await heartbeat.retryScheduledRetryNow({ issueId: f.issue.id, now: retry.scheduledRetryAt! });
+      await heartbeat.resumeQueuedRuns();
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      const [finished] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retry.id));
+      expect(finished).toMatchObject({ status: "succeeded", errorCode: null });
+      expect(finished.activeIdentityContextId).toBeTruthy();
+      expect(executeCallsForAgent(f.reviewer.id)).toHaveLength(2);
+    } finally {
+      mockAdapterExecute.mockImplementation(execute);
+      await db.update(issueThreadInteractions).set({ status: "cancelled" }).where(eq(issueThreadInteractions.id, question.id));
+    }
   });
 
   it.each(["current", "stale", "missing-generation", "invalid-identity"])(
