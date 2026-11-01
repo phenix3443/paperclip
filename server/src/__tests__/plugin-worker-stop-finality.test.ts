@@ -267,6 +267,7 @@ describe("plugin worker stop finality", () => {
     expect(handle.status).toBe("backoff");
     await nextEvent(handle, "ready");
     expect(handle.status).toBe("running");
+    await gate.next("spawned", 1);
     expect(gate.spawned()).toBe(2);
   });
 
