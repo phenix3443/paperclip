@@ -30,6 +30,8 @@ const state = vi.hoisted(() => ({
   heldKeyRead: null as null | { promise: Promise<void>; reached: () => void },
   prepareSignal: null as null | AbortSignal,
   heldWrite: null as null | { status: string; promise: Promise<void>; reached: () => void },
+  configWrites: 0,
+  heldListConfigs: null as null | { promise: Promise<void>; reached: () => void },
 }));
 
 vi.mock("../services/plugin-registry.js", async () => {
@@ -51,8 +53,19 @@ vi.mock("../services/plugin-registry.js", async () => {
         }
         return clone([...state.rows.values()].find((row) => row.pluginKey === key));
       },
-      upsertConfig: async () => ({}),
-      listConfigs: async () => [],
+      upsertConfig: async () => {
+        state.configWrites += 1;
+        return {};
+      },
+      listConfigs: async () => {
+        const held = state.heldListConfigs;
+        if (held) {
+          state.heldListConfigs = null;
+          held.reached();
+          await held.promise;
+        }
+        return [];
+      },
       listByStatus: async (status: string) => [...state.rows.values()].filter((row) => row.status === status).map(clone),
       updateStatus: async (id: string, patch: { status: string; lastError: string | null }) => {
         const held = state.heldWrite;
@@ -371,6 +384,8 @@ beforeEach(() => {
   state.afterStart = null;
   state.failWrite = null;
   state.heldKeyRead = null;
+  state.configWrites = 0;
+  state.heldListConfigs = null;
   vi.useRealTimers();
   vi.restoreAllMocks();
 });
@@ -836,6 +851,63 @@ describe("plugin lifecycle response deadlines through the real route wiring", ()
     release();
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(call).not.toHaveBeenCalled();
+    expect(state.configWrites).toBe(0);
+    expect(harness.workerManager.getWorker(row.id)?.status).toBe("running");
+    expect(harness.workerManager.getWorker(row.id)?.pid).toBe(pid);
+  });
+
+  it("config: a config listing that outlives the deadline never notifies the worker", async () => {
+    harness = await createHarness({ responseDeadlineMs: 300, companyIds: ["company-1"] });
+    const row = seed("deadline.r", "disabled");
+    expect((await request(harness.app).post(`/api/plugins/${row.pluginKey}/enable`).send({})).status).toBe(200);
+    const call = vi.spyOn(harness.workerManager, "call");
+    let release!: () => void;
+    let reached!: () => void;
+    const arrived = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    state.heldListConfigs = {
+      promise: new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+      reached,
+    };
+
+    const pending = request(harness.app).post(`/api/plugins/${row.pluginKey}/config`)
+      .send({ companyId: "company-1", configJson: {} }).then((r) => r);
+    await arrived;
+    const res = await pending;
+    expect(res.status).toBe(504);
+    expect(res.body).toMatchObject({ code: "plugin_lifecycle_timeout", phase: "response" });
+
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(call).not.toHaveBeenCalledWith(row.id, "configChanged", expect.anything(), expect.anything());
+  });
+
+  it("config: an unsupported configChanged answered after the deadline does not restart the worker", async () => {
+    harness = await createHarness({ responseDeadlineMs: 300, companyIds: ["company-1"] });
+    const row = seed("deadline.r", "disabled");
+    expect((await request(harness.app).post(`/api/plugins/${row.pluginKey}/enable`).send({})).status).toBe(200);
+    const pid = harness.workerManager.getWorker(row.id)?.pid;
+    const { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } = await import("@paperclipai/plugin-sdk");
+    let answer!: () => void;
+    const answered = new Promise<void>((resolve) => {
+      answer = resolve;
+    });
+    vi.spyOn(harness.workerManager, "call").mockImplementation(async () => {
+      await answered;
+      throw new JsonRpcCallError({ code: PLUGIN_RPC_ERROR_CODES.METHOD_NOT_IMPLEMENTED, message: "unsupported" });
+    });
+
+    const res = await request(harness.app).post(`/api/plugins/${row.pluginKey}/config`)
+      .send({ companyId: "company-1", configJson: {} });
+    expect(res.status).toBe(504);
+    expect(res.body).toMatchObject({ code: "plugin_lifecycle_timeout", phase: "response" });
+
+    answer();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await new Promise((resolve) => setTimeout(resolve, 300));
     expect(harness.workerManager.getWorker(row.id)?.status).toBe("running");
     expect(harness.workerManager.getWorker(row.id)?.pid).toBe(pid);
   });

@@ -573,6 +573,11 @@ export function pluginRoutes(
     return deadlineAt;
   }
 
+  /** True once the response guard has answered or is about to answer 504. */
+  function responseDeadlinePassed(res: Response, deadlineAt: number): boolean {
+    return res.headersSent || Date.now() >= deadlineAt;
+  }
+
   function sendLifecycleError(res: Response, err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     if (res.headersSent) return;
@@ -1298,9 +1303,9 @@ export function pluginRoutes(
         ? { localPath: canonicalLocalPath, signal: abort.signal }
         : { packageName: trimmedPackage, version: version?.trim(), signal: abort.signal };
 
-      if (res.headersSent || Date.now() >= deadlineAt) {
-        throw new PluginLifecycleTimeoutError(trimmedPackage, "prepare");
-      }
+      // Admission ran past the deadline: the response guard answers 504
+      // (phase "response"); nothing is prepared.
+      if (responseDeadlinePassed(res, deadlineAt)) return;
       let prepareTimer: NodeJS.Timeout | undefined;
       const prepareDeadline = new Promise<never>((_, reject) => {
         prepareTimer = setTimeout(() => {
@@ -2501,6 +2506,8 @@ export function pluginRoutes(
     try {
       const secretRefs = extractSecretRefBindingsFromConfig(body.configJson, schema);
       await validatePluginSecretRefsForCompany(companyId, secretRefs);
+      // Admission ran past the deadline: the guard answers 504; save nothing.
+      if (responseDeadlinePassed(res, deadlineAt)) return;
       await secretService(db).syncSecretRefsForTarget(
         companyId,
         { targetType: "plugin", targetId: plugin.id },
@@ -2526,8 +2533,7 @@ export function pluginRoutes(
       // up the new config on re-initialize. If no worker is running, skip.
       // Past the deadline the response guard answers 504; do not notify or
       // restart the worker from a late continuation.
-      if (res.headersSent || Date.now() >= deadlineAt) return;
-      const workerNotifyMs = deadlineAt - Date.now();
+      if (responseDeadlinePassed(res, deadlineAt)) return;
       if (bridgeDeps?.workerManager.isRunning(plugin.id)) {
         // Refresh the worker's authorized proactive company scopes so the
         // just-configured company can be acted on from proactive loops (e.g.
@@ -2542,13 +2548,14 @@ export function pluginRoutes(
         } catch {
           // Non-fatal: the set is rebuilt from the DB on the next worker start.
         }
+        if (responseDeadlinePassed(res, deadlineAt)) return;
 
         try {
           await bridgeDeps.workerManager.call(
             plugin.id,
             "configChanged",
             { config: body.configJson, companyId },
-            Math.min(CONFIG_CHANGED_RPC_TIMEOUT_MS, workerNotifyMs),
+            Math.max(1, Math.min(CONFIG_CHANGED_RPC_TIMEOUT_MS, deadlineAt - Date.now())),
           );
         } catch (rpcErr) {
           if (
@@ -2557,7 +2564,7 @@ export function pluginRoutes(
           ) {
             // Worker doesn't handle live config — restart it, unless the
             // response deadline already passed while the RPC was pending.
-            if (res.headersSent || Date.now() >= deadlineAt) return;
+            if (responseDeadlinePassed(res, deadlineAt)) return;
             try {
               const epoch = lifecycle.currentEpoch(plugin.id);
               await lifecycle.restartWorker(plugin.id, { source: "config", epoch, deadlineAt });
