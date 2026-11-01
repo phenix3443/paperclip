@@ -82,6 +82,7 @@ vi.mock("../services/live-events.js", () => ({ publishGlobalLiveEvent: vi.fn() }
 const { pluginRoutes } = await import("../routes/plugins.js");
 const { errorHandler } = await import("../middleware/index.js");
 const { pluginLifecycleManager } = await import("../services/plugin-lifecycle.js");
+const { LeaseKeyMismatchError } = await import("../services/plugin-lifecycle-shared.js");
 const { createPluginWorkerManager } = await import("../services/plugin-worker-manager.js");
 const { createPluginToolDispatcher } = await import("../services/plugin-tool-dispatcher.js");
 const { createPluginJobCoordinator } = await import("../services/plugin-job-coordinator.js");
@@ -516,11 +517,9 @@ describe("plugin lifecycle serialization through the real route wiring", () => {
     const target = seed("serial.n", "disabled");
     const callsBefore = state.calls.length;
 
-    const outcome = await harness.appLifecycle
-      .exclusive(holder.pluginKey, "A", (lease) => harness!.appLifecycle.enable(target.id, { lease }))
-      .then(() => null, (err: unknown) => err);
-
-    expect((outcome as Error | null)?.name).toBe("LeaseKeyMismatchError");
+    await expect(harness.appLifecycle
+      .exclusive(holder.pluginKey, "A", (lease) => harness!.appLifecycle.enable(target.id, { lease })))
+      .rejects.toBeInstanceOf(LeaseKeyMismatchError);
     expect(state.rows.get(target.id)!.status).toBe("disabled");
     expect(state.calls.slice(callsBefore)).not.toContain("row:ready");
     expect(harness.workerManager.getWorker(target.id)).toBeUndefined();
@@ -538,7 +537,14 @@ describe("plugin lifecycle serialization through the real route wiring", () => {
     expect(res.status).toBe(400);
     expect(res.body.code).toBe("invalid_transition");
     expect(state.rows.get(row.id)!.status).toBe("error");
-    expect(state.calls.slice(callsBefore).filter((call) => call.startsWith("row:"))).toEqual([]);
+    expect(state.calls.slice(callsBefore)).toEqual([]);
     expect(disabled).not.toHaveBeenCalled();
+
+    const ready = seed("serial.p", "ready");
+    const enable = await request(harness.app).post(`/api/plugins/${ready.pluginKey}/enable`).send({});
+    expect(enable.status).toBe(400);
+    expect(enable.body.code).toBe("invalid_transition");
+    expect(state.rows.get(ready.id)!.status).toBe("ready");
+    expect(state.calls.slice(callsBefore)).toEqual([]);
   });
 });

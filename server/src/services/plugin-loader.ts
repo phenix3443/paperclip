@@ -384,7 +384,6 @@ export interface PluginRuntimeServices {
    * scoped to its capabilities and plugin ID.
    */
   buildHostHandlers: (pluginId: string, manifest: PaperclipPluginManifestV1) => WorkerToHostHandlers;
-  /** Disposes the host services created by `buildHostHandlers` for a plugin. */
   disposeHostServices?: (pluginId: string) => void;
   /**
    * Host instance information passed to the worker during initialization.

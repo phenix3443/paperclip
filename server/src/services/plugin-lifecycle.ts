@@ -55,7 +55,7 @@ import {
   type PluginLifecycleTimings,
 } from "./plugin-lifecycle-shared.js";
 
-const INVALID_TRANSITION = { code: "invalid_transition" } as const;
+const invalidTransition = (message: string) => badRequest(message, { code: "invalid_transition" });
 
 // ---------------------------------------------------------------------------
 // Lifecycle state machine
@@ -391,9 +391,8 @@ export function pluginLifecycleManager(
 
   function assertTransition(plugin: PluginRecord, to: PluginStatus): void {
     if (!isValidTransition(plugin.status, to)) {
-      throw badRequest(
+      throw invalidTransition(
         `Invalid lifecycle transition: ${plugin.status} → ${to} for plugin ${plugin.pluginKey}`,
-        INVALID_TRANSITION,
       );
     }
   }
@@ -602,10 +601,9 @@ export function pluginLifecycleManager(
 
         // Only allow enabling from disabled, error, or upgrade_pending states
         if (plugin.status !== "disabled" && plugin.status !== "error" && plugin.status !== "upgrade_pending") {
-          throw badRequest(
+          throw invalidTransition(
             `Cannot enable plugin in status '${plugin.status}'. ` +
               `Plugin must be in 'disabled', 'error', or 'upgrade_pending' status to be enabled.`,
-            INVALID_TRANSITION,
           );
         }
 
@@ -628,10 +626,9 @@ export function pluginLifecycleManager(
 
         // Only allow disabling from ready state
         if (plugin.status !== "ready" && plugin.status !== "disabled") {
-          throw badRequest(
+          throw invalidTransition(
             `Cannot disable plugin in status '${plugin.status}'. ` +
               `Plugin must be in 'ready' or 'disabled' status to be disabled.`,
-            INVALID_TRANSITION,
           );
         }
 
@@ -767,10 +764,9 @@ export function pluginLifecycleManager(
 
         // Can only upgrade plugins that are ready or already in upgrade_pending
         if (plugin.status !== "ready" && plugin.status !== "upgrade_pending") {
-          throw badRequest(
+          throw invalidTransition(
             `Cannot upgrade plugin in status '${plugin.status}'. ` +
               `Plugin must be in 'ready' or 'upgrade_pending' status to be upgraded.`,
-            INVALID_TRANSITION,
           );
         }
 
@@ -842,10 +838,9 @@ export function pluginLifecycleManager(
 
       const plugin = await requirePlugin(pluginId);
       if (plugin.status !== "ready") {
-        throw badRequest(
+        throw invalidTransition(
           `Cannot start worker for plugin in status '${plugin.status}'. ` +
             `Plugin must be in 'ready' status.`,
-          INVALID_TRANSITION,
         );
       }
 
@@ -886,10 +881,9 @@ export function pluginLifecycleManager(
       return runOp(pluginId, "R", options, async (op) => {
         const plugin = await requirePlugin(pluginId);
         if (plugin.status !== "ready") {
-          throw badRequest(
+          throw invalidTransition(
             `Cannot restart worker for plugin in status '${plugin.status}'. ` +
               `Plugin must be in 'ready' status.`,
-            INVALID_TRANSITION,
           );
         }
 
