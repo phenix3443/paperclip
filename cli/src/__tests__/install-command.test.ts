@@ -243,7 +243,9 @@ describe("managed install commands", () => {
       file === "corepack" ||
       (file === "npm" && args[0] === "pack") ||
       (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs")));
-    expect(buildCalls).toHaveLength(10);
+    expect(buildCalls).toHaveLength(11);
+    const uiDistCall = buildCalls.find(([file, args]) => file === "bash" && args[0] === "scripts/prepare-server-ui-dist.sh");
+    expect(uiDistCall?.[2]?.env?.PAPERCLIP_RELEASE_REUSE_UI_DIST).toBe("1");
     for (const call of buildCalls) {
       const env = call[2]?.env;
       expect(env, `${call[0]} ${call[1].join(" ")} must run with an explicit env`).toBeDefined();
