@@ -438,7 +438,6 @@ export interface WorkerStartOptions {
    * constructs a handle this way).
    */
   duplexRouteSlots?: DuplexRouteSlotController | null;
-  /** Manager-owned start admission; a revoked plugin cannot spawn or publish running. */
   isStartAdmitted?: () => boolean;
   /**
    * Companies this worker may act on from proactive (no-invocation) worker→host
@@ -706,7 +705,6 @@ export interface PluginWorkerHandle {
    */
   restart(): Promise<void>;
 
-  /** Invalidate in-flight and scheduled starts without stopping a running child. */
   revokeStarts?(): void;
 
   /**
@@ -820,15 +818,12 @@ export interface PluginWorkerManager {
   startWorker(pluginId: string, options: WorkerStartOptions): Promise<PluginWorkerHandle>;
 
   /**
-   * Stop and unregister a specific plugin worker. Rejects with
-   * `PluginWorkerStopError` and keeps the registration if the child survives.
+   * Stop and unregister a specific plugin worker.
    */
   stopWorker(pluginId: string): Promise<void>;
 
-  /** Synchronously forbid starts and crash retries for a plugin until `allowStarts`. */
   revokeStarts?(pluginId: string): void;
 
-  /** Re-admit starts for a plugin revoked by `revokeStarts`. */
   allowStarts?(pluginId: string): void;
 
   /**
@@ -1069,6 +1064,7 @@ export function createPluginWorkerHandle(
   let startToken = 0;
   let startInFlight: Promise<void> | null = null;
   let stopInFlight: Promise<void> | null = null;
+  let stopRequests = 0;
   const isStartAdmitted = options.isStartAdmitted ?? (() => true);
 
   const rpcTimeoutMs = options.rpcTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
@@ -3115,7 +3111,7 @@ export function createPluginWorkerHandle(
     );
 
     const willRestart =
-      autoRestart && consecutiveCrashes <= MAX_CONSECUTIVE_CRASHES;
+      autoRestart && consecutiveCrashes <= MAX_CONSECUTIVE_CRASHES && isStartAdmitted();
 
     setStatus("crashed");
     emitter.emit("crash", { pluginId, code, signal, willRestart });
@@ -3256,13 +3252,10 @@ export function createPluginWorkerHandle(
       supportedMethods = result.supportedMethods ?? [];
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (startSuperseded(token)) {
-        await killOwnChild(child);
-        throw new Error(`Worker start for "${pluginId}" was superseded: ${msg}`);
-      }
-      log.error({ err: msg }, "worker initialize failed");
+      const supersededBeforeKill = startSuperseded(token);
+      if (!supersededBeforeKill) log.error({ err: msg }, "worker initialize failed");
       await killOwnChild(child);
-      if (startSuperseded(token)) {
+      if (supersededBeforeKill || startSuperseded(token)) {
         throw new Error(`Worker start for "${pluginId}" was superseded: ${msg}`);
       }
       setStatus("crashed");
@@ -3284,9 +3277,11 @@ export function createPluginWorkerHandle(
   function revokeStarts(): void {
     startToken++;
     cancelPendingRestart();
+    if (status === "backoff") setStatus("crashed");
   }
 
   function stopInternal(): Promise<void> {
+    stopRequests++;
     if (stopInFlight) return stopInFlight;
     const run = stopOnce();
     stopInFlight = run;
@@ -3353,7 +3348,7 @@ export function createPluginWorkerHandle(
     await killWithSignal("SIGKILL", 2_000);
 
     if (childProcess) {
-      log.error("worker process still alive after SIGKILL");
+      log.error("worker process still alive after SIGKILL — this should not happen");
     }
   }
 
@@ -3644,7 +3639,12 @@ export function createPluginWorkerHandle(
     },
 
     async restart() {
-      await stopInternal();
+      const stopping = stopInternal();
+      const requests = stopRequests;
+      await stopping;
+      if (stopRequests !== requests) {
+        throw new Error(`Worker restart for plugin "${pluginId}" was superseded by a stop`);
+      }
       await startInternal();
     },
 
@@ -3867,7 +3867,6 @@ export function createPluginWorkerManager(
   let activeInspections = 0;
   /** Per-plugin startup locks to prevent concurrent spawn races. */
   const startupLocks = new Map<string, Promise<PluginWorkerHandle>>();
-  /** Plugins whose starts and crash retries are revoked until `allowStarts`. */
   const startsRevoked = new Set<string>();
   // The one shared, process-scoped aggregate route-slot controller. The manager
   // injects it into every worker handle, so the duplex route ceiling counts every
@@ -3921,7 +3920,7 @@ export function createPluginWorkerManager(
         // caller already supplied its own (a test may inject its own).
         duplexRouteSlots,
         ...options,
-        isStartAdmitted: () => !startsRevoked.has(pluginId),
+        isStartAdmitted: () => !startsRevoked.has(pluginId) && (options.isStartAdmitted?.() ?? true),
       });
       workers.set(pluginId, handle);
 

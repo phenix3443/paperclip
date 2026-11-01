@@ -174,6 +174,24 @@ describe("plugin worker stop finality", () => {
     return { gate, handle, manager };
   }
 
+  it("a stop that joins a restart's stop phase prevents the restart from starting", async () => {
+    const gate = await createGate();
+    closeGate = gate.close;
+    manager = createPluginWorkerManager();
+    const handle = await manager.startWorker("gated.plugin", startOptions(gate.socketPath, "shutdown"));
+
+    const restarting = handle.restart().then(() => "resolved", () => "rejected");
+    await gate.next("shutdown-received");
+    const stopping = manager.stopWorker("gated.plugin");
+    gate.release("shutdown");
+    await stopping;
+
+    expect(await restarting).toBe("rejected");
+    expect(handle.status).toBe("stopped");
+    expect(manager.getWorker("gated.plugin")).toBeUndefined();
+    expect(gate.spawned()).toBe(1);
+  });
+
   it("N7e: normal crash recovery still restarts the worker", async () => {
     const { gate, handle } = await startThenCrash("");
     expect(handle.status).toBe("backoff");
@@ -183,6 +201,7 @@ describe("plugin worker stop finality", () => {
   });
 
   it("N7: a stop joins an in-flight crash retry and no retry follows", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const gate = await createGate();
     closeGate = gate.close;
     manager = createPluginWorkerManager();
@@ -193,6 +212,7 @@ describe("plugin worker stop finality", () => {
     const crashed = nextEvent(handle, "crash");
     gate.crash();
     await crashed;
+    await vi.advanceTimersByTimeAsync(2_000);
     await gate.next("initialize-received", 1);
     expect(handle.status).toBe("starting");
     const ready: unknown[] = [];
@@ -220,14 +240,16 @@ describe("plugin worker stop finality", () => {
     workers.revokeStarts!("gated.plugin");
     await vi.advanceTimersByTimeAsync(60_000);
 
-    expect(handle.status).toBe("backoff");
+    expect(handle.status).toBe("crashed");
     expect(gate.spawned()).toBe(1);
     await workers.stopWorker("gated.plugin");
     expect(workers.getWorker("gated.plugin")).toBeUndefined();
   });
 
   it("N7c: revoking starts kills an in-flight retry instead of publishing running", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const { gate, handle, manager: workers } = await startThenCrash("initialize");
+    await vi.advanceTimersByTimeAsync(2_000);
     await gate.next("initialize-received", 1);
     expect(handle.status).toBe("starting");
     const ready: unknown[] = [];
