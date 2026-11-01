@@ -10,7 +10,7 @@ import type { heartbeatService } from "../../services/heartbeat.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { and, asc, eq, gt, inArray, isNull, sql } from "drizzle-orm";
 import { z } from "zod";
-import { DOT_AGENT_TOOL_GUIDANCE, GROK_BOT_AGENT_TOOL_GUIDANCE, setAgentAvatarSchema, type SetAgentAvatarInput } from "@paperclipai/shared";
+import { DOT_AGENT_TOOL_GUIDANCE, GROK_BOT_AGENT_TOOL_GUIDANCE, setAgentAvatarInputJsonSchema, setAgentAvatarSchema, type SetAgentAvatarInput } from "@paperclipai/shared";
 import { setAgentProfileAvatar } from "../../services/agent-profile-avatar.js";
 import { consumeDotHistoryReceipt } from "../../services/dot-assignment-follow-up.js";
 import { getStorageService } from "../../storage/index.js";
@@ -568,8 +568,8 @@ function createBroker(db: Db) {
 export function createDotRunnerMcpTools(db: Db, heartbeat?: DotHeartbeat, transfers?: PublicMcpTransfers): PublicMcpToolExtension {
   const broker = dotRunnerBroker(db, { heartbeat });
   const request = { assignmentId: z.uuid(), requestId: z.uuid() };
-  const definitions: Array<{ name: string; description: string; schema: z.ZodType }> = [
-    { name: "paperclip_dot_set_avatar", description: "Update only your bound Paperclip agent's avatar, including while idle after pairing. If you can obtain your own avatar, send its PNG/JPEG/WebP bytes as raw base64 (max 512 KiB, static image). Do not send a URL or invent an image. Use imageBase64: null to restore the Paperclip character. Repeating the same image is safe. No active assignment is needed.", schema: setAgentAvatarSchema },
+  const definitions: Array<{ name: string; description: string; schema: z.ZodType; inputSchema?: Record<string, unknown> }> = [
+    { name: "paperclip_dot_set_avatar", description: "Update only your bound Paperclip agent's avatar, including while idle after pairing. If you can obtain your own avatar, send its PNG/JPEG/WebP bytes as raw base64 (max 512 KiB, static image). Do not send a URL or invent an image. Use imageBase64: null to restore the Paperclip character. Repeating the same image is safe. No active assignment is needed.", schema: setAgentAvatarSchema, inputSchema: setAgentAvatarInputJsonSchema() },
     { name: "paperclip_dot_capabilities", description: "Discover your agent identity, responsible person, configured permissions, enforcement limits, idle entry point, runtime capabilities, and prerequisites. Use this before concluding you cannot act.", schema: z.object({}).strict() },
     { name: "paperclip_dot_request_turn", description: "Start a governed Runner turn for a request from your Dot conversation, even when no task is assigned. Creates one auditable intake task using normal permissions and admission. Retry the exact prompt with the same UUID.", schema: z.object({ prompt: z.string().trim().min(1).max(20_000), requestId: z.uuid(), projectId: z.uuid().optional() }).strict() },
     { name: "paperclip_dot_renew", description: "Renew an accepted assignment before expiry. Choose an expiry no more than two hours ahead or 24 hours after admission. Cannot revive expired, stopped, or revoked work.", schema: z.object({ ...request, expiresAtUnixMs: z.number().int().positive() }).strict() },
@@ -603,7 +603,7 @@ export function createDotRunnerMcpTools(db: Db, heartbeat?: DotHeartbeat, transf
   return {
     async listTools(principal) { const provider = await providerFor(principal); const available = provider === "grok_bot" ? grokDefinitions : definitions;
       return provider ? available.map(d => ({ name: d.name, description: d.description,
-      inputSchema: z.toJSONSchema(d.schema) as { type: "object"; properties: Record<string, unknown> },
+      inputSchema: (d.inputSchema ?? z.toJSONSchema(d.schema)) as { type: "object"; properties: Record<string, unknown> },
       annotations: { readOnlyHint: ["paperclip_dot_capabilities", "paperclip_dot_tasks", "paperclip_dot_inbox", "paperclip_dot_read", "paperclip_dot_operation_status"].includes(d.name.replace("paperclip_grok_", "paperclip_dot_")), destructiveHint: false, idempotentHint: true, openWorldHint: true } })) : []; },
     async callTool(principal, name, raw) {
       const provider = await providerFor(principal);
