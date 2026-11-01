@@ -1,14 +1,23 @@
 import { and, eq, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { activityLog, connectionGrants, createDb, databaseWorkPending, issueThreadInteractions, toolApplications, toolConnections, toolProfiles, type Db } from "@paperclipai/db";
-import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "../services/delivery-work-notifications.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { arrangeOAuthCallback } from "./helpers/oauth-callback-delivery-fixture.js";
+import { arrangeOAuthCallback, OAUTH_CALLBACK_MODES, type OAuthCallbackMode } from "./helpers/oauth-callback-delivery-fixture.js";
+
+const isolated = vi.hoisted(() => ({ grantNotifications: 0 }));
+vi.mock("../services/delivery-work-notifications.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../services/delivery-work-notifications.js")>();
+  return { ...actual, notifyDeliveryWork: async (...args: Parameters<typeof actual.notifyDeliveryWork>) => {
+    if (new Error().stack?.includes("organization-grant")) { isolated.grantNotifications += 1; return; }
+    return actual.notifyDeliveryWork(...args);
+  } };
+});
 
 const support = await getEmbeddedPostgresTestSupport();
 const describePostgres = support.supported ? describe : describe.skip;
-const MODES = ["direct user", "direct organization"] as const;
-type Mode = (typeof MODES)[number];
+type Mode = Extract<OAuthCallbackMode, `direct ${string}`>;
+const MODES = OAUTH_CALLBACK_MODES.filter((mode): mode is Mode => mode.startsWith("direct "));
 
 describePostgres("direct OAuth callback transactions notify the connection delivery worker", () => {
   let db!: ReturnType<typeof createDb>;
@@ -18,7 +27,7 @@ describePostgres("direct OAuth callback transactions notify the connection deliv
     temp = await startEmbeddedPostgresTestDatabase("paperclip-direct-oauth-connection-delivery-");
     db = createDb(temp.connectionString);
   }, 20_000);
-  afterEach(async () => { await fixture?.cleanup(); fixture = null; });
+  afterEach(async () => { await fixture?.cleanup(); fixture = null; isolated.grantNotifications = 0; });
   afterAll(async () => { await db?.$client.end({ timeout: 1 }); await temp?.cleanup(); });
 
   const pause = () => new Promise(resolve => setTimeout(resolve, 200));
@@ -46,6 +55,7 @@ describePostgres("direct OAuth callback transactions notify the connection deliv
     await delivery.settle(baseline + 1);
     await expectEffects(f, delivery, true);
     expect(f.later.refreshCatalog).toHaveBeenCalledOnce();
+    expect(isolated.grantNotifications).toBe(mode === "direct organization" ? 1 : 0);
   });
 
   it.each(MODES)("an equivalent raw %s write leaves the idle worker asleep until an explicit wake", async mode => {
@@ -124,27 +134,21 @@ describePostgres("direct OAuth callback transactions notify the connection deliv
     await expectEffects(f, delivery, false);
   });
 
-  it.each(MODES)("%s callback followed by a duplicate wake retires the card once", async mode => {
+  it.each(MODES)("%s callback followed by a duplicate notification retires the card once", async mode => {
     const { f, delivery, baseline } = await arrange(mode);
     await f.callback();
-    delivery.wake();
     await delivery.settle(baseline + 1);
-    delivery.wake();
-    await delivery.settle(delivery.sweeps + 1);
+    await expectEffects(f, delivery, true);
+    await db.transaction(tx => notifyDeliveryWork(tx, DELIVERY_QUEUES.connection));
+    await delivery.settle(baseline + 2);
     await expectEffects(f, delivery, true);
   });
 
-  it.each(MODES)("%s callback committing while a sweep is held before its read retires once", async mode => {
-    const { f, delivery, baseline } = await arrange(mode);
-    const locker = createDb(temp.connectionString);
-    try {
-      await locker.transaction(async lock => {
-        await lock.execute(sql`lock table issue_thread_interactions in access exclusive mode`);
-        delivery.wake();
-        while (delivery.sweeps === baseline) await new Promise(resolve => setTimeout(resolve, 10));
-        await f.callback();
-      });
-    } finally { await locker.$client.end({ timeout: 1 }); }
+  it.each(MODES)("%s callback committing after a running sweep read retires on the follow-up sweep", async mode => {
+    let commit: (() => Promise<unknown>) | null = null;
+    const { f, delivery, baseline } = await arrange(mode, { afterSweep: async () => { const run = commit; commit = null; await run?.(); } });
+    commit = () => f.callback();
+    delivery.wake();
     await delivery.settle(baseline + 2);
     await expectEffects(f, delivery, true);
   });
@@ -160,12 +164,13 @@ describePostgres("direct OAuth callback transactions notify the connection deliv
   });
 
   it.each(MODES)("%s callback during a drain does not retire until the worker resumes", async mode => {
-    let open = true;
-    const { f, delivery, baseline } = await arrange(mode, { canRun: () => open });
+    let open = true, drainedChecks = 0;
+    const { f, delivery, baseline } = await arrange(mode, { canRun: () => { if (!open) drainedChecks += 1; return open; } });
     open = false;
     await f.callback();
     await pause();
     expect(delivery.sweeps).toBe(baseline);
+    expect(drainedChecks).toBeGreaterThan(0);
     await expectEffects(f, delivery, false);
     open = true;
     delivery.wake();
