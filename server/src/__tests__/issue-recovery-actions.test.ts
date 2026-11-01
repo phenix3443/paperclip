@@ -20,12 +20,16 @@ import {
   chatConversations,
   chatEndpoints,
   companies,
+  companyMemberships,
+  companySkills,
+  runIdentityContexts,
   createDb,
   documentRevisions,
   documents,
   environmentLeases,
   environments,
   heartbeatRuns,
+  heartbeatRunEvents,
   issueApprovals,
   issueComments,
   issueExecutionDecisions,
@@ -45,6 +49,8 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import * as adapters from "../adapters/index.js";
+import { applyIssueExecutionPolicyTransition, issueExecutionGeneration, normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { buildPaperclipWakePayload, heartbeatService } from "../services/heartbeat.js";
@@ -181,6 +187,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     await db.delete(environmentLeases);
     await db.delete(activityLog);
     await db.delete(costEvents);
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(environments);
@@ -188,6 +195,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     await db.delete(issues);
     await db.delete(agentRuntimeState);
     await db.delete(agents);
+    await db.delete(companySkills);
+    await db.delete(companyMemberships);
     await db.delete(companies);
     await db.delete(authUsers);
   });
@@ -1259,59 +1268,93 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(enqueueWakeup).not.toHaveBeenCalled();
   });
 
+  async function admitQuotaReview(f: Awaited<ReturnType<typeof seedCompany>>) {
+    const userId = `quota-review-${f.companyId}`;
+    await db.insert(authUsers).values({ id: userId, name: "Quota reviewer operator",
+      email: `${userId}@example.test`, createdAt: new Date(), updatedAt: new Date() });
+    await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user",
+      principalId: userId, status: "active", membershipRole: "operator" });
+    await db.update(companies).set({ defaultResponsibleUserId: userId }).where(eq(companies.id, f.companyId));
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: true } } })
+      .where(eq(agents.id, f.managerId));
+    await db.update(issues).set({ responsibleUserId: userId }).where(eq(issues.id, f.sourceIssueId));
+    const [original] = await db.select().from(issues).where(eq(issues.id, f.sourceIssueId));
+    const policy = normalizeIssueExecutionPolicy({ stages: [{ type: "review",
+      participants: [{ type: "agent", agentId: f.managerId }] }] })!;
+    const submitted = applyIssueExecutionPolicyTransition({ issue: original, policy, requestedStatus: "done",
+      actor: { agentId: f.coderId, userId: null }, requestedAssigneePatch: {} });
+    // Preserve the cross-agent legacy assignment before admission computes G0.
+    await db.update(issues).set({ ...submitted.patch, executionPolicy: policy, assigneeAgentId: f.coderId })
+      .where(eq(issues.id, f.sourceIssueId));
+    // Keep automatic completion recovery parked until this test calls the real reconciler.
+    const [question] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId,
+      issueId: f.sourceIssueId, kind: "ask_user_questions", status: "pending", continuationPolicy: "wake_assignee",
+      payload: { version: 1, questions: [{ id: "scope", prompt: "Continue?", selectionMode: "single", required: true,
+        options: [{ id: "yes", label: "Yes" }] }] }, createdByAgentId: f.coderId }).returning();
+    const actualAdapter = adapters.getServerAdapter("codex_local");
+    const execute = vi.fn(async () => ({ exitCode: 1, signal: null, timedOut: false,
+      errorMessage: "Provider quota exceeded for this model.", errorCode: "provider_quota", errorFamily: "provider_quota",
+      executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false }, errorFamily: "provider_quota" },
+      summary: "", provider: "test", model: "test-model" }));
+    const adapter = vi.spyOn(adapters, "getServerAdapter").mockReturnValue({ ...actualAdapter, supportsLocalAgentJwt: false, execute });
+    const heartbeat = heartbeatService(db);
+    try {
+      await heartbeat.wakeup(f.managerId, { source: "automation", triggerDetail: "system", reason: "issue_execution_stage_started",
+        payload: { issueId: f.sourceIssueId }, requestedByActorType: "agent", requestedByActorId: f.coderId,
+        contextSnapshot: { issueId: f.sourceIssueId } });
+      await heartbeat.drainActiveRunExecutions();
+      const sources = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.managerId));
+      expect(sources).toHaveLength(1);
+      const source = sources[0];
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect(source).toMatchObject({ status: "failed", errorCode: "provider_quota", responsibleUserId: userId });
+      expect(source.activeIdentityContextId).toBeTruthy();
+      const [identity] = await db.select().from(runIdentityContexts).where(eq(runIdentityContexts.id, source.activeIdentityContextId!));
+      expect(identity).toMatchObject({ status: "accepted", runId: source.id, companyId: f.companyId, responsibleUserId: userId });
+      const [before] = await db.select().from(issues).where(eq(issues.id, f.sourceIssueId));
+      expect(source.contextSnapshot?.reviewerAssignmentGeneration).toBe(issueExecutionGeneration(before));
+      await db.delete(issueThreadInteractions).where(eq(issueThreadInteractions.id, question.id));
+      return source;
+    } finally {
+      await heartbeat.drainActiveRunExecutions();
+      adapter.mockRestore();
+    }
+  }
+
   it("schedules a quota monitor for a cross-agent active review participant", async () => {
-    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
-    const stageId = randomUUID();
-    await db.update(issues).set({
-      status: "in_review",
-      assigneeAgentId: coderId,
-      executionPolicy: {
-        mode: "normal",
-        commentRequired: true,
-        stages: [{
-          id: stageId,
-          type: "review",
-          approvalsNeeded: 1,
-          participants: [{ id: randomUUID(), type: "agent", agentId: managerId, userId: null }],
-        }],
-      },
-      executionState: {
-        status: "pending",
-        currentStageId: stageId,
-        currentStageIndex: 0,
-        currentStageType: "review",
-        currentParticipant: { type: "agent", agentId: managerId, userId: null },
-        returnAssignee: { type: "agent", agentId: coderId, userId: null },
-        reviewRequest: null,
-        completedStageIds: [],
-        lastDecisionId: null,
-        lastDecisionOutcome: null,
-      },
-    }).where(eq(issues.id, sourceIssueId));
+    const fixture = await seedCompany();
+    const { companyId, managerId, coderId, sourceIssueId } = fixture;
+    const source = await admitQuotaReview(fixture);
+    const runId = source.id;
     const [reviewIssueBeforeRecovery] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
-    expect(reviewIssueBeforeRecovery).toMatchObject({
-      assigneeAgentId: coderId,
-      executionState: {
-        currentParticipant: { type: "agent", agentId: managerId },
-        returnAssignee: { type: "agent", agentId: coderId },
-      },
-    });
-    const runId = randomUUID();
-    await db.insert(heartbeatRuns).values({
-      id: runId,
-      companyId,
-      agentId: managerId,
-      invocationSource: "automation",
-      status: "failed",
-      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
-      error: "Provider quota exceeded for this model.",
-      errorCode: "adapter_failed",
-      startedAt: new Date("2026-07-15T20:00:00.000Z"),
-      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
-      contextSnapshot: { issueId: sourceIssueId },
-    });
+    expect(reviewIssueBeforeRecovery).toMatchObject({ assigneeAgentId: coderId,
+      executionState: { currentParticipant: { type: "agent", agentId: managerId },
+        returnAssignee: { type: "agent", agentId: coderId } } });
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
+
+    // Rejection of legacy evidence remains explicit; only restore the real admitted source afterward.
+    for (const missing of ["identity", "generation"] as const) {
+      const context = { ...source.contextSnapshot };
+      if (missing === "generation") delete context.reviewerAssignmentGeneration;
+      await db.update(heartbeatRuns).set(missing === "identity" ? { activeIdentityContextId: null } : { contextSnapshot: context })
+        .where(eq(heartbeatRuns.id, source.id));
+      try {
+        await expect(recovery.reconcileStrandedAssignedIssues()).rejects.toThrow(
+          missing === "identity" ? "accepted identity is unavailable" : "no generation proof");
+        const [held] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+        expect(held.executionPolicy).toEqual(reviewIssueBeforeRecovery.executionPolicy);
+        expect(held.executionState).toEqual(reviewIssueBeforeRecovery.executionState);
+        expect(held.monitorNextCheckAt).toBeNull();
+        expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, source.id))).toHaveLength(0);
+        expect((await db.select().from(activityLog).where(eq(activityLog.entityId, sourceIssueId)))
+          .filter(row => row.action === "issue.review_quota_monitor_installed")).toHaveLength(0);
+      } finally {
+        await db.update(heartbeatRuns).set({ activeIdentityContextId: source.activeIdentityContextId,
+          contextSnapshot: source.contextSnapshot }).where(eq(heartbeatRuns.id, source.id));
+      }
+    }
 
     const result = await recovery.reconcileStrandedAssignedIssues();
 
@@ -1323,6 +1366,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       monitorNextCheckAt: expect.any(Date),
       monitorNotes: "Provider usage quota reached; retry the active review participant after the default recovery backoff.",
     });
+    expect((await db.select().from(activityLog).where(eq(activityLog.entityId, sourceIssueId)))
+      .filter(row => row.action === "issue.review_quota_monitor_installed")).toMatchObject([
+        { actorType: "system", actorId: "review_quota_monitor", runId,
+          details: { sourceGeneration: source.contextSnapshot?.reviewerAssignmentGeneration,
+            installedGeneration: issueExecutionGeneration(updatedIssue), nextCheckAt: updatedIssue.monitorNextCheckAt!.toISOString() } }]);
     const [updatedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     expect(updatedRun?.errorCode).toBe("provider_quota");
     expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
@@ -1330,48 +1378,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   });
 
   it("does not restamp an in_review quota monitor when the assignee has a newer terminal run", async () => {
-    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
-    const stageId = randomUUID();
-    await db.update(issues).set({
-      status: "in_review",
-      assigneeAgentId: coderId,
-      executionPolicy: {
-        mode: "normal",
-        commentRequired: true,
-        stages: [{
-          id: stageId,
-          type: "review",
-          approvalsNeeded: 1,
-          participants: [{ id: randomUUID(), type: "agent", agentId: managerId, userId: null }],
-        }],
-      },
-      executionState: {
-        status: "pending",
-        currentStageId: stageId,
-        currentStageIndex: 0,
-        currentStageType: "review",
-        currentParticipant: { type: "agent", agentId: managerId, userId: null },
-        returnAssignee: { type: "agent", agentId: coderId, userId: null },
-        reviewRequest: null,
-        completedStageIds: [],
-        lastDecisionId: null,
-        lastDecisionOutcome: null,
-      },
-    }).where(eq(issues.id, sourceIssueId));
-    const participantRunId = randomUUID();
-    await db.insert(heartbeatRuns).values({
-      id: participantRunId,
-      companyId,
-      agentId: managerId,
-      invocationSource: "automation",
-      status: "failed",
-      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
-      error: "Provider quota exceeded for this model.",
-      errorCode: "adapter_failed",
-      startedAt: new Date("2026-07-15T20:00:00.000Z"),
-      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
-      contextSnapshot: { issueId: sourceIssueId },
-    });
+    const fixture = await seedCompany();
+    const { companyId, coderId, sourceIssueId } = fixture;
+    const source = await admitQuotaReview(fixture);
+    const participantRunId = source.id;
     const enqueueWakeup = vi.fn(async () => null);
     const recovery = recoveryService(db, { enqueueWakeup });
 
@@ -1396,8 +1406,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       status: "failed",
       error: "Stale assignee wake fired after the issue entered review.",
       errorCode: "issue_assignee_changed",
-      startedAt: new Date("2026-07-15T20:02:00.000Z"),
-      finishedAt: new Date("2026-07-15T20:03:00.000Z"),
+      startedAt: new Date(source.finishedAt!.getTime() + 60_000),
+      finishedAt: new Date(source.finishedAt!.getTime() + 120_000),
       contextSnapshot: { issueId: sourceIssueId },
     });
 
