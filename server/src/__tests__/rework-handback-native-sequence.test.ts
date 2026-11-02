@@ -1,7 +1,9 @@
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import express from "express";
 import request from "supertest";
 import { and, asc, eq } from "drizzle-orm";
@@ -19,6 +21,8 @@ import {
   issueExecutionDecisions,
   issueRecoveryActions,
   issues,
+  projects,
+  projectWorkspaces,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -53,6 +57,7 @@ vi.mock("../adapters/index.ts", async () => {
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { instanceSettingsService } from "../services/instance-settings.ts";
 import {
   continuationSummaryParksExecutor,
   getIssueContinuationSummaryDocument,
@@ -64,6 +69,26 @@ import {
 } from "../services/recovery/rework-handback-continuation.ts";
 
 const PARK_ERROR = "issue_continuation_waiting_on_review";
+const BRANCH = "fix/rework-sequence";
+const execFileAsync = promisify(execFile);
+
+async function git(cwd: string, args: string[]) {
+  return (await execFileAsync("git", args, { cwd })).stdout.trim();
+}
+
+async function createRepoWithWorktree() {
+  const repoRoot = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-rework-sequence-repo-")));
+  await git(repoRoot, ["init"]);
+  await git(repoRoot, ["config", "user.email", "paperclip-test@example.com"]);
+  await git(repoRoot, ["config", "user.name", "Paperclip Test"]);
+  await fs.writeFile(path.join(repoRoot, "README.md"), "rework sequence\n", "utf8");
+  await git(repoRoot, ["add", "README.md"]);
+  await git(repoRoot, ["commit", "-m", "initial"]);
+  const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", "rework-sequence");
+  await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+  await git(repoRoot, ["worktree", "add", "-b", BRANCH, worktreePath, "HEAD"]);
+  return { repoRoot, worktreePath };
+}
 
 const support = await getEmbeddedPostgresTestSupport();
 const describePostgres = support.supported ? describe : describe.skip;
@@ -72,6 +97,7 @@ if (!support.supported) console.warn(`Skipping rework hand-back sequence tests: 
 describePostgres("rework hand-back through the native review sequence", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
+  const tempRoots: string[] = [];
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-rework-sequence-");
@@ -91,8 +117,12 @@ describePostgres("rework hand-back through the native review sequence", () => {
     await heartbeatService(db).drainActiveRunExecutions();
     await truncateTablesWithDeadlockRetry(
       db,
-      "TRUNCATE TABLE issue_recovery_actions, issue_execution_decisions, heartbeat_run_events, heartbeat_runs, agent_wakeup_requests, issue_comments, documents, activity_log, issues, execution_workspaces, agents, company_memberships, companies RESTART IDENTITY CASCADE",
+      "TRUNCATE TABLE issue_recovery_actions, issue_execution_decisions, heartbeat_run_events, heartbeat_runs, agent_wakeup_requests, issue_comments, documents, activity_log, issues, execution_workspaces, project_workspaces, projects, agents, company_memberships, companies RESTART IDENTITY CASCADE",
     );
+    while (tempRoots.length > 0) {
+      const root = tempRoots.pop();
+      if (root) await fs.rm(root, { recursive: true, force: true }).catch(() => undefined);
+    }
   });
 
   afterAll(async () => {
@@ -162,18 +192,51 @@ describePostgres("rework hand-back through the native review sequence", () => {
       adapterType: "codex_local", adapterConfig: {}, runtimeConfig: {}, permissions: {},
     });
     await db.insert(agents).values([agentRow(executorId, "Executor"), agentRow(reviewerId, "Reviewer")]);
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const { repoRoot, worktreePath } = await createRepoWithWorktree();
+    tempRoots.push(repoRoot);
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Rework sequence",
+      status: "active",
+      executionWorkspacePolicy: {
+        enabled: true,
+        defaultMode: "isolated_workspace",
+        workspaceStrategy: { type: "git_worktree", baseRef: "HEAD", branchTemplate: BRANCH },
+      },
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary",
+      cwd: repoRoot,
+      isPrimary: true,
+    });
     await db.insert(executionWorkspaces).values({
       id: workspaceId,
       companyId,
+      projectId,
+      projectWorkspaceId,
       mode: "isolated_workspace",
       strategyType: "git_worktree",
-      name: "rework",
-      branchName: "fix/rework-sequence",
-      cwd: await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-rework-sequence-ws-")),
+      name: BRANCH,
+      status: "active",
+      cwd: worktreePath,
+      baseRef: "HEAD",
+      branchName: BRANCH,
+      providerType: "git_worktree",
+      providerRef: worktreePath,
+      metadata: { createdByRuntime: true, gitBranchOwnershipVersion: 1 },
     });
     await db.insert(issues).values({
       id: issueId,
       companyId,
+      projectId,
+      projectWorkspaceId,
       title: "Rework after review",
       status: "in_progress",
       priority: "medium",
@@ -181,6 +244,7 @@ describePostgres("rework hand-back through the native review sequence", () => {
       responsibleUserId: "responsible-user",
       executionWorkspaceId: workspaceId,
       executionWorkspacePreference: "reuse_existing",
+      executionWorkspaceSettings: { mode: "isolated_workspace" },
       executionPolicy: {
         mode: "normal",
         commentRequired: true,
@@ -196,10 +260,12 @@ describePostgres("rework hand-back through the native review sequence", () => {
       identifier: `${issuePrefix}-1`,
       startedAt: new Date(),
     });
+    await db.update(executionWorkspaces).set({ sourceIssueId: issueId }).where(eq(executionWorkspaces.id, workspaceId));
     return { companyId, executorId, reviewerId, issueId, workspaceId, stageId, participantId };
   }
 
   type Seeded = Awaited<ReturnType<typeof seed>>;
+
 
   async function snapshot(seeded: Seeded) {
     const [issue] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
@@ -251,7 +317,7 @@ describePostgres("rework hand-back through the native review sequence", () => {
       status: "in_progress",
       assigneeAgentId: seeded.executorId,
       responsibleUserId: "responsible-user",
-      workspaceBranch: "fix/rework-sequence",
+      workspaceBranch: BRANCH,
       executionState: {
         status: "changes_requested",
         currentStageId: seeded.stageId,
@@ -298,7 +364,7 @@ describePostgres("rework hand-back through the native review sequence", () => {
     expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
     expect(continuationSummaryParksExecutor((await getIssueContinuationSummaryDocument(db, seeded.issueId))?.body)).toBe(false);
     expect(await snapshot(seeded)).toEqual(baseline);
-  });
+  }, 120_000);
 
   it.skip("R3: a parked continuation after a recorded changes_requested gets one ordinary successor and keeps every gate", async () => {
     const seeded = await seed();
@@ -348,5 +414,5 @@ describePostgres("rework hand-back through the native review sequence", () => {
       wakeReason: "issue_continuation_needed",
     });
     expect(await snapshot(seeded)).toEqual(baseline);
-  });
+  }, 120_000);
 });
