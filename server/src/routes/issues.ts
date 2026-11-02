@@ -5583,7 +5583,15 @@ export function issueRoutes(
         sampleStalledBlockerIdentifier: safeSample(blocker.sampleStalledBlockerIdentifier),
         pendingFinalizeBlockerIssueIds: blocker.pendingFinalizeBlockerIssueIds.filter((id) => proof.ids.has(id)),
       } } : {}),
-      ...(attention ? { blockedInboxAttention: { ...attention, sampleIssueIdentifier: safeSample(attention.sampleIssueIdentifier) } } : {}),
+      ...(attention ? { blockedInboxAttention: { ...attention,
+        sampleIssueIdentifier: safeSample(attention.sampleIssueIdentifier),
+        leafIssue: attention.leafIssue && proof.ids.has(attention.leafIssue.id) ? attention.leafIssue : null,
+        recoveryIssue: attention.recoveryIssue && proof.ids.has(attention.recoveryIssue.id) ? attention.recoveryIssue : null,
+        ...(attention.reason === "blocked_by_dependency_cycle" ? {
+          owner: { type: "unknown" as const, agentId: null, userId: null, label: null },
+          action: { label: "Break dependency cycle", detail: "Inspect the dependencies you can access and remove one link to break the cycle." },
+        } : {}),
+      } } : {}),
     };
     if (!blocker || [blocker.directBlockerIssueId, blocker.terminalBlockerIssueId]
       .every((id) => !id || proof.ids.has(id))) return safeRow;
@@ -5593,10 +5601,11 @@ export function issueRoutes(
         terminalBlocker: null, sampleBlockerIdentifier: null, sampleStalledBlockerIdentifier: null,
         pendingFinalizeBlockerIssueIds: [] },
       ...(attention && ["blocked_chain_stalled", "blocked_by_uninvokable_assignee", "blocked_by_dependency_cycle"].includes(attention.reason) ? {
-        blockedInboxAttention: { ...attention, reason: "blocked_chain_stalled",
+        blockedInboxAttention: { ...safeRow.blockedInboxAttention!, reason: attention.reason === "blocked_by_dependency_cycle" ? attention.reason : "blocked_chain_stalled",
           owner: { type: "unknown", agentId: null, userId: null, label: null },
           leafIssue: null, recoveryIssue: null, sampleIssueIdentifier: null,
-          action: { label: "Inspect blocker chain", detail: "Open the dependencies you can access to resolve this chain." } },
+          action: attention.reason === "blocked_by_dependency_cycle" ? safeRow.blockedInboxAttention!.action
+            : { label: "Inspect blocker chain", detail: "Open the dependencies you can access to resolve this chain." } },
       } : {}),
     };
   }

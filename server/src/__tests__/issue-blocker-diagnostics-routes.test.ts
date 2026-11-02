@@ -244,28 +244,40 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
 
   });
 
-  it("does not expose a hidden stalled sample when a readable hard-attention branch is selected", async () => {
+  it.each(["hard-attention", "cycle"])("does not expose hidden sample or action references through a readable %s branch", async (branch) => {
     const company = await seedCompany(db);
     const agent = await seedAgent(db, company.id);
     const project = await seedProject(db, company.id, "Hidden branch");
     await db.update(projects).set({ visibility: "private" }).where(eq(projects.id, project.id));
     const root = await seedIssue(db, { companyId: company.id, title: "Public mixed root", status: "blocked", assigneeAgentId: agent.id });
-    const hard = await seedIssue(db, { companyId: company.id, title: "Readable cancelled blocker", status: "cancelled" });
+    const hard = await seedIssue(db, { companyId: company.id, title: "Readable blocker", status: branch === "cycle" ? "blocked" : "cancelled", assigneeAgentId: branch === "cycle" ? agent.id : null });
     const hidden = await seedIssue(db, { companyId: company.id, projectId: project.id, title: "Hidden mixed review", status: "in_review" });
     await db.update(issues).set({ identifier: "SECRET-1", assigneeUserId: "hidden-user", executionState: {
       status: "pending", currentParticipant: { type: "user", userId: "hidden-user" },
     } }).where(eq(issues.id, hidden.id));
     await blockIssue(db, company.id, hard.id, root.id);
     await blockIssue(db, company.id, hidden.id, root.id);
+    if (branch === "cycle") {
+      await db.delete(issueRelations).where(eq(issueRelations.issueId, hidden.id));
+      await blockIssue(db, company.id, hidden.id, hard.id);
+      await blockIssue(db, company.id, hard.id, hidden.id);
+    }
     const app = createApp(db, { type: "agent", agentId: agent.id, companyId: company.id, runId: null, source: "agent_jwt" });
     for (const path of [`/api/companies/${company.id}/issues?attention=blocked`, `/api/issues/${root.id}`, `/api/issues/${root.id}/heartbeat-context`]) {
       const response = await request(app).get(path).expect(200);
       expect(JSON.stringify(response.body, (_key, value) => value?.locked ? "[locked]" : value)).not.toContain("SECRET-1");
+      if (branch === "cycle" && Array.isArray(response.body)) {
+        expect(response.body.find((row: IssueRow) => row.id === root.id).blockedInboxAttention).toMatchObject({
+          reason: "blocked_by_dependency_cycle", owner: { type: "unknown" }, action: { label: "Break dependency cycle" },
+        });
+      }
       expect(JSON.stringify(response.body)).not.toContain("Hidden mixed review");
       expect(JSON.stringify(response.body)).not.toContain("hidden-user");
     }
     const allowed = await request(createApp(db, boardActor(company))).get(`/api/companies/${company.id}/issues?attention=blocked`).expect(200);
-    expect(allowed.body.find((row: IssueRow) => row.id === root.id).blockerAttention.sampleStalledBlockerIdentifier).toBe("SECRET-1");
+    const allowedRoot = allowed.body.find((row: IssueRow) => row.id === root.id);
+    if (branch === "cycle") expect(allowedRoot.blockedInboxAttention.reason).toBe("blocked_by_dependency_cycle");
+    else expect(allowedRoot.blockerAttention.sampleStalledBlockerIdentifier).toBe("SECRET-1");
   });
 
   it("returns stale-blocker diagnosis and anomaly flags for a done blocker on a blocked issue", async () => {
