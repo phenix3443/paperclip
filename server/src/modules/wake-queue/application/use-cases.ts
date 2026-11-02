@@ -705,7 +705,7 @@ async function runReleaseRecoveryTail(
   });
 
   if (decision.kind === "queue_review_participant_recovery") {
-    const queuedRun = await transaction.queueReviewParticipantRecoveryRun({
+    const queued = await transaction.queueReviewParticipantRecoveryRun({
       companyId: issue.companyId,
       issue,
       finishingRun: run,
@@ -713,6 +713,11 @@ async function runReleaseRecoveryTail(
       sessionBefore,
       now: input.now,
     });
+    if (queued.kind === "ineligible_source") {
+      return { outcome: { kind: "blocked", issue, previousStatus: statusForBlock(issue),
+        noticeKind: "execution_review_participant" }, postCommitEffects };
+    }
+    const queuedRun = queued.run;
     postCommitEffects.push({ kind: "run_queued", run: queuedRun });
     return {
       outcome: { kind: "queued_review_participant_recovery", run: queuedRun },
@@ -1012,6 +1017,7 @@ export function createReleaseIssueExecution(deps: {
         previousStatus: result.outcome.previousStatus,
         latestRun: result.run,
         noticeKind: result.outcome.noticeKind,
+        releaseReceipt: result.blockedReceipt,
       });
     } else if (result.outcome.kind === "blocked_recovery_in_place") {
       await deps.recovery.escalateStrandedRecoveryIssueInPlace({

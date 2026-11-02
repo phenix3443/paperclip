@@ -40,7 +40,7 @@ import { issueRecoveryActionService } from "../../../services/issue-recovery-act
 import { readContinuationAttempt } from "../../../services/recovery/run-liveness-continuations.js";
 import { withRecoveryContext } from "../../../services/recovery/status-only-context.js";
 import { boundRunIssueId } from "../../../services/run-task-binding.js";
-import { parseIssueExecutionState } from "../../../services/issue-execution-policy.js";
+import { issueExecutionGeneration, parseIssueExecutionState } from "../../../services/issue-execution-policy.js";
 import {
   queuedCommentIdsFromWakePayload,
   withQueuedCommentIdsInWakePayload,
@@ -62,6 +62,7 @@ import type {
   IssueLockWriter,
   IssueSnapshot,
   LockedIssueExecution,
+  ReleaseBlockedReceipt,
   ReleaseTransactionResult,
   RunSnapshot,
   WakeAdmissionReader,
@@ -641,7 +642,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       const generation = source?.contextSnapshot?.reviewerAssignmentGeneration;
       if (!source || boundRunIssueId(source) !== issue.id || !identity ||
           identity.responsibleUserId !== source.responsibleUserId || typeof generation !== "string")
-        throw new HttpError(409, "Review recovery source generation or accepted identity is unavailable");
+        return { kind: "ineligible_source" } as const;
       const executionState = parseIssueExecutionState(issue.executionState);
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
@@ -716,7 +717,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         })
         .where(and(eq(issues.id, issue.id), eq(issues.companyId, companyId)));
 
-      return toRunSummary(queuedRun);
+      return { kind: "queued", run: toRunSummary(queuedRun) } as const;
     },
 
     async queueImmediateRecoveryRun({
@@ -1241,7 +1242,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         if (successor) return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
 
         if (preDrain.kind === "blocked") {
-          return {
+          return attachBlockedReceipt(tx, input.companyId, {
             outcome: {
               kind: "blocked",
               issue: toIssueSnapshot(issueRow),
@@ -1250,7 +1251,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
             },
             postCommitEffects: [],
             run: runSnapshot,
-          };
+          });
         }
 
         // The durable external answer owns the sole successor of this retired
@@ -1309,8 +1310,18 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           }).where(and(eq(issues.companyId, input.companyId), eq(issues.id, issueRow.id),
             sql`${issues.executionRunId} is null`));
         }
-        return { ...result, run: runSnapshot };
+        return attachBlockedReceipt(tx, input.companyId, { ...result, run: runSnapshot });
       });
     },
   };
+}
+
+async function attachBlockedReceipt<T extends ReleaseTransactionResult>(tx: Db, companyId: string, result: T) {
+  if (result.outcome.kind !== "blocked") return result;
+  const [row] = await tx.select().from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, result.outcome.issue.id)));
+  const blockedReceipt: ReleaseBlockedReceipt = { issueId: row.id, companyId: row.companyId, status: row.status,
+    statusVersion: row.statusVersion, lastStatusDecisionId: row.lastStatusDecisionId, executionRunId: row.executionRunId,
+    checkoutRunId: row.checkoutRunId, executionAgentNameKey: row.executionAgentNameKey,
+    executionGeneration: issueExecutionGeneration(row) };
+  return { ...result, blockedReceipt };
 }

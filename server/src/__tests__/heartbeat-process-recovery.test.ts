@@ -223,6 +223,41 @@ vi.mock("@paperclipai/shared/telemetry", async () => {
   };
 });
 
+const escalationBarrier = vi.hoisted(() => ({
+  hook: null as null | ((input: any, original: (input: any) => Promise<unknown>) => Promise<unknown>),
+  results: [] as unknown[],
+  dispositionRunIds: [] as string[],
+}));
+vi.mock("../services/heartbeat/run-completion.ts", async () => {
+  const actual = await vi.importActual<typeof import("../services/heartbeat/run-completion.ts")>("../services/heartbeat/run-completion.ts");
+  return {
+    ...actual,
+    createHeartbeatRunCompletion: ((db, deps) => actual.createHeartbeatRunCompletion(db, { ...deps,
+      handleIssueReviewPathDisposition: async (run) => {
+        await deps.handleIssueReviewPathDisposition(run);
+        escalationBarrier.dispositionRunIds.push(run.id);
+      } })) as typeof actual.createHeartbeatRunCompletion,
+  };
+});
+vi.mock("../services/recovery/service.ts", async () => {
+  const actual = await vi.importActual<typeof import("../services/recovery/service.ts")>("../services/recovery/service.ts");
+  return {
+    ...actual,
+    recoveryService: ((...args: Parameters<typeof actual.recoveryService>) => {
+      const service = actual.recoveryService(...args);
+      const original = service.escalateStrandedAssignedIssue;
+      return { ...service, escalateStrandedAssignedIssue: async (input: Parameters<typeof original>[0]) => {
+        const hook = escalationBarrier.hook;
+        if (!hook) return original(input);
+        escalationBarrier.hook = null;
+        const result = await hook(input, original as (input: any) => Promise<unknown>);
+        escalationBarrier.results.push(result);
+        return result;
+      } };
+    }) as typeof actual.recoveryService,
+  };
+});
+
 vi.mock("../adapters/index.ts", async () => {
   const actual = await vi.importActual<typeof import("../adapters/index.ts")>(
     "../adapters/index.ts",
@@ -6543,6 +6578,201 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       );
     });
     expect(validationComment).toBeTruthy();
+  });
+
+  describe("legacy reviewer refusal and release receipt", () => {
+    afterEach(() => { escalationBarrier.hook = null; escalationBarrier.results = []; escalationBarrier.dispositionRunIds = []; });
+
+    async function claimFor(issueId: string, companyId: string, agentId: string) {
+      const claimantId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: claimantId, companyId, agentId, invocationSource: "automation",
+        triggerDetail: "system", status: "running", contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_commented" },
+        startedAt: new Date() });
+      await db.update(issues).set({ executionRunId: claimantId, checkoutRunId: claimantId, executionAgentNameKey: "claimant" })
+        .where(eq(issues.id, issueId));
+      return claimantId;
+    }
+
+    async function sideEffects(issueId: string, companyId: string) {
+      return {
+        actions: await selectRecoveryActionsForIssue(issueId),
+        comments: (await selectRecoveryCommentsForIssue(issueId)).map((comment) => comment.id),
+        children: (await db.select({ id: issues.id }).from(issues).where(eq(issues.parentId, issueId))).length,
+        wakes: (await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.companyId, companyId))).length,
+        relations: (await db.select({ id: issueRelations.id }).from(issueRelations)
+          .where(eq(issueRelations.companyId, companyId))).length,
+      };
+    }
+
+    async function finishLegacyReviewer(mutate?: (seed: { companyId: string; agentId: string; issueId: string }) =>
+      Promise<"reread" | "original">) {
+      const seed = await seedInReviewParticipantRunFixture({ admittedReviewSource: true });
+      mockAdapterExecute.mockImplementationOnce(async () => {
+        const [running] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seed.runId));
+        const { reviewerAssignmentGeneration: _g, ...legacyContext } = running.contextSnapshot ?? {};
+        await db.update(heartbeatRuns).set({ activeIdentityContextId: null, contextSnapshot: legacyContext })
+          .where(eq(heartbeatRuns.id, seed.runId));
+        return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Reviewed nothing.",
+          provider: "test", model: "test-model" };
+      });
+      const atHook: { row?: typeof issues.$inferSelect; effects?: Awaited<ReturnType<typeof sideEffects>> } = {};
+      if (mutate) {
+        escalationBarrier.hook = async (input, original) => {
+          const mode = await mutate(seed);
+          const [reread] = await db.select().from(issues).where(eq(issues.id, seed.issueId));
+          Object.assign(atHook, { row: reread, effects: await sideEffects(seed.issueId, seed.companyId) });
+          return original(mode === "reread" ? { ...input, issue: reread } : input);
+        };
+      }
+      const [before] = await db.select().from(issues).where(eq(issues.id, seed.issueId));
+      const heartbeat = heartbeatService(db);
+      await heartbeat.resumeQueuedRuns();
+      await waitForRunToSettle(heartbeat, seed.runId, 8_000);
+      await heartbeat.waitForRunExecutionDrain(seed.runId);
+      return { ...seed, before, heartbeat, atHook };
+    }
+
+    it("I1 releases the lock and escalates a legacy reviewer source without a successor or state change", async () => {
+      const { issueId, agentId, runId, before } = await finishLegacyReviewer();
+      const issue = await waitForValue(async () => {
+        const row = await selectRecoveryIssueById(issueId);
+        return row?.status === "blocked" ? row : null;
+      }, 8_000);
+      expect(issue).toMatchObject({ executionRunId: null, checkoutRunId: null, assigneeAgentId: before.assigneeAgentId,
+        assigneeUserId: before.assigneeUserId, responsibleUserId: before.responsibleUserId });
+      expect(issue!.executionState).toEqual(before.executionState);
+      expect(issue!.executionPolicy).toEqual(before.executionPolicy);
+      expect((await selectRecoveryRunsByAgent(agentId)).filter((run) => run.id !== runId)).toEqual([]);
+      expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+      expect((await selectRecoveryActionsForIssue(issueId))[0]).toMatchObject({
+        status: "active", cause: "execution_review_participant_recovery" });
+      expect(escalationBarrier.dispositionRunIds).toContain(runId);
+    });
+
+    it("I3 never dispatches a stale-generation successor and never leaves the lock on the finished run", async () => {
+      const seed = await seedInReviewParticipantRunFixture({ admittedReviewSource: true });
+      mockAdapterExecute.mockImplementationOnce(async () => {
+        const [issue] = await db.select().from(issues).where(eq(issues.id, seed.issueId));
+        await db.update(issues).set({ executionState: { ...(issue.executionState as Record<string, unknown>),
+          currentStageId: randomUUID(), changesRequestedCount: 1 } }).where(eq(issues.id, seed.issueId));
+        return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Stage moved.",
+          provider: "test", model: "test-model" };
+      });
+      const heartbeat = heartbeatService(db);
+      await heartbeat.resumeQueuedRuns();
+      await waitForRunToSettle(heartbeat, seed.runId, 8_000);
+      await heartbeat.waitForRunExecutionDrain(seed.runId);
+      const successors = await waitForValue(async () => {
+        const runs = (await selectRecoveryRunsByAgent(seed.agentId)).filter((run) => run.id !== seed.runId);
+        return runs.every((run) => !["queued", "running"].includes(run.status)) ? runs : null;
+      }, 8_000);
+      expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+      expect(successors!.every((run) => run.status !== "succeeded")).toBe(true);
+      expect((await selectRecoveryIssueById(seed.issueId))?.executionRunId).not.toBe(seed.runId);
+    });
+
+    it.each([
+      ["I4a a claimant took the lock (commit -> loader)", "claim", "reread"],
+      ["I4b the reviewer generation changed (commit -> loader)", "generation", "reread"],
+      ["I5 a claimant took the lock (loader -> lock)", "claim", "original"],
+    ] as const)("%s: the stale refusal does not block the new authority", async (_name, change, mode) => {
+      let claimantId: string | null = null;
+      let changedState: unknown = null;
+      const { issueId, companyId, atHook } = await finishLegacyReviewer(async (seed) => {
+        if (change === "claim") claimantId = await claimFor(seed.issueId, seed.companyId, seed.agentId);
+        else {
+          const [row] = await db.select().from(issues).where(eq(issues.id, seed.issueId));
+          changedState = { ...(row.executionState as Record<string, unknown>), changesRequestedCount: 1 };
+          await db.update(issues).set({ executionState: changedState as never }).where(eq(issues.id, seed.issueId));
+        }
+        return mode;
+      });
+      const result = await waitForValue(async () => escalationBarrier.results.length ? { value: escalationBarrier.results[0] } : null, 8_000);
+      expect(result!.value).toBeNull();
+      const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(after.status).toBe("in_review");
+      if (claimantId) expect(after).toMatchObject({ executionRunId: claimantId, checkoutRunId: claimantId, executionAgentNameKey: "claimant" });
+      else expect(after.executionState).toEqual(changedState);
+      expect(await sideEffects(issueId, companyId)).toMatchObject({ actions: [], children: 0 });
+      expect(await sideEffects(issueId, companyId)).toEqual(atHook.effects);
+      const { status, statusVersion, lastStatusDecisionId, assigneeAgentId, assigneeUserId, responsibleUserId } = atHook.row!;
+      expect(after).toMatchObject({ status, statusVersion, lastStatusDecisionId, assigneeAgentId, assigneeUserId, responsibleUserId });
+      expect(after.executionState).toEqual(atHook.row!.executionState);
+    });
+
+    async function finishWorkspaceValidation(mutate?: (seed: { companyId: string; agentId: string; issueId: string }) =>
+      Promise<"reread" | "original">) {
+      const seed = await seedQueuedIssueRunFixture();
+      const atHook: { row?: typeof issues.$inferSelect; effects?: Awaited<ReturnType<typeof sideEffects>> } = {};
+      const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-release-receipt-"));
+      const projectId = randomUUID();
+      const workspaceId = randomUUID();
+      const heartbeat = heartbeatService(db);
+      const previousSettings = await instanceSettingsService(db).getExperimental();
+      try {
+        await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+        await db.insert(projects).values({ id: projectId, companyId: seed.companyId, name: "Local documents", status: "in_progress" });
+        await db.insert(projectWorkspaces).values({ id: workspaceId, companyId: seed.companyId, projectId, name: "Documents",
+          sourceType: "local_path", cwd, isPrimary: true });
+        await db.update(issues).set({ projectId, projectWorkspaceId: workspaceId,
+          executionWorkspaceSettings: { mode: "isolated_workspace" } }).where(eq(issues.id, seed.issueId));
+        await db.update(agents).set({ adapterConfig: { workspaceStrategy: { type: "git_worktree" } } })
+          .where(eq(agents.id, seed.agentId));
+        if (mutate) {
+          escalationBarrier.hook = async (input, original) => {
+            const mode = await mutate(seed);
+            const [reread] = await db.select().from(issues).where(eq(issues.id, seed.issueId));
+            Object.assign(atHook, { row: reread, effects: await sideEffects(seed.issueId, seed.companyId) });
+            return original(mode === "reread" ? { ...input, issue: reread } : input);
+          };
+        }
+        await heartbeat.resumeQueuedRuns();
+        await waitForRunToSettle(heartbeat, seed.runId, 5_000);
+        await heartbeat.waitForRunExecutionDrain(seed.runId);
+        await waitForPendingRunFailureReports();
+        return { ...seed, atHook };
+      } finally {
+        await heartbeat.waitForRunExecutionDrain(seed.runId);
+        await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: previousSettings.enableIsolatedWorkspaces });
+        await fs.rm(cwd, { recursive: true, force: true });
+      }
+    }
+
+    it("I6 keeps the observable workspace-validation escalation when nothing raced the release", async () => {
+      const { issueId, companyId, runId } = await finishWorkspaceValidation();
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(run).toMatchObject({ status: "failed", errorCode: "workspace_validation_failed" });
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]).toMatchObject({ status: "blocked", executionRunId: null });
+      const [action] = await db.select().from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+      expect(action).toMatchObject({ status: "active", kind: "workspace_validation" });
+    });
+
+    it.each([
+      ["I7 commit -> loader", "reread"],
+      ["I8 loader -> lock", "original"],
+    ] as const)("%s: a new claimant keeps the issue after an early workspace-validation release", async (_name, mode) => {
+      let claimantId: string | null = null;
+      let claimed: typeof issues.$inferSelect | null = null;
+      const { issueId, companyId, atHook } = await finishWorkspaceValidation(async (seed) => {
+        claimantId = await claimFor(seed.issueId, seed.companyId, seed.agentId);
+        claimed = (await db.select().from(issues).where(eq(issues.id, seed.issueId)))[0]!;
+        return mode;
+      });
+      expect(escalationBarrier.results).toEqual([null]);
+      const [after] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(after).toMatchObject({ status: "in_progress", executionRunId: claimantId, checkoutRunId: claimantId,
+        executionAgentNameKey: "claimant", statusVersion: claimed!.statusVersion });
+      expect(after.executionState).toEqual(claimed!.executionState);
+      expect(after).toMatchObject({ responsibleUserId: claimed!.responsibleUserId, assigneeAgentId: claimed!.assigneeAgentId });
+      expect(await db.select().from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)))).toEqual([]);
+      expect((await selectRecoveryCommentsForIssue(issueId)).some((comment) => comment.body.includes("workspace failed validation")))
+        .toBe(false);
+      expect(after).toEqual(atHook.row);
+      expect(await sideEffects(issueId, companyId)).toEqual(atHook.effects);
+    });
   });
 
   it("keeps an explicit local-path/worktree conflict blocked with a board action and no Sentry event", async () => {
