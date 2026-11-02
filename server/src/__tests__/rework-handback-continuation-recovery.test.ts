@@ -75,7 +75,6 @@ describePostgres("rework hand-back continuation recovery", () => {
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
   afterEach(async () => {
-    await heartbeatService(db).waitForPendingWakeups?.();
     await truncateTablesWithDeadlockRetry(
       db,
       "TRUNCATE TABLE issue_recovery_actions, heartbeat_run_events, heartbeat_runs, agent_wakeup_requests, issue_comments, activity_log, issues, agents, company_memberships, companies RESTART IDENTITY CASCADE",

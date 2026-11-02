@@ -71,7 +71,7 @@ describePostgres("owner disposition repair retry context", () => {
       getRun: state.getRun,
       getAgent: state.getAgent,
       resolveSessionBeforeForWakeup: state.resolveSessionBeforeForWakeup,
-      resolveResponsibleUserIdForRunContext: vi.fn(async () => null),
+      resolveResponsibleUserIdForRunContext: vi.fn(async () => "retry-user"),
       getAgentInvokability: (agent: Agent | null | undefined) => evaluateAgentInvokabilityFromDb(db, agent),
       appendRunEvent: vi.fn(async () => undefined),
       escalatePlanApprovalResumeFailureNeedsAttention: vi.fn(async () => null),
@@ -286,6 +286,6 @@ describePostgres("owner disposition repair retry context", () => {
     const f = await fixture({ ...input, action: null });
     const scheduled = await scheduleRetry(f.run, f.executor);
     expectRepairRetry(scheduled);
-    if (input.legacyEpisode) expect(scheduled.context.legacyDispositionEpisode).toBeTruthy();
+    if ("legacyEpisode" in input && input.legacyEpisode) expect(scheduled.context.legacyDispositionEpisode).toBeTruthy();
   });
 });
