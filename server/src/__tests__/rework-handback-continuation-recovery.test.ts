@@ -44,6 +44,8 @@ vi.mock("../adapters/index.ts", async () => {
 });
 
 import { heartbeatService } from "../services/heartbeat.ts";
+import { createReleaseIssueExecution } from "../modules/wake-queue/application/use-cases.ts";
+import { createPostgresWakeQueueAdapter } from "../modules/wake-queue/adapters/postgres.ts";
 import {
   REWORK_HANDBACK_CONTINUATION_KEY_PREFIX,
   REWORK_HANDBACK_CONTINUATION_SOURCE,
@@ -397,6 +399,56 @@ describePostgres("rework hand-back continuation recovery", () => {
     const [issue] = await db.select({ executionRunId: issues.executionRunId }).from(issues)
       .where(eq(issues.id, seeded.issueId));
     expect(issue?.executionRunId).toBe(holderRunId);
+  });
+
+  it("R3c: a lease holder that finishes promotes the deferred keyed wake into one successor of the parked run", async () => {
+    const seeded = await seed();
+    const holderRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: holderRunId,
+      companyId: seeded.companyId,
+      agentId: seeded.reviewerId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "running",
+      scopeKind: "issue",
+      issueId: seeded.issueId,
+      startedAt: new Date(),
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+    });
+    await db.update(issues).set({ executionRunId: holderRunId }).where(eq(issues.id, seeded.issueId));
+    const key = keyFor(seeded);
+    expect(await directWake(seeded, key)).toBeNull();
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, holderRunId));
+
+    const release = createReleaseIssueExecution({
+      issueLock: createPostgresWakeQueueAdapter(db, {
+        resolveResponsibleUserId: async () => "responsible-user",
+        getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+        resolveSessionBeforeForWakeup: async () => null,
+      }),
+      recovery: { escalateStrandedAssignedIssue: async () => undefined, escalateStrandedRecoveryIssueInPlace: async () => undefined },
+    });
+    const { outcome } = await release({ companyId: seeded.companyId, runId: holderRunId, now: new Date(), suppressImmediateRecovery: true });
+
+    expect(outcome).toMatchObject({ kind: "promoted" });
+    const runs = await successorRuns(seeded.parkedRunId);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]!.contextSnapshot).toMatchObject({
+      issueId: seeded.issueId,
+      source: REWORK_HANDBACK_CONTINUATION_SOURCE,
+      retryOfRunId: seeded.parkedRunId,
+    });
+    const rows = await keyRows(seeded.executorId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.runId).toBe(runs[0]!.id);
+    expect(await directWake(seeded, key)).toMatchObject({ id: runs[0]!.id });
+    expect(await keyRows(seeded.executorId)).toHaveLength(1);
+    expect(await successorRuns(seeded.parkedRunId)).toHaveLength(1);
+    const after = await readIssue(seeded.issueId);
+    expect(after.executionRunId).toBe(runs[0]!.id);
+    expect(invariants(after)).toEqual(invariants(seeded.before));
   });
 
   it("R3c: cancelling the lease holder re-admits the deferred keyed wake as one successor of the parked run", async () => {
