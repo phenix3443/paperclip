@@ -1,3 +1,4 @@
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../delivery-work-notifications.js";
 import { writeToolConnectionHealthChange } from "../../tool-connection-health-notifications.js";
 import { connectionActorUserId } from "../actor.js";
 import { vercelConnectHttpError, vercelCredentialFor, vercelConnectResourcesFor } from "../vercel-credentials.js";
@@ -6,7 +7,7 @@ import { connectionMethodForConnection, projectedConnectionHeaders } from "../co
 import { emitConnectionUpdated } from "../../connector-telemetry.js";
 import { and, eq, ne } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { connectionGrants, companyMemberships, toolApplications, toolConnections } from "@paperclipai/db";
+import { afterDatabaseCommit, connectionGrants, companyMemberships, toolApplications, toolConnections } from "@paperclipai/db";
 import type { ConnectionGrantKind, ConnectToolAppResult } from "@paperclipai/shared";
 import { getConnectableAppDefinition, recommendedDefaultsForApp } from "@paperclipai/shared";
 import { badRequest, forbidden, HttpError } from "../../../errors.js";
@@ -163,51 +164,53 @@ export function createVercelOAuthCallback(db: Db, dependencies: Dependencies) {
       revokedByUserId: null,
       updatedAt: now(),
     };
-    if (existingGrant) {
-      await db
-        .update(connectionGrants)
-        .set(grantValues)
-        .where(eq(connectionGrants.id, existingGrant.id));
-    } else {
-      await db.insert(connectionGrants).values({
-        companyId: connection.companyId,
-        connectionId: connection.id,
-        kind: grantKind,
-        subjectUserId: stateRow.subjectUserId,
-        ...grantValues,
-        createdByUserId:
-          connectionActorUserId(input.actor),
-      });
-    }
     const preActivationLifecycle = {
       status: connection.status,
       enabled: connection.enabled,
     };
-    [connection] = await writeToolConnectionHealthChange(db, connection, tx => tx
-      .update(toolConnections)
-      .set({
-        status: "active",
-        enabled: true,
-        credentialRefs: [],
-        credentialSecretRefs: [],
-        updatedAt: now(),
-      })
-      .where(
-        and(
-          eq(toolConnections.id, connection.id),
-          eq(toolConnections.companyId, connection.companyId),
-        ),
-      )
-      .returning());
-    emitConnectionUpdated(
-      connection,
-      preActivationLifecycle,
-      "oauth_callback",
-    );
-    await db
-      .update(toolApplications)
-      .set({ status: "active", updatedAt: now() })
-      .where(eq(toolApplications.id, connection.applicationId));
+    connection = await db.transaction(async tx => {
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
+      if (existingGrant) {
+        await tx
+          .update(connectionGrants)
+          .set(grantValues)
+          .where(eq(connectionGrants.id, existingGrant.id));
+      } else {
+        await tx.insert(connectionGrants).values({
+          companyId: connection.companyId,
+          connectionId: connection.id,
+          kind: grantKind,
+          subjectUserId: stateRow.subjectUserId,
+          ...grantValues,
+          createdByUserId:
+            connectionActorUserId(input.actor),
+        });
+      }
+      const [updated] = await writeToolConnectionHealthChange(tx as unknown as Db, connection, tx => tx
+        .update(toolConnections)
+        .set({
+          status: "active",
+          enabled: true,
+          credentialRefs: [],
+          credentialSecretRefs: [],
+          updatedAt: now(),
+        })
+        .where(
+          and(
+            eq(toolConnections.id, connection.id),
+            eq(toolConnections.companyId, connection.companyId),
+          ),
+        )
+        .returning());
+      await tx
+        .update(toolApplications)
+        .set({ status: "active", updatedAt: now() })
+        .where(eq(toolApplications.id, connection.applicationId));
+      await afterDatabaseCommit(tx, DELIVERY_QUEUES.connection, () => {
+        emitConnectionUpdated(updated, preActivationLifecycle, "oauth_callback");
+      });
+      return updated;
+    });
     const sourceTemplateKey =
       typeof connection.config.sourceTemplateKey === "string"
         ? connection.config.sourceTemplateKey

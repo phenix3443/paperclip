@@ -1,9 +1,15 @@
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { activityLog, connectionGrants, createDb, databaseWorkPending, issueThreadInteractions, toolApplications, toolConnections, toolPolicies, toolProfiles, type Db } from "@paperclipai/db";
+import { emitConnectionUpdated } from "../services/connector-telemetry.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../services/delivery-work-notifications.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { arrangeOAuthCallback, OAUTH_CALLBACK_MODES, type OAuthCallbackMode } from "./helpers/oauth-callback-delivery-fixture.js";
+
+vi.mock("../services/connector-telemetry.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../services/connector-telemetry.js")>(),
+  emitConnectionUpdated: vi.fn(),
+}));
 
 const isolated = vi.hoisted(() => ({ grantNotifications: 0 }));
 vi.mock("../services/delivery-work-notifications.js", async importOriginal => {
@@ -16,10 +22,10 @@ vi.mock("../services/delivery-work-notifications.js", async importOriginal => {
 
 const support = await getEmbeddedPostgresTestSupport();
 const describePostgres = support.supported ? describe : describe.skip;
-type Mode = Extract<OAuthCallbackMode, `direct ${string}`>;
-const MODES = OAUTH_CALLBACK_MODES.filter((mode): mode is Mode => mode.startsWith("direct "));
+type Mode = Extract<OAuthCallbackMode, `direct ${string}` | `vercel ${string}`>;
+const MODES = OAUTH_CALLBACK_MODES.filter((mode): mode is Mode => mode.startsWith("direct ") || mode.startsWith("vercel "));
 
-describePostgres("direct OAuth callback transactions notify the connection delivery worker", () => {
+describePostgres("direct and Vercel OAuth callback transactions notify the connection delivery worker", () => {
   let db!: ReturnType<typeof createDb>;
   let temp!: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let fixture: Awaited<ReturnType<typeof arrangeOAuthCallback>> | null = null;
@@ -27,7 +33,7 @@ describePostgres("direct OAuth callback transactions notify the connection deliv
     temp = await startEmbeddedPostgresTestDatabase("paperclip-direct-oauth-connection-delivery-");
     db = createDb(temp.connectionString);
   }, 20_000);
-  afterEach(async () => { await fixture?.cleanup(); fixture = null; isolated.grantNotifications = 0; });
+  afterEach(async () => { await fixture?.cleanup(); fixture = null; isolated.grantNotifications = 0; vi.mocked(emitConnectionUpdated).mockClear(); });
   afterAll(async () => { await db?.$client.end({ timeout: 1 }); await temp?.cleanup(); });
 
   const pause = () => new Promise(resolve => setTimeout(resolve, 200));
@@ -43,10 +49,10 @@ describePostgres("direct OAuth callback transactions notify the connection deliv
     else expect(card.status).toBe("pending");
     expect(deliveries).toHaveLength(retired ? 1 : 0);
     expect(delivery.wakeup).toHaveBeenCalledTimes(retired ? 1 : 0);
-    if (!retired) expect(await db.select().from(activityLog).where(eq(activityLog.action, "issue.thread_interaction_resolved"))).toHaveLength(0);
+    expect(await db.select().from(activityLog).where(eq(activityLog.action, "issue.thread_interaction_resolved"))).toHaveLength(retired ? 1 : 0);
   }
   const grantFor = (f: NonNullable<typeof fixture>, mode: Mode) => and(eq(connectionGrants.connectionId, f.connection.id),
-    eq(connectionGrants.kind, mode === "direct user" ? "user" : "organization"));
+    eq(connectionGrants.kind, mode.endsWith("user") ? "user" : "organization"));
 
   it.each(MODES)("%s callback retires the exact access request through its own transaction before any maintenance tick", async mode => {
     const { f, delivery, baseline } = await arrange(mode);
@@ -55,6 +61,7 @@ describePostgres("direct OAuth callback transactions notify the connection deliv
     await delivery.settle(baseline + 1);
     await expectEffects(f, delivery, true);
     expect(f.later.refreshCatalog).toHaveBeenCalledOnce();
+    if (mode.startsWith("vercel")) expect(emitConnectionUpdated).toHaveBeenCalledOnce();
     expect(isolated.grantNotifications).toBe(mode === "direct organization" ? 1 : 0);
   });
 
@@ -62,7 +69,7 @@ describePostgres("direct OAuth callback transactions notify the connection deliv
     const { f, delivery, baseline } = await arrange(mode);
     await db.update(toolConnections).set({ status: "active", enabled: true }).where(eq(toolConnections.id, f.connection.id));
     await db.update(toolApplications).set({ status: "active" }).where(eq(toolApplications.id, f.connection.applicationId));
-    if (mode === "direct user") await db.update(connectionGrants).set({ status: "active", revokedAt: null }).where(grantFor(f, mode));
+    if (mode.endsWith("user")) await db.update(connectionGrants).set({ status: "active", revokedAt: null }).where(grantFor(f, mode));
     else await db.insert(connectionGrants).values({ companyId: f.companyId, connectionId: f.connection.id, kind: "organization", isDefault: true, status: "active" });
     await pause();
     expect(delivery.sweeps).toBe(baseline);
@@ -76,31 +83,41 @@ describePostgres("direct OAuth callback transactions notify the connection deliv
     const { f, delivery, baseline } = await arrange(mode);
     const before = await f.read();
     await db.transaction(async tx => {
-      await tx.execute(sql`create function reject_secret_insert() returns trigger language plpgsql as $$ begin raise exception 'secret rejected'; end $$`);
-      await tx.execute(sql`create trigger reject_secret_insert before insert on company_secrets for each row execute function reject_secret_insert()`);
+      const vercel = mode.startsWith("vercel");
+      await tx.execute(sql`create function reject_callback_write() returns trigger language plpgsql as $$ begin raise exception 'write rejected'; end $$`);
+      await tx.execute(vercel
+        ? sql`create trigger reject_callback_write before insert or update on connection_grants for each row execute function reject_callback_write()`
+        : sql`create trigger reject_callback_write before insert on company_secrets for each row execute function reject_callback_write()`);
       expect(pending()).toBe(false);
       await expect(f.callback({ client: tx as unknown as Db })).rejects.toThrow();
       expect(pending()).toBe(true);
       expect(await tx.select().from(connectionGrants).where(eq(connectionGrants.connectionId, f.connection.id))).toEqual(before.grants);
-      await tx.execute(sql`drop trigger reject_secret_insert on company_secrets`);
-      await tx.execute(sql`drop function reject_secret_insert()`);
+      await tx.execute(vercel ? sql`drop trigger reject_callback_write on connection_grants` : sql`drop trigger reject_callback_write on company_secrets`);
+      await tx.execute(sql`drop function reject_callback_write()`);
     });
     await delivery.settle(baseline + 1);
     await expectEffects(f, delivery, false);
   });
 
-  it.each(MODES)("%s callback publishes only when the caller-owned transaction commits", async mode => {
-    const { f, delivery, baseline } = await arrange(mode);
-    await db.transaction(async tx => {
-      await f.callback({ client: tx as unknown as Db });
-      expect(pending()).toBe(true);
-      await pause();
-      expect(delivery.sweeps).toBe(baseline);
-      await expectEffects(f, delivery, false);
-    });
-    await delivery.settle(baseline + 1);
-    await expectEffects(f, delivery, true);
-  });
+  it.each(MODES.flatMap(mode => [false, true].map(rollback => [mode, rollback] as const)))(
+    "%s callback waits for outer settlement (rollback=%s)", async (mode, rollback) => {
+      const { f, delivery, baseline } = await arrange(mode);
+      const transaction = db.transaction(async tx => {
+        await f.callback({ client: tx as unknown as Db });
+        expect(pending()).toBe(true);
+        if (mode.startsWith("vercel")) expect(emitConnectionUpdated).not.toHaveBeenCalled();
+        await pause();
+        expect(delivery.sweeps).toBe(baseline);
+        await expectEffects(f, delivery, false);
+        if (rollback) throw new Error("outer rollback");
+      });
+      if (rollback) await expect(transaction).rejects.toThrow("outer rollback");
+      else await transaction;
+      await delivery.settle(baseline + 1);
+      await expectEffects(f, delivery, !rollback);
+      if (mode.startsWith("vercel")) expect(emitConnectionUpdated).toHaveBeenCalledTimes(rollback ? 0 : 1);
+    },
+  );
 
   it.each(MODES)("%s callback that fails after its notification and writes keeps the card pending", async mode => {
     const { f, delivery, baseline } = await arrange(mode);
@@ -112,14 +129,17 @@ describePostgres("direct OAuth callback transactions notify the connection deliv
     await delivery.settle(baseline);
     const after = await f.read();
     expect(after.grants).toEqual(before.grants);
-    expect(after.connection.status).toBe(before.connection.status);
+    expect(after.connection).toEqual(before.connection);
+    expect((await db.select().from(toolApplications).where(eq(toolApplications.id, f.connection.applicationId)))[0].status).toBe("draft");
     await expectEffects(f, delivery, false);
     expect(f.later.refreshCatalog).not.toHaveBeenCalled();
+    if (mode.startsWith("vercel")) expect(emitConnectionUpdated).not.toHaveBeenCalled();
   });
 
   it.each([
     ...MODES.flatMap(mode => ["narrowed policy", "weaker permission", "changed tool"].map(gap => [mode, gap] as const)),
     ["direct organization", "ambiguous identity"] as const,
+    ["vercel organization", "ambiguous identity"] as const,
   ])("%s callback with %s notifies without retiring the card", async (mode, gap) => {
     fixture = await arrangeOAuthCallback(db, mode);
     const f = fixture;
