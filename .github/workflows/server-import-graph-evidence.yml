@@ -1,0 +1,55 @@
+name: server-import-graph-evidence
+on:
+  push:
+    branches: [chore/server-import-graph-evidence]
+permissions:
+  contents: read
+jobs:
+  graph:
+    if: github.repository == 'phenix3443/paperclip'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: diagnostic
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 4c4a4be3a6639c6f5b7f268823b368180b985f9f
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86
+        with:
+          version: 9.15.4
+          package_json_file: source/package.json
+      - name: Install static-analysis inputs without lifecycle scripts
+        working-directory: source
+        run: |
+          pnpm install --frozen-lockfile --ignore-scripts
+          npm install --prefix "$RUNNER_TEMP/graph-tools" --ignore-scripts --no-audit --no-fund typescript@5.9.3
+      - name: Resolve imports without emit or diagnostics
+        working-directory: source
+        env:
+          GRAPH_WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          export GRAPH_TYPESCRIPT="$RUNNER_TEMP/graph-tools/node_modules/typescript/lib/typescript.js"
+          export GRAPH_OUT="$GITHUB_WORKSPACE/evidence"
+          node "$GITHUB_WORKSPACE/diagnostic/.github/scripts/server-import-graph.mjs"
+          cp "$RUNNER_TEMP/graph-tools/package-lock.json" "$GRAPH_OUT/tool-package-lock.json"
+          cp pnpm-lock.yaml "$GRAPH_OUT/source-pnpm-lock.yaml"
+          cp server/tsconfig.src.json "$GRAPH_OUT/tsconfig.src.json"
+          cp server/tsconfig.json "$GRAPH_OUT/tsconfig.json"
+          cp tsconfig.base.json "$GRAPH_OUT/tsconfig.base.json"
+          git diff --exit-code
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: server-import-graph-evidence
+          path: evidence/
+          retention-days: 90
+          if-no-files-found: error
