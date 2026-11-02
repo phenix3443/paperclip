@@ -192,12 +192,12 @@ function normaliseSql(input: string): string {
   return collapseSql(stripSqlForKeywordScan(input));
 }
 
-function deniedSqlViews(input: string): string[] {
+function keywordScanTexts(input: string): string[] {
   return [normaliseSql(input), collapseSql(stripSqlWithLegacyRegexes(input))];
 }
 
-function anyViewMatches(views: readonly string[], pattern: RegExp): boolean {
-  return views.some((view) => pattern.test(view));
+function anyTextMatches(texts: readonly string[], pattern: RegExp): boolean {
+  return texts.some((text) => pattern.test(text));
 }
 
 function extractQualifiedRefs(statement: string): SqlRef[] {
@@ -243,8 +243,7 @@ function assertAllowedPublicRead(
   }
 }
 
-function assertNoBannedSql(statement: string): void {
-  const views = deniedSqlViews(statement);
+function assertNoBannedSql(scanTexts: readonly string[]): void {
   const banned = [
     /\bcreate\s+extension\b/,
     /\bcreate\s+(?:event\s+)?trigger\b/,
@@ -257,7 +256,7 @@ function assertNoBannedSql(statement: string): void {
     /\bcall\b/,
     /\bdo\s+(?:\$\$|language\b)/,
   ];
-  const matched = banned.find((pattern) => anyViewMatches(views, pattern));
+  const matched = banned.find((pattern) => anyTextMatches(scanTexts, pattern));
   if (matched) {
     throw new Error(`Plugin SQL contains a disallowed statement or clause: ${matched.source}`);
   }
@@ -269,22 +268,22 @@ export function validatePluginMigrationStatement(
   coreReadTables: readonly PluginDatabaseCoreReadTable[] = [],
 ): void {
   assertIdentifier(namespace, "namespace");
-  assertNoBannedSql(statement);
+  const scanTexts = keywordScanTexts(statement);
+  const normalized = scanTexts[0]!;
+  assertNoBannedSql(scanTexts);
 
-  const normalized = normaliseSql(statement);
-  const views = deniedSqlViews(statement);
-  if (anyViewMatches(views, /^\s*(drop|truncate)\b/)) {
+  if (anyTextMatches(scanTexts, /^\s*(drop|truncate)\b/)) {
     throw new Error("Destructive plugin migrations are not allowed in Phase 1");
   }
 
-  if (anyViewMatches(views, /\bdelete\s+from\b/)) {
+  if (anyTextMatches(scanTexts, /\bdelete\s+from\b/)) {
     throw new Error("Plugin migrations cannot delete data");
   }
 
   const ddlOrBackfillAllowed =
     /^(create|alter|comment)\b/.test(normalized) ||
     /^(insert\s+into|update)\b/.test(normalized) ||
-    (normalized.startsWith("with ") && /\b(insert\s+into|update)\b/.test(normalized));
+    (normalized.startsWith("with ") && scanTexts.every((text) => /\b(insert\s+into|update)\b/.test(text)));
   if (!ddlOrBackfillAllowed) {
     throw new Error("Plugin migrations may contain DDL or namespace-scoped backfill statements only");
   }
@@ -330,12 +329,13 @@ export function validatePluginRuntimeQuery(
     throw new Error("Plugin runtime SQL must contain exactly one statement");
   }
   const statement = statements[0]!;
-  assertNoBannedSql(statement);
-  const normalized = normaliseSql(statement);
+  const scanTexts = keywordScanTexts(statement);
+  const normalized = scanTexts[0]!;
+  assertNoBannedSql(scanTexts);
   if (!normalized.startsWith("select ") && !normalized.startsWith("with ")) {
     throw new Error("ctx.db.query only allows SELECT statements");
   }
-  if (anyViewMatches(deniedSqlViews(statement), /\b(insert|update|delete|alter|create|drop|truncate)\b/)) {
+  if (anyTextMatches(scanTexts, /\b(insert|update|delete|alter|create|drop|truncate)\b/)) {
     throw new Error("ctx.db.query cannot contain mutation or DDL keywords");
   }
 
@@ -356,12 +356,13 @@ export function validatePluginRuntimeExecute(query: string, namespace: string): 
     throw new Error("Plugin runtime SQL must contain exactly one statement");
   }
   const statement = statements[0]!;
-  assertNoBannedSql(statement);
-  const normalized = normaliseSql(statement);
+  const scanTexts = keywordScanTexts(statement);
+  const normalized = scanTexts[0]!;
+  assertNoBannedSql(scanTexts);
   if (!/^(insert\s+into|update|delete\s+from)\b/.test(normalized)) {
     throw new Error("ctx.db.execute only allows INSERT, UPDATE, or DELETE");
   }
-  if (anyViewMatches(deniedSqlViews(statement), /\b(alter|create|drop|truncate)\b/)) {
+  if (anyTextMatches(scanTexts, /\b(alter|create|drop|truncate)\b/)) {
     throw new Error("ctx.db.execute cannot contain DDL keywords");
   }
 

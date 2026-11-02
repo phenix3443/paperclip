@@ -264,6 +264,12 @@ describe("plugin database SQL validation", () => {
       )
     ).toThrow(/disallowed/i);
     expect(() =>
+      validatePluginMigrationStatement(
+        "WITH a AS (SELECT 1 AS x) SELECT x, $$\"'\"$$, $$ update plugin_test.rows $$, $$'$$ FROM a",
+        "plugin_test",
+      )
+    ).toThrow(/DDL or namespace-scoped backfill/i);
+    expect(() =>
       validatePluginRuntimeQuery(
         "WITH a AS (SELECT $$\"$$ AS x), d AS (DELETE FROM plugin_test.rows RETURNING 1) SELECT '\"' FROM a",
         "plugin_test",
