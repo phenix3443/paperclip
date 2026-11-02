@@ -399,17 +399,20 @@ async function removeConnection(
           .where(and(eq(toolProfileEntries.companyId, connection.companyId), eq(toolProfileEntries.profileId, appProfile.id)))
           .returning({ id: toolProfileEntries.id })).length;
       });
-      appProfileBindingsRemoved = (
-        await db
-          .delete(toolProfileBindings)
-          .where(
-            and(
-              eq(toolProfileBindings.companyId, connection.companyId),
-              eq(toolProfileBindings.profileId, appProfile.id),
-            ),
-          )
-          .returning({ id: toolProfileBindings.id })
-      ).length;
+      appProfileBindingsRemoved = await db.transaction(async tx => {
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
+        return (
+          await tx
+            .delete(toolProfileBindings)
+            .where(
+              and(
+                eq(toolProfileBindings.companyId, connection.companyId),
+                eq(toolProfileBindings.profileId, appProfile.id),
+              ),
+            )
+            .returning({ id: toolProfileBindings.id })
+        ).length;
+      });
 
       const gatewayRows = await db
         .select({ id: toolMcpGateways.id })
@@ -421,7 +424,10 @@ async function removeConnection(
           ),
         );
       if (gatewayRows.length === 0) {
-        await db.delete(toolProfiles).where(eq(toolProfiles.id, appProfile.id));
+        await db.transaction(async tx => {
+          await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
+          await tx.delete(toolProfiles).where(eq(toolProfiles.id, appProfile.id));
+        });
         appProfileOutcome = "deleted";
       } else {
         // `tool_mcp_gateways.profile_id` is ON DELETE RESTRICT, so a gateway
@@ -429,10 +435,13 @@ async function removeConnection(
         // engine only consults `active` profiles, and it has no entries left —
         // and revoke the tokens those gateways already handed out, which are the
         // one credential a caller could still present.
-        await db
-          .update(toolProfiles)
-          .set({ status: "archived", defaultAction: "deny", updatedAt: now })
-          .where(eq(toolProfiles.id, appProfile.id));
+        await db.transaction(async tx => {
+          await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
+          await tx
+            .update(toolProfiles)
+            .set({ status: "archived", defaultAction: "deny", updatedAt: now })
+            .where(eq(toolProfiles.id, appProfile.id));
+        });
         appProfileOutcome = "archived";
         const revokedTokens = await db
           .update(toolMcpGatewayTokens)
