@@ -814,6 +814,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         comments: await db.select().from(issueComments).where(eq(issueComments.issueId, seed.sourceIssueId)),
         actions: await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, seed.companyId)),
         wakes: await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, seed.companyId)),
+        relations: await db.select().from(issueRelations).where(eq(issueRelations.companyId, seed.companyId)),
       };
     }
 
@@ -836,6 +837,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       ["R3 the execution generation changed", async (seed: Awaited<ReturnType<typeof seedReleasedBlock>>) => {
         await db.update(issues).set({ executionState: { status: "pending", currentStageId: "stage-2", changesRequestedCount: 1 } })
           .where(eq(issues.id, seed.sourceIssueId));
+      }],
+      ["R3b the assignee changed through issueService.update", async (seed: Awaited<ReturnType<typeof seedReleasedBlock>>) => {
+        await issueService(db).update(seed.sourceIssueId, { assigneeAgentId: seed.managerId });
       }],
       ["R4 the status decision moved", async (seed: Awaited<ReturnType<typeof seedReleasedBlock>>) => {
         await db.update(issues).set({ statusVersion: sql`${issues.statusVersion} + 1`, lastStatusDecisionId: randomUUID() })

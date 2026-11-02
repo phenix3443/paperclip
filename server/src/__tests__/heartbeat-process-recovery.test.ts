@@ -6590,6 +6590,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         children: (await db.select({ id: issues.id }).from(issues).where(eq(issues.parentId, issueId))).length,
         wakes: (await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
           .where(eq(agentWakeupRequests.companyId, companyId))).length,
+        relations: (await db.select({ id: issueRelations.id }).from(issueRelations)
+          .where(eq(issueRelations.companyId, companyId))).length,
       };
     }
 
@@ -6605,10 +6607,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Reviewed nothing.",
           provider: "test", model: "test-model" };
       });
+      const atHook: { row?: typeof issues.$inferSelect; effects?: Awaited<ReturnType<typeof sideEffects>> } = {};
       if (mutate) {
         escalationBarrier.hook = async (input, original) => {
           const mode = await mutate(seed);
           const [reread] = await db.select().from(issues).where(eq(issues.id, seed.issueId));
+          Object.assign(atHook, { row: reread, effects: await sideEffects(seed.issueId, seed.companyId) });
           return original(mode === "reread" ? { ...input, issue: reread } : input);
         };
       }
@@ -6617,7 +6621,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       await heartbeat.resumeQueuedRuns();
       await waitForRunToSettle(heartbeat, seed.runId, 8_000);
       await heartbeat.waitForRunExecutionDrain(seed.runId);
-      return { ...seed, before, heartbeat };
+      return { ...seed, before, heartbeat, atHook };
     }
 
     it("I1 releases the lock and escalates a legacy reviewer source without a successor or state change", async () => {
@@ -6641,7 +6645,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       mockAdapterExecute.mockImplementationOnce(async () => {
         const [issue] = await db.select().from(issues).where(eq(issues.id, seed.issueId));
         await db.update(issues).set({ executionState: { ...(issue.executionState as Record<string, unknown>),
-          changesRequestedCount: 1 } }).where(eq(issues.id, seed.issueId));
+          currentStageId: randomUUID(), changesRequestedCount: 1 } }).where(eq(issues.id, seed.issueId));
         return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Stage moved.",
           provider: "test", model: "test-model" };
       });
@@ -6665,7 +6669,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     ] as const)("%s: the stale refusal does not block the new authority", async (_name, change, mode) => {
       let claimantId: string | null = null;
       let changedState: unknown = null;
-      const { issueId, companyId } = await finishLegacyReviewer(async (seed) => {
+      const { issueId, companyId, atHook } = await finishLegacyReviewer(async (seed) => {
         if (change === "claim") claimantId = await claimFor(seed.issueId, seed.companyId, seed.agentId);
         else {
           const [row] = await db.select().from(issues).where(eq(issues.id, seed.issueId));
@@ -6681,6 +6685,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       if (claimantId) expect(after).toMatchObject({ executionRunId: claimantId, checkoutRunId: claimantId, executionAgentNameKey: "claimant" });
       else expect(after.executionState).toEqual(changedState);
       expect(await sideEffects(issueId, companyId)).toMatchObject({ actions: [], children: 0 });
+      expect(await sideEffects(issueId, companyId)).toEqual(atHook.effects);
+      const { status, statusVersion, lastStatusDecisionId, assigneeAgentId, assigneeUserId, responsibleUserId } = atHook.row!;
+      expect(after).toMatchObject({ status, statusVersion, lastStatusDecisionId, assigneeAgentId, assigneeUserId, responsibleUserId });
+      expect(after.executionState).toEqual(atHook.row!.executionState);
     });
 
     async function finishWorkspaceValidation(mutate?: (seed: { companyId: string; agentId: string; issueId: string }) =>
@@ -6735,9 +6743,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     ] as const)("%s: a new claimant keeps the issue after an early workspace-validation release", async (_name, mode) => {
       let claimantId: string | null = null;
       let claimed: typeof issues.$inferSelect | null = null;
+      let relationsAtClaim: unknown[] = [];
       const { issueId, companyId } = await finishWorkspaceValidation(async (seed) => {
         claimantId = await claimFor(seed.issueId, seed.companyId, seed.agentId);
         claimed = (await db.select().from(issues).where(eq(issues.id, seed.issueId)))[0]!;
+        relationsAtClaim = await db.select().from(issueRelations).where(eq(issueRelations.companyId, seed.companyId));
         return mode;
       });
       expect(escalationBarrier.results).toEqual([null]);
@@ -6750,6 +6760,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)))).toEqual([]);
       expect((await selectRecoveryCommentsForIssue(issueId)).some((comment) => comment.body.includes("workspace failed validation")))
         .toBe(false);
+      expect(await db.select().from(issueRelations).where(eq(issueRelations.companyId, companyId))).toEqual(relationsAtClaim);
     });
   });
 
