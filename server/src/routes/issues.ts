@@ -5581,7 +5581,7 @@ export function issueRoutes(
       ...(blocker ? { blockerAttention: { ...blocker,
         sampleBlockerIdentifier: safeSample(blocker.sampleBlockerIdentifier),
         sampleStalledBlockerIdentifier: safeSample(blocker.sampleStalledBlockerIdentifier),
-        pendingFinalizeBlockerIssueIds: blocker.pendingFinalizeBlockerIssueIds.filter((id) => proof.ids.has(id)),
+        pendingFinalizeBlockerIssueIds: blocker.pendingFinalizeBlockerIssueIds?.filter((id) => proof.ids.has(id)),
       } } : {}),
       ...(attention ? { blockedInboxAttention: { ...attention,
         sampleIssueIdentifier: safeSample(attention.sampleIssueIdentifier),
