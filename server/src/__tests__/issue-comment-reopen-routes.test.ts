@@ -1,3 +1,4 @@
+import { executionDecisionInputsDigest } from "@paperclipai/shared";
 import express from "express";
 import request from "supertest";
 import { getTableName } from "drizzle-orm";
@@ -3010,16 +3011,110 @@ describe("issue comment reopen routes", () => {
       });
       return {
         initial, read: () => committed,
-        send: async (method: "patch" | "post", status = "done", attachmentIds?: string[], body = "  kind: review\ndecision: approved  ") => {
+        send: async (method: "patch" | "post", status = "done", attachmentIds?: string[], body = "  kind: review\ndecision: approved  ", extra: Record<string, unknown> = {}) => {
           const state = parseIssueExecutionState(committed.issue.executionState);
           const agentId = state?.status === "pending" ? reviewer : "22222222-2222-4222-8222-222222222222";
           const app = await installActor(createApp(), { type: "agent", agentId, companyId: "company-1", source: "agent_key", runId: "review-run" });
           return method === "patch"
-            ? request(app).patch(`/api/issues/${initial.id}`).send({ status, comment: body, attachmentIds })
+            ? request(app).patch(`/api/issues/${initial.id}`).send({ status, comment: body, attachmentIds, ...extra })
             : request(app).post(`/api/issues/${initial.id}/comments`).send({ body, attachmentIds });
         },
       };
     }
+
+    it("rejects a caller snapshot that changed before PATCH without persisting anything", async () => {
+      const f = await fixture();
+      const expectedExecutionDecisionDigest = await executionDecisionInputsDigest({ ...f.initial, monitorAttemptCount: 8 });
+      const res = await f.send("patch", "done", undefined, "Approve", { expectedExecutionDecisionDigest });
+      expect(res.status).toBe(409);
+      expect(res.body.details.code).toBe("execution_policy_transition_stale");
+      expect(f.read()).toEqual({ issue: f.initial, comments: [], decisions: [], activities: [] });
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    });
+
+    it("accepts a matching digest and never persists the request precondition", async () => {
+      const f = await fixture();
+      const expectedExecutionDecisionDigest = await executionDecisionInputsDigest(f.initial);
+      expect((await f.send("patch", "done", undefined, "Approve", { expectedExecutionDecisionDigest })).status).toBe(200);
+      expect([f.read().comments.length, f.read().decisions.length, f.read().activities.length]).toEqual([1, 1, 1]);
+      expect(f.read().issue).not.toHaveProperty("expectedExecutionDecisionDigest");
+      expect(f.read().activities[0].details).not.toHaveProperty("expectedExecutionDecisionDigest");
+    });
+
+    it.each([
+      ["status", "blocked"], ["assigneeAgentId", "different-agent"], ["assigneeUserId", "different-user"],
+      ["responsibleUserId", "different-owner"], ["createdByUserId", "different-creator"],
+      ["executionPolicy", { mode: "normal", stages: [] }], ["executionState", null],
+      ["monitorNextCheckAt", new Date("2026-12-01T00:00:00.000Z")],
+      ["monitorWakeRequestedAt", new Date("2026-12-01T00:00:00.000Z")],
+      ["monitorLastTriggeredAt", new Date("2026-12-01T00:00:00.000Z")],
+      ["monitorAttemptCount", 7], ["monitorNotes", "changed"], ["monitorScheduledBy", "board"],
+    ])("rejects a %s change under the lock without comments or decisions", async (key, value) => {
+      const f = await fixture();
+      const expectedExecutionDecisionDigest = await executionDecisionInputsDigest(f.initial);
+      mockIssueService.getByIdForUpdate.mockResolvedValue({ ...f.initial, [key]: value });
+      const res = await f.send("patch", "done", undefined, "Approve", { expectedExecutionDecisionDigest });
+      expect(res.status).toBe(409);
+      expect(res.body.details.code).toBe("execution_policy_transition_stale");
+      expect(f.read()).toEqual({ issue: f.initial, comments: [], decisions: [], activities: [] });
+    });
+
+    it.each([
+      { unknownField: true }, { title: "Rename" }, { executionPolicy: null }, { expectedExecutionPolicy: null },
+      { expectedStatusVersion: 1 }, { resume: false }, { attachmentIds: [] }, { assigneeAgentId: null },
+    ])("rejects mixed guarded requests before side effects: %j", async extra => {
+      const f = await fixture();
+      const expectedExecutionDecisionDigest = await executionDecisionInputsDigest(f.initial);
+      const res = await f.send("patch", "done", undefined, "Approve", { expectedExecutionDecisionDigest, ...extra });
+      expect(res.status).toBe(422);
+      expect(f.read()).toEqual({ issue: f.initial, comments: [], decisions: [], activities: [] });
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    });
+
+    it.each(["in_review"])("rejects a matching digest on a non-decision %s request", async status => {
+      const f = await fixture();
+      const expectedExecutionDecisionDigest = await executionDecisionInputsDigest(f.initial);
+      const res = await f.send("patch", status, undefined, "ordinary comment", { expectedExecutionDecisionDigest });
+      expect(res.status).toBe(409);
+      expect(res.body.details.code).toBe("execution_policy_transition_stale");
+      expect(f.read()).toEqual({ issue: f.initial, comments: [], decisions: [], activities: [] });
+    });
+
+    it("rejects a matching digest on an ordinary task update", async () => {
+      const f = await fixture();
+      const ordinary = { ...f.initial, status: "in_progress", executionPolicy: null, executionState: null };
+      mockIssueService.getById.mockResolvedValue(ordinary);
+      const res = await f.send("patch", "in_progress", undefined, "ordinary update", {
+        expectedExecutionDecisionDigest: await executionDecisionInputsDigest(ordinary),
+      });
+      expect(res.status).toBe(409);
+      expect(res.body.details.code).toBe("execution_policy_transition_stale");
+      expect(f.read()).toEqual({ issue: f.initial, comments: [], decisions: [], activities: [] });
+    });
+
+    it("rejects a Board override carrying a matching digest", async () => {
+      const f = await fixture();
+      const app = await installActor(createApp());
+      const res = await request(app).patch(`/api/issues/${f.initial.id}`).send({
+        status: "done", comment: "Override", expectedExecutionDecisionDigest: await executionDecisionInputsDigest(f.initial),
+      });
+      expect(res.status).toBe(409);
+      expect(res.body.details.code).toBe("execution_policy_transition_stale");
+      expect(f.read()).toEqual({ issue: f.initial, comments: [], decisions: [], activities: [] });
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    });
+
+    it("rejects a participant removed from the current policy", async () => {
+      const f = await fixture();
+      const removed = { ...f.initial, executionPolicy: { ...f.initial.executionPolicy, stages: [] } };
+      mockIssueService.getById.mockResolvedValue(removed);
+      const res = await f.send("patch", "done", undefined, "Approve", {
+        expectedExecutionDecisionDigest: await executionDecisionInputsDigest(removed),
+      });
+      expect(res.status).toBe(409);
+      expect(res.body.details.code).toBe("execution_policy_transition_stale");
+      expect(f.read()).toEqual({ issue: f.initial, comments: [], decisions: [], activities: [] });
+    });
 
     it.each(["patch", "post"] as const)("links the final %s decision once", async method => {
       const f = await fixture();

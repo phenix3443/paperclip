@@ -961,6 +961,7 @@ export const updateIssueSchema = objectWithoutDefaults(
   .partial()
   .extend({
     expectedStatusVersion: z.number().int().nonnegative().optional(),
+    expectedExecutionDecisionDigest: z.string().regex(/^[0-9a-f]{64}$/i).transform(value => value.toLowerCase()).optional(),
     /** Reject a policy write if the policy changed after the caller read it. */
     expectedExecutionPolicy: z.record(z.string(), z.unknown()).optional().nullable(),
     requestDepth: issueRequestDepthInputSchema.optional(),
