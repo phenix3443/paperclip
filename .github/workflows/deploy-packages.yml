@@ -4,6 +4,8 @@
 # exports them through PAPERCLIP_INSTALL_PACKAGES_DIR after its smoke check.
 name: deploy-packages
 
+# Draft scaffold for the approved maintenance workflow slice.
+
 on:
   push:
     branches: [develop]
