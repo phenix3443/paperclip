@@ -4,9 +4,12 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   type Db,
   agents,
+  activityLog,
   authUsers,
   agentWakeupRequests,
   agentRuntimeState,
+  budgetPolicies,
+  budgetIncidents,
   companies,
   companyMemberships,
   costEvents,
@@ -34,9 +37,10 @@ import {
   heartbeatService,
 } from "../services/heartbeat.ts";
 import { runningProcesses } from "../adapters/index.ts";
+import { issueService } from "../services/issues.js";
 import { recoveryService } from "../services/recovery/service.ts";
 import { withQueuedCommentIdsInWakePayload } from "../services/issue-queued-comment-queue.ts";
-import { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy, issueExecutionGeneration } from "../services/issue-execution-policy.js";
+import { applyIssueMonitorPolicyTransition, applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy, issueExecutionGeneration } from "../services/issue-execution-policy.js";
 import { createAdmissionTransactionScope, createWakeAdmissionWriter } from "../modules/wake-queue/adapters/postgres.js";
 import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapters/postgres.js";
 import { reserveRunBudget } from "../services/budget-reservations.js";
@@ -1956,6 +1960,168 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       if (["queued", "accounting", "provider", "retry"].includes(phase))
         expect(task.executionState).toMatchObject({ changesRequestedCount: 2 });
     } finally { restore?.(); release(); beforeClaimCheck = null; await Promise.all([wakePromise, explicitRetryPromise]); }
+  });
+
+  it.each(["manual", "scheduled", "manual-paused", "scheduled-paused", "manual-budget", "scheduled-budget"] as const)("rejects an older queued wake and admits the consumed ordinary monitor generation (%s)", async mode => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const [author] = await db.insert(agents).values({ companyId, name: "Author", role: "engineer", adapterType: "codex_local" }).returning();
+    const policy = normalizeIssueExecutionPolicy({ stages: [{ type: "review", participants: [{ type: "agent", agentId }] }] })!;
+    const [original] = await db.insert(issues).values({ companyId, title: "Ordinary monitor review",
+      status: "in_progress", assigneeAgentId: author.id, executionPolicy: policy }).returning();
+    const submitted = applyIssueExecutionPolicyTransition({ issue: original, policy, requestedStatus: "done",
+      requestedAssigneePatch: {}, actor: { agentId: author.id }, commentBody: "Ready for review" });
+    await db.update(issues).set(submitted.patch).where(eq(issues.id, original.id));
+    let entered = false;
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    beforeClaimCheck = async () => { entered = true; await held; };
+    const wake = heartbeat.wakeup(agentId, { source: "automation", triggerDetail: "system", reason: "issue_execution_stage_started",
+      payload: { issueId: original.id }, requestedByActorType: "agent", requestedByActorId: author.id,
+      contextSnapshot: { issueId: original.id } });
+    const execute = mockAdapterExecute.getMockImplementation()!;
+    try {
+      expect(await waitForCondition(async () => entered)).toBe(true);
+      const [older] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      const [before] = await db.select().from(issues).where(eq(issues.id, original.id));
+      expect(older.contextSnapshot?.reviewerAssignmentGeneration).toBe(issueExecutionGeneration(before));
+      const nextCheckAt = new Date().toISOString();
+      const installedPolicy = normalizeIssueExecutionPolicy({ ...before.executionPolicy!, monitor: { nextCheckAt, notes: "Review check" } })!;
+      const transition = applyIssueMonitorPolicyTransition({ issue: before, policy: normalizeIssueExecutionPolicy(installedPolicy),
+        previousPolicy: normalizeIssueExecutionPolicy(before.executionPolicy), requestedStatus: before.status,
+        requestedAssigneePatch: {}, actor: { agentId }, monitorExplicitlyUpdated: true });
+      const installed = await issueService(db).update(original.id, { ...transition.patch, executionPolicy: installedPolicy, actorAgentId: agentId });
+      expect(issueExecutionGeneration(installed!)).not.toBe(older.contextSnapshot?.reviewerAssignmentGeneration);
+      expect(await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({ companyId, runId: older.id,
+        expectedStatus: "queued", now: new Date() })).toMatchObject({ outcome: "cancelled", errorCode: "issue_review_participant_changed" });
+      release(); beforeClaimCheck = null; await wake;
+      mockAdapterExecute.mockImplementation(async () => {
+        const [current] = await db.select().from(issues).where(eq(issues.id, original.id));
+        const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+        const monitorRun = runs.find(run => run.contextSnapshot?.source === "issue.monitor")!;
+        expect(monitorRun.contextSnapshot?.reviewerAssignmentGeneration).toBe(issueExecutionGeneration(current));
+        expect(monitorRun.activeIdentityContextId).toBeTruthy();
+        await db.insert(issueThreadInteractions).values({ companyId, issueId: original.id, kind: "request_confirmation",
+          status: "pending", continuationPolicy: "wake_assignee", payload: { version: 1, prompt: "Keep review pending" }, createdByAgentId: agentId });
+        return execute();
+      });
+      if (mode.endsWith("-paused") || mode.endsWith("-budget")) {
+        if (mode.endsWith("-paused")) {
+          await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+        } else {
+          await db.insert(budgetPolicies).values({ companyId, scopeType: "agent", scopeId: agentId,
+            windowKind: "lifetime", amount: 1, hardStopEnabled: true });
+          await db.insert(costEvents).values({ companyId, agentId, provider: "test", model: "test-model",
+            costCents: 1, occurredAt: new Date(), billingType: "metered_api", costStatus: "reported" });
+        }
+        try {
+          if (mode.startsWith("manual")) {
+            await expect(heartbeat.triggerIssueMonitor(original.id, { now: new Date(), actorType: "user",
+              actorId: "responsible-user" })).rejects.toMatchObject({ status: 409,
+                message: expect.stringMatching(mode.endsWith("-budget") ? /budget hard-stop/ : /not invokable/i) });
+          } else {
+            expect(await heartbeat.tickTimers(new Date())).toMatchObject({ enqueued: 0 });
+          }
+          if (mode.endsWith("-budget")) {
+            const [incident] = await db.select().from(budgetIncidents).where(eq(budgetIncidents.companyId, companyId));
+            expect(incident).toMatchObject({ scopeType: "agent", scopeId: agentId, thresholdType: "hard", amountLimit: 1 });
+            const [policy] = await db.select().from(budgetPolicies).where(eq(budgetPolicies.companyId, companyId));
+            expect(policy).toMatchObject({ amount: 1, hardStopEnabled: true });
+            const [cost] = await db.select().from(costEvents).where(eq(costEvents.companyId, companyId));
+            expect(cost.costCents).toBe(1);
+          }
+          const [held] = await db.select().from(issues).where(eq(issues.id, original.id));
+          expect(held).toMatchObject({ monitorNextCheckAt: installed!.monitorNextCheckAt, monitorWakeRequestedAt: null, monitorAttemptCount: 0 });
+          expect(held.executionPolicy).toEqual(installed!.executionPolicy);
+          expect(held.executionState).toEqual(installed!.executionState);
+          expect(held.responsibleUserId).toBe(installed!.responsibleUserId);
+          expect(held.assigneeAgentId).toBe(installed!.assigneeAgentId);
+          expect(held.assigneeUserId).toBe(installed!.assigneeUserId);
+          expect(held.status).toBe(installed!.status);
+          const allRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+          expect(allRuns.map(run => run.id)).toEqual([older.id]);
+          expect(allRuns[0]).toMatchObject({ status: "cancelled", errorCode: "issue_review_participant_changed" });
+          expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
+            .filter(run => run.contextSnapshot?.source === "issue.monitor")).toHaveLength(0);
+          expect(mockAdapterExecute).not.toHaveBeenCalled();
+        } finally {
+          if (mode.endsWith("-paused")) await db.update(agents).set({ status: "idle" }).where(eq(agents.id, agentId));
+        }
+        return;
+      }
+      if (mode === "manual") expect(await heartbeat.triggerIssueMonitor(original.id, { now: new Date(), actorType: "user", actorId: "responsible-user" })).toMatchObject({ outcome: "triggered" });
+      else expect(await heartbeat.tickTimers(new Date())).toMatchObject({ enqueued: 1 });
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      const monitorRun = runs.find(run => run.contextSnapshot?.source === "issue.monitor")!;
+      expect(monitorRun).toMatchObject({ status: "succeeded", errorCode: null });
+      expect(monitorRun.contextSnapshot?.reviewerAssignmentGeneration).not.toBe(older.contextSnapshot?.reviewerAssignmentGeneration);
+      expect(countExecuteCallsForRun(older.id)).toBe(0);
+      expect(countExecuteCallsForRun(monitorRun.id)).toBe(1);
+      const [consumed] = await db.select().from(issues).where(eq(issues.id, original.id));
+      expect(consumed).toMatchObject({ monitorNextCheckAt: null, monitorAttemptCount: 1 });
+      const { monitor: previousMonitor, ...reviewHistory } = before.executionState!;
+      expect(consumed.executionState).toMatchObject(reviewHistory);
+    } finally { release(); beforeClaimCheck = null; mockAdapterExecute.mockImplementation(execute); await wake; }
+  });
+
+  it.each(["manual", "scheduled"] as const)("rolls back a deferred ordinary monitor behind a real active review (%s)", async mode => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const [author] = await db.insert(agents).values({ companyId, name: "Author", role: "engineer", adapterType: "codex_local" }).returning();
+    const policy = normalizeIssueExecutionPolicy({ stages: [{ type: "review", participants: [{ type: "agent", agentId }] }] })!;
+    const [original] = await db.insert(issues).values({ companyId, title: "Active ordinary monitor review",
+      status: "in_progress", assigneeAgentId: author.id, executionPolicy: policy }).returning();
+    const submitted = applyIssueExecutionPolicyTransition({ issue: original, policy, requestedStatus: "done",
+      requestedAssigneePatch: {}, actor: { agentId: author.id }, commentBody: "Ready for review" });
+    await db.update(issues).set(submitted.patch).where(eq(issues.id, original.id));
+    let entered = false;
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const execute = mockAdapterExecute.getMockImplementation()!;
+    mockAdapterExecute.mockImplementation(async () => { entered = true; await held; return execute(); });
+    const wake = heartbeat.wakeup(agentId, { source: "automation", triggerDetail: "system", reason: "issue_execution_stage_started",
+      payload: { issueId: original.id }, requestedByActorType: "agent", requestedByActorId: author.id,
+      contextSnapshot: { issueId: original.id } });
+    try {
+      expect(await waitForCondition(async () => entered)).toBe(true);
+      const [active] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      const [before] = await db.select().from(issues).where(eq(issues.id, original.id));
+      expect(active).toMatchObject({ status: "running", activeIdentityContextId: expect.any(String) });
+      expect(before.executionRunId).toBe(active.id);
+      expect(active.contextSnapshot?.reviewerAssignmentGeneration).toBe(issueExecutionGeneration(before));
+      const installedPolicy = normalizeIssueExecutionPolicy({ ...before.executionPolicy!, monitor: {
+        nextCheckAt: new Date().toISOString(), notes: "Review after the active turn" } })!;
+      const transition = applyIssueMonitorPolicyTransition({ issue: before, policy: installedPolicy,
+        previousPolicy: normalizeIssueExecutionPolicy(before.executionPolicy), requestedStatus: before.status,
+        requestedAssigneePatch: {}, actor: { agentId }, monitorExplicitlyUpdated: true });
+      await issueService(db).update(original.id, { ...transition.patch, executionPolicy: installedPolicy, actorAgentId: agentId });
+      const [installed] = await db.select().from(issues).where(eq(issues.id, original.id));
+      expect(issueExecutionGeneration(installed)).not.toBe(active.contextSnapshot?.reviewerAssignmentGeneration);
+      expect(await heartbeat.wakeup(agentId, { source: "automation", triggerDetail: "system", reason: "issue_commented",
+        payload: { issueId: original.id }, requestedByActorType: "agent", requestedByActorId: author.id,
+        contextSnapshot: { issueId: original.id } })).toMatchObject({ id: active.id });
+      const runsBefore = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      expect(runsBefore).toHaveLength(1);
+      expect(runsBefore[0].contextSnapshot?.reviewerAssignmentGeneration).toBe(active.contextSnapshot?.reviewerAssignmentGeneration);
+      const wakesBefore = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+      expect(wakesBefore.filter(wake => wake.status === "coalesced")).toHaveLength(1);
+      expect(wakesBefore.filter(wake => wake.status === "deferred_issue_execution")).toHaveLength(0);
+      if (mode === "manual") expect(await heartbeat.triggerIssueMonitor(original.id, {
+        now: new Date(), actorType: "user", actorId: "responsible-user" })).toMatchObject({ outcome: "skipped" });
+      else expect(await heartbeat.tickTimers(new Date())).toMatchObject({ enqueued: 0 });
+      const [after] = await db.select().from(issues).where(eq(issues.id, original.id));
+      expect(after).toMatchObject({ monitorNextCheckAt: installed.monitorNextCheckAt,
+        monitorAttemptCount: installed.monitorAttemptCount, monitorWakeRequestedAt: null,
+        executionPolicy: installed.executionPolicy, executionState: installed.executionState,
+        responsibleUserId: installed.responsibleUserId, assigneeAgentId: installed.assigneeAgentId,
+        assigneeUserId: installed.assigneeUserId, status: installed.status, executionRunId: active.id });
+      expect(issueExecutionGeneration(after)).toBe(issueExecutionGeneration(installed));
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).toEqual(runsBefore);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toEqual(wakesBefore);
+      const diagnostics = await db.select().from(activityLog).where(eq(activityLog.entityId, original.id));
+      expect(diagnostics.filter(entry => entry.action === "issue.monitor_deferred")).toHaveLength(1);
+      expect(diagnostics.filter(entry => entry.action === "issue.monitor_triggered")).toHaveLength(0);
+      expect(countExecuteCallsForRun(active.id)).toBe(1);
+    } finally { release(); await wake; await drainHeartbeatRunsToQuiescence(db, heartbeat); mockAdapterExecute.mockImplementation(execute); }
   });
 
   it("settles a manually admitted review from its linked operator receipt before comment authors", async () => {

@@ -966,6 +966,7 @@ export function heartbeatService(
   const runDispatch = createRunDispatch(db);
   const {
     scheduleBoundedRetryForRun,
+    scheduleMonitorRetryForRun,
     timerClaimWasFirstHeartbeat,
     scheduleInteractionContinuationInfrastructureRetryIfEligible,
     findSharedWorkspaceHolder,
@@ -1525,9 +1526,11 @@ export function heartbeatService(
   } = createHeartbeatScheduling(db, {
     issuesSvc,
     enqueueWakeup,
+    enqueueMonitorWakeup: heartbeatQueue.enqueueMonitorWakeup,
     getRun,
     getAgent,
     scheduleBoundedRetryForRun,
+    scheduleMonitorRetryForRun,
     getSchedulingSuppression,
     getWorktreeExecutionCutoff,
     toAgentOrgRow,

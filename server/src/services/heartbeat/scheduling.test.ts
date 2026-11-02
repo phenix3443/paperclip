@@ -11,6 +11,7 @@ import { conflict } from "../../errors.js";
 import { createHeartbeatRunPreparation } from "./run-preparation.js";
 import { createHeartbeatRunState } from "./run-state.js";
 import { createHeartbeatScheduling, type HeartbeatSchedulingDependencies } from "./scheduling.js";
+import { issueExecutionGeneration } from "../issue-execution-policy.js";
 import { readIdleSleepSafety } from "../idle-sleep-safety.js";
 import { PaperclipRunnerToolAuthority } from "../native-runtime/paperclip-runner-tool-authority.js";
 import { finalizeNativeRun } from "../native-runtime/native-run-finalizer.js";
@@ -41,6 +42,8 @@ function callbacks(db: Db) {
       create: vi.fn<HeartbeatSchedulingDependencies["issuesSvc"]["create"]>(),
     },
     enqueueWakeup: vi.fn<HeartbeatSchedulingDependencies["enqueueWakeup"]>(async () => admitted),
+    enqueueMonitorWakeup: vi.fn<HeartbeatSchedulingDependencies["enqueueMonitorWakeup"]>(),
+    scheduleMonitorRetryForRun: vi.fn<HeartbeatSchedulingDependencies["scheduleMonitorRetryForRun"]>(),
     scheduleBoundedRetryForRun: vi.fn<HeartbeatSchedulingDependencies["scheduleBoundedRetryForRun"]>(),
     getSchedulingSuppression: vi.fn(async () => ({ suppressed: false })),
     getWorktreeExecutionCutoff: vi.fn<HeartbeatSchedulingDependencies["getWorktreeExecutionCutoff"]>(async () => null),
@@ -117,6 +120,84 @@ describe.skipIf(!postgres.supported)("heartbeat scheduling database boundary", (
     deps.parseHeartbeatPolicy.mockReturnValue({ ...timerPolicy, enabled: true });
     deps.parseHeartbeatPolicy.mockClear();
   }
+
+  it.each(["manual", "scheduled"])("consumes a claimed review monitor inside admission and returns its changed generation (%s)", async dispatch => {
+    const f = await fixture();
+    const stageId = randomUUID();
+    const policy = { mode: "normal", commentRequired: true,
+      stages: [{ id: stageId, type: "review", participants: [{ id: randomUUID(), type: "agent", agentId: f.agent.id }], approvalsNeeded: 1 }],
+      monitor: { nextCheckAt: dueAt.toISOString() } };
+    const state = { status: "pending", currentStageId: stageId, currentStageIndex: 0, currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: f.agent.id, userId: null },
+      returnAssignee: { type: "agent", agentId: f.agent.id, userId: null }, reviewRequest: null,
+      completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null };
+    await db.update(issues).set({ status: "in_review", executionPolicy: policy, executionState: state }).where(eq(issues.id, f.issue.id));
+    const enqueueMonitorWakeup = vi.fn<HeartbeatSchedulingDependencies["enqueueMonitorWakeup"]>(async (_agentId, _opts, admission) => db.transaction(async tx => {
+      const current = await readIssue(f.issue.id);
+      const consumed = await admission.consume(tx, current, f.agent.id);
+      expect(issueExecutionGeneration(consumed)).not.toBe(issueExecutionGeneration(current));
+      expect(consumed.monitorNextCheckAt).toBeNull();
+      expect(consumed.monitorAttemptCount).toBe(1);
+      expect(consumed.executionState).toMatchObject(state);
+      return admitted;
+    }));
+    const scheduler = createHeartbeatScheduling(db, { ...f.deps, enqueueMonitorWakeup });
+    if (dispatch === "manual") expect(await scheduler.triggerIssueMonitor(f.issue.id, { now })).toMatchObject({ outcome: "triggered" });
+    else expect(await scheduler.tickTimers(now)).toMatchObject({ enqueued: 1 });
+    expect(enqueueMonitorWakeup).toHaveBeenCalledOnce();
+    expect(f.deps.enqueueWakeup).not.toHaveBeenCalled();
+    expect(await readIssue(f.issue.id)).toMatchObject({ monitorNextCheckAt: null, monitorAttemptCount: 1 });
+  });
+
+  it.each(["after-consume", "after-insert", "commit", "replacement", "generation", "agent", "company"] as const)(
+    "retains a review monitor when atomic admission fails at %s", async fault => {
+    const f = await fixture();
+    const stageId = randomUUID();
+    const policy = { mode: "normal", commentRequired: true,
+      stages: [{ id: stageId, type: "review", participants: [{ id: randomUUID(), type: "agent", agentId: f.agent.id }], approvalsNeeded: 1 }],
+      monitor: { nextCheckAt: dueAt.toISOString() } };
+    const state = { status: "pending", currentStageId: stageId, currentStageIndex: 0, currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: f.agent.id, userId: null },
+      returnAssignee: { type: "agent", agentId: f.agent.id, userId: null }, reviewRequest: null,
+      completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null };
+    await db.update(issues).set({ status: "in_review", executionPolicy: policy, executionState: state }).where(eq(issues.id, f.issue.id));
+    const before = await readIssue(f.issue.id);
+    const replacement = new Date(now.getTime() + 60_000);
+    if (fault === "commit") {
+      await db.execute(sql`create function reject_monitor_commit() returns trigger language plpgsql as $$
+        begin raise exception 'Synthetic monitor commit failure'; end; $$`);
+      await db.execute(sql`create constraint trigger reject_monitor_commit after insert on heartbeat_runs
+        deferrable initially deferred for each row execute function reject_monitor_commit()`);
+    }
+    const enqueueMonitorWakeup = vi.fn<HeartbeatSchedulingDependencies["enqueueMonitorWakeup"]>(async (_agentId, _opts, admission) => {
+      if (fault === "replacement") await db.update(issues).set({ monitorNextCheckAt: replacement, monitorWakeRequestedAt: null }).where(eq(issues.id, f.issue.id));
+      return db.transaction(async tx => {
+        const current = await readIssue(f.issue.id);
+        await admission.consume(tx, fault === "generation" ? { ...current, responsibleUserId: "changed" }
+          : fault === "company" ? { ...current, companyId: randomUUID() } : current,
+          fault === "agent" ? randomUUID() : f.agent.id);
+        if (fault === "after-consume") throw new Error("Synthetic admission failure");
+        const [run] = await tx.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: f.agent.id,
+          status: "queued", contextSnapshot: { issueId: f.issue.id } }).returning();
+        if (fault === "after-insert") throw new Error("Synthetic insert failure");
+        return run;
+      });
+    });
+    try {
+      const scheduler = createHeartbeatScheduling(db, { ...f.deps, enqueueMonitorWakeup });
+      expect(await scheduler.tickTimers(now)).toMatchObject({ enqueued: 0 });
+      const saved = await readIssue(f.issue.id);
+      expect(saved).toMatchObject({ monitorNextCheckAt: fault === "replacement" ? replacement : before.monitorNextCheckAt,
+        monitorWakeRequestedAt: null, monitorAttemptCount: 0 });
+      expect(saved.executionState).toMatchObject(state);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.company.id))).toHaveLength(0);
+    } finally {
+      if (fault === "commit") {
+        await db.execute(sql`drop trigger reject_monitor_commit on heartbeat_runs`);
+        await db.execute(sql`drop function reject_monitor_commit()`);
+      }
+    }
+  });
 
   it("shares database monitor claims across scheduler instances", async () => {
     const f = await fixture();

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { PROVIDER_QUOTA_MONITOR_SERVICE_NAME } from "@paperclipai/shared";
 import {
   costEvents,
@@ -9,6 +9,10 @@ import {
   agentWakeupRequests,
   agents,
   companies,
+  authUsers,
+  companyMemberships,
+  runIdentityContexts,
+  issueThreadInteractions,
   companySkills,
   createDb,
   documentRevisions,
@@ -26,8 +30,10 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import * as adapters from "../adapters/index.js";
+import { issueService } from "../services/issues.js";
 import { heartbeatService } from "../services/heartbeat.ts";
-import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
+import { applyIssueExecutionPolicyTransition, applyIssueMonitorPolicyTransition, issueExecutionGeneration, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
 import { PaperclipRunnerToolAuthority } from "../services/native-runtime/paperclip-runner-tool-authority.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -106,6 +112,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     await db.delete(heartbeatRunEvents);
     await db.delete(issueRecoveryActions);
     await db.delete(issueComments);
+    await db.delete(issueThreadInteractions);
     await db.delete(documentRevisions);
     await db.delete(issueDocuments);
     await db.delete(documents);
@@ -119,7 +126,9 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     await db.delete(agentRuntimeState);
     await db.delete(agents);
     await db.delete(companySkills);
+    await db.delete(companyMemberships);
     await db.delete(companies);
+    await db.delete(authUsers);
   }
 
   afterEach(async () => {
@@ -470,81 +479,91 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
   });
 
   it("wakes a cross-agent review participant for provider quota monitors", async () => {
-    const sourceRunId = randomUUID();
-    const { companyId, issueId, agentId: assigneeAgentId } = await seedFixture({
-      issueStatus: "in_review",
-      monitor: { serviceName: PROVIDER_QUOTA_MONITOR_SERVICE_NAME, externalRef: sourceRunId },
-    });
-    const participantAgentId = randomUUID();
-    await db.insert(agents).values({
-      id: participantAgentId,
-      companyId,
-      name: "Quota-limited reviewer",
-      role: "engineer",
-      status: "active",
-      adapterType: "process",
-      adapterConfig: {
-        command: process.execPath,
-        args: ["-e", ""],
-        cwd: process.cwd(),
-      },
-      runtimeConfig: {
-        heartbeat: {
-          enabled: false,
-          wakeOnDemand: true,
-        },
-      },
-      permissions: {},
-    });
+    const { companyId, issueId, agentId: assigneeAgentId } = await seedFixture();
+    const userId = `quota-review-${companyId}`;
+    await db.insert(authUsers).values({ id: userId, name: "Quota reviewer operator",
+      email: `${userId}@example.test`, createdAt: new Date(), updatedAt: new Date() });
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: userId,
+      status: "active", membershipRole: "operator" });
+    await db.update(companies).set({ defaultResponsibleUserId: userId }).where(eq(companies.id, companyId));
+    const [participant] = await db.insert(agents).values({ companyId, name: "Quota-limited reviewer", role: "engineer",
+      status: "idle", adapterType: "codex_local", adapterConfig: {},
+      runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true } }, permissions: {} }).returning();
+    const participantAgentId = participant.id;
     seededAgentIds.add(participantAgentId);
-    const monitorState = await db
-      .select({ executionState: issues.executionState })
-      .from(issues)
-      .where(eq(issues.id, issueId))
-      .then((rows) => parseIssueExecutionState(rows[0]?.executionState ?? null)?.monitor ?? null);
-    await db.update(issues).set({
-      executionState: {
-        status: "pending",
-        currentStageId: randomUUID(),
-        currentStageIndex: 0,
-        currentStageType: "review",
-        currentParticipant: { type: "agent", agentId: participantAgentId, userId: null },
-        returnAssignee: { type: "agent", agentId: assigneeAgentId, userId: null },
-        reviewRequest: null,
-        completedStageIds: [],
-        lastDecisionId: null,
-        lastDecisionOutcome: null,
-        monitor: monitorState,
-      },
-    }).where(eq(issues.id, issueId));
-    await db.insert(heartbeatRuns).values({
-      id: sourceRunId, companyId, agentId: participantAgentId, status: "failed",
-      errorCode: "provider_quota", finishedAt: new Date("2026-04-11T12:00:00.000Z"),
-      contextSnapshot: { issueId },
-      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
-    });
+    const policy = normalizeIssueExecutionPolicy({ stages: [{ type: "review",
+      participants: [{ type: "agent", agentId: participantAgentId }] }] })!;
+    await db.update(issues).set({ responsibleUserId: userId, executionPolicy: policy, executionState: null,
+      monitorNextCheckAt: null, monitorNotes: null, monitorScheduledBy: null }).where(eq(issues.id, issueId));
+    const [original] = await db.select().from(issues).where(eq(issues.id, issueId));
+    const submitted = applyIssueExecutionPolicyTransition({ issue: original, policy, requestedStatus: "done",
+      requestedAssigneePatch: {}, actor: { agentId: assigneeAgentId }, commentBody: "Ready for review" });
+    await db.update(issues).set({ ...submitted.patch, assigneeAgentId }).where(eq(issues.id, issueId));
+    const [question] = await db.insert(issueThreadInteractions).values({ companyId, issueId,
+      kind: "ask_user_questions", status: "pending", continuationPolicy: "wake_assignee", createdByAgentId: assigneeAgentId,
+      payload: { version: 1, questions: [{ id: "scope", prompt: "Continue?", selectionMode: "single", required: true,
+        options: [{ id: "yes", label: "Yes" }] }] } }).returning();
+    const actualAdapter = adapters.getServerAdapter("codex_local");
+    const execute = vi.fn<adapters.ServerAdapterModule["execute"]>().mockResolvedValue({ exitCode: 1, signal: null, timedOut: false,
+      errorMessage: "Provider quota exceeded for this model.", errorCode: "provider_quota", errorFamily: "provider_quota",
+      executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false }, errorFamily: "provider_quota" },
+      summary: "", provider: "test", model: "test-model" });
+    const adapter = vi.spyOn(adapters, "getServerAdapter").mockReturnValue({ ...actualAdapter, supportsLocalAgentJwt: false, execute });
     const heartbeat = heartbeatService(db);
-    const tickAt = new Date("2026-04-11T12:31:00.000Z");
-    const result = await heartbeat.tickTimers(tickAt);
-
-    expect(result.enqueued).toBe(1);
-    const wakeups = await db.select().from(agentWakeupRequests);
-    expect(wakeups).toHaveLength(1);
-    expect(wakeups[0]).toMatchObject({
-      agentId: participantAgentId,
-      reason: "execution_review_participant_recovery",
-    });
-    const [scheduled] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, sourceRunId));
-    expect(scheduled).toMatchObject({ status: "scheduled_retry", scheduledRetryAttempt: 1 });
-    expect(await heartbeat.promoteDueScheduledRetries(scheduled.scheduledRetryAt!)).toMatchObject({ promoted: 1 });
-    await heartbeat.resumeQueuedRuns();
-    await waitForHeartbeatIdle();
-    const participantRuns = await db
-      .select()
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.agentId, participantAgentId));
-    expect(participantRuns).toHaveLength(2);
-    expect(participantRuns.find((run) => run.id === scheduled.id)?.errorCode).not.toBe("issue_assignee_changed");
+    try {
+      await heartbeat.wakeup(participantAgentId, { source: "automation", triggerDetail: "system", reason: "issue_execution_stage_started",
+        payload: { issueId }, requestedByActorType: "agent", requestedByActorId: assigneeAgentId, contextSnapshot: { issueId } });
+      await heartbeat.drainActiveRunExecutions();
+      const sources = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, participantAgentId));
+      expect(sources).toHaveLength(1);
+      const source = sources[0];
+      const sourceRunId = source.id;
+      expect(source).toMatchObject({ status: "failed", errorCode: "provider_quota", responsibleUserId: userId });
+      expect(execute).toHaveBeenCalledTimes(1);
+      const [identity] = await db.select().from(runIdentityContexts).where(eq(runIdentityContexts.id, source.activeIdentityContextId!));
+      expect(identity).toMatchObject({ status: "accepted", runId: sourceRunId, companyId, responsibleUserId: userId });
+      const [before] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(before).toMatchObject({ assigneeAgentId, executionState: { currentParticipant: { agentId: participantAgentId } } });
+      expect(source.contextSnapshot?.reviewerAssignmentGeneration).toBe(issueExecutionGeneration(before));
+      const nextCheckAt = new Date(Date.now() + 60_000).toISOString();
+      const installedPolicy = { ...policy, monitor: { nextCheckAt, notes: null, scheduledBy: "assignee" as const,
+        kind: "external_service" as const, serviceName: PROVIDER_QUOTA_MONITOR_SERVICE_NAME, externalRef: sourceRunId,
+        timeoutAt: null, maxAttempts: null, recoveryPolicy: "wake_owner" as const } };
+      const transition = applyIssueMonitorPolicyTransition({ issue: before, policy: installedPolicy, previousPolicy: policy,
+        requestedStatus: before.status, requestedAssigneePatch: {}, actor: { agentId: null, userId: null }, monitorExplicitlyUpdated: true });
+      const installed = await issueService(db).update(issueId, { ...transition.patch, executionPolicy: installedPolicy });
+      expect((await db.select().from(activityLog).where(eq(activityLog.entityId, issueId)))
+        .filter(row => row.action === "issue.review_quota_monitor_installed")).toMatchObject([
+          { runId: sourceRunId, details: { sourceGeneration: source.contextSnapshot?.reviewerAssignmentGeneration,
+            installedGeneration: issueExecutionGeneration(installed!), nextCheckAt } }]);
+      await db.delete(issueThreadInteractions).where(eq(issueThreadInteractions.id, question.id));
+      execute.mockResolvedValue({ exitCode: 0, signal: null, timedOut: false, summary: "Review completed.", provider: "test", model: "test-model" });
+      const result = await heartbeat.tickTimers(new Date(nextCheckAt));
+      expect(result.enqueued).toBe(1);
+      const wakeups = (await db.select().from(agentWakeupRequests)).filter(wake => wake.reason === "execution_review_participant_recovery");
+      expect(wakeups).toHaveLength(1);
+      expect(wakeups[0]).toMatchObject({ agentId: participantAgentId, reason: "execution_review_participant_recovery" });
+      const [scheduled] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, sourceRunId));
+      expect(scheduled).toMatchObject({ status: "scheduled_retry", scheduledRetryAttempt: 1 });
+      const [consumed] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(scheduled.contextSnapshot?.reviewerAssignmentGeneration).toBe(issueExecutionGeneration(consumed));
+      const [preservedSource] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, sourceRunId));
+      expect(preservedSource.contextSnapshot?.reviewerAssignmentGeneration).toBe(source.contextSnapshot?.reviewerAssignmentGeneration);
+      expect(await heartbeat.promoteDueScheduledRetries(scheduled.scheduledRetryAt!)).toMatchObject({ promoted: 1 });
+      await heartbeat.resumeQueuedRuns();
+      await heartbeat.drainActiveRunExecutions();
+      await waitForHeartbeatIdle();
+      const participantRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, participantAgentId));
+      expect(participantRuns).toHaveLength(2);
+      expect(participantRuns.find(run => run.id === scheduled.id)?.errorCode).not.toBe("issue_assignee_changed");
+      expect(participantRuns.find(run => run.id === scheduled.id)?.status).toBe("succeeded");
+      expect(execute.mock.calls[1][0].runId).toBe(scheduled.id);
+      expect(execute).toHaveBeenCalledTimes(2);
+    } finally {
+      await heartbeat.drainActiveRunExecutions();
+      adapter.mockRestore();
+    }
   });
 
   it("lets the board trigger a scheduled issue monitor immediately", async () => {

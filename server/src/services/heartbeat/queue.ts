@@ -1,3 +1,4 @@
+import type { IssueMonitorAdmission } from "./scheduling.js";
 import { boundRunIssueId } from "../run-task-binding.js";
 import { issueExecutionGeneration, parseIssueExecutionState } from "../issue-execution-policy.js";
 import { settleNewReviewRunIdentity, settleReviewRunClaimIdentity } from "../run-identity.js";
@@ -357,6 +358,8 @@ export function shouldQueueFollowupForRunningIssueWake(input: {
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
+
+class MonitorAdmissionHeld extends Error {}
 
 /** Queue admission and dispatch share the service lifecycle callbacks and execution ownership. */
 export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDependencies) {
@@ -2149,7 +2152,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     return promise;
   }
 
-  async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string) {
+  async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string, monitorAdmission?: IssueMonitorAdmission) {
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
     const contextSnapshot: Record<string, unknown> = {
@@ -2441,7 +2444,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     ) => {
       // A temporary refusal must leave the handoff retryable, without burning
       // its one durable receipt ID on a skipped wake.
-      if (outboxRequest) return { created: false };
+      if (outboxRequest || monitorAdmission) return { created: false };
       if (executionWaitRequestId) {
         await db.update(agentWakeupRequests).set({
           payload: sql`jsonb_set(coalesce(${agentWakeupRequests.payload}, '{}'::jsonb), '{executionWait}',
@@ -2829,6 +2832,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
       const outcome = await db
         .transaction(async (tx) => {
+          if (monitorAdmission) await tx.select({ id: companies.id }).from(companies).where(eq(companies.id, agent.companyId)).for("share");
+          const result = await (async () => {
           await tx.execute(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );
@@ -3115,6 +3120,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               lastStatusDecisionId: issues.lastStatusDecisionId,
               workspaceBindingRevision: issues.workspaceBindingRevision,
               executionState: issues.executionState,
+              executionPolicy: issues.executionPolicy,
               createdAt: issues.createdAt,
             })
             .from(issues)
@@ -4402,6 +4408,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             adoptedCommentIds = await undeliveredLegacyUserCommentIds(tx as unknown as Db,
               agent.companyId, issueId, agentId, adoptedCommentIds);
           }
+          const admittedIssue = monitorAdmission ? await monitorAdmission.consume(tx as unknown as Db, issue, agentId) : issue;
           let newRun = await tx
             .insert(heartbeatRuns)
             .values({
@@ -4485,7 +4492,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               .where(eq(agentWakeupRequests.id, wakeupRequest.id));
           }
 
-          const reviewState = parseIssueExecutionState(issue.executionState);
+          const reviewState = parseIssueExecutionState(admittedIssue.executionState);
           if (newRun.retryOfRunId) {
             const [sourceRun] = await tx.select().from(heartbeatRuns).where(and(
               eq(heartbeatRuns.id, newRun.retryOfRunId), eq(heartbeatRuns.companyId, issue.companyId),
@@ -4497,7 +4504,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             if (typeof generation === "string") context.reviewerAssignmentGeneration = generation;
             [newRun] = await tx.update(heartbeatRuns).set({ contextSnapshot: context })
               .where(eq(heartbeatRuns.id, newRun.id)).returning();
-          } else if (issue.status === "in_review" && reviewState?.status === "pending" &&
+          } else if (admittedIssue.status === "in_review" && reviewState?.status === "pending" &&
               reviewState.currentStageType === "review" && reviewState.currentParticipant?.type === "agent" &&
               reviewState.currentParticipant.agentId === agentId) {
             const settledIssue = await settleNewReviewRunIdentity(tx as unknown as Db, newRun, Boolean(failedChatRetry));
@@ -4511,9 +4518,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // transitions to "running" — Fix A (lazy locking).
 
           return { kind: "queued" as const, run: newRun };
+          })();
+          if (monitorAdmission && result.kind !== "queued") throw new MonitorAdmissionHeld();
+          return result;
         })
         .catch((error) => {
-          if (isExternalChatWaitAuthorizationContention(error))
+          if (error instanceof MonitorAdmissionHeld || isExternalChatWaitAuthorizationContention(error))
             return { kind: "deferred" as const };
           throw error;
         });
@@ -5073,6 +5083,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
   return {
     enqueueWakeup,
+    enqueueMonitorWakeup: (agentId: string, opts: WakeupOptions, admission: IssueMonitorAdmission) =>
+      enqueueWakeup(agentId, { ...opts, allowRunCoalescing: false }, undefined, admission),
     dispatchPendingNativeStatusWakeups,
     startNextQueuedRunForAgent,
     countRunningRunsForAgent,
