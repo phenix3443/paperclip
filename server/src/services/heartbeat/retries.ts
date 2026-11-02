@@ -52,6 +52,7 @@ import { parseObject } from "../../adapters/utils.js";
 import { logActivity } from "../activity-log.js";
 import { readContinuationAttempt } from "../recovery/index.js";
 import { withRecoveryContext } from "../recovery/status-only-context.js";
+import { selectOwnerRepairRetryContext } from "./owner-repair-retry-context.js";
 import {
   MAX_TURN_CONTINUATION_RETRY_REASON,
   WORKSPACE_BUSY_RETRY_REASON,
@@ -702,9 +703,14 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     const shouldQuarantineWorkspaceForRetry =
       workspaceValidationRetryPayload !== null &&
       Object.keys(workspaceValidationRetryPayload).length > 0;
+    const retrySourceContext = await selectOwnerRepairRetryContext(
+      db,
+      { companyId: run.companyId, agentId: run.agentId, issueId },
+      contextSnapshot,
+    );
     const retryContextSnapshot: Record<string, unknown> = withRecoveryContext(
       {
-        ...contextSnapshot,
+        ...retrySourceContext,
         executionRetryAccounting: accountingForScheduledRetry(run, retryReason, schedule.attempt),
         retryOfRunId: run.id,
         wakeReason,
