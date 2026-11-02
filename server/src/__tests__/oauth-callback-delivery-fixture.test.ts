@@ -34,12 +34,19 @@ describePostgres("OAuth callback delivery fixture", () => {
     expect(fixture.claim).toHaveBeenCalledTimes(mode.startsWith("cloud") ? 1 : 0);
     expect(after.connection).toMatchObject({ status: mode === "cloud draft" ? "draft" : "active", enabled: mode !== "cloud draft" });
     expect(after.grants).toHaveLength(1);
-    expect(after.grants[0]).toMatchObject(mode === "direct organization"
+    expect(after.grants[0]).toMatchObject(mode.endsWith("organization")
       ? { kind: "organization", isDefault: true, status: "active" }
       : { kind: "user", subjectUserId: "owner", status: "active" });
     const refs = mode === "direct organization" ? after.connection.credentialSecretRefs : after.grants[0]!.credentialSecretRefs;
-    expect(refs.map(ref => ref.configPath).sort()).toEqual(["oauth.access_token", "oauth.refresh_token"]);
-    expect(await db.select().from(companySecrets).where(eq(companySecrets.companyId, fixture.companyId))).toHaveLength(2);
+    const vercel = mode.startsWith("vercel");
+    expect(refs.map(ref => ref.configPath).sort()).toEqual(vercel ? [] : ["oauth.access_token", "oauth.refresh_token"]);
+    expect(await db.select().from(companySecrets).where(eq(companySecrets.companyId, fixture.companyId))).toHaveLength(vercel ? 0 : 2);
+    if (vercel) {
+      expect(after.connection).toMatchObject({ credentialSource: "vercel_connect", credentialSecretRefs: [] });
+      expect(after.grants[0]!.externalCredential).toMatchObject({
+        provider: "vercel_connect", subjectType: "user", subjectId: expect.any(String), expiresAt: expect.any(String),
+      });
+    }
     const sweeps = delivery.sweeps;
     await delivery.wake();
     await delivery.settle(sweeps + 1);
