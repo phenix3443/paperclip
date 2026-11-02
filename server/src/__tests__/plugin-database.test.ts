@@ -250,6 +250,33 @@ describe("plugin database SQL validation", () => {
     ).toThrow(/cannot delete/i);
   });
 
+  it("keeps rejecting SQL that quotes from separate literals pair up to hide", () => {
+    expect(() =>
+      validatePluginMigrationStatement(
+        "CREATE TABLE plugin_test.rows (a text DEFAULT $$\"$$); GRANT ALL ON plugin_test.rows TO public; SELECT '\"'",
+        "plugin_test",
+      )
+    ).toThrow(/disallowed/i);
+    expect(() =>
+      validatePluginMigrationStatement(
+        "CREATE TABLE plugin_test.rows (a text DEFAULT $$\"$$); GRANT ALL ON plugin_test.rows TO public; SELECT $$'$$, $$\"$$, $$'$$, $$'$$",
+        "plugin_test",
+      )
+    ).toThrow(/disallowed/i);
+    expect(() =>
+      validatePluginRuntimeQuery(
+        "WITH a AS (SELECT $$\"$$ AS x), d AS (DELETE FROM plugin_test.rows RETURNING 1) SELECT '\"' FROM a",
+        "plugin_test",
+      )
+    ).toThrow(/mutation/i);
+    expect(() =>
+      validatePluginRuntimeExecute(
+        "UPDATE plugin_test.rows SET a = $$\"$$; DROP TABLE plugin_test.rows; SELECT '\"'",
+        "plugin_test",
+      )
+    ).toThrow(/ddl/i);
+  });
+
   it("ends line comments at a carriage return like PostgreSQL", () => {
     expect(() =>
       validatePluginMigrationStatement(

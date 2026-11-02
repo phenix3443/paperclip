@@ -176,8 +176,28 @@ function stripSqlForKeywordScan(input: string): string {
   return output;
 }
 
+function stripSqlWithLegacyRegexes(input: string): string {
+  return input
+    .replace(/'([^']|'')*'/g, "''")
+    .replace(/"([^"]|"")*"/g, "\"\"")
+    .replace(/--.*$/gm, "")
+    .replace(/\/\*[\s\S]*?\*\//g, "");
+}
+
+function collapseSql(input: string): string {
+  return input.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
 function normaliseSql(input: string): string {
-  return stripSqlForKeywordScan(input).replace(/\s+/g, " ").trim().toLowerCase();
+  return collapseSql(stripSqlForKeywordScan(input));
+}
+
+function deniedSqlViews(input: string): string[] {
+  return [normaliseSql(input), collapseSql(stripSqlWithLegacyRegexes(input))];
+}
+
+function anyViewMatches(views: readonly string[], pattern: RegExp): boolean {
+  return views.some((view) => pattern.test(view));
 }
 
 function extractQualifiedRefs(statement: string): SqlRef[] {
@@ -224,7 +244,7 @@ function assertAllowedPublicRead(
 }
 
 function assertNoBannedSql(statement: string): void {
-  const normalized = normaliseSql(statement);
+  const views = deniedSqlViews(statement);
   const banned = [
     /\bcreate\s+extension\b/,
     /\bcreate\s+(?:event\s+)?trigger\b/,
@@ -237,7 +257,7 @@ function assertNoBannedSql(statement: string): void {
     /\bcall\b/,
     /\bdo\s+(?:\$\$|language\b)/,
   ];
-  const matched = banned.find((pattern) => pattern.test(normalized));
+  const matched = banned.find((pattern) => anyViewMatches(views, pattern));
   if (matched) {
     throw new Error(`Plugin SQL contains a disallowed statement or clause: ${matched.source}`);
   }
@@ -252,11 +272,12 @@ export function validatePluginMigrationStatement(
   assertNoBannedSql(statement);
 
   const normalized = normaliseSql(statement);
-  if (/^\s*(drop|truncate)\b/.test(normalized)) {
+  const views = deniedSqlViews(statement);
+  if (anyViewMatches(views, /^\s*(drop|truncate)\b/)) {
     throw new Error("Destructive plugin migrations are not allowed in Phase 1");
   }
 
-  if (/\bdelete\s+from\b/.test(normalized)) {
+  if (anyViewMatches(views, /\bdelete\s+from\b/)) {
     throw new Error("Plugin migrations cannot delete data");
   }
 
@@ -314,7 +335,7 @@ export function validatePluginRuntimeQuery(
   if (!normalized.startsWith("select ") && !normalized.startsWith("with ")) {
     throw new Error("ctx.db.query only allows SELECT statements");
   }
-  if (/\b(insert|update|delete|alter|create|drop|truncate)\b/.test(normalized)) {
+  if (anyViewMatches(deniedSqlViews(statement), /\b(insert|update|delete|alter|create|drop|truncate)\b/)) {
     throw new Error("ctx.db.query cannot contain mutation or DDL keywords");
   }
 
@@ -340,7 +361,7 @@ export function validatePluginRuntimeExecute(query: string, namespace: string): 
   if (!/^(insert\s+into|update|delete\s+from)\b/.test(normalized)) {
     throw new Error("ctx.db.execute only allows INSERT, UPDATE, or DELETE");
   }
-  if (/\b(alter|create|drop|truncate)\b/.test(normalized)) {
+  if (anyViewMatches(deniedSqlViews(statement), /\b(alter|create|drop|truncate)\b/)) {
     throw new Error("ctx.db.execute cannot contain DDL keywords");
   }
 
