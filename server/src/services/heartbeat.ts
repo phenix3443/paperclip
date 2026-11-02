@@ -1210,6 +1210,7 @@ export function heartbeatService(
           latestRun: rows.runRow,
           notice,
           recoveryCause,
+          releaseReceipt: input.releaseReceipt,
         });
       },
       escalateStrandedRecoveryIssueInPlace: async (input) => {

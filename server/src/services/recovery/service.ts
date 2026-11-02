@@ -120,8 +120,10 @@ import {
   executeIssuePostCommitActions,
   type IssuePostCommitAction,
 } from "../issues.js";
+import type { ReleaseBlockedReceipt } from "../../modules/wake-queue/application/ports.js";
 import {
   applyIssueMonitorPolicyTransition,
+  issueExecutionGeneration,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "../issue-execution-policy.js";
@@ -4446,6 +4448,7 @@ export function recoveryService(
     notice?: StrandedRecoveryNoticeSeed | null;
     recoveryCause?: StrandedRecoveryCause;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
+    releaseReceipt?: ReleaseBlockedReceipt;
   }) {
     const publications: ActivityPublication[] = [];
     const postCommitActions: IssuePostCommitAction[] = [];
@@ -4470,6 +4473,12 @@ export function recoveryService(
         || current.updatedAt.getTime() !== input.issue.updatedAt.getTime()) {
         return null;
       }
+      const receipt = input.releaseReceipt;
+      if (receipt && (receipt.issueId !== current.id || receipt.companyId !== current.companyId
+        || receipt.status !== current.status || receipt.statusVersion !== current.statusVersion
+        || receipt.lastStatusDecisionId !== current.lastStatusDecisionId || receipt.executionRunId !== current.executionRunId
+        || receipt.checkoutRunId !== current.checkoutRunId || receipt.executionAgentNameKey !== current.executionAgentNameKey
+        || receipt.executionGeneration !== issueExecutionGeneration(current))) return null;
 
       // Acceptance holds the same issue lock before writing its successor.
       // An awaiting-release handoff need not change the issue's version or

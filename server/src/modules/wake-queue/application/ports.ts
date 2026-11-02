@@ -207,7 +207,7 @@ export interface WakeQueueTransaction {
     recoveryAgent: InvokableAgentSnapshot;
     sessionBefore: string | null;
     now: Date;
-  }): Promise<RunSummary>;
+  }): Promise<{ kind: "queued"; run: RunSummary } | { kind: "ineligible_source" }>; // ineligible persists nothing
   /**
    * Queues the run with the context snapshot and the responsible user the
    * caller already resolved.
@@ -244,14 +244,22 @@ export interface IssueLockWriter {
       locked: LockedIssueExecution,
       ports: { host: WakeQueueHost; transaction: WakeQueueTransaction },
     ) => Promise<ReleaseTransactionResult>,
-  ): Promise<ReleaseTransactionResult & { run: RunSnapshot }>;
+  ): Promise<ReleaseTransactionResult & { run: RunSnapshot; blockedReceipt?: ReleaseBlockedReceipt }>;
 }
+
+/** The blocked issue row as this release left it, read under its lock after its own writes. */
+export type ReleaseBlockedReceipt = {
+  issueId: string; companyId: string; status: string; statusVersion: number; lastStatusDecisionId: string | null;
+  executionRunId: string | null; checkoutRunId: string | null; executionAgentNameKey: string | null;
+  executionGeneration: string;
+};
 
 export type StrandedAssignedIssueEscalationInput = {
   issue: IssueSnapshot;
   previousStatus: "todo" | "in_progress" | "in_review";
   latestRun: RunSnapshot;
   noticeKind: ReleaseRecoveryBlockedNoticeKind;
+  releaseReceipt?: ReleaseBlockedReceipt;
 };
 
 export type StrandedRecoveryInPlaceEscalationInput = {
