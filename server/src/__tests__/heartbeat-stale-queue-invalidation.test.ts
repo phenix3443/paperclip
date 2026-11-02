@@ -4,6 +4,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import {
   type Db,
   agents,
+  activityLog,
   authUsers,
   agentWakeupRequests,
   agentRuntimeState,
@@ -2061,6 +2062,66 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       const { monitor: previousMonitor, ...reviewHistory } = before.executionState!;
       expect(consumed.executionState).toMatchObject(reviewHistory);
     } finally { release(); beforeClaimCheck = null; mockAdapterExecute.mockImplementation(execute); await wake; }
+  });
+
+  it.each(["manual", "scheduled"] as const)("rolls back a deferred ordinary monitor behind a real active review (%s)", async mode => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const [author] = await db.insert(agents).values({ companyId, name: "Author", role: "engineer", adapterType: "codex_local" }).returning();
+    const policy = normalizeIssueExecutionPolicy({ stages: [{ type: "review", participants: [{ type: "agent", agentId }] }] })!;
+    const [original] = await db.insert(issues).values({ companyId, title: "Active ordinary monitor review",
+      status: "in_progress", assigneeAgentId: author.id, executionPolicy: policy }).returning();
+    const submitted = applyIssueExecutionPolicyTransition({ issue: original, policy, requestedStatus: "done",
+      requestedAssigneePatch: {}, actor: { agentId: author.id }, commentBody: "Ready for review" });
+    await db.update(issues).set(submitted.patch).where(eq(issues.id, original.id));
+    let entered = false;
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const execute = mockAdapterExecute.getMockImplementation()!;
+    mockAdapterExecute.mockImplementation(async () => { entered = true; await held; return execute(); });
+    const wake = heartbeat.wakeup(agentId, { source: "automation", triggerDetail: "system", reason: "issue_execution_stage_started",
+      payload: { issueId: original.id }, requestedByActorType: "agent", requestedByActorId: author.id,
+      contextSnapshot: { issueId: original.id } });
+    try {
+      expect(await waitForCondition(async () => entered)).toBe(true);
+      const [active] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      const [before] = await db.select().from(issues).where(eq(issues.id, original.id));
+      expect(active).toMatchObject({ status: "running", activeIdentityContextId: expect.any(String) });
+      expect(before.executionRunId).toBe(active.id);
+      expect(active.contextSnapshot?.reviewerAssignmentGeneration).toBe(issueExecutionGeneration(before));
+      const installedPolicy = normalizeIssueExecutionPolicy({ ...before.executionPolicy!, monitor: {
+        nextCheckAt: new Date().toISOString(), notes: "Review after the active turn" } })!;
+      const transition = applyIssueMonitorPolicyTransition({ issue: before, policy: installedPolicy,
+        previousPolicy: normalizeIssueExecutionPolicy(before.executionPolicy), requestedStatus: before.status,
+        requestedAssigneePatch: {}, actor: { agentId }, monitorExplicitlyUpdated: true });
+      await issueService(db).update(original.id, { ...transition.patch, executionPolicy: installedPolicy, actorAgentId: agentId });
+      const [installed] = await db.select().from(issues).where(eq(issues.id, original.id));
+      expect(issueExecutionGeneration(installed)).not.toBe(active.contextSnapshot?.reviewerAssignmentGeneration);
+      expect(await heartbeat.wakeup(agentId, { source: "automation", triggerDetail: "system", reason: "issue_commented",
+        payload: { issueId: original.id }, requestedByActorType: "agent", requestedByActorId: author.id,
+        contextSnapshot: { issueId: original.id } })).toMatchObject({ id: active.id });
+      const runsBefore = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      expect(runsBefore).toHaveLength(1);
+      expect(runsBefore[0].contextSnapshot?.reviewerAssignmentGeneration).toBe(active.contextSnapshot?.reviewerAssignmentGeneration);
+      const wakesBefore = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+      expect(wakesBefore.filter(wake => wake.status === "coalesced")).toHaveLength(1);
+      expect(wakesBefore.filter(wake => wake.status === "deferred_issue_execution")).toHaveLength(0);
+      if (mode === "manual") expect(await heartbeat.triggerIssueMonitor(original.id, {
+        now: new Date(), actorType: "user", actorId: "responsible-user" })).toMatchObject({ outcome: "skipped" });
+      else expect(await heartbeat.tickTimers(new Date())).toMatchObject({ enqueued: 0 });
+      const [after] = await db.select().from(issues).where(eq(issues.id, original.id));
+      expect(after).toMatchObject({ monitorNextCheckAt: installed.monitorNextCheckAt,
+        monitorAttemptCount: installed.monitorAttemptCount, monitorWakeRequestedAt: null,
+        executionPolicy: installed.executionPolicy, executionState: installed.executionState,
+        responsibleUserId: installed.responsibleUserId, assigneeAgentId: installed.assigneeAgentId,
+        assigneeUserId: installed.assigneeUserId, status: installed.status, executionRunId: active.id });
+      expect(issueExecutionGeneration(after)).toBe(issueExecutionGeneration(installed));
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).toEqual(runsBefore);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId))).toEqual(wakesBefore);
+      const diagnostics = await db.select().from(activityLog).where(eq(activityLog.entityId, original.id));
+      expect(diagnostics.filter(entry => entry.action === "issue.monitor_deferred")).toHaveLength(1);
+      expect(diagnostics.filter(entry => entry.action === "issue.monitor_triggered")).toHaveLength(0);
+      expect(countExecuteCallsForRun(active.id)).toBe(1);
+    } finally { release(); await wake; await drainHeartbeatRunsToQuiescence(db, heartbeat); mockAdapterExecute.mockImplementation(execute); }
   });
 
   it("settles a manually admitted review from its linked operator receipt before comment authors", async () => {
