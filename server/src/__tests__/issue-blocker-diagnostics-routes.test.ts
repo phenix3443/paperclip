@@ -7,6 +7,7 @@ import {
   agents,
   companies,
   createDb,
+  executionWorkspaces,
   heartbeatRuns,
   issueRelations,
   issues,
@@ -195,7 +196,9 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
   afterEach(async () => {
     await db.delete(issueRelations);
     await db.delete(heartbeatRuns);
+    await db.update(executionWorkspaces).set({ sourceIssueId: null });
     await db.delete(issues);
+    await db.delete(executionWorkspaces);
     await db.delete(agents);
     await db.delete(projects);
     await db.delete(companies);
@@ -205,14 +208,20 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
     await tempDb?.cleanup();
   });
 
-  it.each(["private", "open"] as const)("redacts the user owner of an unreadable %s review tail", async (visibility) => {
+  it.each(["private", "open", "inherited", "workspace"] as const)("redacts the user owner of an unreadable %s review tail", async (visibility) => {
     const company = await seedCompany(db);
     const agent = await seedAgent(db, company.id);
     const project = await seedProject(db, company.id, "Private review project");
-    await db.update(projects).set({ visibility: "private" }).where(eq(projects.id, project.id));
+    await db.update(projects).set({ visibility: visibility === "open" ? "private" : "open" }).where(eq(projects.id, project.id));
     const root = await seedIssue(db, { companyId: company.id, title: "Visible source", status: "blocked", assigneeAgentId: agent.id });
     const tail = await seedIssue(db, { companyId: company.id, projectId: project.id, title: "Hidden review title", status: "in_review" });
-    await db.update(issues).set({ visibility, privacyRootIssueId: visibility === "private" ? tail.id : null, createdByUserId: "hidden-user", assigneeUserId: "hidden-user", executionState: {
+    const ancestor = visibility === "inherited" ? await seedIssue(db, { companyId: company.id, title: "Private ancestor" }) : null;
+    if (ancestor) await db.update(issues).set({ visibility: "private", privacyRootIssueId: ancestor.id }).where(eq(issues.id, ancestor.id));
+    if (visibility === "workspace") {
+      const [workspace] = await db.insert(executionWorkspaces).values({ companyId: company.id, sourceIssueId: tail.id, name: "Private task workspace", mode: "isolated_workspace", strategyType: "git_worktree", providerType: "git_worktree" }).returning();
+      await db.update(issues).set({ executionWorkspaceId: workspace!.id }).where(eq(issues.id, tail.id));
+    }
+    await db.update(issues).set({ visibility: visibility === "private" || visibility === "workspace" ? "private" : "open", privacyParentIssueId: ancestor?.id ?? null, privacyRootIssueId: ancestor?.id ?? (visibility === "private" || visibility === "workspace" ? tail.id : null), createdByUserId: "hidden-user", assigneeUserId: "hidden-user", executionState: {
       status: "pending", currentParticipant: { type: "user", userId: "hidden-user" },
     } }).where(eq(issues.id, tail.id));
     await blockIssue(db, company.id, tail.id, root.id);
@@ -233,6 +242,30 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
       expect(allowed.body.find((row: IssueRow) => row.id === root.id).blockedInboxAttention.owner.userId).toBe("hidden-user");
     }
 
+  });
+
+  it("does not expose a hidden stalled sample when a readable hard-attention branch is selected", async () => {
+    const company = await seedCompany(db);
+    const agent = await seedAgent(db, company.id);
+    const project = await seedProject(db, company.id, "Hidden branch");
+    await db.update(projects).set({ visibility: "private" }).where(eq(projects.id, project.id));
+    const root = await seedIssue(db, { companyId: company.id, title: "Public mixed root", status: "blocked", assigneeAgentId: agent.id });
+    const hard = await seedIssue(db, { companyId: company.id, title: "Readable cancelled blocker", status: "cancelled" });
+    const hidden = await seedIssue(db, { companyId: company.id, projectId: project.id, title: "Hidden mixed review", status: "in_review" });
+    await db.update(issues).set({ identifier: "SECRET-1", assigneeUserId: "hidden-user", executionState: {
+      status: "pending", currentParticipant: { type: "user", userId: "hidden-user" },
+    } }).where(eq(issues.id, hidden.id));
+    await blockIssue(db, company.id, hard.id, root.id);
+    await blockIssue(db, company.id, hidden.id, root.id);
+    const app = createApp(db, { type: "agent", agentId: agent.id, companyId: company.id, runId: null, source: "agent_jwt" });
+    for (const path of [`/api/companies/${company.id}/issues?attention=blocked`, `/api/issues/${root.id}`, `/api/issues/${root.id}/heartbeat-context`]) {
+      const response = await request(app).get(path).expect(200);
+      expect(JSON.stringify(response.body, (_key, value) => value?.locked ? "[locked]" : value)).not.toContain("SECRET-1");
+      expect(JSON.stringify(response.body)).not.toContain("Hidden mixed review");
+      expect(JSON.stringify(response.body)).not.toContain("hidden-user");
+    }
+    const allowed = await request(createApp(db, boardActor(company))).get(`/api/companies/${company.id}/issues?attention=blocked`).expect(200);
+    expect(allowed.body.find((row: IssueRow) => row.id === root.id).blockerAttention.sampleStalledBlockerIdentifier).toBe("SECRET-1");
   });
 
   it("returns stale-blocker diagnosis and anomaly flags for a done blocker on a blocked issue", async () => {
@@ -377,6 +410,11 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
     // Uniform 404 so cross-tenant ids are indistinguishable from missing ones.
     expect(res.status, JSON.stringify(res.body)).toBe(404);
     expect(res.body.error).toBe("Issue not found");
+    for (const path of [`/api/issues/${issueA.id}`, `/api/issues/${issueA.id}/heartbeat-context`, `/api/companies/${companyA.id}/issues?attention=blocked`]) {
+      const denied = await request(createApp(db, agentActor(companyB, agentB, runB!.id))).get(path);
+      expect(denied.status).toBeGreaterThanOrEqual(400);
+      expect(JSON.stringify(denied.body)).not.toContain(issueA.title);
+    }
   });
 
   it("caps blocker output and withholds readiness when truncated", async () => {

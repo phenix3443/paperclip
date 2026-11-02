@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -1677,6 +1677,41 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     if (operations.length) await db.update(workspaceOperations).set({ phase: "workspace_finalize" }).where(eq(workspaceOperations.id, operations.at(-1)!.id));
     expect((await svc.getDependencyReadiness(reviewId)).isDependencyReady).toBe(true);
     expect((await svc.list(companyId, { attention: "blocked" })).find((row) => row.id === reviewId)?.blockedInboxAttention?.action.label).toBe("Complete review");
+  });
+
+  it.each(["attributed", "unattributed"])("preserves %s readiness on shared workspaces and accepts a later finalize from another issue", async (attribution) => {
+    const { companyId, rootId, midId, reviewId } = await seedHumanHeldReviewChain("BHS");
+    for (const id of [rootId, midId]) await db.update(issues).set({ status: "todo" }).where(eq(issues.id, id));
+    const workspaceId = randomUUID();
+    await db.insert(executionWorkspaces).values({ id: workspaceId, companyId, name: "Shared finalize fixture", mode: "isolated_workspace", strategyType: "git_worktree", providerType: "git_worktree" });
+    for (const suffix of [4, 5]) {
+      const blockerId = await insertIssue({ companyId, identifier: `BHS-${suffix}`, title: "Shared blocker", status: "done" });
+      await db.update(issues).set({ executionWorkspaceId: workspaceId }).where(eq(issues.id, blockerId));
+      await block({ companyId, blockerIssueId: blockerId, blockedIssueId: reviewId });
+      if (attribution === "attributed") await db.insert(workspaceOperations).values({ companyId, executionWorkspaceId: workspaceId, issueId: blockerId, phase: "worktree_prepare", status: "succeeded", startedAt: new Date("2026-10-01T00:00:01Z") });
+    }
+    await db.insert(workspaceOperations).values({ companyId, executionWorkspaceId: workspaceId, issueId: null, phase: "worktree_prepare", status: "succeeded", startedAt: new Date("2026-10-01T00:00:02Z") });
+    expect((await svc.getDependencyReadiness(reviewId)).isDependencyReady).toBe(false);
+    expect((await svc.list(companyId, { attention: "blocked" })).find((row) => row.id === reviewId)).toBeUndefined();
+    await db.insert(workspaceOperations).values({ companyId, executionWorkspaceId: workspaceId, issueId: rootId, phase: "workspace_finalize", status: "succeeded", startedAt: new Date("2026-10-01T00:00:03Z") });
+    expect((await svc.getDependencyReadiness(reviewId)).isDependencyReady).toBe(true);
+    expect((await svc.list(companyId, { attention: "blocked" })).find((row) => row.id === reviewId)?.blockedInboxAttention?.action.label).toBe("Complete review");
+  });
+
+  it("does not declare a review ready from conflicting finalize operations in the same native millisecond", async () => {
+    const { companyId, rootId, midId, reviewId } = await seedHumanHeldReviewChain("BHT");
+    for (const id of [rootId, midId]) await db.update(issues).set({ status: "todo" }).where(eq(issues.id, id));
+    const workspaceId = randomUUID();
+    await db.insert(executionWorkspaces).values({ id: workspaceId, companyId, name: "Tied finalize fixture", mode: "isolated_workspace", strategyType: "git_worktree", providerType: "git_worktree" });
+    const blockerId = await insertIssue({ companyId, identifier: "BHT-4", title: "Ambiguous finalize", status: "done" });
+    await db.update(issues).set({ executionWorkspaceId: workspaceId }).where(eq(issues.id, blockerId));
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: reviewId });
+    await db.insert(workspaceOperations).values([
+      { companyId, executionWorkspaceId: workspaceId, issueId: blockerId, phase: "worktree_prepare", status: "succeeded", startedAt: sql`'2026-10-01T00:00:00.000100Z'::timestamptz` },
+      { companyId, executionWorkspaceId: workspaceId, issueId: blockerId, phase: "workspace_finalize", status: "succeeded", startedAt: sql`'2026-10-01T00:00:00.000900Z'::timestamptz` },
+    ]);
+    expect((await svc.getDependencyReadiness(reviewId)).isDependencyReady).toBe(false);
+    expect((await svc.list(companyId, { attention: "blocked" })).find((row) => row.id === reviewId)?.blockedInboxAttention?.action.label).not.toBe("Complete review");
   });
 
   it("does not infer review readiness from a blocker omitted from the inbox graph", async () => {

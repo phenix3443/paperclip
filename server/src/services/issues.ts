@@ -5956,32 +5956,55 @@ async function readyUserReviewIds(
     ), done_pairs AS MATERIALIZED (
       SELECT DISTINCT root_id, blocker_id, workspace_id FROM sources
       WHERE status = 'done' AND workspace_id IS NOT NULL AND bound_workspace_id IS NOT NULL
-    ), history AS MATERIALIZED (
-      SELECT o.execution_workspace_id AS workspace_id, o.issue_id, o.phase, o.status,
-        date_trunc('milliseconds', o.started_at) AS started_at
-      FROM (SELECT DISTINCT workspace_id FROM done_pairs) candidate
-      CROSS JOIN LATERAL (
-        SELECT operation.execution_workspace_id, operation.issue_id, operation.phase,
-          operation.status, operation.started_at FROM ${workspaceOperations} operation
+    ), bindings AS MATERIALIZED (
+      SELECT DISTINCT blocker_id, workspace_id FROM done_pairs
+    ), workspace_latest AS MATERIALIZED (
+      SELECT candidate.workspace_id, (
+        SELECT operation.started_at FROM ${workspaceOperations} operation
         WHERE operation.company_id = ${companyId}::uuid
           AND operation.execution_workspace_id = candidate.workspace_id
-        ORDER BY operation.started_at DESC OFFSET 0
-      ) o
-    ), latest AS (
-      SELECT DISTINCT ON (workspace_id, issue_id) * FROM history
-      ORDER BY workspace_id, issue_id, started_at DESC
-    ), finalized AS (
-      SELECT workspace_id, max(started_at) AS finalized_at FROM history
-      WHERE phase = 'workspace_finalize' AND status = 'succeeded' GROUP BY workspace_id
+        ORDER BY operation.started_at DESC LIMIT 1
+      ) AS started_at
+      FROM (SELECT DISTINCT workspace_id FROM bindings) candidate
+    ), latest AS MATERIALIZED (
+      SELECT pair.blocker_id, pair.workspace_id,
+        date_trunc('milliseconds', coalesce(own.started_at, fallback.started_at)) AS started_at,
+        current_ops.finalized
+      FROM bindings pair
+      LEFT JOIN LATERAL (
+        SELECT operation.started_at FROM ${workspaceOperations} operation
+        WHERE operation.company_id = ${companyId}::uuid
+          AND operation.execution_workspace_id = pair.workspace_id AND operation.issue_id = pair.blocker_id
+        ORDER BY operation.started_at DESC LIMIT 1
+      ) own ON true
+      LEFT JOIN LATERAL (
+        SELECT operation.started_at FROM ${workspaceOperations} operation
+        WHERE own.started_at IS NULL AND operation.company_id = ${companyId}::uuid
+          AND operation.execution_workspace_id = pair.workspace_id AND operation.issue_id IS NULL
+        ORDER BY operation.started_at DESC LIMIT 1
+      ) fallback ON true
+      LEFT JOIN LATERAL (
+        SELECT bool_and(operation.phase = 'workspace_finalize' AND operation.status = 'succeeded') AS finalized
+        FROM ${workspaceOperations} operation
+        WHERE operation.company_id = ${companyId}::uuid
+          AND operation.execution_workspace_id = pair.workspace_id
+          AND operation.issue_id IS NOT DISTINCT FROM (CASE WHEN own.started_at IS NULL THEN NULL::uuid ELSE pair.blocker_id END)
+          AND operation.started_at >= date_trunc('milliseconds', coalesce(own.started_at, fallback.started_at))
+          AND operation.started_at < date_trunc('milliseconds', coalesce(own.started_at, fallback.started_at)) + interval '1 millisecond'
+      ) current_ops ON true
     ), pending AS (
       SELECT pair.root_id FROM done_pairs pair
-      LEFT JOIN latest own ON own.workspace_id = pair.workspace_id AND own.issue_id = pair.blocker_id
-      LEFT JOIN latest fallback ON fallback.workspace_id = pair.workspace_id AND fallback.issue_id IS NULL
-      LEFT JOIN finalized f ON f.workspace_id = pair.workspace_id
-      WHERE coalesce(own.started_at, fallback.started_at) IS NOT NULL
-        AND (coalesce(own.phase, fallback.phase) <> 'workspace_finalize'
-          OR coalesce(own.status, fallback.status) <> 'succeeded')
-        AND (f.finalized_at IS NULL OR f.finalized_at <= coalesce(own.started_at, fallback.started_at))
+      JOIN latest l ON l.workspace_id = pair.workspace_id AND l.blocker_id = pair.blocker_id
+      JOIN workspace_latest w ON w.workspace_id = pair.workspace_id
+      WHERE l.started_at IS NOT NULL AND l.finalized IS DISTINCT FROM true
+        AND NOT EXISTS (
+          SELECT 1 FROM ${workspaceOperations} operation
+          WHERE operation.company_id = ${companyId}::uuid
+            AND operation.execution_workspace_id = pair.workspace_id
+            AND operation.started_at >= l.started_at + interval '1 millisecond'
+            AND operation.started_at <= w.started_at
+            AND operation.phase = 'workspace_finalize' AND operation.status = 'succeeded'
+        )
     )
     SELECT requested.id AS "issueId",
       NOT EXISTS (SELECT 1 FROM sources s WHERE s.root_id = requested.id

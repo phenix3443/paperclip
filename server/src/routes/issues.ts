@@ -5555,30 +5555,45 @@ export function issueRoutes(
     };
   }
 
-  function readableRelationIds(rootId: string, edges: IssueEdgeReference[]) {
-    const ids = new Set([rootId]);
+  function readableRelationProofs(roots: Array<{ id: string; identifier?: string | null }>, edges: IssueEdgeReference[]) {
+    const ids = new Set(roots.map((row) => row.id));
+    const samples = new Set(roots.flatMap((row) => [row.id, ...(row.identifier ? [row.identifier] : [])]));
     const pending = [...edges];
+    const visited = new Set<string>();
     while (pending.length > 0) {
       const edge = pending.pop()!;
-      if ("locked" in edge || ids.has(edge.id)) continue;
+      if ("locked" in edge || visited.has(edge.id)) continue;
+      visited.add(edge.id);
       ids.add(edge.id);
+      samples.add(edge.id);
+      if (edge.identifier) samples.add(edge.identifier);
       pending.push(...(edge.terminalBlockers ?? []));
     }
-    return ids;
+    return { ids, samples };
   }
 
   function projectBlockerMetadata<T extends {
     id: string;
     blockerAttention?: IssueBlockerAttention | null;
     blockedInboxAttention?: IssueBlockedInboxAttention | null;
-  }>(row: T, readableIds: ReadonlySet<string>): T {
+  }>(row: T, proof: ReturnType<typeof readableRelationProofs>): T {
+    const safeSample = (sample: string | null) => sample && proof.samples.has(sample) ? sample : null;
     const blocker = row.blockerAttention;
-    if (!blocker || [blocker.directBlockerIssueId, blocker.terminalBlockerIssueId]
-      .every((id) => !id || readableIds.has(id))) return row;
     const attention = row.blockedInboxAttention;
-    return {
+    const safeRow = {
       ...row,
-      blockerAttention: { ...blocker, directBlockerIssueId: null, terminalBlockerIssueId: null,
+      ...(blocker ? { blockerAttention: { ...blocker,
+        sampleBlockerIdentifier: safeSample(blocker.sampleBlockerIdentifier),
+        sampleStalledBlockerIdentifier: safeSample(blocker.sampleStalledBlockerIdentifier),
+        pendingFinalizeBlockerIssueIds: blocker.pendingFinalizeBlockerIssueIds.filter((id) => proof.ids.has(id)),
+      } } : {}),
+      ...(attention ? { blockedInboxAttention: { ...attention, sampleIssueIdentifier: safeSample(attention.sampleIssueIdentifier) } } : {}),
+    };
+    if (!blocker || [blocker.directBlockerIssueId, blocker.terminalBlockerIssueId]
+      .every((id) => !id || proof.ids.has(id))) return safeRow;
+    return {
+      ...safeRow,
+      blockerAttention: { ...safeRow.blockerAttention!, directBlockerIssueId: null, terminalBlockerIssueId: null,
         terminalBlocker: null, sampleBlockerIdentifier: null, sampleStalledBlockerIdentifier: null,
         pendingFinalizeBlockerIssueIds: [] },
       ...(attention && ["blocked_chain_stalled", "blocked_by_uninvokable_assignee", "blocked_by_dependency_cycle"].includes(attention.reason) ? {
@@ -5619,12 +5634,14 @@ export function issueRoutes(
           : {}),
       };
     };
-    const knownIds = new Set([...readableIds, ...rows.map((row) => row.id)]);
-    return rows.map((row) => projectBlockerMetadata({
+    const visibleRows = rows.map((row) => ({
       ...row,
       ...(row.blockedBy ? { blockedBy: row.blockedBy.map((issue) => redact(issue)) } : {}),
       ...(row.blocks ? { blocks: row.blocks.map((issue) => redact(issue)) } : {}),
-    }, knownIds)) as T[];
+    }));
+    const proof = readableRelationProofs(visibleRows,
+      visibleRows.flatMap((row) => [...(row.blockedBy ?? []), ...(row.blocks ?? [])]));
+    return visibleRows.map((row) => projectBlockerMetadata(row, proof)) as T[];
   }
 
   async function assertIssueWriteInfluenceAllowed(
@@ -9491,7 +9508,7 @@ export function issueRoutes(
     );
     const visibleRelations = await redactIssueRelationEdges(req, issue.companyId, relationsWithRecoveryActions);
     const safeBlockerAttention = projectBlockerMetadata({ id: issue.id, blockerAttention },
-      readableRelationIds(issue.id, [...visibleRelations.blockedBy, ...visibleRelations.blocks])).blockerAttention;
+      readableRelationProofs([issue], [...visibleRelations.blockedBy, ...visibleRelations.blocks])).blockerAttention;
     const revalidatedActiveRecoveryAction = await revalidateActiveSourceRecoveryForRead({
         issue,
         trigger: "read_projection",
@@ -9851,7 +9868,7 @@ export function issueRoutes(
       Promise.all(mentionedProjects.map((mentionedProject) => canActorReadProject(req, mentionedProject))),
     ]);
     const safeBlockerAttention = projectBlockerMetadata({ id: issue.id, blockerAttention },
-      readableRelationIds(issue.id, [...visibleRelations.blockedBy, ...visibleRelations.blocks])).blockerAttention;
+      readableRelationProofs([issue], [...visibleRelations.blockedBy, ...visibleRelations.blocks])).blockerAttention;
     const visibleMentionedProjects = mentionedProjects.filter((_, index) => mentionedProjectVisibility[index]);
     // Recovery revalidation may change the blocker; read it afterwards.
     const executionBlocker = await timing.time("execution_blocker", () => getExecutionBlocker(db, issue.companyId, issue.id));
