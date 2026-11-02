@@ -125,7 +125,7 @@ function createFakeTransaction(overrides: Partial<WakeQueueTransaction> = {}): W
     hasPendingWakeInteraction: vi.fn(async () => false),
     isAutomaticRecoverySuppressedByPauseHold: vi.fn(async () => false),
     isImmediateRecoverySourceBlocked: vi.fn(async () => false),
-    queueReviewParticipantRecoveryRun: vi.fn(async () => runSummary("review-recovery")),
+    queueReviewParticipantRecoveryRun: vi.fn(async () => ({ kind: "queued" as const, run: runSummary("review-recovery") })),
     queueImmediateRecoveryRun: vi.fn(async () => runSummary("immediate-recovery")),
     ...overrides,
   };
@@ -819,6 +819,51 @@ describe("releaseIssueExecution review-participant recovery", () => {
   it("still retries the review participant when nothing else is pending", async () => {
     const { transaction } = await release(false);
     expect(transaction.queueReviewParticipantRecoveryRun).toHaveBeenCalledTimes(1);
+  });
+
+  it("U1 blocks an ineligible source with the review-participant notice and forwards the release receipt", async () => {
+    const transaction = createFakeTransaction({
+      queueReviewParticipantRecoveryRun: vi.fn(async () => ({ kind: "ineligible_source" as const })),
+    });
+    const recovery = createFakeRecovery();
+    const receipt = { issueId: ISSUE.id, companyId: "company-1", status: "in_review", statusVersion: 3,
+      lastStatusDecisionId: null, executionRunId: null, checkoutRunId: null, executionAgentNameKey: null,
+      executionGeneration: "receipt-generation" };
+    let lockResolved = false;
+    const issueLock: IssueLockWriter = {
+      withIssueExecutionLock: vi.fn(async (_input, fn) => {
+        const result = await fn({ primaryIssue: reviewIssue, run: reviewRun }, { host: createFakeHost(), transaction });
+        lockResolved = true;
+        return { ...result, run: reviewRun, blockedReceipt: receipt };
+      }),
+    };
+    vi.mocked(recovery.escalateStrandedAssignedIssue).mockImplementation(async () => { expect(lockResolved).toBe(true); });
+    const result = await createReleaseIssueExecution({ issueLock, recovery })({ companyId: "company-1", runId: "run-1", now: new Date() });
+    expect(result.outcome).toEqual({ kind: "blocked", issue: reviewIssue, previousStatus: "in_review",
+      noticeKind: "execution_review_participant" });
+    expect(result.postCommitEffects.some(effect => effect.kind === "run_queued")).toBe(false);
+    expect(recovery.escalateStrandedAssignedIssue).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      issue: reviewIssue, previousStatus: "in_review", noticeKind: "execution_review_participant", releaseReceipt: receipt }));
+  });
+
+  it("U2 propagates an unrelated writer failure without escalating", async () => {
+    const failure = new Error("db down");
+    const transaction = createFakeTransaction({ queueReviewParticipantRecoveryRun: vi.fn(async () => { throw failure; }) });
+    const recovery = createFakeRecovery();
+    const issueLock = createFakeIssueLock(createFakeHost(), transaction, reviewIssue, reviewRun);
+    await expect(createReleaseIssueExecution({ issueLock, recovery })({ companyId: "company-1", runId: "run-1", now: new Date() }))
+      .rejects.toBe(failure);
+    expect(recovery.escalateStrandedAssignedIssue).not.toHaveBeenCalled();
+  });
+
+  it("U3 keeps the queued review-participant recovery outcome for an accepted source", async () => {
+    const transaction = createFakeTransaction();
+    const recovery = createFakeRecovery();
+    const issueLock = createFakeIssueLock(createFakeHost(), transaction, reviewIssue, reviewRun);
+    const result = await createReleaseIssueExecution({ issueLock, recovery })({ companyId: "company-1", runId: "run-1", now: new Date() });
+    expect(result.outcome).toEqual({ kind: "queued_review_participant_recovery", run: runSummary("review-recovery") });
+    expect(result.postCommitEffects).toContainEqual({ kind: "run_queued", run: runSummary("review-recovery") });
+    expect(recovery.escalateStrandedAssignedIssue).not.toHaveBeenCalled();
   });
 
   it("does not look for interactions outside the review-participant branch", async () => {

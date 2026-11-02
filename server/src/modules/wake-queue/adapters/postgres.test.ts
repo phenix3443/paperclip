@@ -1,6 +1,6 @@
 import { instanceSettingsService } from "../../../services/instance-settings.js";
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { Db } from "@paperclipai/db";
 import {
@@ -16,6 +16,7 @@ import {
   issueRecoveryActions,
   issues,
   nativeRunFinalizations,
+  runIdentityContexts,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -28,7 +29,8 @@ import {
 } from "./postgres.js";
 import type { WakeQueuePostgresAdapterDeps } from "./postgres.js";
 import { createReleaseIssueExecution } from "../application/use-cases.js";
-import type { TransactionScope } from "../application/ports.js";
+import type { LockedIssueExecution, TransactionScope } from "../application/ports.js";
+import { issueExecutionGeneration } from "../../../services/issue-execution-policy.js";
 
 // Proves the atomicity and company-scope properties the security review
 // requires: every mutation names `companyId` in its own SQL `WHERE` clause,
@@ -1047,6 +1049,168 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     // executionRunId already pointed at the retry, not the finishing run, so it must survive.
     expect(issueRow?.executionRunId).toBe(retryRunId);
     expect(issueRow?.checkoutRunId).toBeNull();
+  });
+
+  describe("review participant recovery source eligibility", () => {
+    async function seedReviewSource(input: { identity?: "accepted" | "superseded" | "none"; identityUser?: string;
+      generation?: unknown; boundIssue?: "same" | "other" } = {}) {
+      const companyId = await seedCompany();
+      const agentId = await seedAgent({ companyId });
+      const issueId = await seedIssue({ companyId, status: "in_review", assigneeAgentId: agentId });
+      const otherIssueId = await seedIssue({ companyId, status: "todo" });
+      const contextSnapshot: Record<string, unknown> = { issueId };
+      if ("generation" in input) { if (input.generation !== undefined) contextSnapshot.reviewerAssignmentGeneration = input.generation; }
+      else contextSnapshot.reviewerAssignmentGeneration = "generation-g1";
+      const runId = await seedRun({ companyId, agentId, status: "succeeded", contextSnapshot });
+      await db.update(heartbeatRuns).set({ responsibleUserId: "responsible-user", finishedAt: new Date() })
+        .where(eq(heartbeatRuns.id, runId));
+      if ((input.identity ?? "accepted") !== "none") {
+        const [identity] = await db.insert(runIdentityContexts).values({ companyId, runId, revision: 1,
+          responsibleUserId: input.identityUser ?? "responsible-user", cause: "test", correlationId: randomUUID(),
+          status: input.identity ?? "accepted" }).returning();
+        await db.update(heartbeatRuns).set({ activeIdentityContextId: identity.id }).where(eq(heartbeatRuns.id, runId));
+      }
+      await db.update(issues).set({ executionRunId: runId, checkoutRunId: runId }).where(eq(issues.id, issueId));
+      return { companyId, agentId, issueId, otherIssueId, runId };
+    }
+
+    async function releaseThroughWriter(seed: Awaited<ReturnType<typeof seedReviewSource>>,
+      override: (locked: LockedIssueExecution) => Partial<{ companyId: string; issueId: string; agentId: string }> = () => ({})) {
+      const adapter = createPostgresWakeQueueAdapter(db, stubDeps);
+      let writerResult: unknown;
+      const result = await adapter.withIssueExecutionLock({ companyId: seed.companyId, runId: seed.runId, now: new Date() },
+        async (locked, ports) => {
+          const changed = override(locked);
+          const recoveryAgent = await ports.transaction.findInvokableAgent({ companyId: seed.companyId, agentId: seed.agentId });
+          const queued = await ports.transaction.queueReviewParticipantRecoveryRun({
+            companyId: changed.companyId ?? seed.companyId,
+            issue: { ...locked.primaryIssue, id: changed.issueId ?? locked.primaryIssue.id },
+            finishingRun: locked.run,
+            recoveryAgent: { ...recoveryAgent!, id: changed.agentId ?? recoveryAgent!.id },
+            sessionBefore: null,
+            now: new Date(),
+          });
+          writerResult = queued;
+          return queued.kind === "queued"
+            ? { outcome: { kind: "queued_review_participant_recovery" as const, run: queued.run }, postCommitEffects: [] }
+            : { outcome: { kind: "released" as const }, postCommitEffects: [] };
+        });
+      return { result, writerResult };
+    }
+
+    async function expectNothingPersisted(seed: Awaited<ReturnType<typeof seedReviewSource>>, source: typeof heartbeatRuns.$inferSelect) {
+      const [issue] = await db.select().from(issues).where(eq(issues.id, seed.issueId));
+      expect(issue).toMatchObject({ executionRunId: null, checkoutRunId: null });
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, seed.companyId))).toHaveLength(1);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, seed.companyId))).toHaveLength(0);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seed.runId)))[0]).toEqual(source);
+    }
+
+    it.each([
+      ["T1 missing identity", { identity: "none" as const }],
+      ["T2 identity not accepted", { identity: "superseded" as const }],
+      ["T3 identity responsible user mismatch", { identityUser: "other-user" }],
+      ["T4 generation missing", { generation: undefined }],
+      ["T5 generation non-string", { generation: 42 }],
+    ])("%s refuses as ineligible_source and still commits the release", async (_name, input) => {
+      const seed = await seedReviewSource(input);
+      const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seed.runId));
+      const { writerResult } = await releaseThroughWriter(seed);
+      expect(writerResult).toEqual({ kind: "ineligible_source" });
+      await expectNothingPersisted(seed, source);
+    });
+
+    it.each([
+      ["T6 cross-agent", "agent"],
+      ["T7 cross-issue", "issue"],
+      ["T8 cross-company", "company"],
+    ])("%s source refuses as ineligible_source and still commits the release", async (_name, kind) => {
+      const seed = await seedReviewSource();
+      const otherCompanyId = kind === "company" ? await seedCompany() : null;
+      const otherAgentId = kind === "agent" ? await seedAgent({ companyId: seed.companyId }) : null;
+      const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seed.runId));
+      const { writerResult } = await releaseThroughWriter(seed, () => ({
+        ...(otherAgentId ? { agentId: otherAgentId } : {}),
+        ...(kind === "issue" ? { issueId: seed.otherIssueId } : {}),
+        ...(otherCompanyId ? { companyId: otherCompanyId } : {}),
+      }));
+      expect(writerResult).toEqual({ kind: "ineligible_source" });
+      await expectNothingPersisted(seed, source);
+      if (otherCompanyId) {
+        expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, otherCompanyId))).toHaveLength(0);
+      }
+    });
+
+    it("T9 queues an accepted source with its generation verbatim and never restamps the source", async () => {
+      const seed = await seedReviewSource();
+      const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seed.runId));
+      const { result, writerResult } = await releaseThroughWriter(seed);
+      expect(writerResult).toMatchObject({ kind: "queued", run: { id: expect.any(String) } });
+      const successorId = (writerResult as { run: { id: string } }).run.id;
+      expect(result.outcome.kind).toBe("queued_review_participant_recovery");
+      const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successorId));
+      expect(successor.contextSnapshot?.reviewerAssignmentGeneration).toBe("generation-g1");
+      expect((await db.select().from(issues).where(eq(issues.id, seed.issueId)))[0].executionRunId).toBe(successorId);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seed.runId)))[0]).toEqual(source);
+    });
+
+    it("T10 rolls back the whole release when the writer's wake insert fails", async () => {
+      const seed = await seedReviewSource();
+      await db.execute(sql.raw(`create or replace function test_fail_wake_insert() returns trigger language plpgsql as $$
+        begin raise exception 'injected wake insert failure'; end $$`));
+      await db.execute(sql.raw(`create trigger test_fail_wake_insert before insert on agent_wakeup_requests
+        for each row execute function test_fail_wake_insert()`));
+      try {
+        const error = await releaseThroughWriter(seed).then(() => null, (caught: unknown) => caught as Error & { cause?: Error; status?: number });
+        expect(error?.status).toBeUndefined();
+        expect(error?.cause?.message ?? error?.message).toMatch(/injected wake insert failure/);
+      } finally {
+        await db.execute(sql.raw("drop trigger if exists test_fail_wake_insert on agent_wakeup_requests"));
+        await db.execute(sql.raw("drop function if exists test_fail_wake_insert()"));
+      }
+      const [issue] = await db.select().from(issues).where(eq(issues.id, seed.issueId));
+      expect(issue).toMatchObject({ executionRunId: seed.runId, checkoutRunId: seed.runId });
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, seed.companyId))).toHaveLength(1);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, seed.companyId))).toHaveLength(0);
+    });
+
+    it("T11 keeps a competing claimant's lock and never reaches the writer", async () => {
+      const seed = await seedReviewSource();
+      const claimantId = await seedRun({ companyId: seed.companyId, agentId: seed.agentId, status: "running",
+        contextSnapshot: { issueId: seed.issueId } });
+      await db.update(issues).set({ executionRunId: claimantId }).where(eq(issues.id, seed.issueId));
+      let drained = false;
+      const result = await createPostgresWakeQueueAdapter(db, stubDeps).withIssueExecutionLock(
+        { companyId: seed.companyId, runId: seed.runId, now: new Date() },
+        async () => { drained = true; return { outcome: { kind: "released" as const }, postCommitEffects: [] }; });
+      expect(drained).toBe(false);
+      expect(result.outcome.kind).toBe("released");
+      expect((await db.select().from(issues).where(eq(issues.id, seed.issueId)))[0].executionRunId).toBe(claimantId);
+    });
+  });
+
+  it.each([
+    ["T12", "workspace_validation_failed", "workspace_validation"],
+    ["T13", "configuration_incomplete", "configuration_incomplete"],
+  ])("%s attaches a post-write receipt to the early pre-drain blocked exit", async (_name, errorCode, noticeKind) => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent({ companyId });
+    const issueId = await seedIssue({ companyId, status: "in_progress", assigneeAgentId: agentId });
+    const runId = await seedRun({ companyId, agentId, status: "failed", errorCode, contextSnapshot: { issueId } });
+    await db.update(issues).set({ executionRunId: runId, checkoutRunId: runId, executionAgentNameKey: "codexcoder" })
+      .where(eq(issues.id, issueId));
+    let drained = false;
+    const result = await createPostgresWakeQueueAdapter(db, stubDeps).withIssueExecutionLock(
+      { companyId, runId, now: new Date() },
+      async () => { drained = true; return { outcome: { kind: "released" as const }, postCommitEffects: [] }; });
+    expect(drained).toBe(false);
+    expect(result.outcome).toMatchObject({ kind: "blocked", noticeKind });
+    const [row] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(result.blockedReceipt).toEqual({
+      issueId, companyId, status: row.status, statusVersion: row.statusVersion,
+      lastStatusDecisionId: row.lastStatusDecisionId, executionRunId: null, checkoutRunId: null,
+      executionAgentNameKey: null, executionGeneration: issueExecutionGeneration(row),
+    });
   });
 
   // The admission half opens no transaction of its own: `heartbeat.ts` still
