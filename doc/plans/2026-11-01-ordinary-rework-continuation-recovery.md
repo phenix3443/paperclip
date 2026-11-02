@@ -336,9 +336,59 @@ again for the same decision, the new `statusVersion` gives a new key, and each
 resulting run is still counted by the ledger below. A replay after a lost response
 (first commit succeeded, caller saw an error or timeout) returns the same run and
 writes nothing, so it does not count against the ledger or the transient budget.
-When the sweep receives `skipped` for a key that is spent with no run, it escalates
-through the existing `escalateStrandedAssignedIssue` instead of leaving the issue
-with no live path.
+A key that is spent with no run must lead to escalation, not to waiting; the
+result contract below is how the sweep tells that apart from a valid deferral.
+
+Result contract (queue -> recovery helper -> sweep). The `replayed`, `deferred`
+and `skipped` kinds above are internal to `enqueueWakeup`. At its public boundary
+`deferred` and `skipped` both become `null` (`heartbeat/queue.ts:4847-4848`), and
+`RecoveryWakeup` returns `HeartbeatRun | null` (`recovery/service.ts:258-261`).
+C3 does not change either signature, so no existing caller changes. Instead it
+reuses the out-parameter that `enqueueStrandedIssueRecovery` already has for this
+purpose (`outcome?: { retryExhausted?: boolean }`, `recovery/service.ts:2040-2046`,
+consumed today by the review lane at `5786-5821`) and adds one optional field:
+
+```ts
+outcome?: {
+  retryExhausted?: boolean;
+  continuationReceipt?: "bound" | "waiting" | "spent" | "absent";
+};
+```
+
+The helper sets `continuationReceipt` only for
+`source = issue.rework_handback_continuation_recovery`, only when
+`deps.enqueueWakeup` returned `null`, and only by reading the receipt for the
+exact key it sent: rows with `ordinaryWakeRequestPredicate()`, the same
+`companyId`, `agentId` and `idempotencyKey`. Every other source leaves the field
+unset, and callers that do not pass `outcome`, or ignore the new field, behave as
+today.
+
+| Receipt rows for the key (read after `null`) | `continuationReceipt` | Sweep action |
+|---|---|---|
+| a row with `runId` set (a deferral promoted between the return and the read) | `bound` | count as requeued; no escalation, no new attempt |
+| a row without `runId` in `deferred_issue_execution` (active lease, N4), or an execution-reconciliation wait that carries the key | `waiting` | skip; the existing release path (`resumeQueuedRuns`) or recovery action owns it; no escalation |
+| only rows without `runId` in a terminal status (`skipped`, including `issue_state_guard_mismatch`, `failed`, `cancelled`) | `spent` | re-read `hasActiveExecutionPath(companyId, issueId, null)`; if no live path, escalate with `escalateStrandedAssignedIssue` (same call and notice as the ledger exhaustion below); otherwise skip |
+| no row | `absent` | skip without escalation; nothing was written (a shape rejection, or an admission rolled back on lock contention, `55P03`, which `enqueueWakeup` maps to `deferred` at `queue.ts:4830-4833`), so the key is not spent and the next sweep retries it |
+
+A non-null return needs no read: it is either a new run or a replay of the run
+bound to the key, and the sweep counts it as requeued. A replay is not a new
+attempt: it adds no row and no run, so the ledger, which counts runs, does not
+move.
+
+Why the read is safe after the transaction: under the issue lock a key gets at
+most one row (step 3), and that row only moves forward: `deferred` to bound or to
+terminal, never back. The read therefore sees the outcome's state or a later one,
+and either is correct to act on. The `spent` case is the only one that writes,
+and it repeats the live-path read the review lane already does before escalating.
+`allowRunCoalescing = false` matters here too: with it the wake queue never merges
+the request into another deferred row
+(`modules/wake-queue/application/use-cases.ts:943-958`), so an active-lease
+deferral always inserts its own row carrying the key (`insertNewDeferredWake`,
+`adapters/postgres.ts:1211-1225`), and `waiting` is never misread as `absent`.
+
+The helper builds the request itself, so a shape rejection is a programming
+error; R3c asserts the helper's own request passes step 1, and `absent` is
+otherwise only the transient rollback case.
 
 Coalescing. `allowRunCoalescing = false` (the same setting owner-repair
 continuations and case handoffs use) means the wake never merges into another
@@ -431,7 +481,9 @@ run-dispatch module (`modules/run-dispatch/`), C2 in
 `services/issue-continuation-summary.ts`, C3 in `services/recovery/service.ts`,
 C4 in `services/heartbeat/retries.ts`, and the C3 key lookup in
 `services/heartbeat/queue.ts` next to the existing `execution-reconciliation:`
-lookup. `heartbeat.ts` does not grow.
+lookup. The `continuationReceipt` read and its type stay in
+`services/recovery/service.ts`; `enqueueWakeup` and `RecoveryWakeup` keep their
+signatures. `heartbeat.ts` does not grow.
 
 ## 5. Synthetic regression
 
@@ -481,6 +533,32 @@ Assertions, red on `870a6179a5ae`, green after the fix:
     (`statusVersion` changed) the new key admits one run;
   - in every case the ledger count, `executionRetryAccounting` and the transient
     budget are the same as after a single successful call.
+
+  The kind returned inside the queue does not cross the public interface, so the
+  following cases drive the whole chain: the real recovery sweep (the C3 branch),
+  `enqueueStrandedIssueRecovery`, the real `enqueueWakeup` and the embedded DB.
+  Assertions are on the sweep result, the issue row and the DB rows, not on the
+  queue's internal kind:
+  - **deferred does not escalate:** with an active execution lease, two sweeps in
+    a row leave `continuationReceipt = waiting`, one `deferred_issue_execution`
+    row, the issue still `in_progress` with no escalation notice and no
+    `escalated` count; after the lease is released the existing promotion gives
+    exactly one successor run bound to that row, and a third sweep sees `bound`
+    (or the run) and adds nothing;
+  - **spent escalates:** a guard denial spends the key; with no other live path
+    the next sweep sees `spent` and escalates once through
+    `escalateStrandedAssignedIssue`; with another live run for the issue it sees
+    `spent`, re-reads the live path and does not escalate;
+  - **replay is not a new attempt:** after a first sweep queues the run, a second
+    sweep with the same key gets the same run back (non-null), the ledger count
+    from `summarizeRecentContinuationRetries` is unchanged and the sweep does not
+    count a second requeue toward R3b's limit;
+  - **absent:** an admission rolled back on lock contention (`55P03`; if the
+    embedded DB cannot reproduce it deterministically, the wake-queue adapter
+    throws that code once) leaves no row, `continuationReceipt = absent`, no
+    escalation, and the next sweep admits one run with the same key;
+  - **compatibility:** an existing lane that passes `outcome` (the review lane)
+    still sees only `retryExhausted`, with `continuationReceipt` unset.
 - **R4 (3.4/C4):** a repair run whose action has been resolved is interrupted with
   a settled `SIGTERM` (`server_shutdown_interrupted`), then a
   `transient_failure_retry` is scheduled. The retry context has none of the C4
