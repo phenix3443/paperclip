@@ -354,6 +354,18 @@ and one linked `issue.updated` together. Activity exposes decision/comment IDs,
 previous decision, participant, and transaction-current execution-state from/to.
 Existing read permissions apply; historical decisions are not backfilled.
 
+Decision-only REST PATCH can include `expectedExecutionDecisionDigest`, computed
+with the shared `executionDecisionInputsDigest` helper. Only status, comment and
+commentClientRequestId may accompany it (other keys422). Normal updates, Board
+overrides and removed participants return409 execution_policy_transition_stale.
+The caller snapshot is compared again under the existing row lock before comment
+replay or decision persistence. The optional field changes no actor/run grants;
+CLI and native finish tools do not expose this field. Regression coverage:
+[shared digest](../../packages/shared/src/execution-decision-inputs.test.ts),
+[route matrix](../../server/src/__tests__/issue-comment-reopen-routes.test.ts), and
+[PostgreSQL race/replay](../../server/src/__tests__/issue-review-hold-routes.test.ts).
+This is test coverage, not a live agent-access qualification.
+
 Evidence: `source-only` — reviewed at `3bbc2104b65caf9f7763938a01260a5673e12f7a`; [issues.ts](../../server/src/routes/issues.ts), [paperclip-runner-tool-authority.ts](../../server/src/services/native-runtime/paperclip-runner-tool-authority.ts), [native-completion-feedback.ts](../../server/src/services/native-runtime/native-completion-feedback.ts), [native-completion-feedback.test.ts](../../server/src/services/native-runtime/native-completion-feedback.test.ts), [native-deliverable-feedback.test.ts](../../server/src/services/native-runtime/native-deliverable-feedback.test.ts), [paperclip-runner-tool-authority.test.ts](../../server/src/services/native-runtime/paperclip-runner-tool-authority.test.ts), [issue-stalled-review-decision-routes.test.ts](../../server/src/__tests__/issue-stalled-review-decision-routes.test.ts). No live execution claimed.
 
 Verification: `not-run` — Actual native accepted report→provider stop→workspace finalization→persisted status/output; stale/failed report correction without repeating work. Test blocked/review/done, pending question/blocker, invalid/self/foreign reviewer, missing output and duplicate report.

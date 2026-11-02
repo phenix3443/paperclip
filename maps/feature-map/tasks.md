@@ -149,6 +149,11 @@ For staged reviews, approve through PATCH and through an approval comment, inclu
 an intermediate stage that stays In review. Each decision must have one required
 comment and one linked `issue.updated` activity. Route fault tests cover rollback;
 this is source/test coverage, not a live acceptance result.
+For REST decision callers that supply a snapshot digest, change one reviewed input
+before submission and expect409 with no comment, decision or review-count change.
+Race a guarded decision against the responsible human's decision and inspect the
+single committed winner. Additional request keys must return422. See the
+[atomic precondition contract](../../doc/SPEC-implementation.md#execution-decision-snapshot-precondition).
 
 Manual: Add a comment and edit authorized properties. Reload and verify history, actor, and values. Complete a disposable task and inspect its deliverable; reopen through an available action and confirm the next execution follows current policy.
 

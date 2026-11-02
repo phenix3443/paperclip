@@ -16,6 +16,13 @@ import {
 import { createAgentSchema } from "./agent.js";
 
 describe("issue validators", () => {
+  it("accepts only a 64-digit hexadecimal decision digest and leaves old requests unchanged", () => {
+    expect(updateIssueSchema.parse({}).expectedExecutionDecisionDigest).toBeUndefined();
+    expect(updateIssueSchema.parse({ expectedExecutionDecisionDigest: "AB".repeat(32) }).expectedExecutionDecisionDigest).toBe("ab".repeat(32));
+    for (const value of [null, 3, "a".repeat(63), "a".repeat(65), "g".repeat(64)]) {
+      expect(updateIssueSchema.safeParse({ expectedExecutionDecisionDigest: value }).success).toBe(false);
+    }
+  });
   it.each(["BASH_ENV", "ZDOTDIR", "GH_CONFIG_DIR", "PAPERCLIP_GITHUB_LAUNCHER_DIR"])("rejects task-owned managed shell selector %s", key => {
     for (const name of [key, key.toLowerCase()]) {
       const overrides = {adapterConfig:{env:{[name]:"/workspace/startup"}}};
