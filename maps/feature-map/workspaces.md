@@ -148,6 +148,19 @@ Automated: [workspace detail](../../ui/src/pages/ExecutionWorkspaceDetail.test.t
 
 Manual: Provision a disposable workspace, wait for readiness, start an available service, open its endpoint, and inspect a real response and logs. Stop it and verify it actually stops. Exercise close/reopen only after inspecting pending changes and active runs.
 
+Detached repository custody belongs to `workspaces/closure`. In a disposable
+workspace, remove a configured repository from the project set and run normal
+preparation. Its full checkout must move outside Git under the instance root.
+Close readiness must block on a refused entry, a nonempty legacy retained
+directory, or any custody receipt, including terminal-safe and unreadable states.
+Cleanup, Git expiration, task-directory retention, and compaction must refuse
+before their removal hooks. A no-receipt fixture must still reach those hooks.
+The [custody tests](../../server/src/__tests__/detached-repository-custody.test.ts)
+and removal matrices in the existing expiration, task-directory and compaction
+suites exercise isolated filesystem/PostgreSQL fixtures; they do not prove live
+migration, provider execution, or safe deletion. See the
+[retention contract](../../doc/detached-repository-retention.md).
+
 ## Gotchas
 
 - UI visibility, default isolation policy, the local environment row, a workspace

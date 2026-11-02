@@ -1,10 +1,12 @@
+import * as retentionPreparation from "../services/project-repository-retention.js";
+import * as nestedWorktrees from "../services/nested-repository-worktrees.js";
 import express from "express";
 import request from "supertest";
 import { fileResourceRoutes } from "../routes/file-resources.js";
 import { errorHandler } from "../middleware/index.js";
 import { EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { createHash, randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { execFileSync } from "node:child_process";
 import { mkdtemp, mkdir, writeFile, readFile, realpath, readdir, rename, rm } from "node:fs/promises";
 import os from "node:os";
@@ -18,7 +20,7 @@ import { createWorkspaceGitOperationScheduler, WorkspaceGitScanError } from "../
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { createHeartbeatWorkspaceResolver } from "../services/heartbeat/workspaces.js";
-import { resolveManagedProjectWorkspaceDir, resolvePaperclipInstanceRoot } from "../home-paths.js";
+import { resolveDetachedRepositoryRetentionDir, resolveManagedProjectWorkspaceDir, resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { accessService } from "../services/access.js";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
@@ -819,12 +821,39 @@ suite("task project repository provisioning", () => {
       // The fixture adapter reports no progress; exercise reuse outside its unrelated wake cooldown.
       await db.update(heartbeatRuns).set({ startedAt: new Date(Date.now() - 181_000), finishedAt: new Date(Date.now() - 180_000) })
         .where(eq(heartbeatRuns.agentId, agentId));
-      const continued = await admit();
+      const nativeLinked = await nestedWorktrees.readLinkedNestedCheckout(copy);
+      const originalRetention = retentionPreparation.retainProjectRepositoryEntries;
+      const originalBaseLock = nestedWorktrees.withNestedRepositoryBaseLock;
+      let sourceChecks = 0, baseChecks = 0;
+      const assertHeld = async (lifecycle: boolean) => db.transaction(async tx => {
+        const current = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, binding)).then(rows => rows[0]!);
+        const locks = await tx.execute<{ source_locked: boolean; lifecycle_locked: boolean }>(sql`SELECT
+          pg_try_advisory_xact_lock(hashtextextended(${`isolated_repository_source:${companyId}:${current.sourceIssueId}`}, 0)) AS source_locked,
+          pg_try_advisory_xact_lock(hashtextextended(${`execution_workspace_lifecycle:${binding}`}, 0)) AS lifecycle_locked`);
+        expect(locks[0]?.source_locked).toBe(false);
+        if (lifecycle) expect(locks[0]?.lifecycle_locked).toBe(false);
+      });
+      const retentionCall = vi.spyOn(retentionPreparation, "retainProjectRepositoryEntries").mockImplementation(async input => {
+        const retention = input.retention;
+        if (!retention || input.cwd !== taskCwd) return originalRetention(input);
+        return originalRetention({ ...input, retention: { ...retention, withLifecycleLock: async work => {
+          await assertHeld(false); sourceChecks++;
+          return retention.withLifecycleLock(work);
+        } } });
+      });
+      const baseCall = vi.spyOn(nestedWorktrees, "withNestedRepositoryBaseLock").mockImplementation(async (base, work) => {
+        if (nativeLinked && base === nativeLinked.base) { await assertHeld(true); baseChecks++; }
+        return originalBaseLock(base, work);
+      });
+      let continued: Awaited<ReturnType<typeof admit>>;
+      try { continued = await admit(); }
+      finally { retentionCall.mockRestore(); baseCall.mockRestore(); }
+      expect(sourceChecks).toBeGreaterThan(0);
+      if (nativeLinked) expect(baseChecks).toBeGreaterThan(0);
       expect(continued.status).toBe("succeeded");
       expect(execute.mock.calls.filter(([input]) => input.runId === continued.id)).toHaveLength(1);
-      // Removing a configured repository detaches its files under the same task root.
-      const detachedRoot = path.join(taskCwd, ".paperclip-runtime", "detached-repositories");
-      const detached = await readdir(detachedRoot);
+      const detachedRoot = resolveDetachedRepositoryRetentionDir({ companyId, executionWorkspaceId: binding });
+      const detached = (await readdir(detachedRoot)).filter(name => !name.endsWith(".json"));
       expect(detached.length).toBeGreaterThan(0);
       const retained = await Promise.all(detached.map(name => readFile(path.join(detachedRoot, name, "private.txt"), "utf8").catch(() => null)));
       expect(retained).toContain(expectedBytes);

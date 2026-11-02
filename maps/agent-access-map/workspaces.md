@@ -253,6 +253,16 @@ workspace metadata, and operation logs retain their app-data privacy.
 
 ## `closure`
 
+Detached-checkout retention changes no grants or routes. Existing authorized close
+readiness reads report blocking paths. Cleanup, Git expiration, task-directory
+retention, and compaction refuse under their existing locks whenever a receipt
+exists, in every state. A refused non-active entry or nonempty legacy retained
+directory also blocks removal. Agents receive preservation warnings in the local
+run log; they gain no migration, resolution, override, or deletion capability.
+Fixture evidence remains source-only for this access map. See
+[the retention contract](../../doc/detached-repository-retention.md).
+
+
 Capability ID: `workspaces/closure`.
 
 Review: `baseline`.

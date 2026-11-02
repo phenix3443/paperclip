@@ -2099,6 +2099,15 @@ all service instances share in-flight materialization. Existing public helpers
 and the workspace validation error class remain available from `heartbeat.ts`.
 Keep workspace policy changes separate from scheduling and run execution changes.
 
+Detached repository preservation uses `project-repository-retention.ts` for native
+identity and live-consumer checks, `detached-repository-custody.ts` for rename-only
+custody and pending-receipt recovery, and `detached-repository-retention-guard.ts`
+for the shared destructive-path refusal. Preparation holds source, lifecycle,
+then nested-base locks; reopen reuses its transaction. Lifecycle generation and
+reopen-pending readers live in `execution-workspace-lifecycle-state.ts` and remain
+exported from the workspace service. Receipt reconciliation runs only during normal workspace preparation; this fix
+adds no background job. See [the retention contract](detached-repository-retention.md).
+
 Run preparation is in `server/src/services/heartbeat/run-preparation.ts`. It owns
 issue and wake context, responsible-user resolution, routine environment snapshots,
 skill mentions, adapter environment configuration, and MCP/tool access setup.

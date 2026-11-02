@@ -694,3 +694,10 @@ telemetry-read authorization. Ordinary PRP reads/live delivery retain run-secret
 and current-user redaction. The task page uses one history read on mount/reconnect
 and the existing live transcript stream, then makes a bounded plugin readiness
 check. No panel discovery timer scans runs or provider state while connected.
+
+## Detached repository preservation
+
+`workspace.detached_repository_warning` records refused moves and unresolved
+custody receipts during heartbeat workspace preparation. The system warning names
+the affected path and records the execution workspace ID. It stays in the local
+instance run log. Receipt history never authorizes deletion.

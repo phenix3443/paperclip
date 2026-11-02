@@ -1,3 +1,4 @@
+import { assertWorkspaceRetentionAllowsRemoval } from "./detached-repository-retention-guard.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { and, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
@@ -241,6 +242,7 @@ export async function inspectLockedGitExpirationCandidate(tx: Tx, snapshot: Work
   options.observeCurrent?.(current);
   const workspace = current?.workspace;
   if (!workspace || workspace.updatedAt.getTime() !== snapshot.updatedAt.getTime()) throw new Error("workspace_changed");
+  await assertWorkspaceRetentionAllowsRemoval(tx, workspace);
   if (!await isGitWorkspaceExpirationEligible(tx, workspace, options.now, options.idleCutoff)) throw new Error("live_or_unresolved_consumer");
   const live = LIVE_EXECUTION_WORKSPACE_STATUSES.includes(workspace.status);
   // A restored active workspace starts a new expiration cycle and records its new HEAD.

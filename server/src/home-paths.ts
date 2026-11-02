@@ -92,3 +92,13 @@ export function resolveManagedProjectWorkspaceDir(input: {
     sanitizeFriendlyPathSegment(input.repoName, "_default"),
   );
 }
+
+export function resolveDetachedRepositoryRetentionDir(input: {
+  companyId: string;
+  executionWorkspaceId: string;
+}): string {
+  for (const value of [input.companyId, input.executionWorkspaceId]) {
+    if (!PATH_SEGMENT_RE.test(value)) throw new Error("Invalid detached repository retention identity");
+  }
+  return path.resolve(resolvePaperclipInstanceRoot(), "detached-repositories", input.companyId, input.executionWorkspaceId);
+}
