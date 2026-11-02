@@ -134,7 +134,7 @@ function registerModuleMocks() {
     };
   });
 
-  vi.doMock("../services/index.js", () => ({
+  vi.doMock("../services/index.js", () => Object.fromEntries(Object.entries({
     agentService: () => lifecycle.capture(mockAgentService),
     agentInstructionsService: () => ({}),
     accessService: () => lifecycle.capture(mockAccessService),
@@ -149,7 +149,10 @@ function registerModuleMocks() {
     secretService: () => ({}),
     syncInstructionsBundleConfigFromFilePath: mockAdditionalServices.syncInstructions,
     workspaceOperationService: () => lifecycle.capture(mockWorkspaceOperationService),
-  }));
+  }).map(([name, factory]) => [name, (...args: unknown[]) => {
+    lifecycle.active();
+    return Reflect.apply(factory, undefined, args);
+  }])));
 
   vi.doMock("../adapters/index.js", () => ({
     ...mockAdditionalServices.adapters,

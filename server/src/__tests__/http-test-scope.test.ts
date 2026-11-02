@@ -178,6 +178,19 @@ if (fault) describe(`route scope negative control: ${fault}`, () => {
   });
   it("retains the injected failure", async ({ signal }) => {
     if (fault === "timeout") {
+      const owner = runtime.active();
+      signal.addEventListener("abort", () => {
+        const next = runtime.createScope(new AbortController().signal);
+        owner.track(runtime.run(next, async () => {
+          service.read.mockResolvedValueOnce("sentinel");
+          await new Promise<void>((resolve) => setTimeout(resolve, 2000));
+          expect(expired).toBe(true);
+          expect(service.read).not.toHaveBeenCalled();
+          expect(await service.read()).toBe("sentinel");
+          expect(await service.read()).toBe("fresh");
+          await next.dispose();
+        }), true);
+      }, { once: true });
       service.read.mockImplementationOnce(async () => {
         await new Promise<void>((resolve) => setTimeout(resolve, 16000));
         expired = true;
