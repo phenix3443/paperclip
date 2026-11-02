@@ -2,7 +2,8 @@ import { executionDecisionInputsDigest } from "@paperclipai/shared";
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
+import { PgSelectBase } from "drizzle-orm/pg-core";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agentWakeupRequests,
@@ -208,8 +209,28 @@ describeEmbeddedPostgres("board holds on a pending review", () => {
     const arrived = Promise.withResolvers<void>();
     const firstArrived = Promise.withResolvers<void>();
     const release = Promise.withResolvers<void>();
-    const firstCommitted = Promise.withResolvers<void>();
+    const winnerLocked = Promise.withResolvers<void>();
+    const loserStarted = Promise.withResolvers<void>();
+    const releaseWinner = Promise.withResolvers<void>();
+    const originalThen = PgSelectBase.prototype.then;
+    let lockReads = 0;
+    const lockSpy = vi.spyOn(PgSelectBase.prototype, "then").mockImplementation(function (onFulfilled, onRejected) {
+      const query = this.toSQL();
+      if (query.sql.includes('from "issues"') && query.sql.endsWith("for update") && query.params.includes(before.id) && lockReads < 2) {
+        const index = lockReads++;
+        if (index === 1) loserStarted.resolve();
+        return originalThen.call(this, async rows => {
+          if (index === 0) {
+            winnerLocked.resolve();
+            await releaseWinner.promise;
+          }
+          return onFulfilled ? onFulfilled(rows) : rows;
+        }, onRejected);
+      }
+      return originalThen.call(this, onFulfilled, onRejected);
+    });
     let arrivals = 0;
+    let winnerBackendPid: number | undefined;
     const spy = vi.spyOn(db, "transaction").mockImplementation(async (callback, config) => {
       const index = arrivals++;
       if (index < 2) {
@@ -217,9 +238,14 @@ describeEmbeddedPostgres("board holds on a pending review", () => {
         if (arrivals === 2) arrived.resolve();
         await release.promise;
         const isWinner = index === (winner === "guarded" ? 0 : 1);
-        if (!isWinner) await firstCommitted.promise;
-        try { return await originalTransaction(callback, config); }
-        finally { if (isWinner) firstCommitted.resolve(); }
+        if (!isWinner) await winnerLocked.promise;
+        return originalTransaction(async tx => {
+          if (isWinner) {
+            const [backend] = await tx.execute(sql`select pg_backend_pid() as pid`);
+            winnerBackendPid = Number(backend.pid);
+          }
+          return callback(tx);
+        }, config);
       }
       return originalTransaction(callback, config);
     });
@@ -234,6 +260,14 @@ describeEmbeddedPostgres("board holds on a pending review", () => {
       }).then(response => response);
       await arrived.promise;
       release.resolve();
+      await winnerLocked.promise;
+      await loserStarted.promise;
+      await vi.waitFor(async () => {
+        const waiting = await db.execute(sql`select pid from pg_stat_activity
+          where datname = current_database() and ${winnerBackendPid} = any(pg_blocking_pids(pid))`);
+        expect(waiting.length).toBeGreaterThan(0);
+      }, { timeout: 3000, interval: 20 });
+      releaseWinner.resolve();
       const responses = await Promise.all([guarded, human]);
       expect(responses.map(response => response.status).sort()).toEqual([200, 409]);
       const rejected = responses.find(response => response.status === 409)!;
@@ -259,7 +293,7 @@ describeEmbeddedPostgres("board holds on a pending review", () => {
       expect(decisions.find(decision => !fixture.previousDecisions.some(previous => previous.id === decision.id))?.body)
         .toBe(comments[0].body);
     } finally {
-      release.resolve(); firstCommitted.resolve(); spy.mockRestore();
+      release.resolve(); releaseWinner.resolve(); spy.mockRestore(); lockSpy.mockRestore();
     }
   });
 
