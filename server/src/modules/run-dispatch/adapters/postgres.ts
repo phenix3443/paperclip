@@ -57,6 +57,7 @@ import {
 } from "../../../services/issue-continuation-summary.js";
 import { parseIssueExecutionState } from "../../../services/issue-execution-policy.js";
 import { decideQueuedRunStaleness, decideScheduledRetryGate } from "../domain/policy.js";
+import { isNativeReworkHandback } from "../domain/rework-handback.js";
 import type {
   QueuedRunFacts,
   ReviewParticipantFacts,
@@ -593,7 +594,8 @@ export function createPostgresRunDispatchAdapter(
         issue.status === "in_progress" &&
         !wakeCommentId &&
         !hasResolvedInteractionEvidence &&
-        (wakeReason === "issue_continuation_needed" || retryReason === "issue_continuation_needed"),
+        (wakeReason === "issue_continuation_needed" || retryReason === "issue_continuation_needed") &&
+        !isNativeReworkHandback(issue, input.agentId),
     );
     let continuationSummaryBody: string | null = null;
     let continuationParksExecutor = false;

@@ -27,6 +27,8 @@ export {
   allowsIssueInteractionWake,
   isResolvedInteractionContinuationWakeContext,
 } from "./domain/wake-context.js";
+export { isNativeReworkHandback } from "./domain/rework-handback.js";
+export type { ReworkHandbackIssueFacts } from "./domain/rework-handback.js";
 export type {
   RetryReasonKind,
   BudgetBlockFacts,

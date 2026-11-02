@@ -107,7 +107,12 @@ function inferNextAction(issue: IssueSummaryInput, run: RunSummaryInput, previou
     return "Inspect the failed run, fix the cause, and resume from the most recent concrete action above.";
   }
   if (run.status === "cancelled") return "Confirm the cancellation reason before starting another run.";
-  return previousNextAction ?? "Resume implementation from the acceptance criteria, latest comments, and this summary.";
+  const staleReviewWait =
+    issue.status === "in_progress" &&
+    previousNextAction !== null &&
+    WAITING_FOR_REVIEW_OR_APPROVAL_RE.test(previousNextAction);
+  if (previousNextAction && !staleReviewWait) return previousNextAction;
+  return "Resume implementation from the acceptance criteria, latest comments, and this summary.";
 }
 
 function bulletList(items: string[], empty: string) {
