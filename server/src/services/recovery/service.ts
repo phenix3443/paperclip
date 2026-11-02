@@ -120,7 +120,6 @@ import {
   executeIssuePostCommitActions,
   type IssuePostCommitAction,
 } from "../issues.js";
-import type { ReleaseBlockedReceipt } from "../../modules/wake-queue/application/ports.js";
 import {
   applyIssueMonitorPolicyTransition,
   issueExecutionGeneration,
@@ -4448,7 +4447,10 @@ export function recoveryService(
     notice?: StrandedRecoveryNoticeSeed | null;
     recoveryCause?: StrandedRecoveryCause;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
-    releaseReceipt?: ReleaseBlockedReceipt;
+    releaseReceipt?: {
+      issueId: string; companyId: string; status: string; statusVersion: number; lastStatusDecisionId: string | null;
+      executionRunId: string | null; checkoutRunId: string | null; executionAgentNameKey: string | null; executionGeneration: string;
+    };
   }) {
     const publications: ActivityPublication[] = [];
     const postCommitActions: IssuePostCommitAction[] = [];
