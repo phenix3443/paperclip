@@ -5934,6 +5934,62 @@ function blockedChainOwner(
   return unknown;
 }
 
+async function readyUserReviewIds(
+  dbOrTx: any,
+  companyId: string,
+  candidateIds: string[],
+  relations: Array<{ blockerIssueId: string; blockedIssueId: string }>,
+): Promise<Set<string>> {
+  if (candidateIds.length === 0) return new Set();
+  const candidates = new Set(candidateIds);
+  const links = relations.filter((edge) => candidates.has(edge.blockedIssueId))
+    .map((edge) => ({ root_id: edge.blockedIssueId, blocker_id: edge.blockerIssueId }));
+  const rows = await dbOrTx.execute(sql`
+    WITH requested AS (
+      SELECT value::uuid AS id FROM jsonb_array_elements_text(${JSON.stringify(candidateIds)}::jsonb)
+    ), sources AS MATERIALIZED (
+      SELECT edge.root_id, i.id AS blocker_id, i.status,
+        i.execution_workspace_id AS workspace_id, w.id AS bound_workspace_id
+      FROM jsonb_to_recordset(${JSON.stringify(links)}::jsonb) AS edge(root_id uuid, blocker_id uuid)
+      LEFT JOIN ${issues} i ON i.id = edge.blocker_id AND i.company_id = ${companyId}::uuid
+      LEFT JOIN ${executionWorkspaces} w ON w.id = i.execution_workspace_id AND w.company_id = ${companyId}::uuid
+    ), done_pairs AS MATERIALIZED (
+      SELECT DISTINCT root_id, blocker_id, workspace_id FROM sources
+      WHERE status = 'done' AND workspace_id IS NOT NULL AND bound_workspace_id IS NOT NULL
+    ), history AS MATERIALIZED (
+      SELECT o.execution_workspace_id AS workspace_id, o.issue_id, o.phase, o.status,
+        date_trunc('milliseconds', o.started_at) AS started_at
+      FROM ${workspaceOperations} o
+      WHERE o.company_id = ${companyId}::uuid
+        AND o.execution_workspace_id IN (SELECT workspace_id FROM done_pairs)
+    ), latest AS (
+      SELECT DISTINCT ON (workspace_id, issue_id) * FROM history
+      ORDER BY workspace_id, issue_id, started_at DESC
+    ), finalized AS (
+      SELECT workspace_id, max(started_at) AS finalized_at FROM history
+      WHERE phase = 'workspace_finalize' AND status = 'succeeded' GROUP BY workspace_id
+    ), pending AS (
+      SELECT pair.root_id FROM done_pairs pair
+      LEFT JOIN latest own ON own.workspace_id = pair.workspace_id AND own.issue_id = pair.blocker_id
+      LEFT JOIN latest fallback ON fallback.workspace_id = pair.workspace_id AND fallback.issue_id IS NULL
+      LEFT JOIN finalized f ON f.workspace_id = pair.workspace_id
+      WHERE coalesce(own.started_at, fallback.started_at) IS NOT NULL
+        AND (coalesce(own.phase, fallback.phase) <> 'workspace_finalize'
+          OR coalesce(own.status, fallback.status) <> 'succeeded')
+        AND (f.finalized_at IS NULL OR f.finalized_at <= coalesce(own.started_at, fallback.started_at))
+    )
+    SELECT requested.id AS "issueId",
+      NOT EXISTS (SELECT 1 FROM sources s WHERE s.root_id = requested.id
+        AND (s.status IS DISTINCT FROM 'done' OR (s.workspace_id IS NOT NULL AND s.bound_workspace_id IS NULL)))
+      AND NOT EXISTS (SELECT 1 FROM ${issues} child WHERE child.company_id = ${companyId}::uuid
+        AND child.parent_id = requested.id AND child.status NOT IN ('done', 'cancelled'))
+      AND NOT EXISTS (SELECT 1 FROM pending p WHERE p.root_id = requested.id) AS ready
+    FROM requested
+  `);
+  return new Set((Array.from(rows) as Array<{ issueId: string; ready: boolean }>)
+    .filter((row) => row.ready === true).map((row) => row.issueId));
+}
+
 async function listIssueBlockedInboxAttentionMap(
   dbOrTx: any,
   companyId: string,
@@ -6317,6 +6373,13 @@ async function listIssueBlockedInboxAttentionMap(
       hasWaitingDependents.add(issue.id);
     }
   }
+  const readyReviews = await readyUserReviewIds(dbOrTx, companyId, issueRows
+    .filter((row) => humanHeldReviewUserId(issuesById.get(row.id) ?? row) !== null
+      && hasWaitingDependents.has(row.id) && !hasUnfinishedBlockers.has(row.id)
+      && !(row.monitorNextCheckAt && row.monitorNextCheckAt.getTime() > Date.now())
+      && !liveHandoffRunIssueIds.has(row.id) && !liveHandoffWakeIssueIds.has(row.id)
+      && !interactionByIssueId.has(row.id) && !approvalByIssueId.has(row.id))
+    .map((row) => row.id), graphRelations);
   const blockerCycleByIssueId = new Map<string, IssueBlockerDependencyCycle>();
   const blockerAttentionByIssueId = await listIssueBlockerAttentionMap(
     dbOrTx,
@@ -6574,6 +6637,7 @@ async function listIssueBlockedInboxAttentionMap(
     const reviewerUserId = humanHeldReviewUserId(issuesById.get(row.id) ?? row);
     if (
       reviewerUserId &&
+      readyReviews.has(row.id) &&
       hasWaitingDependents.has(row.id) &&
       !hasUnfinishedBlockers.has(row.id) &&
       !hasMonitor &&

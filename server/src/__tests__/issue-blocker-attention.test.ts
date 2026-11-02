@@ -9,6 +9,8 @@ import {
   companies,
   createDb,
   heartbeatRuns,
+  executionWorkspaces,
+  workspaceOperations,
   issueApprovals,
   issueRelations,
   issueThreadInteractions,
@@ -46,10 +48,12 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     await db.delete(issueApprovals);
     await db.delete(approvals);
     await db.delete(activityLog);
+    await db.delete(workspaceOperations);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(issueRelations);
     await db.delete(issues);
+    await db.delete(executionWorkspaces);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -1657,6 +1661,22 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     expect(root?.blockedInboxAttention?.sampleIssueIdentifier).not.toBe("BHP-3");
     expect(root?.blockerAttention?.sampleStalledBlockerIdentifier).toBeNull();
     expect(root?.blockerAttention?.terminalBlocker).toBeNull();
+  });
+
+  it("keeps a pending-finalize blocker out of a user review tail until native readiness settles", async () => {
+    const { companyId, rootId, midId, reviewId } = await seedHumanHeldReviewChain("BHF");
+    for (const id of [rootId, midId]) await db.update(issues).set({ status: "todo" }).where(eq(issues.id, id));
+    const workspaceId = randomUUID();
+    await db.insert(executionWorkspaces).values({ id: workspaceId, companyId, name: "Finalize fixture", mode: "isolated_workspace", strategyType: "git_worktree", providerType: "git_worktree" });
+    const blockerId = await insertIssue({ companyId, identifier: "BHF-4", title: "Done awaiting finalize", status: "done" });
+    await db.update(issues).set({ executionWorkspaceId: workspaceId }).where(eq(issues.id, blockerId));
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: reviewId });
+    const [operation] = await db.insert(workspaceOperations).values({ companyId, executionWorkspaceId: workspaceId, issueId: blockerId, phase: "worktree_prepare", status: "succeeded" }).returning();
+    expect((await svc.getDependencyReadiness(reviewId)).isDependencyReady).toBe(false);
+    expect((await svc.list(companyId, { attention: "blocked" })).find((row) => row.id === reviewId)).toBeUndefined();
+    await db.update(workspaceOperations).set({ phase: "workspace_finalize" }).where(eq(workspaceOperations.id, operation.id));
+    expect((await svc.getDependencyReadiness(reviewId)).isDependencyReady).toBe(true);
+    expect((await svc.list(companyId, { attention: "blocked" })).find((row) => row.id === reviewId)?.blockedInboxAttention?.action.label).toBe("Complete review");
   });
 
   it("does not infer review readiness from a blocker omitted from the inbox graph", async () => {
