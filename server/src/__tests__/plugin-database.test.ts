@@ -183,6 +183,76 @@ describe("plugin database SQL validation", () => {
     ).toThrow(/outside namespace/i);
   });
 
+  it("keeps comment and quote boundaries consistent between the splitter and the keyword scan", () => {
+    const migration = [
+      "/* block's comment; with a semicolon */",
+      "CREATE TABLE plugin_test.notes (body text DEFAULT 'it''s /* not a comment */ -- nor this; ok');",
+      "-- trailing \"quote; and apostrophe's\"",
+      "COMMENT ON TABLE plugin_test.notes IS 'Plugin''s notes; read only';",
+      "CREATE INDEX notes_body_idx ON plugin_test.notes (body) /* it's */;",
+      "UPDATE plugin_test.notes SET body = '\"' WHERE body IS NULL -- end without newline",
+    ].join("\n");
+    const statements = splitSqlStatements(migration);
+    expect(statements).toHaveLength(4);
+    for (const statement of statements) {
+      expect(() => validatePluginMigrationStatement(statement, "plugin_test")).not.toThrow();
+    }
+  });
+
+  it("does not let comments join or hide SQL tokens", () => {
+    expect(() =>
+      validatePluginMigrationStatement("DROP/**/TABLE plugin_test.rows", "plugin_test")
+    ).toThrow(/destructive/i);
+    expect(() =>
+      validatePluginMigrationStatement(
+        "/* it's */ UPDATE plugin_test.rows SET a = 1; /* don't */ GRANT ALL ON plugin_test.rows TO public",
+        "plugin_test",
+      )
+    ).toThrow(/disallowed/i);
+    expect(() =>
+      validatePluginMigrationStatement(
+        "UPDATE plugin_test.rows SET note = 'a /* b' WHERE id IS NOT NULL; DELETE FROM plugin_test.rows",
+        "plugin_test",
+      )
+    ).toThrow(/cannot delete/i);
+    expect(() =>
+      validatePluginMigrationStatement(
+        "-- it's\nINSERT INTO plugin_test.rows SELECT * FROM plugin_other.rows",
+        "plugin_test",
+      )
+    ).toThrow(/outside namespace/i);
+  });
+
+  it("keeps SQL after an unterminated quote or block comment visible to the keyword scan", () => {
+    // The host grammar has no dollar-quoted or E'' strings, so PostgreSQL can
+    // close these strings where the scanner sees an unterminated quote. The
+    // scan must not hide the SQL that follows such a quote.
+    expect(() =>
+      validatePluginMigrationStatement(
+        "CREATE TABLE plugin_test.rows (a text DEFAULT $$'$$); GRANT ALL ON plugin_test.rows TO public",
+        "plugin_test",
+      )
+    ).toThrow(/disallowed/i);
+    expect(() =>
+      validatePluginMigrationStatement(
+        "INSERT INTO plugin_test.rows VALUES (E'\\''); GRANT ALL ON plugin_test.rows TO public",
+        "plugin_test",
+      )
+    ).toThrow(/disallowed/i);
+    expect(() =>
+      validatePluginMigrationStatement(
+        "CREATE TABLE plugin_test.rows (a text DEFAULT $$/*$$); GRANT ALL ON plugin_test.rows TO public",
+        "plugin_test",
+      )
+    ).toThrow(/disallowed/i);
+    expect(() =>
+      validatePluginMigrationStatement(
+        "UPDATE plugin_test.rows SET a = $$\"$$; DELETE FROM plugin_test.rows",
+        "plugin_test",
+      )
+    ).toThrow(/cannot delete/i);
+  });
+
   it("targets anonymous DO blocks without rejecting do-prefixed aliases", () => {
     expect(() =>
       validatePluginRuntimeQuery(

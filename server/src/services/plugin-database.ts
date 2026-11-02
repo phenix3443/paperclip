@@ -115,11 +115,17 @@ export function splitSqlStatements(input: string): string[] {
 // Same state machine as splitSqlStatements: separate string/comment regexes
 // applied in sequence misread an apostrophe inside a comment as a string
 // opener and swallowed the SQL that followed it.
+//
+// A quote or block comment that never closes stays visible from its opener on.
+// PostgreSQL can close it through grammar the host does not model (dollar
+// quotes, E'' escapes), so hiding the rest could hide live SQL.
 function stripSqlForKeywordScan(input: string): string {
   let output = "";
   let quote: "'" | "\"" | null = null;
   let lineComment = false;
   let blockComment = false;
+  let openedAt = 0;
+  let outputAtOpen = 0;
 
   for (let i = 0; i < input.length; i += 1) {
     const char = input[i]!;
@@ -158,15 +164,22 @@ function stripSqlForKeywordScan(input: string): string {
     }
     if (char === "/" && next === "*") {
       blockComment = true;
+      openedAt = i;
+      outputAtOpen = output.length;
       i += 1;
       continue;
     }
     if (char === "'" || char === "\"") {
       quote = char;
+      openedAt = i;
+      outputAtOpen = output.length;
     }
     output += char;
   }
 
+  if (quote || blockComment) {
+    return output.slice(0, outputAtOpen) + input.slice(openedAt);
+  }
   return output;
 }
 
