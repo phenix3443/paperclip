@@ -121,7 +121,10 @@ describePostgres("connection cleanup delivery notifications", () => {
                 const spy = vi.spyOn(savepoint, "update").mockImplementation(table => {
                   const query = write(table), set = query.set.bind(query);
                   vi.spyOn(query, "set").mockImplementation(values => {
-                    if (matches(table, values)) reached += 1;
+                    if (matches(table, values)) {
+                      reached += 1;
+                      expect(databaseWorkPending(db, DELIVERY_QUEUES.connection)).toBe(true);
+                    }
                     return set(values);
                   });
                   return query;
@@ -134,6 +137,8 @@ describePostgres("connection cleanup delivery notifications", () => {
             await toolAccessService(tx as unknown as typeof db).archiveConnection(f.connection.id, f.companyId);
             expect(databaseWorkPending(db, DELIVERY_QUEUES.connection)).toBe(true);
             expect(reached).toBe(1);
+            await new Promise(resolve => setTimeout(resolve, 100));
+            expect(delivery!.sweeps).toBe(outerBaseline);
             if (mode === "outer rollback") throw new Error("outer rollback");
           });
           if (mode === "outer rollback") await expect(outer).rejects.toThrow("outer rollback");
