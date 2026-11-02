@@ -205,14 +205,14 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
     await tempDb?.cleanup();
   });
 
-  it("redacts the user owner of an unreadable review tail", async () => {
+  it.each(["private", "open"] as const)("redacts the user owner of an unreadable %s review tail", async (visibility) => {
     const company = await seedCompany(db);
     const agent = await seedAgent(db, company.id);
     const project = await seedProject(db, company.id, "Private review project");
     await db.update(projects).set({ visibility: "private" }).where(eq(projects.id, project.id));
     const root = await seedIssue(db, { companyId: company.id, title: "Visible source", status: "blocked", assigneeAgentId: agent.id });
     const tail = await seedIssue(db, { companyId: company.id, projectId: project.id, title: "Hidden review title", status: "in_review" });
-    await db.update(issues).set({ visibility: "private", privacyRootIssueId: tail.id, createdByUserId: "hidden-user", assigneeUserId: "hidden-user", executionState: {
+    await db.update(issues).set({ visibility, privacyRootIssueId: visibility === "private" ? tail.id : null, createdByUserId: "hidden-user", assigneeUserId: "hidden-user", executionState: {
       status: "pending", currentParticipant: { type: "user", userId: "hidden-user" },
     } }).where(eq(issues.id, tail.id));
     await blockIssue(db, company.id, tail.id, root.id);

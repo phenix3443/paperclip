@@ -23,6 +23,15 @@ visibility exception. Company/private-task access checks still apply. Collection
 preferences and hierarchy presentation are browser state, not additional authority.
 Source-reviewed behavior; live agent access verification remains separate.
 
+Blocked attention (`GET /api/companies/{companyId}/issues?attention=blocked`) may
+identify the current user review participant as owner. That presentation grants no
+review, reassignment, or task-mutation authority. Verify a public dependent of an
+unreadable review with the actual permitted actor; omit its user/participant,
+decision, title, and sample data, including when issue visibility is open inside a
+private project or inherited scope. Preserve readiness/finalize and monitor gates.
+The focused blocker-attention and diagnostic-route suites provide isolated checks;
+source-only coverage does not establish live agent access or successful acceptance.
+
 Collection projections `view=index` and `view=rows` use the same issue-list
 company/private-task checks. Optional `ids` and `parentIds` batches accept at most
 100 UUIDs and cannot be combined with blocked attention. They grant no new access.

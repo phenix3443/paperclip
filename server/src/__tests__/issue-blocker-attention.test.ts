@@ -1659,6 +1659,15 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     expect(root?.blockerAttention?.terminalBlocker).toBeNull();
   });
 
+  it("does not infer review readiness from a blocker omitted from the inbox graph", async () => {
+    const { companyId, reviewId } = await seedHumanHeldReviewChain("BHH");
+    const hiddenId = await insertIssue({ companyId, identifier: "BHH-4", title: "Hidden unfinished blocker", status: "blocked" });
+    await db.update(issues).set({ hiddenAt: new Date() }).where(eq(issues.id, hiddenId));
+    await block({ companyId, blockerIssueId: hiddenId, blockedIssueId: reviewId });
+    const rows = await svc.list(companyId, { attention: "blocked" });
+    expect(rows.find((row) => row.id === reviewId)?.blockedInboxAttention?.action.label).not.toBe("Complete review");
+  });
+
   it("keeps covering a user-held review tail that has an active run", async () => {
     const { companyId, agentId, rootId, reviewId } = await seedHumanHeldReviewChain("BHA");
     await activeRun({ companyId, agentId, issueId: reviewId });

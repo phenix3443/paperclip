@@ -26,6 +26,16 @@ Agent access: [companion](../agent-access-map/inbox-search.md).
 
 Use Inbox links or the corresponding task views when the combined list is enabled.
 
+Blocked review-tail verification (`inbox-search/views`): in isolated fixtures, a pending
+user review with waiting work and no unfinished blockers or live path appears with
+its current participant as owner and **Complete review** linking to the review.
+Check dependent rows, keyboard navigation, mobile, and both themes. Future monitors
+and queued/retrying/running work remain live; due or expired monitors alone do not.
+A missing graph node does not prove readiness: retain pending-finalize and hidden
+blockers. An unreadable review must expose no user, title, or sample through a
+readable dependent, including private-project and inherited-privacy cases.
+This is a verification recipe, not a claim that the journey passed.
+
 ### `decisions`
 
 Open `/decisions`, then a queue at `/decisions/queues/:key` and its source item.
