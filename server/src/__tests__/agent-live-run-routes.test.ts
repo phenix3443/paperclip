@@ -2,13 +2,16 @@ import express from "express";
 import request from "supertest";
 import { type SQL } from "drizzle-orm";
 import { PgDialect } from "drizzle-orm/pg-core";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { aroundEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createRouteTestRuntime } from "./helpers/route-test-scope.js";
 
-const mockAgentService = vi.hoisted(() => ({
+const lifecycle = createRouteTestRuntime();
+
+const mockAgentService = lifecycle.facade(() => ({
   getById: vi.fn(),
 }));
 
-const mockHeartbeatService = vi.hoisted(() => ({
+const mockHeartbeatService = lifecycle.facade(() => ({
   list: vi.fn(async () => []),
   buildRunOutputSilence: vi.fn(),
   decorateActiveRunStatus: vi.fn(),
@@ -22,32 +25,32 @@ const mockHeartbeatService = vi.hoisted(() => ({
   getRun: vi.fn(),
 }));
 
-const mockIssueService = vi.hoisted(() => ({
+const mockIssueService = lifecycle.facade(() => ({
   getById: vi.fn(),
   getByIdentifier: vi.fn(),
 }));
-const mockNativeReviewAssignment = vi.hoisted(() => vi.fn());
+const mockNativeReviewAssignment = lifecycle.facade(() => vi.fn());
 
-const mockExecutionProjection = vi.hoisted(() => ({
+const mockExecutionProjection = lifecycle.facade(() => ({
   executionProjectionForRun: vi.fn(async () => null),
   executionProjectionsForRuns: vi.fn(async () => new Map()),
 }));
 
-const mockInstanceSettingsService = vi.hoisted(() => ({
+const mockInstanceSettingsService = lifecycle.facade(() => ({
   get: vi.fn(),
   getExperimental: vi.fn(),
   getGeneral: vi.fn(),
   listCompanyIds: vi.fn(),
 }));
 
-const mockRunSecretRedactionRegistry = vi.hoisted(() => ({
+const mockRunSecretRedactionRegistry = lifecycle.facade(() => ({
   redactForRuns: vi.fn(async (_companyId: string, values: unknown[]) => values),
   redactForRun: vi.fn(
     async (_companyId: string, _runId: string, value: unknown) => value,
   ),
 }));
 
-const mockProviderTraceStore = vi.hoisted(() => ({
+const mockProviderTraceStore = lifecycle.facade(() => ({
   inspect: vi.fn(),
   getByRun: vi.fn(),
   readExactEntries: vi.fn(),
@@ -56,18 +59,18 @@ const mockProviderTraceStore = vi.hoisted(() => ({
   remove: vi.fn(),
   listMetadataForRuns: vi.fn(),
 }));
-const mockWorkspaceDiffReprojection = vi.hoisted(() => ({
+const mockWorkspaceDiffReprojection = lifecycle.facade(() => ({
   project: vi.fn(),
   persist: vi.fn(),
 }));
-const mockLogActivity = vi.hoisted(() => vi.fn());
-const mockQueueRuntimeRequestResolution = vi.hoisted(() => vi.fn());
-const mockAccessService = vi.hoisted(() => ({
+const mockLogActivity = lifecycle.facade(() => vi.fn());
+const mockQueueRuntimeRequestResolution = lifecycle.facade(() => vi.fn());
+const mockAccessService = lifecycle.facade(() => ({
   canUser: vi.fn(),
   decide: vi.fn(),
   hasPermission: vi.fn(),
 }));
-const mockWorkspaceOperationService = vi.hoisted(() => ({
+const mockWorkspaceOperationService = lifecycle.facade(() => ({
   getById: vi.fn(),
   listForRun: vi.fn(),
   readLog: vi.fn(),
@@ -77,7 +80,7 @@ const routeAgentId = "11111111-1111-4111-8111-111111111111";
 const failedChatRunId = "22222222-2222-4222-8222-222222222222";
 const failedChatIssueId = "33333333-3333-4333-8333-333333333333";
 const retryActionId = "44444444-4444-4444-8444-444444444444";
-const mockChatRunRetries = vi.hoisted(() => ({
+const mockChatRunRetries = lifecycle.facade(() => ({
   prepareFailedChatRunRetry: vi.fn(),
   processFailedChatRunRetry: vi.fn(),
 }));
@@ -93,27 +96,27 @@ function registerModuleMocks() {
   );
 
   vi.doMock("../services/agents.js", () => ({
-    agentService: () => mockAgentService,
+    agentService: () => lifecycle.capture(mockAgentService),
   }));
 
   vi.doMock("../services/heartbeat.js", () => ({
-    heartbeatService: () => mockHeartbeatService,
+    heartbeatService: () => lifecycle.capture(mockHeartbeatService),
   }));
 
   vi.doMock("../services/instance-settings.js", () => ({
-    instanceSettingsService: () => mockInstanceSettingsService,
+    instanceSettingsService: () => lifecycle.capture(mockInstanceSettingsService),
   }));
 
   vi.doMock("../services/issues.js", () => ({
-    issueService: () => mockIssueService,
+    issueService: () => lifecycle.capture(mockIssueService),
   }));
 
   vi.doMock("../services/run-secret-redaction.js", () => ({
-    createRunSecretRedactionRegistry: () => mockRunSecretRedactionRegistry,
+    createRunSecretRedactionRegistry: () => lifecycle.capture(mockRunSecretRedactionRegistry),
   }));
 
   vi.doMock("../services/provider-trace-store.js", () => ({
-    providerTraceStore: () => mockProviderTraceStore,
+    providerTraceStore: () => lifecycle.capture(mockProviderTraceStore),
   }));
 
   vi.doMock("../services/provider-trace-workspace-diff-reprojection.js", () => ({
@@ -132,30 +135,52 @@ function registerModuleMocks() {
   });
 
   vi.doMock("../services/index.js", () => ({
-    agentService: () => mockAgentService,
+    agentService: () => lifecycle.capture(mockAgentService),
     agentInstructionsService: () => ({}),
-    accessService: () => mockAccessService,
+    accessService: () => lifecycle.capture(mockAccessService),
     approvalService: () => ({}),
-    builtInAgentService: () => ({ ensureCompanyDefaultAgentGrants: vi.fn() }),
-    companySkillService: () => ({ listRuntimeSkillEntries: vi.fn() }),
+    builtInAgentService: () => lifecycle.capture(mockAdditionalServices).builtIn,
+    companySkillService: () => lifecycle.capture(mockAdditionalServices).skills,
     budgetService: () => ({}),
-    heartbeatService: () => mockHeartbeatService,
+    heartbeatService: () => lifecycle.capture(mockHeartbeatService),
     issueApprovalService: () => ({}),
-    issueService: () => mockIssueService,
+    issueService: () => lifecycle.capture(mockIssueService),
     logActivity: mockLogActivity,
     secretService: () => ({}),
-    syncInstructionsBundleConfigFromFilePath: vi.fn((_agent, config) => config),
-    workspaceOperationService: () => mockWorkspaceOperationService,
+    syncInstructionsBundleConfigFromFilePath: mockAdditionalServices.syncInstructions,
+    workspaceOperationService: () => lifecycle.capture(mockWorkspaceOperationService),
   }));
 
   vi.doMock("../adapters/index.js", () => ({
-    findServerAdapter: vi.fn(),
-    listAdapterModels: vi.fn(),
-    detectAdapterModel: vi.fn(),
-    findActiveServerAdapter: vi.fn(),
-    requireServerAdapter: vi.fn(),
+    ...mockAdditionalServices.adapters,
   }));
 }
+
+const mockAdditionalServices = lifecycle.facade(() => ({
+  builtIn: { ensureCompanyDefaultAgentGrants: vi.fn() },
+  skills: { listRuntimeSkillEntries: vi.fn() },
+  syncInstructions: vi.fn((_agent, config) => config),
+  adapters: {
+    findServerAdapter: vi.fn(), listAdapterModels: vi.fn(), detectAdapterModel: vi.fn(),
+    findActiveServerAdapter: vi.fn(), requireServerAdapter: vi.fn(),
+  },
+}));
+
+registerModuleMocks();
+const { agentRoutes } = await vi.importActual<
+  typeof import("../routes/agents.js")
+>("../routes/agents.js");
+const { errorHandler } = await vi.importActual<
+  typeof import("../middleware/index.js")
+>("../middleware/index.js");
+
+aroundEach(async (runTest, context) => {
+  const scope = lifecycle.createScope(context.signal);
+  await lifecycle.run(scope, async () => {
+    try { await runTest(); }
+    finally { await scope.dispose(); }
+  });
+});
 
 async function createApp(
   db: Record<string, unknown> = {},
@@ -168,15 +193,7 @@ async function createApp(
   },
   options: { chatRunRetries?: typeof mockChatRunRetries } = {},
 ) {
-  // Vitest tracks factory-mock resolution in one shared call stack. Importing
-  // these graphs concurrently can drop the services/index factory mock and
-  // accidentally run real DB-backed activity logging against this test stub.
-  const { agentRoutes } = await vi.importActual<
-    typeof import("../routes/agents.js")
-  >("../routes/agents.js");
-  const { errorHandler } = await vi.importActual<
-    typeof import("../middleware/index.js")
-  >("../middleware/index.js");
+  lifecycle.active();
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
@@ -255,28 +272,7 @@ async function requestApp(
   app: express.Express,
   buildRequest: (baseUrl: string) => request.Test,
 ) {
-  const { createServer } =
-    await vi.importActual<typeof import("node:http")>("node:http");
-  const server = createServer(app);
-  try {
-    await new Promise<void>((resolve) => {
-      server.listen(0, "127.0.0.1", resolve);
-    });
-    const address = server.address();
-    if (!address || typeof address === "string") {
-      throw new Error("Expected HTTP server to listen on a TCP port");
-    }
-    return await buildRequest(`http://127.0.0.1:${address.port}`);
-  } finally {
-    if (server.listening) {
-      await new Promise<void>((resolve, reject) => {
-        server.close((error) => {
-          if (error) reject(error);
-          else resolve();
-        });
-      });
-    }
-  }
+  return lifecycle.active().request(app, buildRequest);
 }
 
 describe("agent live run routes", () => {
@@ -292,18 +288,7 @@ describe("agent live run routes", () => {
     expect(mockRunSecretRedactionRegistry.redactForRuns).toHaveBeenCalled();
   });
   beforeEach(() => {
-    vi.resetModules();
-    vi.doUnmock("../services/agents.js");
-    vi.doUnmock("../services/heartbeat.js");
-    vi.doUnmock("../services/index.js");
-    vi.doUnmock("../services/instance-settings.js");
-    vi.doUnmock("../services/issues.js");
-    vi.doUnmock("../adapters/index.js");
-    vi.doUnmock("../routes/agents.js");
-    vi.doUnmock("../routes/authz.js");
-    vi.doUnmock("../middleware/index.js");
-    registerModuleMocks();
-    vi.clearAllMocks();
+    lifecycle.active();
     mockChatRunRetries.prepareFailedChatRunRetry.mockReset();
     mockChatRunRetries.processFailedChatRunRetry.mockReset();
     mockNativeReviewAssignment.mockReset().mockResolvedValue(null);
