@@ -134,7 +134,7 @@ describe.skipIf(!postgres.supported)("heartbeat scheduling database boundary", (
     await db.update(issues).set({ status: "in_review", executionPolicy: policy, executionState: state }).where(eq(issues.id, f.issue.id));
     const enqueueMonitorWakeup = vi.fn<HeartbeatSchedulingDependencies["enqueueMonitorWakeup"]>(async (_agentId, _opts, admission) => db.transaction(async tx => {
       const current = await readIssue(f.issue.id);
-      const consumed = await admission.consume(tx, current, f.agent.id);
+      const consumed = await admission.consume(tx as unknown as Db, current, f.agent.id);
       expect(issueExecutionGeneration(consumed)).not.toBe(issueExecutionGeneration(current));
       expect(consumed.monitorNextCheckAt).toBeNull();
       expect(consumed.monitorAttemptCount).toBe(1);
@@ -173,7 +173,7 @@ describe.skipIf(!postgres.supported)("heartbeat scheduling database boundary", (
       if (fault === "replacement") await db.update(issues).set({ monitorNextCheckAt: replacement, monitorWakeRequestedAt: null }).where(eq(issues.id, f.issue.id));
       return db.transaction(async tx => {
         const current = await readIssue(f.issue.id);
-        await admission.consume(tx, fault === "generation" ? { ...current, responsibleUserId: "changed" }
+        await admission.consume(tx as unknown as Db, fault === "generation" ? { ...current, responsibleUserId: "changed" }
           : fault === "company" ? { ...current, companyId: randomUUID() } : current,
           fault === "agent" ? randomUUID() : f.agent.id);
         if (fault === "after-consume") throw new Error("Synthetic admission failure");
