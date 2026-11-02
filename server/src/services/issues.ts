@@ -5959,9 +5959,14 @@ async function readyUserReviewIds(
     ), history AS MATERIALIZED (
       SELECT o.execution_workspace_id AS workspace_id, o.issue_id, o.phase, o.status,
         date_trunc('milliseconds', o.started_at) AS started_at
-      FROM ${workspaceOperations} o
-      WHERE o.company_id = ${companyId}::uuid
-        AND o.execution_workspace_id IN (SELECT workspace_id FROM done_pairs)
+      FROM (SELECT DISTINCT workspace_id FROM done_pairs) candidate
+      CROSS JOIN LATERAL (
+        SELECT operation.execution_workspace_id, operation.issue_id, operation.phase,
+          operation.status, operation.started_at FROM ${workspaceOperations} operation
+        WHERE operation.company_id = ${companyId}::uuid
+          AND operation.execution_workspace_id = candidate.workspace_id
+        ORDER BY operation.started_at DESC OFFSET 0
+      ) o
     ), latest AS (
       SELECT DISTINCT ON (workspace_id, issue_id) * FROM history
       ORDER BY workspace_id, issue_id, started_at DESC

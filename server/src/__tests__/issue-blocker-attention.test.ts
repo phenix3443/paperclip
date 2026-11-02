@@ -1663,7 +1663,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     expect(root?.blockerAttention?.terminalBlocker).toBeNull();
   });
 
-  it("keeps a pending-finalize blocker out of a user review tail until native readiness settles", async () => {
+  it.each([0, 1, 1000])("keeps a pending-finalize blocker with %i history rows out of a user review tail until native readiness settles", async (historyCount) => {
     const { companyId, rootId, midId, reviewId } = await seedHumanHeldReviewChain("BHF");
     for (const id of [rootId, midId]) await db.update(issues).set({ status: "todo" }).where(eq(issues.id, id));
     const workspaceId = randomUUID();
@@ -1671,10 +1671,10 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     const blockerId = await insertIssue({ companyId, identifier: "BHF-4", title: "Done awaiting finalize", status: "done" });
     await db.update(issues).set({ executionWorkspaceId: workspaceId }).where(eq(issues.id, blockerId));
     await block({ companyId, blockerIssueId: blockerId, blockedIssueId: reviewId });
-    const [operation] = await db.insert(workspaceOperations).values({ companyId, executionWorkspaceId: workspaceId, issueId: blockerId, phase: "worktree_prepare", status: "succeeded" }).returning();
-    expect((await svc.getDependencyReadiness(reviewId)).isDependencyReady).toBe(false);
-    expect((await svc.list(companyId, { attention: "blocked" })).find((row) => row.id === reviewId)).toBeUndefined();
-    await db.update(workspaceOperations).set({ phase: "workspace_finalize" }).where(eq(workspaceOperations.id, operation.id));
+    const operations = historyCount ? await db.insert(workspaceOperations).values(Array.from({ length: historyCount }, (_, index) => ({ companyId, executionWorkspaceId: workspaceId, issueId: blockerId, phase: "worktree_prepare", status: "succeeded", startedAt: new Date(Date.parse("2026-10-01T00:00:00Z") + index * 1000) }))).returning({ id: workspaceOperations.id }) : [];
+    expect((await svc.getDependencyReadiness(reviewId)).isDependencyReady).toBe(historyCount === 0);
+    expect(Boolean((await svc.list(companyId, { attention: "blocked" })).find((row) => row.id === reviewId))).toBe(historyCount === 0);
+    if (operations.length) await db.update(workspaceOperations).set({ phase: "workspace_finalize" }).where(eq(workspaceOperations.id, operations.at(-1)!.id));
     expect((await svc.getDependencyReadiness(reviewId)).isDependencyReady).toBe(true);
     expect((await svc.list(companyId, { attention: "blocked" })).find((row) => row.id === reviewId)?.blockedInboxAttention?.action.label).toBe("Complete review");
   });

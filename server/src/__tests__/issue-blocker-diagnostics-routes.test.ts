@@ -223,6 +223,16 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
     expect(visible.blockedInboxAttention.owner).toMatchObject({ type: "unknown", userId: null });
     expect(JSON.stringify(visible)).not.toContain("hidden-user");
     expect(JSON.stringify(visible)).not.toContain("Hidden review title");
+    for (const path of [`/api/companies/${company.id}/issues?attention=blocked&status=blocked&limit=1`, `/api/issues/${root.id}`, `/api/issues/${root.id}/heartbeat-context`]) {
+      const detail = await request(app).get(path).expect(200);
+      expect(JSON.stringify(detail.body)).not.toContain("hidden-user");
+      expect(JSON.stringify(detail.body)).not.toContain("Hidden review title");
+    }
+    if (visibility === "open") {
+      const allowed = await request(createApp(db, boardActor(company))).get(`/api/companies/${company.id}/issues?attention=blocked`).expect(200);
+      expect(allowed.body.find((row: IssueRow) => row.id === root.id).blockedInboxAttention.owner.userId).toBe("hidden-user");
+    }
+
   });
 
   it("returns stale-blocker diagnosis and anomaly flags for a done blocker on a blocked issue", async () => {
