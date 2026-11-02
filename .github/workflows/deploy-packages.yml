@@ -6,12 +6,21 @@ name: deploy-packages
 
 on:
   push:
-    branches: [develop]
-  # Validates changes to the packaging itself; deploy.py only accepts push runs on develop.
+    branches: [develop, fix/b-native-release-681]
   pull_request:
     paths:
       - .github/workflows/deploy-packages.yml
       - cli/src/commands/install.ts
+      - server/**
+      - packages/**
+      - scripts/**
+      - package.json
+      - pnpm-lock.yaml
+      - pnpm-workspace.yaml
+      - vitest.config.ts
+      - doc/**
+      - maps/**
+      - rules/**
   workflow_dispatch:
 
 permissions:
@@ -22,8 +31,109 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  routes:
+    name: routes
+    if: >-
+      github.repository == 'phenix3443/paperclip' &&
+      ((github.event_name == 'push' && github.ref == 'refs/heads/fix/b-native-release-681') ||
+       (github.event_name == 'pull_request' &&
+        (github.base_ref == 'fix/b-native-release-681' || github.base_ref == 'fix/b-native-review-681-staging')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+      - name: Install this commit's workspace
+        run: |
+          corepack enable
+          corepack pnpm install --frozen-lockfile
+      - name: Prepare native test dependencies
+        run: corepack pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
+      - name: Run the full B-native regression manifest
+        run: |
+          corepack pnpm --filter @paperclipai/server exec vitest run --no-file-parallelism --maxWorkers=1 \
+            src/__tests__/heartbeat-process-recovery.test.ts \
+            src/__tests__/heartbeat-stale-queue-invalidation.test.ts \
+            src/__tests__/interaction-addressee-review-dispatch-postgres.test.ts \
+            src/__tests__/issue-execution-policy.test.ts \
+            src/__tests__/issue-monitor-scheduler.test.ts \
+            src/__tests__/issue-recovery-actions.test.ts \
+            src/__tests__/run-identity.test.ts \
+            src/modules/run-dispatch/adapters/postgres.test.ts \
+            src/modules/run-dispatch/domain/policy.test.ts \
+            src/services/heartbeat/retries.test.ts \
+            src/services/heartbeat/scheduling.test.ts \
+            src/modules/wake-queue/application/use-cases.test.ts \
+            src/modules/wake-queue/adapters/postgres.test.ts \
+            src/modules/wake-queue/domain/policy.test.ts
+
+  typecheck:
+    name: typecheck
+    if: >-
+      github.repository == 'phenix3443/paperclip' &&
+      ((github.event_name == 'push' && github.ref == 'refs/heads/fix/b-native-release-681') ||
+       (github.event_name == 'pull_request' &&
+        (github.base_ref == 'fix/b-native-release-681' || github.base_ref == 'fix/b-native-review-681-staging')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+      - name: Install this commit's workspace
+        run: |
+          corepack enable
+          corepack pnpm install --frozen-lockfile
+      - name: Typecheck the fixed workspace
+        run: corepack pnpm typecheck
+
+  build:
+    name: build
+    if: >-
+      github.repository == 'phenix3443/paperclip' &&
+      ((github.event_name == 'push' && github.ref == 'refs/heads/fix/b-native-release-681') ||
+       (github.event_name == 'pull_request' &&
+        (github.base_ref == 'fix/b-native-release-681' || github.base_ref == 'fix/b-native-review-681-staging')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+      - name: Install this commit's workspace
+        run: |
+          corepack enable
+          corepack pnpm install --frozen-lockfile
+      - name: Build with the native installer entrypoints
+        env:
+          PAPERCLIP_BUILD_COMMIT: ${{ github.sha }}
+        run: |
+          bash scripts/build-npm.sh --skip-checks --skip-typecheck
+          corepack pnpm -r --filter @paperclipai/server... --if-present run build
+
   packages:
-    if: github.repository == 'phenix3443/paperclip'
+    name: packages
+    needs: [routes, typecheck, build]
+    if: >-
+      always() && !cancelled() && github.repository == 'phenix3443/paperclip' &&
+      ((github.event_name == 'push' && github.ref == 'refs/heads/develop') ||
+       github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'pull_request' && github.base_ref != 'fix/b-native-release-681' &&
+        github.base_ref != 'fix/b-native-review-681-staging') ||
+       (needs.routes.result == 'success' && needs.typecheck.result == 'success' && needs.build.result == 'success'))
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
@@ -31,6 +141,9 @@ jobs:
       REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       # The packages are Node-version independent; the service host installs
       # them with its own Node, which also builds their native modules.
@@ -118,6 +231,83 @@ jobs:
             console.log(`${manifest.files.length} packages for ${manifest.sha} (${manifest.version})`);
           '
           du -sh "$PACKAGES_DIR"
+
+      - name: Bind maintenance push provenance
+        if: github.event_name == 'push' && github.ref == 'refs/heads/fix/b-native-release-681'
+        env:
+          SOURCE_REPOSITORY_ID: ${{ github.repository_id }}
+          SOURCE_WORKFLOW_REF: ${{ github.workflow_ref }}
+          SOURCE_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import { execFileSync } from 'node:child_process';
+          const env = process.env;
+          const repository = 'phenix3443/paperclip';
+          const ref = 'refs/heads/fix/b-native-release-681';
+          const workflowPath = '.github/workflows/deploy-packages.yml';
+          const sha = env.SHA;
+          const positiveInteger = (value) => {
+            assert.match(String(value), /^[1-9][0-9]*$/);
+            const number = Number(value);
+            assert.ok(Number.isSafeInteger(number));
+            return number;
+          };
+          assert.equal(env.REPO, repository);
+          assert.equal(env.GITHUB_EVENT_NAME, 'push');
+          assert.equal(env.GITHUB_REF, ref);
+          assert.match(sha, /^[0-9a-f]{40}$/);
+          assert.equal(env.GITHUB_SHA, sha);
+          assert.equal(env.SOURCE_WORKFLOW_SHA, sha);
+          assert.equal(env.SOURCE_WORKFLOW_REF, `${repository}/${workflowPath}@${ref}`);
+          assert.equal(execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(), sha);
+          const repositoryId = positiveInteger(env.SOURCE_REPOSITORY_ID);
+          const runId = positiveInteger(env.GITHUB_RUN_ID);
+          const runAttempt = positiveInteger(env.GITHUB_RUN_ATTEMPT);
+          const event = JSON.parse(fs.readFileSync(env.GITHUB_EVENT_PATH, 'utf8'));
+          assert.equal(event.repository.full_name, repository);
+          assert.equal(event.repository.id, repositoryId);
+          assert.equal(event.ref, ref);
+          assert.equal(event.after, sha);
+          const api = async (suffix) => {
+            const response = await fetch(`https://api.github.com/repos/${repository}/${suffix}`, {
+              headers: { Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' },
+              signal: AbortSignal.timeout(30000),
+            });
+            assert.ok(response.ok, `GitHub API returned ${response.status}`);
+            return response.json();
+          };
+          const run = await api(`actions/runs/${runId}/attempts/${runAttempt}`);
+          assert.equal(run.id, runId);
+          assert.equal(run.run_attempt, runAttempt);
+          assert.equal(run.event, 'push');
+          assert.equal(run.head_sha, sha);
+          assert.equal(run.path, workflowPath);
+          assert.equal(run.head_branch, 'fix/b-native-release-681');
+          for (const repo of [run.repository, run.head_repository]) {
+            assert.equal(repo.id, repositoryId);
+            assert.equal(repo.full_name, repository);
+          }
+          assert.deepEqual(run.referenced_workflows ?? [], []);
+          const workflowId = positiveInteger(run.workflow_id);
+          const workflow = await api(`actions/workflows/${workflowId}`);
+          assert.equal(workflow.id, workflowId);
+          assert.equal(workflow.path, workflowPath);
+          const workflowBlob = execFileSync('git', ['rev-parse', `${sha}:${workflowPath}`], { encoding: 'utf8' }).trim();
+          assert.match(workflowBlob, /^[0-9a-f]{40}$/);
+          const manifestPath = path.join(env.PACKAGES_DIR, 'payload-packages.json');
+          const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+          assert.equal(manifest.repo, repository);
+          assert.equal(manifest.sha, sha);
+          assert.equal(manifest.provenance, undefined);
+          manifest.provenance = {
+            version: 1, repository, repositoryId, headRepositoryId: repositoryId, ref, sha,
+            workflowId, workflowPath, workflowSha: sha, workflowBlob, runId, runAttempt,
+          };
+          fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+          JS
 
       # Diagnostics only: the report never fails the job.
       - name: Report memory
