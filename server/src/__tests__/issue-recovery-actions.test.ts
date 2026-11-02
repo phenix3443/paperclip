@@ -59,6 +59,7 @@ import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { workspaceOperationService, isNativeWorkspaceFinalizationOperationActive } from "../services/workspace-operations.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryService } from "../services/recovery/service.js";
+import { createPostgresWakeQueueAdapter } from "../modules/wake-queue/adapters/postgres.js";
 import { issueService } from "../services/issues.js";
 import { caseHandoffService } from "../services/case-handoffs.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
@@ -777,6 +778,99 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(await db.select().from(issueRecoveryActions)).toEqual([]);
     expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toEqual([]);
     expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  describe("release receipt fence", () => {
+    async function seedReleasedBlock() {
+      const seeded = await seedCompany();
+      const runId = randomUUID();
+      await seedHeartbeatRun({ companyId: seeded.companyId, agentId: seeded.coderId, runId, issueId: seeded.sourceIssueId, status: "failed" });
+      await db.update(heartbeatRuns).set({ errorCode: "workspace_validation_failed", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+      await db.update(issues).set({ executionRunId: runId, checkoutRunId: runId, executionAgentNameKey: "coder" })
+        .where(eq(issues.id, seeded.sourceIssueId));
+      const released = await createPostgresWakeQueueAdapter(db, {
+        resolveResponsibleUserId: async () => null,
+        getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+        resolveSessionBeforeForWakeup: async () => null,
+      }).withIssueExecutionLock({ companyId: seeded.companyId, runId, now: new Date() }, async () => {
+        throw new Error("the early blocked exit must not drain");
+      });
+      expect(released.outcome.kind).toBe("blocked");
+      expect(released.blockedReceipt).toMatchObject({ issueId: seeded.sourceIssueId, executionRunId: null, checkoutRunId: null });
+      return { ...seeded, runId, receipt: released.blockedReceipt! };
+    }
+
+    async function claimLock(seed: Awaited<ReturnType<typeof seedReleasedBlock>>) {
+      const claimantId = randomUUID();
+      await seedHeartbeatRun({ companyId: seed.companyId, agentId: seed.coderId, runId: claimantId, issueId: seed.sourceIssueId });
+      await db.update(issues).set({ executionRunId: claimantId, checkoutRunId: claimantId, executionAgentNameKey: "coder" })
+        .where(eq(issues.id, seed.sourceIssueId));
+    }
+
+    async function snapshot(seed: { companyId: string; sourceIssueId: string }) {
+      return {
+        issue: (await db.select().from(issues).where(eq(issues.id, seed.sourceIssueId)))[0]!,
+        issueCount: (await db.select().from(issues).where(eq(issues.companyId, seed.companyId))).length,
+        comments: await db.select().from(issueComments).where(eq(issueComments.issueId, seed.sourceIssueId)),
+        actions: await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, seed.companyId)),
+        wakes: await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, seed.companyId)),
+      };
+    }
+
+    async function escalate(seed: Awaited<ReturnType<typeof seedReleasedBlock>>, withReceipt = true) {
+      const [loaded] = await db.select().from(issues).where(eq(issues.id, seed.sourceIssueId));
+      return recoveryService(db, { enqueueWakeup: vi.fn(async () => null) }).escalateStrandedAssignedIssue({
+        issue: loaded!, previousStatus: "in_progress", latestRun: null,
+        comment: "The workspace could not be validated.", ...(withReceipt ? { releaseReceipt: seed.receipt } : {}),
+      });
+    }
+
+    it("R1 escalates exactly as before when the row still equals the receipt", async () => {
+      const seed = await seedReleasedBlock();
+      expect(await escalate(seed)).toMatchObject({ id: seed.sourceIssueId, status: "blocked" });
+      expect((await db.select().from(issues).where(eq(issues.id, seed.sourceIssueId)))[0]).toMatchObject({ status: "blocked" });
+    });
+
+    it.each([
+      ["R2 a new claimant took the lock", async (seed: Awaited<ReturnType<typeof seedReleasedBlock>>) => claimLock(seed)],
+      ["R3 the execution generation changed", async (seed: Awaited<ReturnType<typeof seedReleasedBlock>>) => {
+        await db.update(issues).set({ executionState: { status: "pending", currentStageId: "stage-2", changesRequestedCount: 1 } })
+          .where(eq(issues.id, seed.sourceIssueId));
+      }],
+      ["R4 the status decision moved", async (seed: Awaited<ReturnType<typeof seedReleasedBlock>>) => {
+        await db.update(issues).set({ statusVersion: sql`${issues.statusVersion} + 1`, lastStatusDecisionId: randomUUID() })
+          .where(eq(issues.id, seed.sourceIssueId));
+      }],
+    ])("%s after the release committed: the stale escalation does nothing", async (_name, mutate) => {
+      const seed = await seedReleasedBlock();
+      await mutate(seed);
+      const before = await snapshot(seed);
+      expect(await escalate(seed)).toBeNull();
+      expect(await snapshot(seed)).toEqual(before);
+    });
+
+    it("R5 keeps the previous behavior for callers without a receipt", async () => {
+      const seed = await seedReleasedBlock();
+      await claimLock(seed);
+      expect(await escalate(seed, false)).toMatchObject({ id: seed.sourceIssueId, status: "blocked", executionRunId: null });
+    });
+
+    it("R6 rolls back and rethrows a database fault inside the guarded transaction", async () => {
+      const seed = await seedReleasedBlock();
+      const before = await snapshot(seed);
+      await db.execute(sql.raw(`create or replace function test_fail_issue_update() returns trigger language plpgsql as $$
+        begin raise exception 'injected issue update failure'; end $$`));
+      await db.execute(sql.raw(`create trigger test_fail_issue_update before update on issues
+        for each row execute function test_fail_issue_update()`));
+      try {
+        const error = await escalate(seed).then(() => null, (caught: unknown) => caught as Error & { cause?: Error });
+        expect(error?.cause?.message ?? error?.message).toMatch(/injected issue update failure/);
+      } finally {
+        await db.execute(sql.raw("drop trigger if exists test_fail_issue_update on issues"));
+        await db.execute(sql.raw("drop function if exists test_fail_issue_update()"));
+      }
+      expect(await snapshot(seed)).toEqual(before);
+    });
   });
 
   it.each([false, true])("settles escalation on a one-connection pool (legacy recovery issue: %s)", async (legacyRecoveryIssue) => {
