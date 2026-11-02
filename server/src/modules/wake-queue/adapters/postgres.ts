@@ -45,6 +45,7 @@ import { issueService } from "../../../services/issues.js";
 import { issueRecoveryActionService } from "../../../services/issue-recovery-actions.js";
 import { readContinuationAttempt } from "../../../services/recovery/run-liveness-continuations.js";
 import { withRecoveryContext } from "../../../services/recovery/status-only-context.js";
+import { REWORK_HANDBACK_CONTINUATION_SOURCE, reworkHandbackContinuationKeyRunId } from "../../../services/recovery/rework-handback-continuation.js";
 import { issueExecutionGeneration, parseIssueExecutionState } from "../../../services/issue-execution-policy.js";
 import {
   queuedCommentIdsFromWakePayload,
@@ -491,6 +492,21 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
 
     async finalizePromotedWake(input) {
       await notifyChatRunMilestones(tx, { companyId: input.companyId, issueId: input.issue.id });
+      const contextRetryOfRunId = readNonEmptyString(input.contextSnapshot.retryOfRunId);
+      let retryOfRunId = input.authorizedFailedChatRetry ? contextRetryOfRunId : null;
+      if (!retryOfRunId && contextRetryOfRunId && input.contextSnapshot.source === REWORK_HANDBACK_CONTINUATION_SOURCE) {
+        const [wake] = await tx
+          .select({ idempotencyKey: agentWakeupRequests.idempotencyKey })
+          .from(agentWakeupRequests)
+          .where(and(
+            eq(agentWakeupRequests.id, input.wakeId),
+            eq(agentWakeupRequests.companyId, input.companyId),
+            eq(agentWakeupRequests.agentId, input.deferredAgent.id),
+          ))
+          .limit(1);
+        if (wake?.idempotencyKey && reworkHandbackContinuationKeyRunId(wake.idempotencyKey) === contextRetryOfRunId)
+          retryOfRunId = contextRetryOfRunId;
+      }
       const newRun = await tx
         .insert(heartbeatRuns)
         .values({
@@ -500,9 +516,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           triggerDetail: input.triggerDetail,
           status: "queued",
           wakeupRequestId: input.wakeId,
-          retryOfRunId: input.authorizedFailedChatRetry
-            ? readNonEmptyString(input.contextSnapshot.retryOfRunId)
-            : null,
+          retryOfRunId,
           contextSnapshot: input.contextSnapshot,
           responsibleUserId: input.responsibleUserId,
           sessionIdBefore: input.sessionBefore,

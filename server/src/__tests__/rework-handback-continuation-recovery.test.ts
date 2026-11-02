@@ -399,6 +399,42 @@ describePostgres("rework hand-back continuation recovery", () => {
     expect(issue?.executionRunId).toBe(holderRunId);
   });
 
+  it("R3c: cancelling the lease holder re-admits the deferred keyed wake as one successor of the parked run", async () => {
+    const seeded = await seed();
+    const holderRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: holderRunId,
+      companyId: seeded.companyId,
+      agentId: seeded.reviewerId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "running",
+      scopeKind: "issue",
+      issueId: seeded.issueId,
+      startedAt: new Date(),
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+    });
+    await db.update(issues).set({ executionRunId: holderRunId }).where(eq(issues.id, seeded.issueId));
+    const key = keyFor(seeded);
+    expect(await directWake(seeded, key)).toBeNull();
+    expect(await keyRows(seeded.executorId)).toMatchObject([{ status: "deferred_issue_execution", runId: null }]);
+
+    await heartbeatService(db).cancelRun(holderRunId);
+
+    const runs = await successorRuns(seeded.parkedRunId);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]!.contextSnapshot).toMatchObject({
+      issueId: seeded.issueId,
+      source: REWORK_HANDBACK_CONTINUATION_SOURCE,
+      retryOfRunId: seeded.parkedRunId,
+    });
+    expect(await keyRows(seeded.executorId)).toMatchObject([{ status: "cancelled", runId: null }]);
+    expect(await directWake(seeded, key)).toBeNull();
+    expect(await keyRows(seeded.executorId)).toHaveLength(1);
+    expect(await successorRuns(seeded.parkedRunId)).toHaveLength(1);
+    expect(invariants(await readIssue(seeded.issueId))).toEqual(invariants(seeded.before));
+  });
+
   it("R3c: a malformed request with the key is skipped without a receipt", async () => {
     const seeded = await seed();
     const key = keyFor(seeded);
