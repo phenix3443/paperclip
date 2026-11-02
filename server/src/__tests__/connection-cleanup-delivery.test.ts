@@ -1,7 +1,7 @@
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { activityLog, authUsers, connectionGrants, connectionIntentDeliveries, createDb, databaseWorkPending,
-  issueThreadInteractions, toolCatalogEntries, toolConnectionInstalls, toolConnections } from "@paperclipai/db";
+  issueThreadInteractions, subscribeDatabaseWork, toolCatalogEntries, toolConnectionInstalls, toolConnections } from "@paperclipai/db";
 import { toolAccessService } from "../services/tool-access.js";
 import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -107,6 +107,8 @@ describePostgres("connection cleanup delivery notifications", () => {
         return result;
       });
       const produce = () => toolAccessService(db).archiveConnection(f.connection.id, f.companyId);
+      let intents = 0;
+      const unsubscribe = subscribeDatabaseWork(db, DELIVERY_QUEUES.connection, event => { if (event === "intent") intents += 1; });
       try {
         if (mode.startsWith("outer ")) {
           const outerBaseline = delivery.sweeps;
@@ -115,7 +117,7 @@ describePostgres("connection cleanup delivery notifications", () => {
             transactionSpy.mockRestore();
             const nested = tx.transaction.bind(tx);
             vi.spyOn(tx, "transaction").mockImplementation(async callback => {
-              const baseline = delivery!.sweeps;
+              const baseline = delivery!.sweeps, intentBaseline = intents;
               const value = await nested(async savepoint => {
                 const write = savepoint.update.bind(savepoint);
                 const spy = vi.spyOn(savepoint, "update").mockImplementation(table => {
@@ -123,6 +125,7 @@ describePostgres("connection cleanup delivery notifications", () => {
                   vi.spyOn(query, "set").mockImplementation(values => {
                     if (matches(table, values)) {
                       reached += 1;
+                      expect(intents).toBeGreaterThan(intentBaseline);
                       expect(databaseWorkPending(db, DELIVERY_QUEUES.connection)).toBe(true);
                     }
                     return set(values);
@@ -147,6 +150,10 @@ describePostgres("connection cleanup delivery notifications", () => {
           await noEffect();
           expect((await db.select().from(toolConnections))[0]!.credentialSecretRefs)
             .toEqual(mode === "outer rollback" ? refs : []);
+          if (mode === "outer rollback") {
+            expect((await db.select().from(toolCatalogEntries))[0]!.status).toBe("active");
+            expect((await db.select().from(connectionGrants))[0]!.credentialSecretRefs).toEqual(refs);
+          }
           return;
         }
         if (mode === "negative") {
@@ -182,7 +189,7 @@ describePostgres("connection cleanup delivery notifications", () => {
           else if (branch === "connection credentials") expect((await db.select().from(toolConnections))[0]!.credentialSecretRefs).toEqual(refs);
           else expect((await db.select().from(connectionGrants))[0]!.credentialSecretRefs).toEqual(refs);
         }
-      } finally { release.resolve(); }
+      } finally { unsubscribe(); release.resolve(); }
     });
   });
 });
