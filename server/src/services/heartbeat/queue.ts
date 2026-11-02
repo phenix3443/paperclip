@@ -1,4 +1,5 @@
 import { settleNewReviewRunIdentity, settleReviewRunClaimIdentity } from "../run-identity.js";
+import { REWORK_HANDBACK_CONTINUATION_KEY_PREFIX, reworkHandbackContinuationKeyRunId } from "../recovery/rework-handback-continuation.js";
 import { createDependencyAdmission, DependencyAdmissionHeld, pendingDependencyIntents, pendingDependencyReceiptResults, type DependencyClaim } from "./dependency-admission.js";
 import type { IssueMonitorAdmission } from "./scheduling.js";
 import { parseIssueExecutionState } from "../issue-execution-policy.js";
@@ -3380,6 +3381,45 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           if (ownerRepairRequest && (!ownerRepairIssueBindingGuard ||
               !sameOwnerRepairIssueBinding(ownerRepairIssueBinding(issue), ownerRepairIssueBindingGuard)))
             throw conflict("Owner repair continuation task changed before admission");
+          if (opts.idempotencyKey?.startsWith(REWORK_HANDBACK_CONTINUATION_KEY_PREFIX)) {
+            // All admissions for one issue serialize on its row lock, so the
+            // key lookup and the insert below are atomic per issue.
+            const keyRunId = reworkHandbackContinuationKeyRunId(opts.idempotencyKey);
+            if (
+              !keyRunId ||
+              source !== "automation" ||
+              triggerDetail !== "system" ||
+              reason !== "issue_continuation_needed" ||
+              opts.requestedByActorType !== "system" ||
+              opts.allowRunCoalescing !== false ||
+              payload?.issueId !== issue.id ||
+              enrichedContextSnapshot.issueId !== issue.id ||
+              enrichedContextSnapshot.retryOfRunId !== keyRunId
+            )
+              return { kind: "skipped" as const };
+            const [existingWake] = await tx.select().from(agentWakeupRequests).where(and(
+              ordinaryWakeRequestPredicate(), eq(agentWakeupRequests.companyId, issue.companyId),
+              eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey),
+            )).orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id)).limit(1);
+            if (existingWake) {
+              if (!existingWake.runId)
+                return existingWake.status === "deferred_issue_execution"
+                  ? { kind: "deferred" as const }
+                  : { kind: "skipped" as const };
+              const [existingRun] = await tx.select().from(heartbeatRuns).where(and(
+                eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId),
+                eq(heartbeatRuns.id, existingWake.runId),
+              ));
+              if (
+                !existingRun ||
+                existingRun.contextSnapshot?.issueId !== issue.id ||
+                existingRun.contextSnapshot?.retryOfRunId !== keyRunId ||
+                existingRun.contextSnapshot?.wakeReason !== "issue_continuation_needed"
+              )
+                return { kind: "skipped" as const };
+              return { kind: "replayed" as const, run: existingRun };
+            }
+          }
           const issueStateGuard = opts.issueStateGuard;
           const activeMonitorRun = issueStateGuard?.monitorNextCheckAt === undefined ? null
             : await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(

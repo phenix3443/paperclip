@@ -11,6 +11,13 @@ import { recoveryRunContextColumn, recoveryRunVersionColumn } from "./run-contex
 import { recoveryRunResultColumn } from "./run-result-read.js";
 import { readLegacyDispositionSource } from "./legacy-disposition-read.js";
 import { ordinaryWakeRequestPredicate } from "../../modules/wake-queue/receipt-namespace.js";
+import { isNativeReworkHandback } from "../../modules/run-dispatch/index.js";
+import {
+  REWORK_HANDBACK_CONTINUATION_SOURCE,
+  reworkHandbackContinuationKey,
+} from "./rework-handback-continuation.js";
+
+type ReworkHandbackContinuationReceipt = "bound" | "waiting" | "spent" | "absent";
 import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";
 import { onboardingFirstTaskAwaitingUserSql } from "./onboarding-first-task-wait.js";
 import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
@@ -2023,6 +2030,92 @@ export function recoveryService(
     return Boolean(comment || attachment);
   }
 
+  async function escalateReworkHandbackContinuation(
+    issue: RecoveryIssue,
+    latestRun: LatestIssueRun,
+  ) {
+    return escalateStrandedAssignedIssue({
+      issue,
+      previousStatus: "in_progress",
+      latestRun,
+      notice: {
+        body:
+          "Paperclip requeued the executor's rework after the reviewer requested changes, but the continuation " +
+          "still could not start. Moving it to `blocked` so it is visible for intervention.",
+        title: "Rework continuation did not start",
+        tone: "danger",
+      },
+    });
+  }
+
+  /**
+   * A park cancel on a native rework hand-back is not a deliberate wait: the
+   * reviewer handed the work back to its executor. Queue one ordinary
+   * continuation for it instead of an owner disposition repair.
+   */
+  async function requeueReworkHandbackContinuation(
+    issue: RecoveryIssue,
+    agentId: string,
+    latestRun: LatestIssueRun,
+  ): Promise<"queued" | "escalated" | "skipped"> {
+    if (!latestRun) return "skipped";
+    const { consecutive } = await summarizeRecentContinuationRetries(
+      issue.companyId,
+      issue.id,
+      agentId,
+      CONTINUATION_WAITING_ON_REVIEW_ERROR_CODE,
+    );
+    if (consecutive >= INTERACTION_CONTINUATION_REQUEUE_MAX_ATTEMPTS) {
+      return (await escalateReworkHandbackContinuation(issue, latestRun)) ? "escalated" : "skipped";
+    }
+    if (await isInvocationBudgetBlocked(issue, agentId)) return "skipped";
+    const outcome: { retryExhausted?: boolean; continuationReceipt?: ReworkHandbackContinuationReceipt } = {};
+    const queued = await enqueueStrandedIssueRecovery({
+      issueId: issue.id,
+      agentId,
+      reason: "issue_continuation_needed",
+      retryReason: "issue_continuation_needed",
+      source: REWORK_HANDBACK_CONTINUATION_SOURCE,
+      retryOfRunId: latestRun.id,
+      issueStateGuard: {
+        statuses: ["in_progress"],
+        assigneeAgentId: agentId,
+        statusVersion: issue.statusVersion,
+      },
+      idempotencyKey: reworkHandbackContinuationKey({
+        issueId: issue.id,
+        lastStatusDecisionId: issue.lastStatusDecisionId,
+        statusVersion: issue.statusVersion,
+        parkedRunId: latestRun.id,
+      }),
+      allowRunCoalescing: false,
+      outcome,
+    });
+    if (queued) return "queued";
+    if (outcome.continuationReceipt === "bound") return "queued";
+    if (outcome.continuationReceipt !== "spent") return "skipped";
+    if (await hasActiveExecutionPath(issue.companyId, issue.id, null)) return "skipped";
+    return (await escalateReworkHandbackContinuation(issue, latestRun)) ? "escalated" : "skipped";
+  }
+
+  async function readReworkHandbackContinuationReceipt(
+    agentId: string,
+    idempotencyKey: string,
+  ): Promise<ReworkHandbackContinuationReceipt> {
+    const rows = await db
+      .select({ runId: agentWakeupRequests.runId, status: agentWakeupRequests.status })
+      .from(agentWakeupRequests)
+      .where(and(
+        ordinaryWakeRequestPredicate(),
+        eq(agentWakeupRequests.agentId, agentId),
+        eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+      ));
+    if (rows.length === 0) return "absent";
+    if (rows.some((row) => row.runId)) return "bound";
+    if (rows.some((row) => !["skipped", "failed", "cancelled", "completed", "coalesced"].includes(row.status))) return "waiting";
+    return "spent";
+  }
+
   async function enqueueStrandedIssueRecovery(input: {
     issueId: string;
     agentId: string;
@@ -2037,13 +2130,18 @@ export function recoveryService(
     source: string;
     retryOfRunId?: string | null;
     extraContext?: Record<string, unknown>;
+    issueStateGuard?: { statuses: string[]; assigneeAgentId: string; statusVersion?: number };
+    idempotencyKey?: string;
+    allowRunCoalescing?: boolean;
     /**
      * Out-parameter: set `retryExhausted` when no successor was queued
      * because the failed predecessor has spent its bounded transient retry
      * budget. A null return without it means another authority owns the
      * run (native runtime, reconciliation) and the caller must leave it.
+     * `continuationReceipt` reports, for a rework hand-back continuation
+     * only, what the key's receipt says after a null return.
      */
-    outcome?: { retryExhausted?: boolean };
+    outcome?: { retryExhausted?: boolean; continuationReceipt?: ReworkHandbackContinuationReceipt };
   }) {
     if (input.retryOfRunId) {
       const [predecessor] = await db
@@ -2072,7 +2170,14 @@ export function recoveryService(
           });
           return null;
         }
-        if (deps.scheduleRecoveryRetry) {
+        // A parked continuation never started; it is not a failure, so it
+        // gets an ordinary successor instead of a failure retry.
+        const parkedBeforeStart =
+          input.source === REWORK_HANDBACK_CONTINUATION_SOURCE &&
+          predecessor.status === "cancelled" &&
+          predecessor.errorCode === CONTINUATION_WAITING_ON_REVIEW_ERROR_CODE &&
+          !predecessor.startedAt;
+        if (!parkedBeforeStart && deps.scheduleRecoveryRetry) {
           const retry = await deps.scheduleRecoveryRetry(predecessor.id);
           if (retry) return retry;
           // A spent budget is the one "no retry" the sweeper must not wait
@@ -2085,7 +2190,7 @@ export function recoveryService(
           }
           return null;
         }
-        return null;
+        if (!parkedBeforeStart) return null;
       }
     }
     if (
@@ -2120,14 +2225,18 @@ export function recoveryService(
       // The sweep can combine an old in-progress issue snapshot with a newer
       // successful run. Validate eligibility under the enqueue issue lock so
       // completion or reassignment cannot create a redundant continuation.
-      ...(input.source === "issue.productive_terminal_continuation_recovery"
-        ? {
-            issueStateGuard: {
-              statuses: ["in_progress"],
-              assigneeAgentId: input.agentId,
-            },
-          }
-        : {}),
+      ...(input.issueStateGuard
+        ? { issueStateGuard: input.issueStateGuard }
+        : input.source === "issue.productive_terminal_continuation_recovery"
+          ? {
+              issueStateGuard: {
+                statuses: ["in_progress"],
+                assigneeAgentId: input.agentId,
+              },
+            }
+          : {}),
+      ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+      ...(input.allowRunCoalescing !== undefined ? { allowRunCoalescing: input.allowRunCoalescing } : {}),
       payload: withRecoveryContext(
         {
           issueId: input.issueId,
@@ -2151,6 +2260,18 @@ export function recoveryService(
         "normal_model",
       ),
     });
+
+    if (
+      !queued &&
+      input.outcome &&
+      input.idempotencyKey &&
+      input.source === REWORK_HANDBACK_CONTINUATION_SOURCE
+    ) {
+      input.outcome.continuationReceipt = await readReworkHandbackContinuationReceipt(
+        input.agentId,
+        input.idempotencyKey,
+      );
+    }
 
     if (queued && input.retryOfRunId) {
       return db
@@ -6110,6 +6231,20 @@ export function recoveryService(
           if (resolved) {
             result.waitingOnReviewResolved += 1;
             result.issueIds.push(issue.id);
+            continue;
+          }
+
+          if (isNativeReworkHandback(issue, agentId)) {
+            const handback = await requeueReworkHandbackContinuation(issue, agentId, latestRun);
+            if (handback === "queued") {
+              result.continuationRequeued += 1;
+              result.issueIds.push(issue.id);
+            } else if (handback === "escalated") {
+              result.escalated += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
             continue;
           }
 

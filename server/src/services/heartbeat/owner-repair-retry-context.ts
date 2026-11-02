@@ -3,8 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { issueRecoveryActions, issues } from "@paperclipai/db";
 import { isNativeReworkHandback } from "../../modules/run-dispatch/index.js";
 import { parseObject } from "../../adapters/utils.js";
-
-export const REWORK_HANDBACK_CONTINUATION_SOURCE = "issue.rework_handback_continuation_recovery";
+import { REWORK_HANDBACK_CONTINUATION_SOURCE } from "../recovery/rework-handback-continuation.js";
 
 const OWNER_REPAIR_SOURCE = "issue.deliberate_wait_disposition_repair";
 const OWNER_REPAIR_CAUSE = "deliberate_wait_without_target";
