@@ -4427,8 +4427,6 @@ async function listIssueBlockerAttentionMap(
         pendingFinalizeBlockerIssueIds.has(edge.blockerIssueId)
       );
     });
-    // The assignee user is usually the same person holding the review, so
-    // counting it as a waiting path would hide the review from the inbox.
     const humanHeldReview = humanHeldReviewUserId(node) !== null;
     if (
       node.assigneeUserId &&
@@ -6301,8 +6299,6 @@ async function listIssueBlockedInboxAttentionMap(
       row.issueId ? [row.issueId] : [],
     ),
   );
-  // graphIssues already excludes done issues, so presence there means
-  // unfinished; these mirror the blocker walk's downstream and child edges.
   const hasUnfinishedBlockers = new Set<string>();
   const hasWaitingDependents = new Set<string>();
   for (const relation of graphRelations) {
@@ -6575,7 +6571,6 @@ async function listIssueBlockedInboxAttentionMap(
       continue;
     }
 
-    // List rows carry a null executionState placeholder; the graph row is full.
     const reviewerUserId = humanHeldReviewUserId(issuesById.get(row.id) ?? row);
     if (
       reviewerUserId &&
