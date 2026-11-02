@@ -15,7 +15,7 @@ type RouteTestScope = {
   resources: HttpResource[];
   pending: number;
   assertActive(): void;
-  track<T>(promise: Promise<T>): Promise<T>;
+  track<T>(promise: Promise<T>, reportLate?: boolean): Promise<T>;
   dispose(): Promise<void>;
   request(handler: RequestListener, build: (url: string) => request.Test): Promise<request.Response>;
 };
@@ -58,7 +58,7 @@ export function createRouteTestRuntime(drainMs = 5000) {
             value = Reflect.get(owner, key);
           }
           const result = Reflect.apply(value as (...args: unknown[]) => unknown, owner, args);
-          return result instanceof Promise ? scope.track(result) : result;
+          return result instanceof Promise ? scope.track(result, true) : result;
         },
       });
     }
@@ -75,18 +75,26 @@ export function createRouteTestRuntime(drainMs = 5000) {
     const resources: HttpResource[] = [];
     let closed = signal.aborted;
     let disposal: Promise<void> | undefined;
+    const cleanupErrors: unknown[] = [];
+    const lateErrors: unknown[] = [];
     function assertActive() {
       if (closed || signal.aborted) throw new Error("Route test scope closed");
     }
-    function track<T>(promise: Promise<T>): Promise<T> {
+    function track<T>(promise: Promise<T>, reportLate = false): Promise<T> {
       pending.add(promise);
       const settle = () => pending.delete(promise);
-      void promise.then(settle, settle);
+      void promise.then(settle, (error) => {
+        if (reportLate && closed) lateErrors.push(error);
+        settle();
+      });
       return promise;
     }
     function fence() {
       closed = true;
-      for (const resource of resources) resource.stop();
+      for (const resource of resources) {
+        try { resource.stop(); }
+        catch (error) { cleanupErrors.push(error); poison ??= error; }
+      }
     }
     function dispose(): Promise<void> {
       if (disposal) return disposal;
@@ -98,6 +106,7 @@ export function createRouteTestRuntime(drainMs = 5000) {
             (async () => {
               await Promise.all(resources.map((resource) => resource.closed));
               while (pending.size) await Promise.allSettled([...pending]);
+              if (cleanupErrors.length) throw cleanupErrors[0];
             })(),
             new Promise<never>((_resolve, reject) => {
               timer = setTimeout(() => reject(new Error(`Route test cleanup deadline: pending=${pending.size}`)), drainMs);
@@ -105,16 +114,16 @@ export function createRouteTestRuntime(drainMs = 5000) {
           ]);
         } catch (error) {
           poison ??= error;
-          throw error;
+          throw cleanupErrors[0] ?? error;
         } finally {
           clearTimeout(timer);
           signal.removeEventListener("abort", abort);
         }
+        if (lateErrors.length) throw new AggregateError(lateErrors, "Late route test work failed");
       })();
       return disposal;
     }
     function abort() {
-      fence();
       void dispose().catch(() => {});
     }
     const scope: RouteTestScope = {
@@ -142,14 +151,14 @@ export function createRouteTestRuntime(drainMs = 5000) {
           server, sockets, request: undefined as request.Test | undefined, closed: closing,
           stop() {
             cancel?.();
-            resource.request?.abort();
+            try { resource.request?.abort(); } catch (error) { cleanupErrors.push(error); }
             for (const socket of sockets) socket.destroy();
             if (!listeningSettled || closingStarted) return;
             closingStarted = true;
-            server.close((error) => {
+            try { server.close((error) => {
               if (error && (error as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") failClose(error);
               else settleClose();
-            });
+            }); } catch (error) { failClose(error as Error); }
           },
         };
         resources.push(resource);

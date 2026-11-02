@@ -78,7 +78,8 @@ describe("route test scope", () => {
       expect(service.read).toHaveBeenCalledTimes(1);
       expect(await service.read()).toBe("default");
     });
-    await Promise.all([old.dispose(), next.dispose()]);
+    await expect(old.dispose()).rejects.toThrow("Late route test work failed");
+    await next.dispose();
     expect(old.pending).toBe(0);
   });
 
