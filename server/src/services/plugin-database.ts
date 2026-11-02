@@ -54,7 +54,7 @@ function quoteIdentifier(value: string): string {
   return `"${assertIdentifier(value).replaceAll("\"", "\"\"")}"`;
 }
 
-function splitSqlStatements(input: string): string[] {
+export function splitSqlStatements(input: string): string[] {
   const statements: string[] = [];
   let start = 0;
   let quote: "'" | "\"" | null = null;
@@ -112,12 +112,62 @@ function splitSqlStatements(input: string): string[] {
   return statements;
 }
 
+// Same state machine as splitSqlStatements: separate string/comment regexes
+// applied in sequence misread an apostrophe inside a comment as a string
+// opener and swallowed the SQL that followed it.
 function stripSqlForKeywordScan(input: string): string {
-  return input
-    .replace(/'([^']|'')*'/g, "''")
-    .replace(/"([^"]|"")*"/g, "\"\"")
-    .replace(/--.*$/gm, "")
-    .replace(/\/\*[\s\S]*?\*\//g, "");
+  let output = "";
+  let quote: "'" | "\"" | null = null;
+  let lineComment = false;
+  let blockComment = false;
+
+  for (let i = 0; i < input.length; i += 1) {
+    const char = input[i]!;
+    const next = input[i + 1];
+
+    if (lineComment) {
+      if (char === "\n") {
+        lineComment = false;
+        output += char;
+      }
+      continue;
+    }
+    if (blockComment) {
+      if (char === "*" && next === "/") {
+        blockComment = false;
+        output += " ";
+        i += 1;
+      }
+      continue;
+    }
+    if (quote) {
+      if (char === quote) {
+        if (next === quote) {
+          i += 1;
+        } else {
+          output += quote;
+          quote = null;
+        }
+      }
+      continue;
+    }
+    if (char === "-" && next === "-") {
+      lineComment = true;
+      i += 1;
+      continue;
+    }
+    if (char === "/" && next === "*") {
+      blockComment = true;
+      i += 1;
+      continue;
+    }
+    if (char === "'" || char === "\"") {
+      quote = char;
+    }
+    output += char;
+  }
+
+  return output;
 }
 
 function normaliseSql(input: string): string {

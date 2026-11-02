@@ -21,6 +21,7 @@ import {
 import {
   derivePluginDatabaseNamespace,
   pluginDatabaseService,
+  splitSqlStatements,
   validatePluginMigrationStatement,
   validatePluginRuntimeExecute,
   validatePluginRuntimeQuery,
@@ -127,6 +128,59 @@ describe("plugin database SQL validation", () => {
     expect(() =>
       validatePluginRuntimeExecute("UPDATE public.issues SET title = $1", "plugin_test")
     ).toThrow(/namespace/i);
+  });
+
+  it("ignores quote characters inside comments when validating migrations", () => {
+    const migration = `
+      -- the current attempt's mutable state lives on the same row
+      CREATE TABLE plugin_test.review_limits (
+        id uuid PRIMARY KEY,
+        status text CHECK (status IN ('open', 'done')),
+        issue_id uuid REFERENCES public.issues(id)
+      );
+      /* the "cap" column is optional */
+      ALTER TABLE plugin_test.review_limits ADD COLUMN cap integer DEFAULT 1;
+      -- operator's note: backfill below
+      UPDATE plugin_test.review_limits SET status = 'open' WHERE status IS NULL;
+    `;
+    const statements = splitSqlStatements(migration);
+    expect(statements).toHaveLength(3);
+    for (const statement of statements) {
+      expect(() => validatePluginMigrationStatement(statement, "plugin_test", ["issues"])).not.toThrow();
+    }
+  });
+
+  it("treats -- inside string literals as data, not a comment", () => {
+    expect(() =>
+      validatePluginMigrationStatement(
+        "UPDATE plugin_test.rows SET note = 'a -- b' WHERE id IS NOT NULL",
+        "plugin_test",
+      )
+    ).not.toThrow();
+    expect(() =>
+      validatePluginMigrationStatement(
+        "INSERT INTO plugin_test.rows (note) VALUES ('x -- y'); DELETE FROM plugin_test.rows",
+        "plugin_test",
+      )
+    ).toThrow(/cannot delete/i);
+    expect(() =>
+      validatePluginMigrationStatement(
+        "CREATE TABLE plugin_test.rows (note text DEFAULT '--'); GRANT ALL ON plugin_test.rows TO public",
+        "plugin_test",
+      )
+    ).toThrow(/disallowed/i);
+  });
+
+  it("still rejects destructive or out-of-namespace migrations that carry quoted comments", () => {
+    expect(() =>
+      validatePluginMigrationStatement("-- it's fine\nDROP TABLE plugin_test.rows", "plugin_test")
+    ).toThrow(/destructive/i);
+    expect(() =>
+      validatePluginMigrationStatement("-- don't\nDELETE FROM plugin_test.rows", "plugin_test")
+    ).toThrow(/cannot delete/i);
+    expect(() =>
+      validatePluginMigrationStatement("-- other's\nCREATE TABLE plugin_other.rows (id uuid)", "plugin_test")
+    ).toThrow(/outside namespace/i);
   });
 
   it("targets anonymous DO blocks without rejecting do-prefixed aliases", () => {
