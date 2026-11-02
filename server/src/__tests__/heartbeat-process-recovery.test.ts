@@ -223,12 +223,22 @@ vi.mock("@paperclipai/shared/telemetry", async () => {
   };
 });
 
-// Pass-through unless a test installs a hook: lets a test act between the
-// release commit and the recovery guard of the real escalation.
 const escalationBarrier = vi.hoisted(() => ({
   hook: null as null | ((input: any, original: (input: any) => Promise<unknown>) => Promise<unknown>),
   results: [] as unknown[],
+  dispositionRunIds: [] as string[],
 }));
+vi.mock("../services/heartbeat/run-completion.ts", async () => {
+  const actual = await vi.importActual<typeof import("../services/heartbeat/run-completion.ts")>("../services/heartbeat/run-completion.ts");
+  return {
+    ...actual,
+    createHeartbeatRunCompletion: ((db, deps) => actual.createHeartbeatRunCompletion(db, { ...deps,
+      handleIssueReviewPathDisposition: async (run) => {
+        await deps.handleIssueReviewPathDisposition(run);
+        escalationBarrier.dispositionRunIds.push(run.id);
+      } })) as typeof actual.createHeartbeatRunCompletion,
+  };
+});
 vi.mock("../services/recovery/service.ts", async () => {
   const actual = await vi.importActual<typeof import("../services/recovery/service.ts")>("../services/recovery/service.ts");
   return {
@@ -6571,7 +6581,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   });
 
   describe("legacy reviewer refusal and release receipt", () => {
-    afterEach(() => { escalationBarrier.hook = null; escalationBarrier.results = []; });
+    afterEach(() => { escalationBarrier.hook = null; escalationBarrier.results = []; escalationBarrier.dispositionRunIds = []; });
 
     async function claimFor(issueId: string, companyId: string, agentId: string) {
       const claimantId = randomUUID();
@@ -6595,7 +6605,6 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       };
     }
 
-    // A run admitted before reviewer generations existed: no accepted identity, no G.
     async function finishLegacyReviewer(mutate?: (seed: { companyId: string; agentId: string; issueId: string }) =>
       Promise<"reread" | "original">) {
       const seed = await seedInReviewParticipantRunFixture({ admittedReviewSource: true });
@@ -6638,6 +6647,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
       expect((await selectRecoveryActionsForIssue(issueId))[0]).toMatchObject({
         status: "active", cause: "execution_review_participant_recovery" });
+      expect(escalationBarrier.dispositionRunIds).toContain(runId);
     });
 
     it("I3 never dispatches a stale-generation successor and never leaves the lock on the finished run", async () => {
@@ -6694,6 +6704,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     async function finishWorkspaceValidation(mutate?: (seed: { companyId: string; agentId: string; issueId: string }) =>
       Promise<"reread" | "original">) {
       const seed = await seedQueuedIssueRunFixture();
+      const atHook: { row?: typeof issues.$inferSelect; effects?: Awaited<ReturnType<typeof sideEffects>> } = {};
       const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-release-receipt-"));
       const projectId = randomUUID();
       const workspaceId = randomUUID();
@@ -6712,6 +6723,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           escalationBarrier.hook = async (input, original) => {
             const mode = await mutate(seed);
             const [reread] = await db.select().from(issues).where(eq(issues.id, seed.issueId));
+            Object.assign(atHook, { row: reread, effects: await sideEffects(seed.issueId, seed.companyId) });
             return original(mode === "reread" ? { ...input, issue: reread } : input);
           };
         }
@@ -6719,7 +6731,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         await waitForRunToSettle(heartbeat, seed.runId, 5_000);
         await heartbeat.waitForRunExecutionDrain(seed.runId);
         await waitForPendingRunFailureReports();
-        return seed;
+        return { ...seed, atHook };
       } finally {
         await heartbeat.waitForRunExecutionDrain(seed.runId);
         await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: previousSettings.enableIsolatedWorkspaces });
@@ -6743,11 +6755,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     ] as const)("%s: a new claimant keeps the issue after an early workspace-validation release", async (_name, mode) => {
       let claimantId: string | null = null;
       let claimed: typeof issues.$inferSelect | null = null;
-      let relationsAtClaim: unknown[] = [];
-      const { issueId, companyId } = await finishWorkspaceValidation(async (seed) => {
+      const { issueId, companyId, atHook } = await finishWorkspaceValidation(async (seed) => {
         claimantId = await claimFor(seed.issueId, seed.companyId, seed.agentId);
         claimed = (await db.select().from(issues).where(eq(issues.id, seed.issueId)))[0]!;
-        relationsAtClaim = await db.select().from(issueRelations).where(eq(issueRelations.companyId, seed.companyId));
         return mode;
       });
       expect(escalationBarrier.results).toEqual([null]);
@@ -6760,7 +6770,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)))).toEqual([]);
       expect((await selectRecoveryCommentsForIssue(issueId)).some((comment) => comment.body.includes("workspace failed validation")))
         .toBe(false);
-      expect(await db.select().from(issueRelations).where(eq(issueRelations.companyId, companyId))).toEqual(relationsAtClaim);
+      expect(after).toEqual(atHook.row);
+      expect(await sideEffects(issueId, companyId)).toEqual(atHook.effects);
     });
   });
 

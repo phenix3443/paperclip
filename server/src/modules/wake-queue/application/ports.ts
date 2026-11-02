@@ -247,7 +247,6 @@ export interface IssueLockWriter {
   ): Promise<ReleaseTransactionResult & { run: RunSnapshot; blockedReceipt?: ReleaseBlockedReceipt }>;
 }
 
-/** The blocked issue row as this release left it, read under its lock after its own writes. */
 export type ReleaseBlockedReceipt = {
   issueId: string; companyId: string; status: string; statusVersion: number; lastStatusDecisionId: string | null;
   executionRunId: string | null; checkoutRunId: string | null; executionAgentNameKey: string | null;
