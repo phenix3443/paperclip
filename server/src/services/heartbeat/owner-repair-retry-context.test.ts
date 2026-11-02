@@ -271,11 +271,12 @@ describePostgres("owner disposition repair retry context", () => {
     expectRepairRetry(scheduled);
   });
 
-  it("N5: keeps a live owner repair while review is pending", async () => {
+  it("N5/R5: keeps a live owner repair while review is pending and renders only the recovery contract", async () => {
     const f = await fixture({ review: "pending", action: { status: "active" } });
     const scheduled = await scheduleRetry(f.run, f.executor);
     expect(scheduled.context.recoveryActionId).toBe(f.actionId);
     expectRepairRetry(scheduled);
+    expect(scheduled.payload?.dispositionRepair ?? null).toBeNull();
   });
 
   it.each([
@@ -286,6 +287,13 @@ describePostgres("owner disposition repair retry context", () => {
     const f = await fixture({ ...input, action: null });
     const scheduled = await scheduleRetry(f.run, f.executor);
     expectRepairRetry(scheduled);
-    if ("legacyEpisode" in input && input.legacyEpisode) expect(scheduled.context.legacyDispositionEpisode).toBeTruthy();
+    if ("legacyEpisode" in input && input.legacyEpisode) {
+      expect(scheduled.context.legacyDispositionEpisode).toBeTruthy();
+      expect(scheduled.payload?.dispositionRepair).toMatchObject({
+        instruction: "Revalidate the issue and replace the invalid parked summary.",
+      });
+    } else {
+      expect(scheduled.payload?.dispositionRepair ?? null).toBeNull();
+    }
   });
 });

@@ -345,6 +345,60 @@ describePostgres("rework hand-back continuation recovery", () => {
     expect(rows[0]!.runId).toBe(a!.id);
   });
 
+  it("R3c: another queued executor run keeps the keyed wake in its own uncoalesced receipt", async () => {
+    const seeded = await seed();
+    const otherRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: otherRunId,
+      companyId: seeded.companyId,
+      agentId: seeded.executorId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "queued",
+      scopeKind: "issue",
+      issueId: seeded.issueId,
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId, wakeReason: "issue_commented" },
+    });
+    expect(await directWake(seeded, keyFor(seeded))).toBeNull();
+    const rows = await keyRows(seeded.executorId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ status: "deferred_issue_execution", runId: null, coalescedCount: 0 });
+    const [other] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, otherRunId));
+    expect(other?.contextSnapshot).not.toHaveProperty("retryOfRunId");
+    expect(other?.contextSnapshot?.wakeReason).toBe("issue_commented");
+    expect(await directWake(seeded, keyFor(seeded))).toBeNull();
+    expect(await keyRows(seeded.executorId)).toHaveLength(1);
+  });
+
+  it("N4: an active execution defers the keyed wake once and keeps one receipt", async () => {
+    const seeded = await seed();
+    const holderRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: holderRunId,
+      companyId: seeded.companyId,
+      agentId: seeded.reviewerId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "running",
+      scopeKind: "issue",
+      issueId: seeded.issueId,
+      startedAt: new Date(),
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+    });
+    await db.update(issues).set({ executionRunId: holderRunId }).where(eq(issues.id, seeded.issueId));
+    const key = keyFor(seeded);
+
+    expect(await directWake(seeded, key)).toBeNull();
+    expect(await directWake(seeded, key)).toBeNull();
+    const rows = await keyRows(seeded.executorId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    expect(await successorRuns(seeded.parkedRunId)).toHaveLength(0);
+    const [issue] = await db.select({ executionRunId: issues.executionRunId }).from(issues)
+      .where(eq(issues.id, seeded.issueId));
+    expect(issue?.executionRunId).toBe(holderRunId);
+  });
+
   it("R3c: a malformed request with the key is skipped without a receipt", async () => {
     const seeded = await seed();
     const key = keyFor(seeded);
