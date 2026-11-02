@@ -1483,6 +1483,123 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
         errorCode: "issue_continuation_waiting_on_review",
       });
     });
+
+    describe("native rework hand-back and a stale review-wait summary", () => {
+      const reviewWaitSummary = [
+        "# Continuation Summary",
+        "",
+        "## Next Action",
+        "",
+        "- Wait for reviewer feedback or approval before continuing executor work.",
+      ].join("\n");
+
+      async function seedParkCandidate(executionState: (executorId: string, reviewerId: string) => Record<string, unknown>) {
+        const { companyId, agentId } = await seedCompanyAndAgent();
+        const reviewerId = randomUUID();
+        const issueId = randomUUID();
+        await seedIssue({
+          companyId,
+          issueId,
+          status: "in_progress",
+          assigneeAgentId: agentId,
+          executionState: executionState(agentId, reviewerId),
+        });
+        await seedContinuationSummary({ companyId, issueId, agentId, body: reviewWaitSummary });
+        const runId = await seedRun({
+          companyId,
+          agentId,
+          contextSnapshot: {
+            issueId,
+            wakeReason: "issue_continuation_needed",
+            retryReason: "issue_continuation_needed",
+          },
+        });
+        const snapshot = await db
+          .select({ executionState: issues.executionState, assigneeAgentId: issues.assigneeAgentId, status: issues.status })
+          .from(issues)
+          .where(eq(issues.id, issueId))
+          .then((rows) => rows[0]);
+        return { companyId, issueId, runId, snapshot };
+      }
+
+      function reviewState(input: {
+        status: "changes_requested" | "pending";
+        executorId: string;
+        reviewerId: string;
+        returnAgentId?: string;
+      }) {
+        return {
+          status: input.status,
+          currentStageId: "stage-1",
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: input.reviewerId },
+          returnAssignee: { type: "agent", agentId: input.returnAgentId ?? input.executorId },
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: input.status === "changes_requested" ? "decision-1" : null,
+          lastDecisionOutcome: input.status === "changes_requested" ? "changes_requested" : null,
+          changesRequestedCount: input.status === "changes_requested" ? 1 : 0,
+        };
+      }
+
+      it("admits the executor continuation on a changes_requested hand-back", async () => {
+        const { companyId, issueId, runId, snapshot } = await seedParkCandidate((executorId, reviewerId) =>
+          reviewState({ status: "changes_requested", executorId, reviewerId }),
+        );
+
+        const result = await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({
+          runId,
+          companyId,
+          expectedStatus: "queued",
+          now: new Date(),
+        });
+
+        expect(result).toEqual({ outcome: "not_stale" });
+        const after = await db
+          .select({ executionState: issues.executionState, assigneeAgentId: issues.assigneeAgentId, status: issues.status })
+          .from(issues)
+          .where(eq(issues.id, issueId))
+          .then((rows) => rows[0]);
+        expect(after).toEqual(snapshot);
+        const run = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, runId))
+          .then((rows) => rows[0]);
+        expect(run?.status).toBe("queued");
+      });
+
+      it("still parks the executor continuation while review is pending", async () => {
+        const { companyId, runId } = await seedParkCandidate((executorId, reviewerId) =>
+          reviewState({ status: "pending", executorId, reviewerId }),
+        );
+
+        const result = await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({
+          runId,
+          companyId,
+          expectedStatus: "queued",
+          now: new Date(),
+        });
+
+        expect(result).toMatchObject({ outcome: "cancelled", errorCode: "issue_continuation_waiting_on_review" });
+      });
+
+      it("still parks when the hand-back returns work to another agent", async () => {
+        const { companyId, runId } = await seedParkCandidate((executorId, reviewerId) =>
+          reviewState({ status: "changes_requested", executorId, reviewerId, returnAgentId: randomUUID() }),
+        );
+
+        const result = await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({
+          runId,
+          companyId,
+          expectedStatus: "queued",
+          now: new Date(),
+        });
+
+        expect(result).toMatchObject({ outcome: "cancelled", errorCode: "issue_continuation_waiting_on_review" });
+      });
+    });
   });
 
   describe("promoteOrCancelDueRetry", () => {

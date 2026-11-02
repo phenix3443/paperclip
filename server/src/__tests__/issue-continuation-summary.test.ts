@@ -131,4 +131,56 @@ describe("issue continuation summaries", () => {
 
     expect(continuationSummaryParksExecutor(body)).toBe(false);
   });
+
+  describe("carried-forward next action", () => {
+    const reviewWaitSummary = [
+      "# Continuation Summary",
+      "",
+      "## Next Action",
+      "",
+      "- Wait for reviewer feedback or approval before continuing executor work.",
+    ].join("\n");
+    const runnableSummary = [
+      "# Continuation Summary",
+      "",
+      "## Next Action",
+      "",
+      "- Re-run the focused queue tests, then push the fix.",
+    ].join("\n");
+
+    function build(status: string, previousSummaryBody: string) {
+      return buildContinuationSummaryMarkdown({
+        issue: {
+          id: "issue-1", identifier: "TEST-1", title: "Rework",
+          description: null, status, priority: "medium",
+        },
+        run: { id: "run-3", status: "succeeded", error: null, resultJson: null },
+        agent: { id: "agent-1", name: "Agent", adapterType: "claude_local" },
+        previousSummaryBody,
+      });
+    }
+
+    it("drops a stale review wait once the issue is back in progress", () => {
+      const body = build("in_progress", reviewWaitSummary);
+      expect(extractContinuationSummaryNextAction(body)).toBe(
+        "Resume implementation from the acceptance criteria, latest comments, and this summary.",
+      );
+      expect(continuationSummaryParksExecutor(body)).toBe(false);
+    });
+
+    it("still carries a runnable next action forward while in progress", () => {
+      const body = build("in_progress", runnableSummary);
+      expect(extractContinuationSummaryNextAction(body)).toBe("Re-run the focused queue tests, then push the fix.");
+    });
+
+    it("keeps carrying a review wait outside in_progress", () => {
+      const body = build("blocked", reviewWaitSummary);
+      expect(continuationSummaryParksExecutor(body)).toBe(true);
+    });
+
+    it("still writes the review wait while the issue is in review", () => {
+      const body = build("in_review", runnableSummary);
+      expect(continuationSummaryParksExecutor(body)).toBe(true);
+    });
+  });
 });
