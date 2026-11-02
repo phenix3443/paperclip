@@ -109,6 +109,7 @@ describePostgres("connection cleanup delivery notifications", () => {
       const produce = () => toolAccessService(db).archiveConnection(f.connection.id, f.companyId);
       try {
         if (mode.startsWith("outer ")) {
+          const outerBaseline = delivery.sweeps;
           const outer = transact(async tx => {
             rawSpy.mockRestore();
             transactionSpy.mockRestore();
@@ -137,7 +138,7 @@ describePostgres("connection cleanup delivery notifications", () => {
           });
           if (mode === "outer rollback") await expect(outer).rejects.toThrow("outer rollback");
           else await outer;
-          await delivery.settle();
+          await delivery.settle(outerBaseline + 1);
           await noEffect();
           expect((await db.select().from(toolConnections))[0]!.credentialSecretRefs)
             .toEqual(mode === "outer rollback" ? refs : []);
