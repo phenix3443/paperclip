@@ -33,8 +33,9 @@ that unknown writers have stopped.
 
 Failed workspace persistence does not bypass retention: cleanup of a reconstructed
 workspace re-reads its native identity and history under the source and lifecycle
-locks before teardown or removal. Without a verified durable identity, the new
-directory remains in place and preparation reports the original persistence error.
+locks before teardown or removal. A new worktree whose initial persistence fails
+keeps the existing cleanup behavior: it has no retention history. Preparation
+reports the original persistence error even if cleanup also fails.
 
 Retention refusal creates no removal retry deadline. The existing terminal worker
 reconsiders a held workspace when a native workspace or issue change triggers it;

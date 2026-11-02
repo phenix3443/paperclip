@@ -967,36 +967,56 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
   } catch (error) {
     if (executionWorkspace.created) {
       try {
+        const cleanupOptions = {
+          projectWorkspace: {
+            cwd: resolvedWorkspace.cwd,
+            cleanupCommand: null,
+          },
+          cleanupCommand: configSnapshot?.cleanupCommand ?? null,
+          teardownCommand:
+            configSnapshot?.teardownCommand ??
+            projectExecutionWorkspacePolicy?.workspaceStrategy
+              ?.teardownCommand ??
+            null,
+          recorder: workspaceOperationRecorder,
+        };
         const previous = reusableExistingExecutionWorkspace ?? existingExecutionWorkspace;
-        if (!previous || !lockedSourceIssueId) throw new Error("Workspace cleanup identity is unverified");
-        await withExecutionWorkspaceLifecycleLock(db, previous.id, async tx => {
-          const [workspace] = await tx.select().from(executionWorkspacesTable).where(and(
-            eq(executionWorkspacesTable.companyId, agent.companyId), eq(executionWorkspacesTable.id, previous.id),
-          ));
-          if (!workspace || workspace.sourceIssueId !== lockedSourceIssueId || workspace.cwd !== executionWorkspace.cwd
-            || (workspace.providerRef && workspace.providerRef !== executionWorkspace.cwd)
-            || workspace.providerType !== (executionWorkspace.strategy === "git_worktree" ? "git_worktree" : "local_fs")
-            || !["active", "idle", "in_review"].includes(workspace.status) || workspace.closedAt
-            || metadataHasReopenPendingConsumption(workspace.metadata)
-            || readExecutionWorkspaceLifecycleGeneration(workspace.metadata) !== readExecutionWorkspaceLifecycleGeneration(previous.metadata)) {
-            throw new Error("Workspace cleanup identity changed");
-          }
-          await assertWorkspaceRetentionAllowsRemoval(tx, workspace);
+        if (!previous) {
           await cleanupExecutionWorkspaceArtifacts({
-            workspace,
-            projectWorkspace: {
-              cwd: resolvedWorkspace.cwd,
-              cleanupCommand: null,
+            ...cleanupOptions,
+            workspace: {
+              companyId: agent.companyId,
+              id: workspaceReuseRequest.requestedExecutionWorkspaceId ?? `transient-${run.id}`,
+              cwd: executionWorkspace.cwd,
+              providerType: executionWorkspace.strategy === "git_worktree" ? "git_worktree" : "local_fs",
+              providerRef: executionWorkspace.worktreePath,
+              branchName: executionWorkspace.branchName,
+              repoUrl: executionWorkspace.repoUrl,
+              baseRef: executionWorkspace.repoRef,
+              projectId: resolvedProjectId,
+              projectWorkspaceId: resolvedProjectWorkspaceId,
+              sourceIssueId: issueRef?.id ?? null,
+              metadata: nextExecutionWorkspaceMetadata,
             },
-            cleanupCommand: configSnapshot?.cleanupCommand ?? null,
-            teardownCommand:
-              configSnapshot?.teardownCommand ??
-              projectExecutionWorkspacePolicy?.workspaceStrategy
-                ?.teardownCommand ??
-              null,
-            recorder: workspaceOperationRecorder,
           });
-        });
+        } else {
+          if (!lockedSourceIssueId) throw new Error("Workspace cleanup identity is unverified");
+          await withExecutionWorkspaceLifecycleLock(db, previous.id, async tx => {
+            const [workspace] = await tx.select().from(executionWorkspacesTable).where(and(
+              eq(executionWorkspacesTable.companyId, agent.companyId), eq(executionWorkspacesTable.id, previous.id),
+            ));
+            if (!workspace || workspace.sourceIssueId !== lockedSourceIssueId || workspace.cwd !== executionWorkspace.cwd
+              || (workspace.providerRef && workspace.providerRef !== executionWorkspace.cwd)
+              || workspace.providerType !== (executionWorkspace.strategy === "git_worktree" ? "git_worktree" : "local_fs")
+              || !["active", "idle", "in_review"].includes(workspace.status) || workspace.closedAt
+              || metadataHasReopenPendingConsumption(workspace.metadata)
+              || readExecutionWorkspaceLifecycleGeneration(workspace.metadata) !== readExecutionWorkspaceLifecycleGeneration(previous.metadata)) {
+              throw new Error("Workspace cleanup identity changed");
+            }
+            await assertWorkspaceRetentionAllowsRemoval(tx, workspace);
+            await cleanupExecutionWorkspaceArtifacts({ workspace, ...cleanupOptions });
+          });
+        }
       } catch (cleanupError) {
         logger.warn(
           {

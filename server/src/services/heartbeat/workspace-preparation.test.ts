@@ -767,13 +767,13 @@ describe.skipIf(!support.supported && !externalDatabaseUrl)("heartbeat workspace
     expect((await readIssue(issue.id)).executionWorkspaceId).toBe(workspace.id);
   });
 
-  it("retains a new local worktree without durable identity after workspace persistence fails", async () => {
+  it("cleans up a new local worktree after workspace persistence fails", async () => {
     const { input, source, issue } = await fixture(true);
     vi.spyOn(input.services.executionWorkspacesSvc, "create").mockRejectedValueOnce(new Error("Workspace persistence failed"));
     await expect(prepareHeartbeatWorkspace(db, input)).rejects.toThrow("Workspace persistence failed");
     const worktrees = (await execFile("git", ["-C", source, "worktree", "list", "--porcelain"])).stdout;
-    expect(worktrees.match(/^worktree /gm)).toHaveLength(2);
-    expect((await execFile("git", ["-C", source, "rev-parse", "--verify", `refs/heads/test-${issue.identifier}`])).stdout.trim()).toMatch(/^[a-f0-9]{40}$/);
+    expect(worktrees.match(/^worktree /gm)).toHaveLength(1);
+    await expect(execFile("git", ["-C", source, "rev-parse", "--verify", `refs/heads/test-${issue.identifier}`])).rejects.toThrow();
     expect((await readIssue(issue.id)).executionWorkspaceId).toBeNull();
   });
 
@@ -1143,7 +1143,7 @@ describe.skipIf(!support.supported && !externalDatabaseUrl)("heartbeat workspace
     expect((await readIssue(issue.id)).executionWorkspaceId).toBeNull();
   });
 
-  it("retains an unidentified new worktree when persistence fails and preserves the original error", async () => {
+  it("cleans up a new worktree when persistence fails and preserves the original error", async () => {
     const { input, source } = await fixture(true);
     const error = new Error("workspace persistence unavailable");
     let createdCwd = "";
@@ -1152,7 +1152,7 @@ describe.skipIf(!support.supported && !externalDatabaseUrl)("heartbeat workspace
     });
     await expect(prepareHeartbeatWorkspace(db, input)).rejects.toBe(error);
     expect(createdCwd).not.toBe("");
-    expect(await readFile(join(createdCwd, "late-unique"), "utf8")).toBe("no durable cleanup identity\n");
+    await expect(access(createdCwd)).rejects.toMatchObject({ code: "ENOENT" });
     expect(await readFile(join(source, "README.md"), "utf8")).toBe("source content\n");
     expect(await leases(input.run.id)).toHaveLength(0);
   });
