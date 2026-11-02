@@ -573,7 +573,6 @@ export function pluginRoutes(
     return deadlineAt;
   }
 
-  /** True once the response guard has answered or is about to answer 504. */
   function responseDeadlinePassed(res: Response, deadlineAt: number): boolean {
     return res.headersSent || Date.now() >= deadlineAt;
   }
@@ -1303,8 +1302,6 @@ export function pluginRoutes(
         ? { localPath: canonicalLocalPath, signal: abort.signal }
         : { packageName: trimmedPackage, version: version?.trim(), signal: abort.signal };
 
-      // Admission ran past the deadline: the response guard answers 504
-      // (phase "response"); nothing is prepared.
       if (responseDeadlinePassed(res, deadlineAt)) return;
       let prepareTimer: NodeJS.Timeout | undefined;
       const prepareDeadline = new Promise<never>((_, reject) => {
@@ -2506,7 +2503,6 @@ export function pluginRoutes(
     try {
       const secretRefs = extractSecretRefBindingsFromConfig(body.configJson, schema);
       await validatePluginSecretRefsForCompany(companyId, secretRefs);
-      // Admission ran past the deadline: the guard answers 504; save nothing.
       if (responseDeadlinePassed(res, deadlineAt)) return;
       await secretService(db).syncSecretRefsForTarget(
         companyId,
@@ -2531,8 +2527,6 @@ export function pluginRoutes(
       // If the worker implements onConfigChanged, send the new config via RPC.
       // If it doesn't (METHOD_NOT_IMPLEMENTED), restart the worker so it picks
       // up the new config on re-initialize. If no worker is running, skip.
-      // Past the deadline the response guard answers 504; do not notify or
-      // restart the worker from a late continuation.
       if (responseDeadlinePassed(res, deadlineAt)) return;
       if (bridgeDeps?.workerManager.isRunning(plugin.id)) {
         // Refresh the worker's authorized proactive company scopes so the
@@ -2562,8 +2556,7 @@ export function pluginRoutes(
             rpcErr instanceof JsonRpcCallError &&
             rpcErr.code === PLUGIN_RPC_ERROR_CODES.METHOD_NOT_IMPLEMENTED
           ) {
-            // Worker doesn't handle live config — restart it, unless the
-            // response deadline already passed while the RPC was pending.
+            // Worker doesn't handle live config — restart it.
             if (responseDeadlinePassed(res, deadlineAt)) return;
             try {
               const epoch = lifecycle.currentEpoch(plugin.id);

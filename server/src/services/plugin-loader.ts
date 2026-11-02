@@ -2369,6 +2369,7 @@ export function pluginLoader(
       // ------------------------------------------------------------------
       const packageRoot = resolvePackageRoot ? resolvePackageRoot(activePlugin) : resolvePluginPackageRoot(activePlugin, localPluginDir);
       assertPackageActivation?.({ pluginKey, packageRoot, installedPackagePath: activePlugin.packagePath });
+      options.lease?.assertActive();
       activePlugin = await refreshPluginManifestFromPackage(activePlugin, packageRoot);
       manifest = activePlugin.manifestJson;
       assertPackageActivation?.({ pluginKey, packageRoot, installedPackagePath: activePlugin.packagePath, manifest });
@@ -2379,6 +2380,7 @@ export function pluginLoader(
       // ------------------------------------------------------------------
       // 2. Apply restricted database migrations before worker startup
       // ------------------------------------------------------------------
+      options.lease?.assertActive();
       const databaseNamespace = manifest.database
         ? (await pluginDatabaseService(migrationDb).applyMigrations(pluginId, manifest, packageRoot))?.namespaceName ?? null
         : null;
@@ -2386,6 +2388,7 @@ export function pluginLoader(
       // ------------------------------------------------------------------
       // 3. Build host handlers for this plugin
       // ------------------------------------------------------------------
+      options.lease?.assertActive();
       const hostHandlers = buildHostHandlers(pluginId, manifest);
 
       // ------------------------------------------------------------------
