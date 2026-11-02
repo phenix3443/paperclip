@@ -1,3 +1,5 @@
+export type ReworkHandbackContinuationReceipt = "bound" | "waiting" | "spent" | "absent";
+
 export const REWORK_HANDBACK_CONTINUATION_SOURCE = "issue.rework_handback_continuation_recovery";
 export const REWORK_HANDBACK_CONTINUATION_KEY_PREFIX = "issue_rework_handback_continuation:";
 

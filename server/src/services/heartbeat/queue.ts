@@ -3382,8 +3382,6 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               !sameOwnerRepairIssueBinding(ownerRepairIssueBinding(issue), ownerRepairIssueBindingGuard)))
             throw conflict("Owner repair continuation task changed before admission");
           if (opts.idempotencyKey?.startsWith(REWORK_HANDBACK_CONTINUATION_KEY_PREFIX)) {
-            // All admissions for one issue serialize on its row lock, so the
-            // key lookup and the insert below are atomic per issue.
             const keyRunId = reworkHandbackContinuationKeyRunId(opts.idempotencyKey);
             if (
               !keyRunId ||

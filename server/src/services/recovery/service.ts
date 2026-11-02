@@ -15,9 +15,8 @@ import { isNativeReworkHandback } from "../../modules/run-dispatch/index.js";
 import {
   REWORK_HANDBACK_CONTINUATION_SOURCE,
   reworkHandbackContinuationKey,
+  type ReworkHandbackContinuationReceipt,
 } from "./rework-handback-continuation.js";
-
-type ReworkHandbackContinuationReceipt = "bound" | "waiting" | "spent" | "absent";
 import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";
 import { onboardingFirstTaskAwaitingUserSql } from "./onboarding-first-task-wait.js";
 import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
@@ -2048,11 +2047,6 @@ export function recoveryService(
     });
   }
 
-  /**
-   * A park cancel on a native rework hand-back is not a deliberate wait: the
-   * reviewer handed the work back to its executor. Queue one ordinary
-   * continuation for it instead of an owner disposition repair.
-   */
   async function requeueReworkHandbackContinuation(
     issue: RecoveryIssue,
     agentId: string,
@@ -2077,6 +2071,7 @@ export function recoveryService(
       retryReason: "issue_continuation_needed",
       source: REWORK_HANDBACK_CONTINUATION_SOURCE,
       retryOfRunId: latestRun.id,
+      companyId: issue.companyId,
       issueStateGuard: {
         statuses: ["in_progress"],
         assigneeAgentId: agentId,
@@ -2099,6 +2094,7 @@ export function recoveryService(
   }
 
   async function readReworkHandbackContinuationReceipt(
+    companyId: string,
     agentId: string,
     idempotencyKey: string,
   ): Promise<ReworkHandbackContinuationReceipt> {
@@ -2107,6 +2103,7 @@ export function recoveryService(
       .from(agentWakeupRequests)
       .where(and(
         ordinaryWakeRequestPredicate(),
+        eq(agentWakeupRequests.companyId, companyId),
         eq(agentWakeupRequests.agentId, agentId),
         eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
       ));
@@ -2130,6 +2127,7 @@ export function recoveryService(
     source: string;
     retryOfRunId?: string | null;
     extraContext?: Record<string, unknown>;
+    companyId?: string;
     issueStateGuard?: { statuses: string[]; assigneeAgentId: string; statusVersion?: number };
     idempotencyKey?: string;
     allowRunCoalescing?: boolean;
@@ -2138,8 +2136,6 @@ export function recoveryService(
      * because the failed predecessor has spent its bounded transient retry
      * budget. A null return without it means another authority owns the
      * run (native runtime, reconciliation) and the caller must leave it.
-     * `continuationReceipt` reports, for a rework hand-back continuation
-     * only, what the key's receipt says after a null return.
      */
     outcome?: { retryExhausted?: boolean; continuationReceipt?: ReworkHandbackContinuationReceipt };
   }) {
@@ -2170,8 +2166,6 @@ export function recoveryService(
           });
           return null;
         }
-        // A parked continuation never started; it is not a failure, so it
-        // gets an ordinary successor instead of a failure retry.
         const parkedBeforeStart =
           input.source === REWORK_HANDBACK_CONTINUATION_SOURCE &&
           predecessor.status === "cancelled" &&
@@ -2265,15 +2259,17 @@ export function recoveryService(
       !queued &&
       input.outcome &&
       input.idempotencyKey &&
+      input.companyId &&
       input.source === REWORK_HANDBACK_CONTINUATION_SOURCE
     ) {
       input.outcome.continuationReceipt = await readReworkHandbackContinuationReceipt(
+        input.companyId,
         input.agentId,
         input.idempotencyKey,
       );
     }
 
-    if (queued && input.retryOfRunId) {
+    if (queued && input.retryOfRunId && queued.retryOfRunId !== input.retryOfRunId) {
       return db
         .update(heartbeatRuns)
         .set({

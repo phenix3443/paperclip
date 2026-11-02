@@ -325,9 +325,24 @@ describePostgres("rework hand-back continuation recovery", () => {
       .where(eq(heartbeatRuns.id, first!.id));
     const third = await directWake(seeded, key);
     expect(third?.id).toBe(first!.id);
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, first!.id));
+    const fourth = await directWake(seeded, key);
+    expect(fourth?.id).toBe(first!.id);
     expect(await keyRows(seeded.executorId)).toHaveLength(1);
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, seeded.executorId)))
       .toHaveLength(2);
+  });
+
+  it("R3c: concurrent requests with the same key both return the one bound run", async () => {
+    const seeded = await seed();
+    const key = keyFor(seeded);
+    const [a, b] = await Promise.all([directWake(seeded, key), directWake(seeded, key)]);
+    expect(a).not.toBeNull();
+    expect(b?.id).toBe(a!.id);
+    const rows = await keyRows(seeded.executorId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.runId).toBe(a!.id);
   });
 
   it("R3c: a malformed request with the key is skipped without a receipt", async () => {

@@ -84,11 +84,6 @@ async function ownerRepairContextIsInvalid(
   return isNativeReworkHandback(await loadIssue(db, run), run.agentId);
 }
 
-/**
- * A retry of an owner disposition repair keeps the repair context only while
- * that repair is still valid. Once its action is settled, or the issue is a
- * native rework hand-back to the same agent, the retry is ordinary work.
- */
 export async function selectOwnerRepairRetryContext(
   db: Db,
   run: RetrySourceRun,

@@ -1,8 +1,3 @@
-// Native rework hand-back: the reviewer requested changes and the issue is
-// back with its executor agent. The native execution state is authoritative
-// here; heuristic waits (such as a review-wait continuation summary) must not
-// override it.
-
 export type ReworkHandbackIssueFacts = {
   status: string | null | undefined;
   assigneeAgentId: string | null | undefined;
