@@ -518,17 +518,20 @@ async function removeConnection(
 
     // The catalog stays as history, but `removed` is the status that stops a
     // standing trust rule from auto-allowing one of these actions again.
-    const removedCatalogEntries = await db
-      .update(toolCatalogEntries)
-      .set({ status: "removed", updatedAt: now })
-      .where(
-        and(
-          eq(toolCatalogEntries.companyId, connection.companyId),
-          eq(toolCatalogEntries.connectionId, connection.id),
-          ne(toolCatalogEntries.status, "removed"),
-        ),
-      )
-      .returning({ id: toolCatalogEntries.id });
+    const removedCatalogEntries = await db.transaction(async tx => {
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
+      return tx
+        .update(toolCatalogEntries)
+        .set({ status: "removed", updatedAt: now })
+        .where(
+          and(
+            eq(toolCatalogEntries.companyId, connection.companyId),
+            eq(toolCatalogEntries.connectionId, connection.id),
+            ne(toolCatalogEntries.status, "removed"),
+          ),
+        )
+        .returning({ id: toolCatalogEntries.id });
+    });
 
     // An authorization already in flight would otherwise come back and mint a
     // fresh token for an app the operator just removed.
@@ -633,29 +636,35 @@ async function removeConnection(
 
     const credentialRefsCleared =
       connection.credentialRefs.length + connection.credentialSecretRefs.length;
-    const [cleared] = await db
-      .update(toolConnections)
-      .set({
-        credentialRefs: [],
-        credentialSecretRefs: [],
-        config: withoutInlineOAuthTokens(connection.config),
-        transportConfig: withoutInlineOAuthTokens(connection.transportConfig),
-        updatedAt: now,
-      })
-      .where(eq(toolConnections.id, connection.id))
-      .returning();
+    const [cleared] = await db.transaction(async tx => {
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
+      return tx
+        .update(toolConnections)
+        .set({
+          credentialRefs: [],
+          credentialSecretRefs: [],
+          config: withoutInlineOAuthTokens(connection.config),
+          transportConfig: withoutInlineOAuthTokens(connection.transportConfig),
+          updatedAt: now,
+        })
+        .where(eq(toolConnections.id, connection.id))
+        .returning();
+    });
     if (
       grantRows.some((grant) => (grant.credentialSecretRefs ?? []).length > 0)
     ) {
-      await db
-        .update(connectionGrants)
-        .set({ credentialSecretRefs: [], updatedAt: now })
-        .where(
-          and(
-            eq(connectionGrants.companyId, connection.companyId),
-            eq(connectionGrants.connectionId, connection.id),
-          ),
-        );
+      await db.transaction(async tx => {
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
+        await tx
+          .update(connectionGrants)
+          .set({ credentialSecretRefs: [], updatedAt: now })
+          .where(
+            and(
+              eq(connectionGrants.companyId, connection.companyId),
+              eq(connectionGrants.connectionId, connection.id),
+            ),
+          );
+      });
     }
 
     return {
