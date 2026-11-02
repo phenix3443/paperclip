@@ -2871,3 +2871,5 @@ export * from "./workspace-provider.js";
 export * from "./workflows.js";
 export { updateWorkspacePreferenceSchema, type UpdateWorkspacePreference, type WorkspacePreference } from "./workspace-preferences.js";
 export * from "./agent-configuration.js";
+export { EXECUTION_DECISION_INPUT_KEYS, executionDecisionInputsDigest } from "./execution-decision-inputs.js";
+export type { ExecutionDecisionInputs } from "./execution-decision-inputs.js";

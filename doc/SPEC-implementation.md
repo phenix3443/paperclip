@@ -1487,6 +1487,29 @@ and oversized ID parameters return `400`, including mixed scalar/nested syntax.
 Responses are private and not stored by HTTP caches. Reads do not trigger
 full-detail enrichment, workspace inspection or execution recovery.
 
+### Execution decision snapshot precondition
+
+`PATCH /issues/:issueId` accepts optional `expectedExecutionDecisionDigest`, a
+64-digit hexadecimal SHA-256 digest. The only other permitted request keys are
+`status`, `comment`, and `commentClientRequestId`; additional keys return `422`,
+including unknown keys. Existing requests that omit the digest keep their behavior.
+
+Callers compute `await executionDecisionInputsDigest(issue)` from
+`@paperclipai/shared` over their reviewed issue snapshot. The exported
+`EXECUTION_DECISION_INPUT_KEYS` is also the route's decision-input comparison set:
+status, agent/user assignees, responsible/creator user IDs, execution policy/state,
+and all six monitor bookkeeping fields. Missing values become null, object keys
+sort recursively, arrays retain order, and monitor timestamps become ISO strings.
+
+The request must produce an execution-gate decision by the current participant.
+A normal update, Board override, or removed participant returns `409` with
+`details.code=execution_policy_transition_stale` before mutation. The route checks
+the digest again immediately after locking the issue in its existing decision
+transaction, before the issue update, comment, decision or activity persists.
+A mismatch returns the same `409` and leaves those records and review counts
+unchanged. Digest checks precede comment replay handling; a matching digest keeps
+existing replay semantics. This precondition grants no additional authority.
+
 ### 10.4.1 Atomic Checkout Contract
 
 `POST /issues/:issueId/checkout` request:

@@ -1,3 +1,4 @@
+import { EXECUTION_DECISION_INPUT_KEYS, executionDecisionInputsDigest } from "@paperclipai/shared";
 import { isDeepStrictEqual } from "node:util";
 import { ordinaryWakeRequestPredicate } from "../modules/wake-queue/receipt-namespace.js";
 import { notifyNativeRecoveryNotices } from "../services/native-recovery-notice-notifications.js";
@@ -493,12 +494,7 @@ type NormalizedExecutionPolicy = NonNullable<
 >;
 type IssueRouteSnapshot = typeof issueRows.$inferSelect;
 function executionDecisionInputsMatch(previous: IssueRouteSnapshot, current: IssueRouteSnapshot) {
-  const keys = [
-    "status", "assigneeAgentId", "assigneeUserId", "responsibleUserId", "createdByUserId",
-    "executionPolicy", "executionState", "monitorNextCheckAt", "monitorWakeRequestedAt",
-    "monitorLastTriggeredAt", "monitorAttemptCount", "monitorNotes", "monitorScheduledBy",
-  ] as const;
-  return keys.every(key => isDeepStrictEqual(previous[key], current[key]));
+  return EXECUTION_DECISION_INPUT_KEYS.every(key => isDeepStrictEqual(previous[key], current[key]));
 }
 
 function buildDecisionActivityDetails(input: {
@@ -14417,6 +14413,10 @@ export function issueRoutes(
   router.patch(
     "/issues/:id",
     (req, res, next) => {
+      if (req.body?.expectedExecutionDecisionDigest !== undefined &&
+          Object.keys(req.body).some(key => !["expectedExecutionDecisionDigest", "status", "comment", "commentClientRequestId"].includes(key))) {
+        throw unprocessable("expectedExecutionDecisionDigest requires a decision-only update");
+      }
       res.locals.plainCancellationRequested = req.body?.status === "cancelled" &&
         Object.keys(req.body).every(key => key === "status" || key === "comment");
       if (req.body?.expectedStatusVersion !== undefined && (
@@ -14506,6 +14506,32 @@ export function issueRoutes(
           : issueWriteAuthorizationReason(req, true);
 
       const actor = getActorInfo(req);
+      const expectedExecutionDecisionDigest = req.body.expectedExecutionDecisionDigest;
+      const staleExecutionDecision = () => conflict(
+        "The reviewed task changed or this request is no longer an execution decision. Refresh and retry.",
+        { code: "execution_policy_transition_stale" },
+      );
+      let guardedExecutionTransition: ReturnType<typeof applyIssueExecutionPolicyTransition> | undefined;
+      if (expectedExecutionDecisionDigest !== undefined) {
+        if (await executionDecisionInputsDigest(existing) !== expectedExecutionDecisionDigest) {
+          throw staleExecutionDecision();
+        }
+        const policy = normalizeIssueExecutionPolicy(existing.executionPolicy ?? null);
+        try {
+          guardedExecutionTransition = applyIssueExecutionPolicyTransition({
+            issue: existing, policy, previousPolicy: policy,
+            requestedStatus: req.body.status,
+            requestedAssigneePatch: {},
+            actor: { agentId: actor.agentId ?? null, userId: actor.actorType === "user" ? actor.actorId : null },
+            allowBoardOverride: req.actor.type === "board" && req.actor.source !== "mcp_oauth",
+            commentBody: req.body.comment,
+          });
+        } catch (error) {
+          if (error instanceof HttpError && error.status === 422) throw staleExecutionDecision();
+          throw error;
+        }
+        if (!guardedExecutionTransition.decision) throw staleExecutionDecision();
+      }
       const isClosed = isClosedIssueStatus(existing.status);
       const isBlocked = existing.status === "blocked";
       const plainBlockedCancellation = isBlocked && res.locals.plainCancellationRequested === true;
@@ -14533,6 +14559,7 @@ export function issueRoutes(
         hiddenAt: hiddenAtRaw,
         expectedExecutionPolicy,
         expectedStatusVersion,
+        expectedExecutionDecisionDigest: _expectedExecutionDecisionDigest,
         onBehalfOfUserId: _requestedOnBehalfOfUserId,
         ...updateFields
       } = req.body;
@@ -14902,7 +14929,7 @@ export function issueRoutes(
         req.body.executionPolicy !== undefined && monitorChanged,
       );
 
-      const transition: ReturnType<typeof applyIssueExecutionPolicyTransition> = expectedStatusVersion !== undefined
+      const transition: ReturnType<typeof applyIssueExecutionPolicyTransition> = guardedExecutionTransition ?? (expectedStatusVersion !== undefined
         ? { patch: {} }
         : applyIssueExecutionPolicyTransition({
         issue: existing,
@@ -14928,7 +14955,7 @@ export function issueRoutes(
         reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
         monitorExplicitlyUpdated:
           req.body.executionPolicy !== undefined && monitorChanged,
-      });
+      }));
       const expectedExecutionPolicyTransition = expectedStatusVersion === undefined
         ? {
           inputs: executionPolicyTransitionInputFingerprint(existing),
@@ -15470,6 +15497,10 @@ export function issueRoutes(
             if (decision) {
               decisionExisting = await svc.getByIdForUpdate(id, tx);
               if (!decisionExisting) return null;
+              if (expectedExecutionDecisionDigest !== undefined &&
+                  await executionDecisionInputsDigest(decisionExisting) !== expectedExecutionDecisionDigest) {
+                throw staleExecutionDecision();
+              }
               if (!executionDecisionInputsMatch(existing, decisionExisting)) {
                 throw conflict("The task changed while this update was prepared. Refresh and retry.", { code: "execution_policy_transition_stale" });
               }
