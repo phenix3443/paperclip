@@ -3422,6 +3422,7 @@ type IssueBlockerAttentionNode = {
   executionRunId?: string | null;
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
+  executionState?: unknown;
 };
 type IssueBlockerAttentionInputNode = Pick<
   IssueBlockerAttentionNode,
@@ -3433,7 +3434,7 @@ type IssueBlockerAttentionInputNode = Pick<
   | "status"
   | "assigneeAgentId"
   | "assigneeUserId"
-> & { executionRunId?: string | null };
+> & { executionRunId?: string | null; executionState?: unknown };
 
 type IssueBlockerAttentionEdge = {
   issueId: string;
@@ -3832,6 +3833,24 @@ async function terminalExplicitBlockersByRoot(
   return terminalByRoot;
 }
 
+// A review stage handed to a person (typically the Board once the change
+// request cap is hit) has no agent to wake, so nothing advances it and the
+// chain behind it waits on that person rather than on live work.
+function humanHeldReviewUserId(issue: {
+  status: string;
+  executionState?: unknown;
+}): string | null {
+  if (issue.status !== "in_review") return null;
+  const state = parseObject(issue.executionState);
+  if (state.status !== "pending") return null;
+  const participant = parseObject(state.currentParticipant);
+  return participant.type === "user" &&
+    typeof participant.userId === "string" &&
+    participant.userId.length > 0
+    ? participant.userId
+    : null;
+}
+
 async function listIssueBlockerAttentionMap(
   dbOrTx: any,
   companyId: string,
@@ -3899,6 +3918,7 @@ async function listIssueBlockerAttentionMap(
           executionRunId: issues.executionRunId,
           assigneeAgentId: issues.assigneeAgentId,
           assigneeUserId: issues.assigneeUserId,
+          executionState: issues.executionState,
         })
         .from(issueRelations)
         .innerJoin(issues, eq(issueRelations.issueId, issues.id))
@@ -3923,6 +3943,7 @@ async function listIssueBlockerAttentionMap(
           executionRunId: issues.executionRunId,
           assigneeAgentId: issues.assigneeAgentId,
           assigneeUserId: issues.assigneeUserId,
+          executionState: issues.executionState,
         })
         .from(issues)
         .where(
@@ -3980,6 +4001,7 @@ async function listIssueBlockerAttentionMap(
           executionRunId: row.executionRunId,
           assigneeAgentId: row.assigneeAgentId,
           assigneeUserId: row.assigneeUserId,
+          executionState: row.executionState,
         });
         nextFrontier.add(row.blockerIssueId);
       }
@@ -4387,14 +4409,6 @@ async function listIssueBlockerAttentionMap(
         sampleStalledBlockerIdentifier: null,
       };
     }
-    if (node.assigneeUserId && node.status !== "cancelled") {
-      return {
-        covered: true,
-        stalled: false,
-        sampleBlockerIdentifier: nodeSample,
-        sampleStalledBlockerIdentifier: null,
-      };
-    }
     const downstream = (edgesByIssueId.get(node.id) ?? []).filter((edge) => {
       const blocker = nodesById.get(edge.blockerIssueId);
       return (
@@ -4402,11 +4416,28 @@ async function listIssueBlockerAttentionMap(
         pendingFinalizeBlockerIssueIds.has(edge.blockerIssueId)
       );
     });
+    // The assignee user is usually the same person holding the review, so
+    // counting it as a waiting path would hide the review from the inbox.
+    const humanHeldReviewTail =
+      downstream.length === 0 && humanHeldReviewUserId(node) !== null;
+    if (
+      node.assigneeUserId &&
+      node.status !== "cancelled" &&
+      !humanHeldReviewTail
+    ) {
+      return {
+        covered: true,
+        stalled: false,
+        sampleBlockerIdentifier: nodeSample,
+        sampleStalledBlockerIdentifier: null,
+      };
+    }
     // A reviewer waiting on unfinished blockers correctly has no run of its
     // own, so the review is judged by those blockers, not as a stalled leaf.
     if (node.status === "in_review" && downstream.length === 0) {
       const hasWaitingPath =
-        activeIssueIds.has(node.id) || Boolean(node.assigneeUserId);
+        activeIssueIds.has(node.id) ||
+        (Boolean(node.assigneeUserId) && !humanHeldReviewTail);
       if (hasWaitingPath) {
         return {
           covered: true,
@@ -4530,7 +4561,7 @@ async function listIssueBlockerAttentionMap(
       node.status === "in_progress" ||
       activeIssueIds.has(node.id) ||
       explicitWaitingIssueIds.has(node.id) ||
-      Boolean(node.assigneeUserId)
+      (Boolean(node.assigneeUserId) && humanHeldReviewUserId(node) === null)
     )
       return true;
 
@@ -6260,6 +6291,26 @@ async function listIssueBlockedInboxAttentionMap(
       row.issueId ? [row.issueId] : [],
     ),
   );
+  // graphIssues already excludes done issues, so presence there means
+  // unfinished; these mirror the blocker walk's downstream and child edges.
+  const hasUnfinishedBlockers = new Set<string>();
+  const hasWaitingDependents = new Set<string>();
+  for (const relation of graphRelations) {
+    const blocked = issuesById.get(relation.blockedIssueId);
+    if (issuesById.has(relation.blockerIssueId) && blocked) {
+      hasUnfinishedBlockers.add(relation.blockedIssueId);
+    }
+    if (blocked && blocked.status !== "cancelled") {
+      hasWaitingDependents.add(relation.blockerIssueId);
+    }
+  }
+  for (const issue of graphIssues) {
+    if (!issue.parentId || issue.status === "cancelled") continue;
+    hasUnfinishedBlockers.add(issue.parentId);
+    if (issuesById.get(issue.parentId)?.status === "blocked") {
+      hasWaitingDependents.add(issue.id);
+    }
+  }
   const blockerCycleByIssueId = new Map<string, IssueBlockerDependencyCycle>();
   const blockerAttentionByIssueId = await listIssueBlockerAttentionMap(
     dbOrTx,
@@ -6509,6 +6560,40 @@ async function listIssueBlockedInboxAttentionMap(
           },
           sourceIssue: source,
           externalDetailsRedacted: true,
+        }),
+      );
+      continue;
+    }
+
+    // List rows carry a null executionState placeholder; the graph row is full.
+    const reviewerUserId = humanHeldReviewUserId(issuesById.get(row.id) ?? row);
+    if (
+      reviewerUserId &&
+      hasWaitingDependents.has(row.id) &&
+      !hasUnfinishedBlockers.has(row.id) &&
+      !hasMonitor &&
+      !liveHandoffRunIssueIds.has(row.id) &&
+      !liveHandoffWakeIssueIds.has(row.id)
+    ) {
+      result.set(
+        row.id,
+        attentionBase({
+          state: "awaiting_decision",
+          reason: "pending_user_decision",
+          severity: "medium",
+          stoppedSinceAt: row.updatedAt,
+          owner: {
+            type: "user",
+            agentId: null,
+            userId: reviewerUserId,
+            label: null,
+          },
+          action: {
+            label: "Complete review",
+            detail:
+              "Approve or request changes on this review; the work blocked behind it cannot continue until then.",
+          },
+          sourceIssue: source,
         }),
       );
       continue;
