@@ -1586,6 +1586,79 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     });
   });
 
+  it.each([
+    { status: "approved" },
+    { status: "changes_requested" },
+    { currentParticipant: null },
+    { currentParticipant: { type: "user", userId: "" } },
+    { currentParticipant: { type: "user", userId: "  " } },
+    { currentParticipant: { type: "user", userId: 42 } },
+    { currentParticipant: { type: "unknown", userId: "board-user" } },
+    { currentParticipant: { type: "user", userId: "board-user", agentId: "conflicting-agent" } },
+  ])("keeps uncertain or non-review participant evidence conservative: %j", async (patch) => {
+    const { companyId, rootId, reviewId } = await seedHumanHeldReviewChain("BHM");
+    await db.update(issues).set({ executionState: {
+      status: "pending", currentStageType: "review",
+      currentParticipant: { type: "user", userId: "board-user" }, ...patch,
+    } }).where(eq(issues.id, reviewId));
+    const root = (await svc.list(companyId, { status: "blocked" })).find((row) => row.id === rootId);
+    expect(root?.blockerAttention).toMatchObject({ state: "covered", blockingTreeLive: true });
+    expect((await svc.list(companyId, { attention: "blocked" })).find((row) => row.id === reviewId)).toBeUndefined();
+  });
+
+  it.each(["queued", "scheduled_retry", "future_monitor", "expired_monitor", "due_monitor"])(
+    "preserves the existing user-review waiting path for %s", async (path) => {
+      const { companyId, agentId, rootId, reviewId } = await seedHumanHeldReviewChain("BHW");
+      if (path === "queued" || path === "scheduled_retry") {
+        await activeRun({ companyId, agentId, issueId: reviewId, status: path, current: false,
+          scheduledRetryAt: new Date(Date.now() + 60_000) });
+      } else {
+        await db.update(issues).set({ monitorNextCheckAt: new Date(Date.now() +
+          (path === "future_monitor" ? 60_000 : path === "due_monitor" ? 0 : -60_000))
+        }).where(eq(issues.id, reviewId));
+      }
+      const covered = !["expired_monitor", "due_monitor"].includes(path);
+      const root = (await svc.list(companyId, { status: "blocked" })).find((row) => row.id === rootId);
+      expect(root?.blockerAttention).toMatchObject({ state: covered ? "covered" : "stalled", blockingTreeLive: covered });
+      const tail = (await svc.list(companyId, { attention: "blocked" })).find((row) => row.id === reviewId);
+      expect(Boolean(tail)).toBe(!covered);
+    },
+  );
+
+  it("uses the current user rather than stale assignment or decision history", async () => {
+    const { companyId, rootId, reviewId } = await seedHumanHeldReviewChain("BHO");
+    await db.update(issues).set({ assigneeUserId: "former-assignee", executionState: {
+      status: "pending", currentParticipant: { type: "user", userId: "current-user", agentId: null },
+      completedStageIds: ["old-stage"], lastDecisionId: "old-decision", changesRequestedCount: 3,
+    } }).where(eq(issues.id, reviewId));
+    const rows = await svc.list(companyId, { attention: "blocked" });
+    for (const id of [rootId, reviewId]) {
+      expect(rows.find((row) => row.id === id)?.blockedInboxAttention?.owner).toMatchObject({ type: "user", userId: "current-user" });
+    }
+    expect(rows.find((row) => row.id === reviewId)?.executionState).toBeNull();
+  });
+
+  it.each(["done", "cancelled", "none", "blocked_parent"])("requires unfinished waiting work: %s", async (waiting) => {
+    const { companyId, rootId, midId, reviewId } = await seedHumanHeldReviewChain("BHD");
+    await db.delete(issueRelations);
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, rootId));
+    await db.update(issues).set({ status: waiting === "blocked_parent" ? "blocked" : waiting === "none" ? "todo" : waiting }).where(eq(issues.id, midId));
+    if (waiting === "blocked_parent") await db.update(issues).set({ parentId: midId }).where(eq(issues.id, reviewId));
+    else if (waiting !== "none") await block({ companyId, blockerIssueId: reviewId, blockedIssueId: midId });
+    const rows = await svc.list(companyId, { attention: "blocked" });
+    expect(Boolean(rows.find((row) => row.id === reviewId))).toBe(waiting === "blocked_parent");
+  });
+
+  it("does not expose private review sample data through public dependents", async () => {
+    const { companyId, rootId, reviewId } = await seedHumanHeldReviewChain("BHP");
+    await db.update(issues).set({ visibility: "private", title: "Hidden review title" }).where(eq(issues.id, reviewId));
+    const root = (await svc.list(companyId, { attention: "blocked" })).find((row) => row.id === rootId);
+    expect(root?.blockedInboxAttention?.owner).toMatchObject({ type: "unknown", userId: null });
+    expect(root?.blockedInboxAttention?.sampleIssueIdentifier).not.toBe("BHP-3");
+    expect(root?.blockerAttention?.sampleStalledBlockerIdentifier).toBeNull();
+    expect(root?.blockerAttention?.terminalBlocker).toBeNull();
+  });
+
   it("keeps covering a user-held review tail that has an active run", async () => {
     const { companyId, agentId, rootId, reviewId } = await seedHumanHeldReviewChain("BHA");
     await activeRun({ companyId, agentId, issueId: reviewId });
@@ -1610,21 +1683,26 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     expect(await svc.list(companyId, { attention: "blocked" })).toEqual([]);
   });
 
-  it("judges a user-held review with unfinished blockers by those blockers", async () => {
+  it.each(["live", "stalled", "mixed"])("judges a user-held review with unfinished %s blockers by those blockers", async (path) => {
     const { companyId, agentId, rootId, reviewId } = await seedHumanHeldReviewChain("BHB");
     const leafId = await insertIssue({
       companyId,
       identifier: "BHB-4",
       title: "Running dependency of the review",
-      status: "in_progress",
+      status: path === "live" ? "in_progress" : "in_review",
       assigneeAgentId: agentId,
     });
     await block({ companyId, blockerIssueId: leafId, blockedIssueId: reviewId });
-    await activeRun({ companyId, agentId, issueId: leafId });
-
+    if (path === "live") await activeRun({ companyId, agentId, issueId: leafId });
+    if (path === "mixed") {
+      const runningId = await insertIssue({ companyId, identifier: "BHB-5", title: "Live sibling", status: "in_progress", assigneeAgentId: agentId });
+      await block({ companyId, blockerIssueId: runningId, blockedIssueId: reviewId });
+      await activeRun({ companyId, agentId, issueId: runningId });
+    }
     const root = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === rootId);
-    expect(root?.blockerAttention).toMatchObject({ state: "covered", stalledBlockerCount: 0 });
-    expect(await svc.list(companyId, { attention: "blocked" })).toEqual([]);
+    expect(root?.blockerAttention).toMatchObject({ state: path === "live" ? "covered" : "stalled", blockingTreeLive: path !== "stalled" });
+    const rows = await svc.list(companyId, { attention: "blocked" });
+    expect(rows.find((row) => row.id === reviewId)).toBeUndefined();
   });
   it("reports a cycle through a parent waiting on its child as a dependency cycle", async () => {
     const { companyId, agentId } = await createCompany("BCY");

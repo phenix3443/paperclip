@@ -205,6 +205,26 @@ describeEmbeddedPostgres("issue blocker diagnostics route", () => {
     await tempDb?.cleanup();
   });
 
+  it("redacts the user owner of an unreadable review tail", async () => {
+    const company = await seedCompany(db);
+    const agent = await seedAgent(db, company.id);
+    const project = await seedProject(db, company.id, "Private review project");
+    await db.update(projects).set({ visibility: "private" }).where(eq(projects.id, project.id));
+    const root = await seedIssue(db, { companyId: company.id, title: "Visible source", status: "blocked", assigneeAgentId: agent.id });
+    const tail = await seedIssue(db, { companyId: company.id, projectId: project.id, title: "Hidden review title", status: "in_review" });
+    await db.update(issues).set({ visibility: "private", privacyRootIssueId: tail.id, createdByUserId: "hidden-user", assigneeUserId: "hidden-user", executionState: {
+      status: "pending", currentParticipant: { type: "user", userId: "hidden-user" },
+    } }).where(eq(issues.id, tail.id));
+    await blockIssue(db, company.id, tail.id, root.id);
+    const app = createApp(db, { type: "agent", agentId: agent.id, companyId: company.id, runId: null, source: "agent_jwt" });
+    const response = await request(app).get(`/api/companies/${company.id}/issues?attention=blocked`).expect(200);
+    expect(response.body.some((row: IssueRow) => row.id === tail.id)).toBe(false);
+    const visible = response.body.find((row: IssueRow) => row.id === root.id);
+    expect(visible.blockedInboxAttention.owner).toMatchObject({ type: "unknown", userId: null });
+    expect(JSON.stringify(visible)).not.toContain("hidden-user");
+    expect(JSON.stringify(visible)).not.toContain("Hidden review title");
+  });
+
   it("returns stale-blocker diagnosis and anomaly flags for a done blocker on a blocked issue", async () => {
     const company = await seedCompany(db);
     const agent = await seedAgent(db, company.id);

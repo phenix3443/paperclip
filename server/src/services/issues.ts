@@ -3423,6 +3423,7 @@ type IssueBlockerAttentionNode = {
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
   executionState?: unknown;
+  visibility?: string;
 };
 type IssueBlockerAttentionInputNode = Pick<
   IssueBlockerAttentionNode,
@@ -3619,7 +3620,7 @@ function createIssueBlockerAttention(
 function blockerSampleIdentifier(
   node: IssueBlockerAttentionNode | null | undefined,
 ) {
-  return node?.identifier ?? node?.id ?? null;
+  return node?.visibility === "private" ? null : node?.identifier ?? node?.id ?? null;
 }
 
 function appendBlockerAttentionEdges(
@@ -3833,9 +3834,15 @@ async function terminalExplicitBlockersByRoot(
   return terminalByRoot;
 }
 
-// A review stage handed to a person (typically the Board once the change
-// request cap is hit) has no agent to wake, so nothing advances it and the
-// chain behind it waits on that person rather than on live work.
+const blockerReviewState = sql<unknown>`jsonb_build_object(
+  'status', ${issues.executionState} -> 'status',
+  'currentParticipant', jsonb_build_object(
+    'type', ${issues.executionState} -> 'currentParticipant' -> 'type',
+    'userId', ${issues.executionState} -> 'currentParticipant' -> 'userId',
+    'agentId', ${issues.executionState} -> 'currentParticipant' -> 'agentId'
+  )
+)`;
+
 function humanHeldReviewUserId(issue: {
   status: string;
   executionState?: unknown;
@@ -3845,8 +3852,9 @@ function humanHeldReviewUserId(issue: {
   if (state.status !== "pending") return null;
   const participant = parseObject(state.currentParticipant);
   return participant.type === "user" &&
+    participant.agentId == null &&
     typeof participant.userId === "string" &&
-    participant.userId.length > 0
+    participant.userId.trim().length > 0
     ? participant.userId
     : null;
 }
@@ -3918,7 +3926,8 @@ async function listIssueBlockerAttentionMap(
           executionRunId: issues.executionRunId,
           assigneeAgentId: issues.assigneeAgentId,
           assigneeUserId: issues.assigneeUserId,
-          executionState: issues.executionState,
+          executionState: blockerReviewState,
+          visibility: issues.visibility,
         })
         .from(issueRelations)
         .innerJoin(issues, eq(issueRelations.issueId, issues.id))
@@ -3943,7 +3952,8 @@ async function listIssueBlockerAttentionMap(
           executionRunId: issues.executionRunId,
           assigneeAgentId: issues.assigneeAgentId,
           assigneeUserId: issues.assigneeUserId,
-          executionState: issues.executionState,
+          executionState: blockerReviewState,
+          visibility: issues.visibility,
         })
         .from(issues)
         .where(
@@ -4002,6 +4012,7 @@ async function listIssueBlockerAttentionMap(
           assigneeAgentId: row.assigneeAgentId,
           assigneeUserId: row.assigneeUserId,
           executionState: row.executionState,
+          visibility: row.visibility,
         });
         nextFrontier.add(row.blockerIssueId);
       }
@@ -4418,12 +4429,11 @@ async function listIssueBlockerAttentionMap(
     });
     // The assignee user is usually the same person holding the review, so
     // counting it as a waiting path would hide the review from the inbox.
-    const humanHeldReviewTail =
-      downstream.length === 0 && humanHeldReviewUserId(node) !== null;
+    const humanHeldReview = humanHeldReviewUserId(node) !== null;
     if (
       node.assigneeUserId &&
       node.status !== "cancelled" &&
-      !humanHeldReviewTail
+      !humanHeldReview
     ) {
       return {
         covered: true,
@@ -4437,7 +4447,7 @@ async function listIssueBlockerAttentionMap(
     if (node.status === "in_review" && downstream.length === 0) {
       const hasWaitingPath =
         activeIssueIds.has(node.id) ||
-        (Boolean(node.assigneeUserId) && !humanHeldReviewTail);
+        (Boolean(node.assigneeUserId) && !humanHeldReview);
       if (hasWaitingPath) {
         return {
           covered: true,
@@ -4705,7 +4715,7 @@ async function listIssueBlockerAttentionMap(
         })(),
         directBlockerIssueId: sampleEntry?.edge.blockerIssueId ?? null,
         terminalBlockerIssueId,
-        terminalBlocker: terminalBlockerNode
+        terminalBlocker: terminalBlockerNode && terminalBlockerNode.visibility !== "private"
           ? {
               id: terminalBlockerNode.id,
               identifier: terminalBlockerNode.identifier,
