@@ -224,9 +224,6 @@ describe("plugin database SQL validation", () => {
   });
 
   it("keeps SQL after an unterminated quote or block comment visible to the keyword scan", () => {
-    // The host grammar has no dollar-quoted or E'' strings, so PostgreSQL can
-    // close these strings where the scanner sees an unterminated quote. The
-    // scan must not hide the SQL that follows such a quote.
     expect(() =>
       validatePluginMigrationStatement(
         "CREATE TABLE plugin_test.rows (a text DEFAULT $$'$$); GRANT ALL ON plugin_test.rows TO public",
@@ -251,6 +248,51 @@ describe("plugin database SQL validation", () => {
         "plugin_test",
       )
     ).toThrow(/cannot delete/i);
+  });
+
+  it("ends line comments at a carriage return like PostgreSQL", () => {
+    expect(() =>
+      validatePluginMigrationStatement(
+        "CREATE TABLE plugin_test.rows (id uuid) -- it's\r; GRANT ALL ON plugin_test.rows TO public",
+        "plugin_test",
+      )
+    ).toThrow(/disallowed/i);
+    expect(() =>
+      validatePluginRuntimeQuery(
+        "WITH a AS (SELECT 1) --\r, d AS (DELETE FROM plugin_test.rows RETURNING 1) SELECT * FROM a",
+        "plugin_test",
+      )
+    ).toThrow(/mutation/i);
+    expect(() =>
+      validatePluginMigrationStatement("-- don't\r\nCREATE TABLE plugin_test.rows (id uuid)", "plugin_test")
+    ).not.toThrow();
+  });
+
+  it("applies the same comment and quote handling to runtime SQL", () => {
+    expect(() =>
+      validatePluginRuntimeQuery(
+        "-- the user's rows\nSELECT id, 'a -- b' AS note FROM plugin_test.rows /* it's */",
+        "plugin_test",
+      )
+    ).not.toThrow();
+    expect(() =>
+      validatePluginRuntimeQuery(
+        "SELECT id FROM plugin_test.rows WHERE note = $$'$$ AND id IN (DELETE FROM plugin_test.rows RETURNING id)",
+        "plugin_test",
+      )
+    ).toThrow(/mutation/i);
+    expect(() =>
+      validatePluginRuntimeExecute(
+        "-- don't\nUPDATE plugin_test.rows SET note = 'it''s' WHERE id = $1",
+        "plugin_test",
+      )
+    ).not.toThrow();
+    expect(() =>
+      validatePluginRuntimeExecute(
+        "UPDATE plugin_test.rows SET note = $$\"$$ WHERE id IN (SELECT 1); DROP TABLE plugin_test.rows",
+        "plugin_test",
+      )
+    ).toThrow(/ddl/i);
   });
 
   it("targets anonymous DO blocks without rejecting do-prefixed aliases", () => {
